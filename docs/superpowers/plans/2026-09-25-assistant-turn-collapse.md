@@ -126,7 +126,7 @@ Paraglide JS, Playwright.
   `${sessionId}:${message.id}:${event.kind}:${eventIndex}`; tool-rollup keys use
   the first tool message ID.
 
-- [ ] **Step 1: Write the failing projection test**
+- [x] **Step 1: Write the failing projection test**
 
   In `assistant-turns.test.ts`, create messages for a user prompt, an assistant
   message with thinking and text, consecutive tool-only messages, a
@@ -139,7 +139,7 @@ Paraglide JS, Playwright.
   `continuation`/`resume`/`interrupted` flush a group while `task_notification`
   and `stop_hook` do not.
 
-- [ ] **Step 2: Run the projection test and verify RED**
+- [x] **Step 2: Run the projection test and verify RED**
 
   Run from `frontend/`:
 
@@ -150,7 +150,7 @@ Paraglide JS, Playwright.
   Expected: FAIL because `buildTranscriptNodes` and the assistant-turn event
   types do not exist.
 
-- [ ] **Step 3: Implement the pure event projection**
+- [x] **Step 3: Implement the pure event projection**
 
   Implement `buildTranscriptNodes` without store imports. It must:
 
@@ -170,7 +170,7 @@ Paraglide JS, Playwright.
     last non-empty user-facing message event as `finalOutput`; later tool,
     thinking, and system events do not replace it.
 
-- [ ] **Step 4: Run focused projection and existing display-item tests**
+- [x] **Step 4: Run focused projection and existing display-item tests**
 
   ```bash
   ./node_modules/.bin/vp test run \
