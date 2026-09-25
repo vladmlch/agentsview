@@ -85,3 +85,4 @@ graphify-out/
 # roborev snapshots
 /.roborev/
 .env*
+.agents
