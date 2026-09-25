@@ -145,6 +145,20 @@ describe("TurnCollapseStore", () => {
       expect(store.isUserPromptExpanded(5)).toBe(true);
       expect(store.isUserPromptExpanded(6)).toBe(false);
     });
+
+    it("exposes the current bulk baseline direction", () => {
+      const store = setup();
+      expect(store.bulkBaseline).toBeNull();
+
+      store.collapseAll();
+      expect(store.bulkBaseline).toBe("collapse");
+
+      store.expandAll();
+      expect(store.bulkBaseline).toBe("expand");
+
+      store.activateSession("s2");
+      expect(store.bulkBaseline).toBeNull();
+    });
   });
 
   describe("session scope", () => {
@@ -187,6 +201,19 @@ describe("TurnCollapseStore", () => {
       expect(store.isTurnExpanded(TURN_A, false)).toBe(true);
       expect(store.isTurnExpanded(TURN_B, true)).toBe(false);
     });
+
+    it("clears stray writes made while no session is active", () => {
+      const store = new TurnCollapseStore();
+      store.collapseAll();
+      store.setTurnExpanded(TURN_A, false);
+      store.setUserPromptExpanded(5, true);
+
+      store.activateSession(null);
+
+      expect(store.isTurnExpanded(TURN_A, true)).toBe(true);
+      expect(store.isUserPromptExpanded(5)).toBe(false);
+      expect(store.bulkBaseline).toBeNull();
+    });
   });
 
   describe("key migration", () => {
@@ -219,6 +246,28 @@ describe("TurnCollapseStore", () => {
 
       expect(store.isTurnExpanded("s1:turn:7", true)).toBe(true);
       expect(store.isTurnExpanded("s1:turn:7", false)).toBe(false);
+    });
+
+    it("is a no-op when old and new keys are identical", () => {
+      const store = setup();
+      store.setTurnExpanded(TURN_A, false);
+
+      store.migrateTurnKey(TURN_A, TURN_A);
+
+      expect(store.isTurnExpanded(TURN_A, true)).toBe(false);
+    });
+
+    it("overwrites an existing override on the new key", () => {
+      const store = setup();
+      store.setTurnExpanded(TURN_A, true);
+      store.setTurnExpanded("s1:turn:7", false);
+
+      // Last-writer-wins: the migrated state reflects the user's latest
+      // intent for the same logical turn.
+      store.migrateTurnKey(TURN_A, "s1:turn:7");
+
+      expect(store.isTurnExpanded("s1:turn:7", false)).toBe(true);
+      expect(store.isTurnExpanded(TURN_A, false)).toBe(false);
     });
   });
 
