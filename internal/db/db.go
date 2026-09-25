@@ -612,7 +612,10 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // message_nodes sibling branches, and continuation-summary nodes are marked
 // as compact boundaries. Re-parse Devin sessions to restore messages the
 // main chain does not reach.)
-const dataVersion = 148
+// (149: Devin message_nodes are preferred over possibly stale transcript
+// exports, and Devin subagent calls/results are normalized from both formats.
+// Re-parse Devin sessions to restore current messages and tool details.)
+const dataVersion = 149
 
 const archiveOnlyVersionBase = 1 << 20
 
