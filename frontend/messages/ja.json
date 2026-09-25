@@ -372,6 +372,8 @@
   "tool_block_status_label": "状態：",
   "tool_block_source_label": "ソース：",
   "tool_block_agent_label": "エージェント：",
+  "tool_block_subagent_label": "サブエージェント：",
+  "tool_block_subagent_result_label": "サブエージェントの結果：",
   "tool_block_show_less": "あまり見せない",
   "tool_block_show_all_lines": [
     {

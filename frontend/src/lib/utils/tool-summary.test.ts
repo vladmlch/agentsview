@@ -34,6 +34,48 @@ describe("summarizeToolCall", () => {
     ).toBeNull();
   });
 
+  describe("Devin subagents", () => {
+    it("prefers run_subagent title to its full task prompt", () => {
+      expect(
+        summarizeToolCall(
+          call({
+            tool_name: "run_subagent",
+            category: "Task",
+            input_json: JSON.stringify({
+              title: "Review parser behavior",
+              task: "Review the parser and summarize its current behavior.\nSecond line.",
+            }),
+          }),
+        ),
+      ).toBe("Review parser behavior");
+    });
+
+    it("uses the first task line when run_subagent has no title", () => {
+      expect(
+        summarizeToolCall(
+          call({
+            tool_name: "run_subagent",
+            category: "Task",
+            input_json: JSON.stringify({ task: "Inspect the parser.\nReport findings." }),
+          }),
+        ),
+      ).toBe("Inspect the parser.");
+    });
+
+    it("previews the first line of a read_subagent result", () => {
+      expect(
+        summarizeToolCall(
+          call({
+            tool_name: "read_subagent",
+            category: "Task",
+            input_json: JSON.stringify({ agent_id: "agent-fixture-1" }),
+            result_content: "Subagent task complete.\n## Summary\nFull report.",
+          }),
+        ),
+      ).toBe("Subagent task complete.");
+    });
+  });
+
   describe("Bash", () => {
     it("shows the command", () => {
       expect(

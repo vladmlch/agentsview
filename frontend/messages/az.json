@@ -374,6 +374,8 @@
   "tool_block_status_label": "Vəziyyət:",
   "tool_block_source_label": "Mənbə:",
   "tool_block_agent_label": "Agent:",
+  "tool_block_subagent_label": "Alt agent:",
+  "tool_block_subagent_result_label": "Alt agentin nəticəsi:",
   "tool_block_show_less": "Daha az göstər",
   "tool_block_show_all_lines": [
     {

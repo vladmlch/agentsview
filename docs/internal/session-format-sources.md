@@ -2606,14 +2606,13 @@ schemas keep their existing ordering behavior.
   completion, and cached tokens. The parser handles multiple observed field
   names; no authoritative provider-reported USD value is consumed, so pricing
   is catalog-derived when model attribution is possible. Transcript JSON is
-  written only by an explicit session export, so most sessions have none; for
-  those the parser reads per-assistant-message counters from the
-  `message_nodes` fallback at `chat_message -> metadata.metrics`
-  (`input_tokens`, `output_tokens`, `cache_read_tokens`,
-  `cache_creation_tokens`, any of which may be JSON null). `message_nodes` is
-  a forest, so totals are summed only along the main chain
-  (`sessions.main_chain_id` walked up via `parent_node_id`); summing every row
-  double-counts retries and edits. Older databases that predate
+  written only by an explicit session export, so most sessions have none.
+  Per-assistant-message counters are read from `message_nodes` at
+  `chat_message -> metadata.metrics` (`input_tokens`, `output_tokens`,
+  `cache_read_tokens`, `cache_creation_tokens`, any of which may be JSON
+  null). `message_nodes` is a forest, so totals are summed only along the main
+  chain (`sessions.main_chain_id` walked up via `parent_node_id`); summing
+  every row double-counts retries and edits. Older databases that predate
   `sessions.main_chain_id` keep that field invalid and fall back to all
   message nodes in creation order. When Devin continues a compacted session,
   it re-roots the context: the new chain starts at a fresh snapshot whose
@@ -2629,9 +2628,20 @@ schemas keep their existing ordering behavior.
   excluded. Continuation-summary nodes are surfaced as `compact_boundary`
   markers, matching the Claude compact-boundary convention. Exported
   transcripts open with the same summary step and likewise drop
-  pre-continuation steps, so the transcript path recovers eras from
-  `message_nodes` too unless the export carries real content before the
-  boundary. Verified against a live Devin CLI database 2026-09-25.
+  pre-continuation steps; when an export is the fallback source, earlier eras
+  can still be recovered from the node forest unless the export carries real
+  content before the boundary. Verified against a live Devin CLI database
+  2026-09-25.
+  A valid `message_nodes` representation is preferred over an export because
+  the explicit export can lag the live session. Export JSON is used when the
+  node table cannot provide an ordered chain, the session has no nodes, or a
+  node message is invalid JSON; the representations are not merged. Native
+  `chat_message` `tool_calls[]` use `id`, `name`, and `arguments`; tool-result
+  nodes use `role=tool` with `tool_call_id` and `content`. Exported `steps[]`
+  can also include `tool_calls[]`, using `tool_call_id`, `function_name`, and
+  `arguments`. Their `observation.results[]` entries link to calls through
+  `source_call_id` and carry result text in `content`. Verified against Devin
+  CLI session artifacts 2026-09-25.
   Assistant `chat_message.thinking` is an object
   (`{"thinking": string, "signature": ..., "signature_type": ...}`), never a
   bare string: across a live database every populated node used the object

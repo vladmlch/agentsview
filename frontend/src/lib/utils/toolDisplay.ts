@@ -1,3 +1,5 @@
+import { m } from "../i18n/index.js";
+
 /** Returns the user-facing label for a tool call.
  *
  *  Prefers the normalized category (e.g. "Bash" for codex's
@@ -9,6 +11,8 @@
  *  informative than its category (e.g. "Skill" inside the
  *  Tool category). */
 export function displayToolName(call: { tool_name: string; category?: string | null }): string {
+  if (call.tool_name === "run_subagent") return m.tool_block_subagent_label();
+  if (call.tool_name === "read_subagent") return m.tool_block_subagent_result_label();
   const cat = call.category;
   if (cat && cat !== "Other" && cat !== "Tool") return cat;
   return call.tool_name;
