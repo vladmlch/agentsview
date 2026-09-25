@@ -103,7 +103,7 @@ describe("buildTranscriptNodes", () => {
     expect(second.finalOutput?.message.id).toBe(18);
   });
 
-  it("keys child events by source message, kind, and event index", () => {
+  it("keys child events by source message, kind, and segment index", () => {
     const nodes = nodesOf([
       userMsg(10, 0),
       assistantMsg(11, 1, "[Thinking]\nplan\n[/Thinking]\n\nOn it."),
@@ -176,7 +176,7 @@ describe("buildTranscriptNodes", () => {
     const turn = nodes[1]!;
     if (turn.kind !== "assistant-turn") throw new Error("expected a turn");
     expect(turn.events.map((e) => e.kind)).toEqual(["message", "tool"]);
-    expect(turn.events[1]!.toolCalls).toBe(calls);
+    expect(turn.events[1]!.toolCalls).toEqual(calls);
   });
 
   it("picks the last non-empty message event as finalOutput when tools follow", () => {
@@ -218,13 +218,25 @@ describe("buildTranscriptNodes", () => {
   it("joins the turn for a mid-turn system row that arrives before the first reply", () => {
     const nodes = nodesOf([
       userMsg(10, 0),
-      boundaryMsg(11, 1, "task_notification", "<task-notification>done</task-notification>"),
-      assistantMsg(12, 2, "reply"),
+      msg({
+        id: 11,
+        ordinal: 1,
+        role: "user",
+        is_system: true,
+        source_subtype: "task_notification",
+        content: "<task-notification>done</task-notification>",
+        timestamp: "2025-02-17T21:04:30Z",
+      }),
+      msg({ id: 12, ordinal: 2, content: "reply", timestamp: "2025-02-17T21:05:00Z" }),
     ]);
     expect(kindsOf(nodes)).toEqual(["prompt", "assistant-turn"]);
     const turn = nodes[1]!;
     if (turn.kind !== "assistant-turn") throw new Error("expected a turn");
+    // The key and firstMessageId still anchor on the first assistant
+    // message, but timestamp is the first member's — the system row.
     expect(turn.key).toBe("s1:turn:12");
+    expect(turn.firstMessageId).toBe(12);
+    expect(turn.timestamp).toBe("2025-02-17T21:04:30Z");
     expect(turn.events.map((e) => e.kind)).toEqual(["system", "message"]);
   });
 
@@ -306,5 +318,100 @@ describe("buildTranscriptNodes", () => {
       userMsg(11, 1),
     ]);
     expect(kindsOf(nodes)).toEqual(["standalone", "prompt"]);
+  });
+
+  it("keeps an empty-content assistant message as an eventless turn", () => {
+    const nodes = nodesOf([userMsg(10, 0), assistantMsg(11, 1, "")]);
+    expect(kindsOf(nodes)).toEqual(["prompt", "assistant-turn"]);
+    const turn = nodes[1]!;
+    if (turn.kind !== "assistant-turn") throw new Error("expected a turn");
+    expect(turn.events).toEqual([]);
+    expect(turn.finalOutput).toBeNull();
+  });
+
+  it("keeps a whitespace-only message event out of finalOutput", () => {
+    const nodes = nodesOf([userMsg(10, 0), assistantMsg(11, 1, "   ")]);
+    const turn = nodes[1]!;
+    if (turn.kind !== "assistant-turn") throw new Error("expected a turn");
+    expect(turn.events.map((e) => e.kind)).toEqual(["message"]);
+    expect(turn.finalOutput).toBeNull();
+  });
+
+  it("merges non-contiguous tool segments into one trailing tool event", () => {
+    const content = "[Bash]\n$ a\n\nbetween calls\n\n[Read]\nf.ts";
+    const nodes = nodesOf([
+      userMsg(10, 0),
+      msg({ id: 11, ordinal: 1, content, has_tool_use: true }),
+    ]);
+    const turn = nodes[1]!;
+    if (turn.kind !== "assistant-turn") throw new Error("expected a turn");
+    expect(turn.events.map((e) => e.kind)).toEqual(["message", "tool"]);
+    const tool = turn.events[1]!;
+    // The tool event keys off its first segment but its segment list is
+    // sparse: indexes 0 and 2 of the source message's segments.
+    expect(tool.segmentIndex).toBe(0);
+    expect(tool.segments?.map((s) => s.label)).toEqual(["Bash", "Read"]);
+    expect(turn.events[0]!.segmentIndex).toBe(1);
+  });
+
+  it("emits separate message events for text runs split by thinking", () => {
+    const content = "First part.\n\n[Thinking]\nreconsider\n[/Thinking]\n\nSecond part.";
+    const nodes = nodesOf([
+      userMsg(10, 0),
+      msg({ id: 11, ordinal: 1, content, has_thinking: true }),
+    ]);
+    const turn = nodes[1]!;
+    if (turn.kind !== "assistant-turn") throw new Error("expected a turn");
+    expect(turn.events.map((e) => e.kind)).toEqual(["message", "thinking", "message"]);
+    expect(turn.events[0]!.segmentIndex).toBe(0);
+    expect(turn.events[2]!.segmentIndex).toBe(2);
+    expect(turn.events[0]!.key).toBe("s1:11:message:0");
+    expect(turn.events[2]!.key).toBe("s1:11:message:2");
+  });
+
+  it("reports the turn model and first member timestamp", () => {
+    const nodes = nodesOf([
+      userMsg(10, 0),
+      msg({
+        id: 11,
+        ordinal: 1,
+        content: "working",
+        model: "claude-opus-4",
+        timestamp: "2025-02-17T21:05:00Z",
+      }),
+      msg({
+        id: 12,
+        ordinal: 2,
+        content: "done",
+        model: "claude-opus-4",
+        timestamp: "2025-02-17T21:06:00Z",
+      }),
+    ]);
+    const turn = nodes[1]!;
+    if (turn.kind !== "assistant-turn") throw new Error("expected a turn");
+    expect(turn.model).toBe("claude-opus-4");
+    expect(turn.timestamp).toBe("2025-02-17T21:05:00Z");
+  });
+
+  it("returns no nodes when every row is a hidden system message", () => {
+    const nodes = nodesOf([
+      msg({ id: 10, ordinal: 0, role: "user", is_system: true, content: "hidden a" }),
+      msg({ id: 11, ordinal: 1, role: "user", is_system: true, content: "hidden b" }),
+    ]);
+    expect(nodes).toEqual([]);
+  });
+
+  it("emits per-message tool events for ungrouped tool-only items", () => {
+    const items = buildDisplayItems(
+      [userMsg(10, 0), toolMsg(11, 1), toolMsg(12, 2, "Read", "f.ts")],
+      { skipToolGrouping: true },
+    );
+    const nodes = buildTranscriptNodes(items, "s1");
+    expect(kindsOf(nodes)).toEqual(["prompt", "assistant-turn"]);
+    const turn = nodes[1]!;
+    if (turn.kind !== "assistant-turn") throw new Error("expected a turn");
+    expect(turn.events.map((e) => e.kind)).toEqual(["tool", "tool"]);
+    expect(turn.events.map((e) => e.message.id)).toEqual([11, 12]);
+    expect(turn.events.map((e) => e.key)).toEqual(["s1:11:tool:0", "s1:12:tool:0"]);
   });
 });
