@@ -983,3 +983,218 @@ func TestParseDevinSessionRedactsCredentialPathsAndTokenLikeValues(t *testing.T)
 		transcriptPath,
 	)
 }
+
+// A continued (compacted) Devin session stores the pre-continuation thread on
+// sibling branches of the main chain: the chain itself opens with a fresh
+// context snapshot plus the continuation summary, so the original user message
+// is unreachable from main_chain_id. The parser recovers system-headed sibling
+// subtrees as earlier eras, keeps edits/retries out, and marks the summary as
+// a compact boundary.
+func TestParseDevinSessionMessageNodesRecoversPreContinuationEra(t *testing.T) {
+	const sessionID = "session-continued"
+	fixture := newDevinTestFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Continued session",
+		WorkingDirectory: "/tmp/continued",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103300)),
+		MainChainID:      new(int64(12)),
+	})
+	// Main chain: 1 -> 2 -> 10 -> 11 -> 12. Node 2 is the fork point where
+	// the post-continuation context re-roots.
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"message_id":"m-ctx-a","role":"system","content":"system prompt a"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ParentNodeID: new(int64(1)), ChatMessage: `{"message_id":"m-ctx-b","role":"system","content":"system prompt b"}`, CreatedAt: 1704103201},
+
+		// Era 1: sibling subtree headed by a re-captured context block.
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 3, ParentNodeID: new(int64(2)), ChatMessage: `{"message_id":"m-era1-ctx","role":"system","content":"era one context"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 4, ParentNodeID: new(int64(3)), ChatMessage: `{"message_id":"m-era1-user","role":"user","content":"original user prompt"}`, CreatedAt: 1704103201},
+		// Pending/committed duplicate pair sharing one message_id: the
+		// higher node_id (6) wins.
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 5, ParentNodeID: new(int64(4)), ChatMessage: `{"message_id":"m-era1-work","role":"assistant","content":"era one work pending","metadata":{"metrics":{"output_tokens":3}}}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 6, ParentNodeID: new(int64(4)), ChatMessage: `{"message_id":"m-era1-work","role":"assistant","content":"era one work committed","metadata":{"metrics":{"output_tokens":7}}}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 7, ParentNodeID: new(int64(6)), ChatMessage: `{"message_id":"m-era1-final","role":"assistant","content":"era one final answer"}`, CreatedAt: 1704103201},
+
+		// Abandoned user-edit branch: not an era, stays excluded.
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 8, ParentNodeID: new(int64(2)), ChatMessage: `{"message_id":"m-edit","role":"user","content":"edited prompt superseded"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 9, ParentNodeID: new(int64(8)), ChatMessage: `{"message_id":"m-edit-reply","role":"assistant","content":"answer to edited prompt"}`, CreatedAt: 1704103201},
+
+		// Current era on the main chain: fresh context, continuation
+		// summary, then post-compaction work.
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 10, ParentNodeID: new(int64(2)), ChatMessage: `{"message_id":"m-era2-ctx","role":"system","content":"era two context"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 11, ParentNodeID: new(int64(10)), ChatMessage: `{"message_id":"m-summary","role":"system","content":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nFull conversation history saved at /tmp/history_x.md.\nSummary: did work"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 12, ParentNodeID: new(int64(11)), ChatMessage: `{"message_id":"m-era2-work","role":"assistant","content":"post-compaction work","metadata":{"metrics":{"output_tokens":5}}}`, CreatedAt: 1704103201},
+	)
+
+	sess, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+
+	require.Len(t, msgs, 9)
+
+	// Era 1 comes first, linearized to its committed line.
+	assert.Equal(t, RoleSystem, msgs[0].Role)
+	assert.Equal(t, "era one context", msgs[0].Content)
+	assert.Equal(t, RoleUser, msgs[1].Role)
+	assert.Equal(t, "original user prompt", msgs[1].Content)
+	assert.Equal(t, "era one work committed", msgs[2].Content)
+	assert.Equal(t, "era one final answer", msgs[3].Content)
+
+	// The abandoned edit branch is not part of the output.
+	for _, m := range msgs {
+		assert.NotContains(t, m.Content, "edited prompt superseded")
+		assert.NotContains(t, m.Content, "answer to edited prompt")
+	}
+
+	// Then the current era: context, boundary, work.
+	assert.Equal(t, "era two context", msgs[6].Content)
+	boundary := msgs[7]
+	assert.Equal(t, RoleSystem, boundary.Role)
+	assert.True(t, boundary.IsSystem)
+	assert.True(t, boundary.IsCompactBoundary)
+	assert.Equal(t, "system", boundary.SourceType)
+	assert.Equal(t, "compact_boundary", boundary.SourceSubtype)
+	assert.Contains(t, boundary.Content, "continuing work from a previous conversation thread")
+	assert.Equal(t, "post-compaction work", msgs[8].Content)
+
+	assert.Equal(t, "original user prompt", sess.FirstMessage)
+	assert.Equal(t, 1, sess.UserMessageCount)
+	assert.Equal(t, 9, sess.MessageCount)
+
+	// Token metrics from the recovered era count toward session totals.
+	assert.True(t, sess.HasTotalOutputTokens)
+	assert.Equal(t, 12, sess.TotalOutputTokens) // 7 + 5
+}
+
+// When Devin appends the continuation in place, the earlier thread stays on
+// the main chain: nothing is recovered, but the summary is still marked as a
+// compact boundary.
+func TestParseDevinSessionMessageNodesMarksAppendedContinuation(t *testing.T) {
+	const sessionID = "session-appended-continuation"
+	fixture := newDevinTestFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Appended continuation",
+		WorkingDirectory: "/tmp/appended",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103300)),
+		MainChainID:      new(int64(5)),
+	})
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"message_id":"m-a","role":"system","content":"context"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ParentNodeID: new(int64(1)), ChatMessage: `{"message_id":"m-b","role":"user","content":"first prompt"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 3, ParentNodeID: new(int64(2)), ChatMessage: `{"message_id":"m-c","role":"assistant","content":"first work"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 4, ParentNodeID: new(int64(3)), ChatMessage: `{"message_id":"m-d","role":"system","content":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: earlier work"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 5, ParentNodeID: new(int64(4)), ChatMessage: `{"message_id":"m-e","role":"assistant","content":"continued work"}`, CreatedAt: 1704103201},
+	)
+
+	sess, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.Len(t, msgs, 5)
+
+	assert.True(t, msgs[3].IsCompactBoundary)
+	assert.Equal(t, "compact_boundary", msgs[3].SourceSubtype)
+	assert.Equal(t, "first prompt", sess.FirstMessage)
+	assert.Equal(t, 1, sess.UserMessageCount)
+}
+
+// A transcript export that opens with the continuation summary lost the
+// pre-continuation history just like the bare main chain does; the parser
+// prepends the recovered eras from message_nodes.
+func TestParseDevinSessionTranscriptRecoversPreContinuationEra(t *testing.T) {
+	const sessionID = "session-continued-export"
+	fixture := newDevinTestFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Continued export",
+		WorkingDirectory: "/tmp/continued-export",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103300)),
+		MainChainID:      new(int64(12)),
+	})
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"message_id":"m-ctx","role":"system","content":"context"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 3, ParentNodeID: new(int64(1)), ChatMessage: `{"message_id":"m-era1-ctx","role":"system","content":"era one context"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 4, ParentNodeID: new(int64(3)), ChatMessage: `{"message_id":"m-era1-user","role":"user","content":"original user prompt"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 5, ParentNodeID: new(int64(4)), ChatMessage: `{"message_id":"m-era1-work","role":"assistant","content":"era one work"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 10, ParentNodeID: new(int64(1)), ChatMessage: `{"message_id":"m-era2-ctx","role":"system","content":"era two context"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 11, ParentNodeID: new(int64(10)), ChatMessage: `{"message_id":"m-summary","role":"system","content":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: earlier work"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 12, ParentNodeID: new(int64(11)), ChatMessage: `{"message_id":"m-era2-work","role":"assistant","content":"post-compaction work"}`, CreatedAt: 1704103201},
+	)
+	fixture.writeTranscript(t, sessionID, `{
+		"created_at":"2024-01-01T10:00:00Z",
+		"updated_at":"2024-01-01T10:01:05Z",
+		"steps":[
+			{"step_id":1,"source":"system","timestamp":"2024-01-01T10:00:00Z","message":"era two context"},
+			{"step_id":2,"source":"system","timestamp":"2024-01-01T10:00:01Z","message":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: earlier work"},
+			{"step_id":3,"source":"agent","timestamp":"2024-01-01T10:00:05Z","message":[{"type":"text","text":"post-compaction work"}]}
+		]
+	}`)
+
+	sess, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+
+	// Recovered era first, then the transcript's own steps.
+	require.Len(t, msgs, 6)
+	assert.Equal(t, RoleSystem, msgs[0].Role)
+	assert.Equal(t, RoleUser, msgs[1].Role)
+	assert.Equal(t, "original user prompt", msgs[1].Content)
+	assert.Equal(t, "era one work", msgs[2].Content)
+	assert.Equal(t, "era two context", msgs[3].Content)
+	assert.True(t, msgs[4].IsCompactBoundary)
+	assert.Equal(t, "compact_boundary", msgs[4].SourceSubtype)
+	assert.Equal(t, "post-compaction work", msgs[5].Content)
+
+	assert.Equal(t, "original user prompt", sess.FirstMessage)
+	assert.Equal(t, 1, sess.UserMessageCount)
+	for i, m := range msgs {
+		assert.Equal(t, i, m.Ordinal)
+	}
+}
+
+// An export that carries real content before the continuation summary already
+// contains the full thread; recovered eras would duplicate it, so the
+// transcript stays authoritative.
+func TestParseDevinSessionTranscriptWithPreBoundaryWorkSkipsRecovery(t *testing.T) {
+	const sessionID = "session-full-export"
+	fixture := newDevinTestFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Full export",
+		WorkingDirectory: "/tmp/full-export",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103300)),
+		MainChainID:      new(int64(12)),
+	})
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"message_id":"m-ctx","role":"system","content":"context"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 3, ParentNodeID: new(int64(1)), ChatMessage: `{"message_id":"m-era1-ctx","role":"system","content":"era one context"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 4, ParentNodeID: new(int64(3)), ChatMessage: `{"message_id":"m-era1-user","role":"user","content":"original user prompt"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 10, ParentNodeID: new(int64(1)), ChatMessage: `{"message_id":"m-era2-ctx","role":"system","content":"era two context"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 11, ParentNodeID: new(int64(10)), ChatMessage: `{"message_id":"m-summary","role":"system","content":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: earlier work"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 12, ParentNodeID: new(int64(11)), ChatMessage: `{"message_id":"m-era2-work","role":"assistant","content":"post-compaction work"}`, CreatedAt: 1704103201},
+	)
+	fixture.writeTranscript(t, sessionID, `{
+		"created_at":"2024-01-01T10:00:00Z",
+		"updated_at":"2024-01-01T10:01:05Z",
+		"steps":[
+			{"step_id":1,"source":"system","timestamp":"2024-01-01T10:00:00Z","message":"context"},
+			{"step_id":2,"source":"user","timestamp":"2024-01-01T10:00:01Z","message":"original user prompt"},
+			{"step_id":3,"source":"agent","timestamp":"2024-01-01T10:00:02Z","message":[{"type":"text","text":"era one work"}]},
+			{"step_id":4,"source":"system","timestamp":"2024-01-01T10:00:03Z","message":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: earlier work"},
+			{"step_id":5,"source":"agent","timestamp":"2024-01-01T10:00:05Z","message":[{"type":"text","text":"post-compaction work"}]}
+		]
+	}`)
+
+	sess, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+
+	require.Len(t, msgs, 5)
+	assert.Equal(t, "original user prompt", msgs[1].Content)
+	assert.True(t, msgs[3].IsCompactBoundary)
+	assert.Equal(t, 1, sess.UserMessageCount)
+}

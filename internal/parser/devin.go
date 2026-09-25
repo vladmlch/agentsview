@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json/jsontext"
@@ -10,6 +11,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -384,6 +386,39 @@ func parseDevinSession(ctx context.Context, dbPath, rawSessionID, machine string
 		return true
 	})
 
+	// An export that opens with a continuation summary lost the earlier
+	// thread the same way the message_nodes main chain does; recover the
+	// previous eras from the node forest that lives in the same database.
+	if devinTranscriptLostPreContinuation(messages) {
+		recovered, rerr := devinRecoveredEraMessages(ctx, dbPath, rawSessionID, meta, model)
+		if rerr != nil {
+			return nil, nil, rerr
+		}
+		if len(recovered) > 0 {
+			messages = append(recovered, messages...)
+			for i := range messages {
+				messages[i].Ordinal = i
+			}
+			userMsgCount = 0
+			firstMessage = ""
+			firstStepAt = time.Time{}
+			for _, msg := range messages {
+				if firstStepAt.IsZero() && !msg.Timestamp.IsZero() {
+					firstStepAt = msg.Timestamp
+				}
+				if msg.Timestamp.After(lastStepAt) {
+					lastStepAt = msg.Timestamp
+				}
+				if msg.Role == RoleUser && strings.TrimSpace(msg.Content) != "" {
+					userMsgCount++
+					if firstMessage == "" {
+						firstMessage = truncate(strings.ReplaceAll(msg.Content, "\n", " "), 300)
+					}
+				}
+			}
+		}
+	}
+
 	startedAt := firstNonZeroTime(
 		metaTime(meta, func(m *DevinSessionMeta) time.Time { return m.CreatedAt }),
 		rootStartedAt,
@@ -423,6 +458,7 @@ func parseDevinSessionFromMessageNodes(ctx context.Context,
 	cwd := metaValue(meta, func(m *DevinSessionMeta) string { return m.CWD })
 
 	chain := devinMainChainRows(rows, meta)
+	ordered := append(devinRecoveredEraRows(rows, chain, meta), chain...)
 
 	var (
 		messages     []ParsedMessage
@@ -431,7 +467,7 @@ func parseDevinSessionFromMessageNodes(ctx context.Context,
 		lastStepAt   time.Time
 		userMsgCount int
 	)
-	for _, row := range chain {
+	for _, row := range ordered {
 		msg, ok, err := parseDevinDBMessageNode(rawSessionID, row, len(messages), model)
 		if err != nil {
 			return nil, nil, false, err
@@ -642,7 +678,67 @@ func parseDevinDBMessageNode(
 	if row.ParentNodeID.Valid {
 		msg.SourceParentUUID = devinNodeSourceUUID(rawSessionID, row.ParentNodeID.Int64)
 	}
+	markDevinContinuationBoundary(&msg, role, isSystem, content)
 	return msg, true, nil
+}
+
+// markDevinContinuationBoundary flags a continuation-summary message the same
+// way the Claude parser flags compact summaries: the frontend renders the
+// existing compact-boundary divider with the summary expandable underneath.
+func markDevinContinuationBoundary(msg *ParsedMessage, role RoleType, isSystem bool, content string) {
+	if !devinIsContinuationSummary(role, isSystem, content) {
+		return
+	}
+	msg.SourceType = "system"
+	msg.SourceSubtype = "compact_boundary"
+	msg.IsCompactBoundary = true
+}
+
+// devinTranscriptLostPreContinuation reports whether an exported transcript
+// opens with the continuation summary before any non-system step: the export
+// then covers only the post-compaction era and the earlier history must come
+// from the message_nodes forest. A transcript with real content before the
+// boundary already carries the full thread and stays authoritative.
+func devinTranscriptLostPreContinuation(messages []ParsedMessage) bool {
+	for _, msg := range messages {
+		if msg.IsCompactBoundary {
+			return true
+		}
+		if !msg.IsSystem {
+			return false
+		}
+	}
+	return false
+}
+
+// devinRecoveredEraMessages parses pre-continuation era nodes from the
+// message_nodes forest for the transcript path, where the transcript itself
+// only covers the post-compaction era.
+func devinRecoveredEraMessages(
+	ctx context.Context,
+	dbPath, rawSessionID string,
+	meta *DevinSessionMeta,
+	model string,
+) ([]ParsedMessage, error) {
+	rows, err := listDevinMessageNodes(ctx, dbPath, rawSessionID)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	chain := devinMainChainRows(rows, meta)
+	var out []ParsedMessage
+	for _, row := range devinRecoveredEraRows(rows, chain, meta) {
+		msg, ok, err := parseDevinDBMessageNode(rawSessionID, row, len(out), model)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, msg)
+		}
+	}
+	return out, nil
 }
 
 // devinNodeThinking extracts thinking text from a message node's thinking
@@ -799,6 +895,180 @@ func parseDevinDBToolResult(toolCallID, content gjson.Result) (ParsedToolResult,
 		ContentLength: toolResultContentLength(content),
 		ContentRaw:    content.Raw,
 	}, true
+}
+
+// devinContinuationSummaryPrefix opens the system message Devin inserts when a
+// session continues from a compacted thread. On the message_nodes path its
+// presence also signals that the pre-continuation history may live on sibling
+// branches of the main chain rather than on the chain itself.
+const devinContinuationSummaryPrefix = "You are continuing work from a previous conversation thread"
+
+func devinIsContinuationSummary(role RoleType, isSystem bool, content string) bool {
+	return role == RoleSystem && isSystem &&
+		strings.HasPrefix(strings.TrimSpace(content), devinContinuationSummaryPrefix)
+}
+
+// devinNodeContinuationSummary reports whether a raw message_nodes chat_message
+// is the continuation-summary system node. It reads the role and text directly
+// so the recovery scan does not need a full parse of every row.
+func devinNodeContinuationSummary(chatMessage string) bool {
+	if gjson.Get(chatMessage, "role").Str != "system" {
+		return false
+	}
+	return strings.HasPrefix(
+		strings.TrimSpace(devinNodeText(chatMessage)),
+		devinContinuationSummaryPrefix,
+	)
+}
+
+// devinNodeText extracts the text of a chat_message content field, which is a
+// plain string for system/user nodes and a block array for assistant nodes.
+func devinNodeText(chatMessage string) string {
+	content := gjson.Get(chatMessage, "content")
+	if content.Type == gjson.String {
+		return content.Str
+	}
+	var b strings.Builder
+	content.ForEach(func(_, item gjson.Result) bool {
+		if item.Get("type").Str == "text" {
+			b.WriteString(item.Get("text").Str)
+		}
+		return true
+	})
+	return b.String()
+}
+
+func devinNodeMessageID(chatMessage string) string {
+	return gjson.Get(chatMessage, "message_id").Str
+}
+
+// devinRecoveredEraRows returns pre-continuation message nodes that live on
+// sibling branches of the main chain, ordered era-by-era root-to-leaf.
+//
+// When Devin continues a compacted session it writes a fresh context chain and
+// points sessions.main_chain_id at its leaf, so walking parents from the leaf
+// never reaches the earlier thread: the chain forks where the new context
+// re-roots, and each previous era survives as a sibling subtree whose head is a
+// re-captured system context block. Sibling subtrees headed by user or
+// assistant nodes are edits and abandoned retries -- Devin keeps those off the
+// main chain in every session -- so only system-headed subtrees qualify, and
+// only at forks that precede an on-chain continuation summary.
+//
+// Inside an era subtree, sibling nodes sharing one message_id are
+// pending/committed duplicates of the same logical message; the higher node_id
+// wins. Siblings with distinct message_ids are alternate timelines (retries,
+// edited turns); the era's surviving line is the deepest subtree.
+func devinRecoveredEraRows(
+	rows []devinMessageNodeRow,
+	chain []devinMessageNodeRow,
+	meta *DevinSessionMeta,
+) []devinMessageNodeRow {
+	if meta == nil || !meta.MainChainID.Valid || len(chain) == 0 ||
+		chain[len(chain)-1].NodeID != meta.MainChainID.Int64 {
+		// No resolvable main chain: devinMainChainRows fell back to the
+		// flat node list, so nothing is missing to recover.
+		return nil
+	}
+
+	inChain := make(map[int64]bool, len(chain))
+	lastSummaryIdx := -1
+	for i, row := range chain {
+		inChain[row.NodeID] = true
+		if devinNodeContinuationSummary(row.ChatMessage) {
+			lastSummaryIdx = i
+		}
+	}
+	if lastSummaryIdx < 0 {
+		return nil
+	}
+
+	children := make(map[int64][]devinMessageNodeRow, len(rows))
+	for _, row := range rows {
+		if row.ParentNodeID.Valid {
+			children[row.ParentNodeID.Int64] =
+				append(children[row.ParentNodeID.Int64], row)
+		}
+	}
+
+	var roots []devinMessageNodeRow
+	for i := 0; i < lastSummaryIdx; i++ {
+		for _, child := range children[chain[i].NodeID] {
+			if inChain[child.NodeID] {
+				continue
+			}
+			if gjson.Get(child.ChatMessage, "role").Str != "system" {
+				continue
+			}
+			roots = append(roots, child)
+		}
+	}
+	if len(roots) == 0 {
+		return nil
+	}
+	slices.SortFunc(roots, func(a, b devinMessageNodeRow) int {
+		return cmp.Compare(a.NodeID, b.NodeID)
+	})
+
+	depthMemo := make(map[int64]int, len(rows))
+	visiting := make(map[int64]bool)
+	var depth func(id int64) int
+	depth = func(id int64) int {
+		if d, ok := depthMemo[id]; ok {
+			return d
+		}
+		if visiting[id] {
+			return 0
+		}
+		visiting[id] = true
+		d := 1
+		for _, child := range children[id] {
+			if cd := depth(child.NodeID) + 1; cd > d {
+				d = cd
+			}
+		}
+		delete(visiting, id)
+		depthMemo[id] = d
+		return d
+	}
+
+	seen := make(map[string]bool, len(rows))
+	for _, row := range chain {
+		if mid := devinNodeMessageID(row.ChatMessage); mid != "" {
+			seen[mid] = true
+		}
+	}
+
+	var out []devinMessageNodeRow
+	for _, root := range roots {
+		cur := root
+		for walked := 0; walked <= len(rows); walked++ {
+			mid := devinNodeMessageID(cur.ChatMessage)
+			if mid == "" || !seen[mid] {
+				out = append(out, cur)
+				if mid != "" {
+					seen[mid] = true
+				}
+			}
+			kids := children[cur.NodeID]
+			if len(kids) == 0 {
+				break
+			}
+			distinct := make(map[string]bool, len(kids))
+			for _, kid := range kids {
+				distinct[devinNodeMessageID(kid.ChatMessage)] = true
+			}
+			if len(distinct) == 1 {
+				cur = slices.MaxFunc(kids, func(a, b devinMessageNodeRow) int {
+					return cmp.Compare(a.NodeID, b.NodeID)
+				})
+				continue
+			}
+			cur = slices.MaxFunc(kids, func(a, b devinMessageNodeRow) int {
+				return cmp.Compare(depth(a.NodeID), depth(b.NodeID))
+			})
+		}
+	}
+	return out
 }
 
 func devinDBRole(role string) (RoleType, bool, bool) {
@@ -1005,7 +1275,7 @@ func parseDevinStep(rawSessionID string, step gjson.Result, ordinal int, model s
 		model,
 	)
 
-	return ParsedMessage{
+	msg := ParsedMessage{
 		Ordinal:          ordinal,
 		Role:             role,
 		Content:          content,
@@ -1024,7 +1294,9 @@ func parseDevinStep(rawSessionID string, step gjson.Result, ordinal int, model s
 		HasContextTokens: hasContextTokens,
 		HasOutputTokens:  hasOutputTokens,
 		SourceUUID:       devinStepSourceUUID(rawSessionID, step.Get("step_id")),
-	}, true
+	}
+	markDevinContinuationBoundary(&msg, role, isSystem, content)
+	return msg, true
 }
 
 func devinTokenUsageFromMetrics(metrics gjson.Result) (
