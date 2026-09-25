@@ -88,6 +88,7 @@ graphify-out/
 # roborev snapshots
 /.roborev/
 .env*
+<<<<<<< HEAD
 .agents
 /.go/cache/0b/0b7f42182f0a2a87d28a43526979c8da3d55a6e5d11c3209eef10c5f98719130-a
 /.go/cache/0c/0c8cf664104fe86b290d65618c9b8583c2a8b099304e0a7b453c76307927ffcb-a
@@ -544,3 +545,4 @@ graphify-out/
 /.go/pkg/mod/cache/download/golang.org/x/exp/@v/v0.0.0-20260603202125-055de637280b.lock
 /.go/pkg/mod/cache/download/golang.org/x/net/@v/v0.58.0.lock
 /.go/pkg/mod/cache/download/golang.org/x/sync/@v/v0.23.0.lock
+.agents
