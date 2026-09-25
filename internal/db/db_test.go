@@ -1007,6 +1007,11 @@ func TestCurrentDataVersionDevinMessageNodeTokenUsage(t *testing.T) {
 		"Devin message_nodes token usage requires re-parsing fallback sessions")
 }
 
+func TestCurrentDataVersionDevinMessageNodeThinking(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 123,
+		"Devin message_nodes thinking objects require re-parsing to restore dropped thinking text")
+}
+
 func TestCurrentDataVersionPositAssistantProviderIdentity(t *testing.T) {
 	assert.GreaterOrEqual(t, CurrentDataVersion(), 95,
 		"Posit Assistant provider identity requires re-parsing usage rows")
