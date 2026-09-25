@@ -4,14 +4,15 @@
  * turn-ending system cards), and assistant turns split into ordered
  * thinking/message/skill/tool/system child events.
  *
- * Pure projection — no store imports. Source messages stay flat; every
- * node and event keys back to its source `DbMessage.id` scoped by the
- * session id so keys stay stable across pagination and remounts.
+ * Pure projection — no store imports. Source messages stay flat; turn
+ * and child-event keys are built from source `DbMessage.id` values
+ * scoped by the session id so they stay stable across pagination and
+ * remounts.
  */
 import type { DbMessage as Message, DbToolCall as ToolCall } from "../api/generated/index.js";
 import { enrichSegments, parseContent, type ContentSegment } from "./content-parser.js";
 import type { DisplayItem, MessageItem } from "./display-items.js";
-import { isSystemBoundaryMessage, isSystemMessage } from "./messages.js";
+import { isMidTurnSystemMessage, isSystemBoundaryMessage, isSystemMessage } from "./messages.js";
 import { computeMainModel } from "./model.js";
 
 export type TurnEventKind = "message" | "thinking" | "tool" | "skill" | "tool-rollup" | "system";
@@ -21,6 +22,11 @@ export interface TurnEvent {
   kind: TurnEventKind;
   message: Message;
   ordinals: number[];
+  /** Index of the event's first segment in the source message's enriched
+   *  segment array. Text/code runs are contiguous, so `segments[k]` came
+   *  from index `segmentIndex + k`; a merged `tool` event's segments may
+   *  be sparse. Absent on `system` and `tool-rollup` events, which cover
+   *  whole messages rather than segments. */
   segmentIndex?: number;
   segments?: ContentSegment[];
   toolMessages?: Message[];
@@ -31,12 +37,17 @@ export interface TurnEvent {
 export interface AssistantTurnItem {
   kind: "assistant-turn";
   key: string;
+  /** `DbMessage.id` of the first assistant-authored member — the turn's
+   *  anchor and the source of `key`. Can differ from `messages[0]` when
+   *  a mid-turn system row opened the turn before the first reply. */
   firstMessageId: number;
   messages: Message[];
   events: TurnEvent[];
   ordinals: number[];
   finalOutput: TurnEvent | null;
   model: string | null;
+  /** Timestamp of `messages[0]` — the turn's true start, including a
+   *  mid-turn system row that arrived before the first assistant reply. */
   timestamp: string;
 }
 
@@ -54,18 +65,17 @@ export interface StandaloneNode {
 
 export type TranscriptNode = PromptNode | StandaloneNode | AssistantTurnItem;
 
-// Same mid-turn rule as transcript-mode.ts: these system subtypes report
-// work inside the current assistant turn, so they are child events, not
-// turn boundaries. Every other boundary subtype ends the turn.
-const MID_TURN_SYSTEM_SUBTYPES = new Set(["task_notification", "stop_hook"]);
-
+/** Child-event key `${sessionId}:${messageId}:${kind}:${segmentIndex}`.
+ *  `segmentIndex` is the first covered segment's index for
+ *  message/thinking/skill/tool events; `system` and `tool-rollup`
+ *  events cover whole messages or groups and pass literal 0. */
 function eventKey(
   sessionId: string,
   messageId: number,
   kind: TurnEventKind,
-  index: number,
+  segmentIndex: number,
 ): string {
-  return `${sessionId}:${messageId}:${kind}:${index}`;
+  return `${sessionId}:${messageId}:${kind}:${segmentIndex}`;
 }
 
 /**
@@ -175,12 +185,16 @@ export function buildTranscriptNodes(
 
   const openTurn = (): PendingTurn => (pending ??= { items: [], messages: [], events: [] });
 
+  const standalone = (item: DisplayItem) => {
+    nodes.push({ kind: "standalone", item, ordinals: [...item.ordinals] });
+  };
+
   const flushTurn = () => {
     if (!pending) return;
     const anchor = pending.anchor;
     if (anchor === undefined) {
       for (const item of pending.items) {
-        nodes.push({ kind: "standalone", item, ordinals: item.ordinals });
+        standalone(item);
       }
     } else {
       const messages = pending.messages;
@@ -193,14 +207,10 @@ export function buildTranscriptNodes(
         ordinals: messages.map((m) => m.ordinal),
         finalOutput: findFinalOutput(pending.events),
         model: computeMainModel(messages) || null,
-        timestamp: messages[0]?.timestamp ?? "",
+        timestamp: messages[0]!.timestamp,
       });
     }
     pending = null;
-  };
-
-  const standalone = (item: DisplayItem) => {
-    nodes.push({ kind: "standalone", item, ordinals: item.ordinals });
   };
 
   for (const item of items) {
@@ -232,7 +242,7 @@ export function buildTranscriptNodes(
     // turn intact instead of splitting it on an invisible message.
     if (isSystemMessage(message)) continue;
     if (isSystemBoundaryMessage(message)) {
-      if (MID_TURN_SYSTEM_SUBTYPES.has(message.source_subtype)) {
+      if (isMidTurnSystemMessage(message)) {
         const turn = openTurn();
         turn.items.push(item);
         turn.messages.push(message);
@@ -253,7 +263,7 @@ export function buildTranscriptNodes(
     // only a main-line user message is a real prompt boundary.
     if (message.role === "user" && !message.is_sidechain) {
       flushTurn();
-      nodes.push({ kind: "prompt", item, ordinals: item.ordinals });
+      nodes.push({ kind: "prompt", item, ordinals: [...item.ordinals] });
       continue;
     }
 

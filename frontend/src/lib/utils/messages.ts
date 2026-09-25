@@ -45,6 +45,24 @@ export function isSystemBoundaryMessage(m: Message): m is Message & { source_sub
   return !!m.source_subtype && m.source_subtype !== "compact_boundary";
 }
 
+// System rows that arrive while the assistant is still working on the
+// current prompt. The Claude parser keeps them on role "user" so analytics
+// do not count them as replies, but they are not prompts: a task
+// notification reports a background agent finishing, and stop hook feedback
+// is injected by tooling. Treating them as turn boundaries split one
+// exchange into many and promoted every "still waiting" status line before
+// them to a final answer.
+const MID_TURN_SYSTEM_SUBTYPES = new Set(["task_notification", "stop_hook"]);
+
+/**
+ * Reports whether the message is a mid-turn system row — a task
+ * notification or stop-hook feedback card that belongs inside the
+ * current assistant turn instead of acting as a turn boundary.
+ */
+export function isMidTurnSystemMessage(m: Message): boolean {
+  return isSystemBoundaryMessage(m) && MID_TURN_SYSTEM_SUBTYPES.has(m.source_subtype);
+}
+
 /**
  * Returns true if the message is system-injected and should be
  * hidden from the UI. Checks the backend is_system flag first,
