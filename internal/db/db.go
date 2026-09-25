@@ -531,7 +531,11 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // {thinking, signature, signature_type} object instead of a plain string
 // that Devin never writes. Re-parse Devin sessions to restore dropped
 // thinking text on assistant messages.)
-const dataVersion = 118
+// (119: Devin continued sessions recover the pre-compaction history from
+// message_nodes sibling branches, and continuation-summary nodes are marked
+// as compact boundaries. Re-parse Devin sessions to restore messages the
+// main chain does not reach.)
+const dataVersion = 119
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
