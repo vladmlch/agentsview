@@ -560,7 +560,11 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // (125: Gemini and Cursor files that share a session ID remain separate
 // conversations. Re-parse unchanged sources, including cached remote mirrors,
 // to recover conversations previously collapsed into one archived session.)
-const dataVersion = 125
+// (126: Devin message_nodes thinking is read from the observed
+// {thinking, signature, signature_type} object instead of a plain string
+// that Devin never writes. Re-parse Devin sessions to restore dropped
+// thinking text on assistant messages.)
+const dataVersion = 126
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
