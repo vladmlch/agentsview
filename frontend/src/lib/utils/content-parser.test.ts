@@ -447,6 +447,74 @@ describe("parseContent - Skill tool", () => {
   });
 });
 
+describe("parseContent - XML skill envelopes", () => {
+  it("collapses a Devin-style skill injection with Instructions header", () => {
+    const text =
+      'Instructions for the "diagnosing-bugs" skill:\n\n' +
+      '<skill name="diagnosing-bugs" status="running">\n' +
+      "Source: skills/diagnosing-bugs/SKILL.md\n\n" +
+      "Diagnosing Bugs\nA discipline for hard bugs.\n</skill>";
+    const segments = parseContent(text);
+    expect(segments).toEqual([
+      {
+        type: "skill",
+        content:
+          "Source: skills/diagnosing-bugs/SKILL.md\n\n" +
+          "Diagnosing Bugs\nA discipline for hard bugs.",
+        label: "diagnosing-bugs",
+      },
+    ]);
+  });
+
+  it("collapses a bare <skill> block without the header", () => {
+    const segments = parseContent('<skill name="brainstorming" status="running">\nBody\n</skill>');
+    expect(segments).toEqual([{ type: "skill", content: "Body", label: "brainstorming" }]);
+  });
+
+  it("captures an unclosed <skill> block to end of text", () => {
+    const text =
+      '<skill name="big-skill" status="running">\n' +
+      "This skill's instructions are too large to return inline.";
+    const segments = parseContent(text);
+    expect(segments).toEqual([
+      {
+        type: "skill",
+        content: "This skill's instructions are too large to return inline.",
+        label: "big-skill",
+      },
+    ]);
+  });
+
+  it("keeps text before and after the injection visible", () => {
+    const text =
+      "Intro text.\n\n" + '<skill name="x" status="running">\nBody\n</skill>\n\n' + "Tail text.";
+    const segments = parseContent(text);
+    expect(segments.map((s) => s.type)).toEqual(["text", "skill", "text"]);
+    expect(segments[0]!.content).toBe("Intro text.");
+    expect(segments[2]!.content).toBe("Tail text.");
+  });
+
+  it("handles multiple injections in one message", () => {
+    const text =
+      '<skill name="a" status="running">\nfirst\n</skill>\n\n' +
+      '<skill name="b" status="done">\nsecond\n</skill>';
+    const segments = parseContent(text);
+    expect(segments.map((s) => s.label)).toEqual(["a", "b"]);
+  });
+
+  it("does not match a <skill> mention mid-line", () => {
+    const text = 'Use the <skill name="x"> envelope in transcripts.';
+    const segments = parseContent(text);
+    expect(segments.every((s) => s.type === "text")).toBe(true);
+  });
+
+  it("does not match inside an inline code span", () => {
+    const text = '`example envelope:\n<skill name="x" status="running">\nbody\n</skill>`';
+    const segments = parseContent(text);
+    expect(segments.every((s) => s.type === "text")).toBe(true);
+  });
+});
+
 describe("parseContent - TaskCreate/TaskUpdate/SendMessage tools", () => {
   it("recognizes TaskCreate as a tool block", () => {
     const segments = parseContent("[TaskCreate: Fix bug]");
