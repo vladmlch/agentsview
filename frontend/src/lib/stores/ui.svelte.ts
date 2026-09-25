@@ -53,6 +53,7 @@ const VITALS_KEY = "agentsview-session-vitals";
 const VITALS_CALLS_EXPANDED_KEY = "agentsview-session-vitals-calls-expanded";
 const SIGNAL_PANEL_KEY = "agentsview-signal-panel";
 const FOLLOW_LATEST_KEY = "agentsview-follow-latest";
+const AUTO_COLLAPSE_TURNS_KEY = "agentsview-auto-collapse-turns";
 
 /** Resolves the visible block types from a stored filter payload. */
 export function parseBlockFilters(raw: string | null): Set<BlockType> {
@@ -281,6 +282,10 @@ class UIStore {
   signalPanelOpen: boolean = $state(readStoredBool(SIGNAL_PANEL_KEY, false));
   followLatest: boolean = $state(readStoredBool(FOLLOW_LATEST_KEY, false));
   followLatestRequest: number = $state(0);
+  /** Default expansion for assistant turn headers and their child event
+   *  rows. Manual and bulk expansion choices live in the session-scoped
+   *  turn-collapse store and are not affected by this preference. */
+  autoCollapseAssistantTurns: boolean = $state(readStoredBool(AUTO_COLLAPSE_TURNS_KEY, true));
 
   /**
    * Set of block types currently visible. Writers MUST reassign this Set
@@ -403,6 +408,14 @@ class UIStore {
       $effect(() => {
         try {
           localStorage?.setItem(FOLLOW_LATEST_KEY, String(this.followLatest));
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(AUTO_COLLAPSE_TURNS_KEY, String(this.autoCollapseAssistantTurns));
         } catch {
           // ignore
         }
@@ -568,6 +581,10 @@ class UIStore {
 
   toggleFollowLatest() {
     this.setFollowLatest(!this.followLatest);
+  }
+
+  setAutoCollapseAssistantTurns(enabled: boolean) {
+    this.autoCollapseAssistantTurns = enabled;
   }
 
   zoomIn() {

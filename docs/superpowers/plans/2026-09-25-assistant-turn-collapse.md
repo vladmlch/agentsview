@@ -373,7 +373,7 @@ Paraglide JS, Playwright.
   store persistence effect. It defaults both assistant turn headers and event
   rows to collapsed; the Appearance checkbox UI is added in Task 7.
 
-- [ ] **Step 1: Write failing state tests**
+- [x] **Step 1: Write failing state tests**
 
   Add tests proving default resolution, manual overrides, bulk overrides across
   keys not yet loaded, manual exceptions after a bulk action, reset on session
@@ -382,7 +382,7 @@ Paraglide JS, Playwright.
   Include an exact assertion that a manual event override wins over the bulk
   baseline until the next call to `expandAll` or `collapseAll`.
 
-- [ ] **Step 2: Run focused state tests and verify RED**
+- [x] **Step 2: Run focused state tests and verify RED**
 
   ```bash
   ./node_modules/.bin/vp test run src/lib/stores/turn-collapse.test.ts
@@ -390,25 +390,25 @@ Paraglide JS, Playwright.
 
   Expected: FAIL because the turn expansion store does not exist.
 
-- [ ] **Step 3: Implement the state resolver and test its transitions**
+- [x] **Step 3: Implement the state resolver and test its transitions**
 
   Implement the maps and methods above as a pure session-scoped state module
   using Svelte `$state` only for observable fields. Do not persist group, event,
   output, or prompt overrides.
 
-- [ ] **Step 4: Add the persisted UI preference test first**
+- [x] **Step 4: Add the persisted UI preference test first**
 
   In `ui.test.ts`, assert `autoCollapseAssistantTurns` defaults to `true`, can
   be set to `false`, and persists `"false"` under
   `agentsview-auto-collapse-turns` after a Svelte tick.
 
-- [ ] **Step 5: Implement the UI preference**
+- [x] **Step 5: Implement the UI preference**
 
   Add a constant key, `readStoredBool(key, true)` initialization, setter, and a
   `$effect` local-storage write following the existing follow-latest preference
   pattern.
 
-- [ ] **Step 6: Run focused store tests and verify GREEN**
+- [x] **Step 6: Run focused store tests and verify GREEN**
 
   ```bash
   ./node_modules/.bin/vp test run \
@@ -424,7 +424,7 @@ Paraglide JS, Playwright.
   Expected: tests and focused format/lint/type checks pass for all state and
   persistence cases.
 
-- [ ] **Step 7: Commit the state task**
+- [x] **Step 7: Commit the state task**
 
   ```bash
   git add \
