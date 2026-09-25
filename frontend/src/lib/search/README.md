@@ -32,13 +32,16 @@ candidates without invoking navigation or closing find.
 ## Presentation and recovery
 
 Search respects block-type filters and Focused mode. The transcript and index
-share `projectSessionScope`, so hidden categories do not contribute matches.
-Changing a filter updates counts, results, and navigation without retyping.
-Collapsed content within that scope remains searchable; only the current
-matching disclosure is opened automatically. Skim layout temporarily lifts while
-searching without changing the saved layout preference. Native CSS highlights do
-not rewrite transcript text. Precise reveal handles nested scrolling and the
-application's text-size/zoom settings.
+share `projectSessionScope`: index membership is filter-independent, so hidden
+categories still contribute matches, and a block type owning a match is
+temporarily revealed while the find view is open without touching the saved
+filter. Manually hiding a revealed type suppresses the reveal until it is
+re-enabled or find closes. Focused mode still narrows which messages are
+eligible at all. Collapsed content within that scope remains searchable; only
+the current matching disclosure is opened automatically. Skim layout
+temporarily lifts while searching without changing the saved layout
+preference. Native CSS highlights do not rewrite transcript text. Precise
+reveal handles nested scrolling and the application's text-size/zoom settings.
 
 Native Markdown details elements also open for the current match. Search
 restores only its own temporary changes on navigation or close, preserving

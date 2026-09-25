@@ -3,7 +3,15 @@ import type { Match } from "./session-index.js";
 import type { SearchBlock } from "./block-text.js";
 import { overviewLocations, overviewTicks, overviewY, nearestOverviewMatch } from "./overview.js";
 function match(ordinal: number, start = 0, occurrence = 0): Match {
-  return { ordinal, blockKey: `${ordinal}:text:0`, start, end: start + 1, occurrence };
+  return {
+    ordinal,
+    blockKey: `${ordinal}:text:0`,
+    start,
+    end: start + 1,
+    occurrence,
+    kind: "text",
+    role: "assistant",
+  };
 }
 function block(ordinal: number, text: string): SearchBlock {
   return { key: `${ordinal}:text:0`, ordinal, kind: "text", text };

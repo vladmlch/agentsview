@@ -42,10 +42,15 @@ export interface SearchView {
   setFollowLatest(follow: boolean): void;
   /** Display projection inputs; absent means unfiltered normal mode. */
   transcriptMode?: "normal" | "focused";
+  /**
+   * Saved block-visibility set. Writers MUST reassign the Set rather than
+   * mutate it in place: the filter-diff effect below snapshots the previous
+   * reference, so in-place mutation is not observable as a change.
+   */
   visibleBlocks?: ReadonlySet<BlockType>;
   hasBlockFilters?: boolean;
   renderUnknownXmlBlocksAsPreformatted?: boolean;
-  /** Saved block-visibility predicate; used when `visibleBlocks` is absent. */
+  /** Saved block-visibility predicate; preferred over `visibleBlocks` when defined. */
   isBlockVisible?(type: BlockType): boolean;
 }
 
@@ -72,6 +77,7 @@ export class InSessionSearchStore {
   private disposeEffects: () => void;
   private previousSessionId: string | null;
   private historyRequest: { sessionId: string; promise: Promise<void> } | null = null;
+  /** Snapshot the `visibleBlocks` diff effect compares against each run. */
   private previousVisibleBlocks: ReadonlySet<BlockType> | undefined;
 
   private historyIncomplete = $derived(
@@ -79,7 +85,11 @@ export class InSessionSearchStore {
   );
   historyError = $derived(this.isOpen && this.historyIncomplete && this.historyFailed);
   isActive = $derived(this.isOpen && this.debouncedQuery.trim() !== "");
-  /** What the transcript renders right now: filters and focused mode included. */
+  /**
+   * The mode's saved-filter projection, shared by navigation and search.
+   * `displayItems`/`normalItems` follow the saved filter; `messages` is the
+   * filter-independent membership the index searches.
+   */
   scope: SessionScope | null = $derived.by(() => {
     if (!this.source.sessionId) return null;
     return projectSessionScope({
@@ -345,8 +355,9 @@ export class InSessionSearchStore {
   noteManualBlockFilterChange(type: BlockType, visible: boolean): void {
     if (!this.isOpen) return;
     if (visible === !this.suppressedTypes.has(type)) return;
-    // Reassign rather than mutate: `$state`-proxied Set mutations do not
-    // invalidate `$derived` readers in all contexts.
+    // Reassign rather than mutate: the visibleBlocks diff effect works on
+    // reference snapshots, so reassignment is the explicit invalidation
+    // signal consumers of this set rely on.
     const next = new Set(this.suppressedTypes);
     if (visible) {
       next.delete(type);
@@ -356,7 +367,11 @@ export class InSessionSearchStore {
     this.suppressedTypes = next;
   }
 
-  /** Saved block visibility plus the open search's temporary reveals. */
+  /**
+   * Saved block visibility plus the open search's temporary reveals. Must
+   * agree with `isTranscriptBlockVisible` in session-scope.ts, which applies
+   * the same saved-or-revealed rule inside the scope projection.
+   */
   isBlockEffectivelyVisible(type: BlockType): boolean {
     const saved = this.view.visibleBlocks;
     const savedVisible = this.view.isBlockVisible
