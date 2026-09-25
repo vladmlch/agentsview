@@ -109,8 +109,8 @@ responsibility in the server.
 ## Transcript Presentation
 
 - Render each collapsed child event as a compact one-line preview. Text and
-  thinking previews are limited to about 80 characters; tool rows use a
-  type-specific summary.
+  thinking previews are limited to about 80 Unicode code points; tool rows use
+  a type-specific summary.
 - Show the assistant model and message/tool-call counts in the turn header.
   Show timestamp, token usage, and context statistics when available.
 - Select the final output as the last non-empty user-facing assistant text in
@@ -121,9 +121,10 @@ responsibility in the server.
   temporarily revealed by search. Keep its child event row in the expanded turn
   as a collapsed preview; the full output and preview are both present when the
   turn is expanded.
-- For user prompts longer than 600 characters, show the first 500 characters
-  and a `Show full prompt` control. Attachments remain separate and follow the
-  existing attachment and image visibility behavior.
+- For user prompts longer than 600 Unicode code points, show the first 500
+  Unicode code points and a `Show full prompt` control without splitting a
+  surrogate pair. Attachments remain separate and follow the existing attachment
+  and image visibility behavior.
 - Reuse existing message, thinking, tool, and skill rendering for their promoted
   child event rows where practical. Do not add another nested collapse layer for
   an event already promoted to a row. Keep code blocks inside the message-text
