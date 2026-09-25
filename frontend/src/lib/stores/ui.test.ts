@@ -584,6 +584,94 @@ describe("UIStore", () => {
     });
   });
 
+  describe("auto-collapse assistant turns preference", () => {
+    it("defaults to enabled", async () => {
+      const original = globalThis.localStorage;
+      Object.defineProperty(globalThis, "localStorage", {
+        value: {
+          getItem: vi.fn(() => null),
+          setItem: vi.fn(),
+        },
+        writable: true,
+        configurable: true,
+      });
+
+      try {
+        // @ts-expect-error -- query string busts module cache
+        const mod = await import("./ui.svelte.js?autoCollapseDefault");
+        expect(mod.ui.autoCollapseAssistantTurns).toBe(true);
+      } finally {
+        Object.defineProperty(globalThis, "localStorage", {
+          value: original,
+          writable: true,
+          configurable: true,
+        });
+      }
+    });
+
+    it("restores a disabled preference", async () => {
+      const original = globalThis.localStorage;
+      Object.defineProperty(globalThis, "localStorage", {
+        value: {
+          getItem: vi.fn((key: string) =>
+            key === "agentsview-auto-collapse-turns" ? "false" : null,
+          ),
+          setItem: vi.fn(),
+        },
+        writable: true,
+        configurable: true,
+      });
+
+      try {
+        // @ts-expect-error -- query string busts module cache
+        const mod = await import("./ui.svelte.js?autoCollapseDisabled");
+        expect(mod.ui.autoCollapseAssistantTurns).toBe(false);
+      } finally {
+        Object.defineProperty(globalThis, "localStorage", {
+          value: original,
+          writable: true,
+          configurable: true,
+        });
+      }
+    });
+
+    it("persists changes under agentsview-auto-collapse-turns", async () => {
+      const original = globalThis.localStorage;
+      const setItem = vi.fn();
+      Object.defineProperty(globalThis, "localStorage", {
+        value: { getItem: vi.fn(() => null), setItem },
+        writable: true,
+        configurable: true,
+      });
+
+      try {
+        // @ts-expect-error -- query string busts module cache
+        const mod = await import("./ui.svelte.js?autoCollapsePersist");
+        setItem.mockClear();
+
+        mod.ui.setAutoCollapseAssistantTurns(false);
+        await tick();
+
+        expect(mod.ui.autoCollapseAssistantTurns).toBe(false);
+        expect(setItem).toHaveBeenCalledWith("agentsview-auto-collapse-turns", "false");
+      } finally {
+        Object.defineProperty(globalThis, "localStorage", {
+          value: original,
+          writable: true,
+          configurable: true,
+        });
+      }
+    });
+
+    it("can be set back to enabled on the shared store", () => {
+      ui.setAutoCollapseAssistantTurns(false);
+      expect(ui.autoCollapseAssistantTurns).toBe(false);
+
+      ui.setAutoCollapseAssistantTurns(true);
+      expect(ui.autoCollapseAssistantTurns).toBe(true);
+    });
+  });
+
   describe("postMessage theme control", () => {
     it("should change theme on valid theme:set message", () => {
       ui.theme = "light";
