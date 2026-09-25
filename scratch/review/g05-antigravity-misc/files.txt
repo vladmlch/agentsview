@@ -1,0 +1,15 @@
+internal/parser/antigravity.go
+internal/parser/antigravity_brain_transcript.go
+internal/parser/antigravity_brain_transcript_test.go
+internal/parser/antigravity_cli.go
+internal/parser/antigravity_provider.go
+internal/parser/antigravity_provider_test.go
+internal/parser/antigravity_subagents.go
+internal/parser/antigravity_subagents_test.go
+internal/parser/antigravity_test.go
+internal/parser/discovery.go
+internal/parser/discovery_test.go
+internal/parser/sqlite_dsn.go
+internal/parser/sqlite_dsn_test.go
+internal/parser/types.go
+internal/parser/warp.go

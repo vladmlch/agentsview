@@ -1,0 +1,2108 @@
+diff --git a/internal/parser/devin.go b/internal/parser/devin.go
+index f6e7f0a9..83fc3318 100644
+--- a/internal/parser/devin.go
++++ b/internal/parser/devin.go
+@@ -1,6 +1,7 @@
+ package parser
+ 
+ import (
++	"cmp"
+ 	"context"
+ 	"database/sql"
+ 	"encoding/json/jsontext"
+@@ -10,6 +11,7 @@ import (
+ 	"math"
+ 	"os"
+ 	"path/filepath"
++	"slices"
+ 	"strings"
+ 	"time"
+ 
+@@ -19,6 +21,8 @@ import (
+ 
+ const devinDBFilename = "sessions.db"
+ 
++var errInvalidDevinMessageNode = errors.New("invalid devin message_nodes chat_message")
++
+ // DevinSessionMeta is lightweight metadata for a Devin session row.
+ type DevinSessionMeta struct {
+ 	RawSessionID string
+@@ -305,44 +309,64 @@ func devinRedactedSessionID() string {
+ 	return "<redacted-session-id>"
+ }
+ 
+-func parseDevinSession(ctx context.Context, dbPath, rawSessionID, machine string) (*ParsedSession, []ParsedMessage, error) {
++func parseDevinSession(
++	ctx context.Context, dbPath, rawSessionID, machine string,
++) (*ParsedSession, []ParsedMessage, error) {
++	session, messages, _, err := parseDevinSessionWithSubagents(
++		ctx, dbPath, rawSessionID, machine,
++	)
++	return session, messages, err
++}
++
++func parseDevinSessionWithSubagents(
++	ctx context.Context, dbPath, rawSessionID, machine string,
++) (*ParsedSession, []ParsedMessage, []devinParsedSubagent, error) {
+ 	meta, err := getDevinSessionMeta(ctx, dbPath, rawSessionID)
+ 	if err != nil {
+-		return nil, nil, err
++		return nil, nil, nil, err
+ 	}
+ 	if meta == nil {
+-		return nil, nil, sql.ErrNoRows
++		return nil, nil, nil, sql.ErrNoRows
++	}
++
++	// message_nodes is Devin's live session history. Explicit exports can lag
++	// behind it, so use the node chain whenever the database has a usable node
++	// representation; the export remains the compatibility fallback.
++	nodeSess, nodeMsgs, nodeSubagents, nodeOK, nodesErr :=
++		parseDevinSessionFromMessageNodesWithSubagents(
++			ctx, dbPath, rawSessionID, machine, meta,
++		)
++	if nodesErr == nil && nodeOK {
++		return nodeSess, nodeMsgs, nodeSubagents, nil
++	}
++	if _, ok := errors.AsType[*devinSubagentParseError](nodesErr); ok {
++		return nil, nil, nil, nodesErr
++	}
++	if nodesErr != nil && !errors.Is(nodesErr, errInvalidDevinMessageNode) {
++		return nil, nil, nil, nodesErr
+ 	}
+ 
+ 	transcriptPath := filepath.Join(filepath.Dir(dbPath), "transcripts", rawSessionID+".json")
+ 	info, err := os.Stat(transcriptPath)
+ 	if err != nil {
+ 		if !os.IsNotExist(err) {
+-			return nil, nil, newDevinTranscriptError("stat", err)
++			return nil, nil, nil, newDevinTranscriptError("stat", err)
+ 		}
+-		fallbackErr := newDevinTranscriptError("missing", nil)
+-		sess, msgs, ok, err := parseDevinSessionFromMessageNodes(ctx, dbPath, rawSessionID, machine, meta)
+-		if err == nil && ok {
+-			return sess, msgs, nil
+-		}
+-		if err != nil {
+-			return nil, nil, fallbackErr
+-		}
+-		return nil, nil, fallbackErr
++		return nil, nil, nil, newDevinTranscriptError("missing", nil)
+ 	}
+ 
+ 	data, err := os.ReadFile(transcriptPath)
+ 	if err != nil {
+-		return nil, nil, newDevinTranscriptError("read", err)
++		return nil, nil, nil, newDevinTranscriptError("read", err)
+ 	}
+ 	if !gjson.ValidBytes(data) {
+-		return nil, nil, newDevinTranscriptError("invalid", nil)
++		return nil, nil, nil, newDevinTranscriptError("invalid", nil)
+ 	}
+ 
+ 	root := gjson.ParseBytes(data)
+ 	steps := root.Get("steps")
+ 	if !steps.IsArray() {
+-		return nil, nil, newDevinTranscriptError("missing steps array in", nil)
++		return nil, nil, nil, newDevinTranscriptError("missing steps array in", nil)
+ 	}
+ 
+ 	model := firstNonEmpty(root.Get("agent.model_name").Str, metaValue(meta, func(m *DevinSessionMeta) string { return m.Model }))
+@@ -384,6 +408,39 @@ func parseDevinSession(ctx context.Context, dbPath, rawSessionID, machine string
+ 		return true
+ 	})
+ 
++	// An export that opens with a continuation summary lost the earlier
++	// thread the same way the message_nodes main chain does; recover the
++	// previous eras from the node forest that lives in the same database.
++	if devinTranscriptLostPreContinuation(messages) {
++		recovered, rerr := devinRecoveredEraMessages(ctx, dbPath, rawSessionID, meta, model)
++		if rerr != nil {
++			return nil, nil, nil, rerr
++		}
++		if len(recovered) > 0 {
++			messages = append(recovered, messages...)
++			for i := range messages {
++				messages[i].Ordinal = i
++			}
++			userMsgCount = 0
++			firstMessage = ""
++			firstStepAt = time.Time{}
++			for _, msg := range messages {
++				if firstStepAt.IsZero() && !msg.Timestamp.IsZero() {
++					firstStepAt = msg.Timestamp
++				}
++				if msg.Timestamp.After(lastStepAt) {
++					lastStepAt = msg.Timestamp
++				}
++				if msg.Role == RoleUser && strings.TrimSpace(msg.Content) != "" {
++					userMsgCount++
++					if firstMessage == "" {
++						firstMessage = truncate(strings.ReplaceAll(msg.Content, "\n", " "), 300)
++					}
++				}
++			}
++		}
++	}
++
+ 	startedAt := firstNonZeroTime(
+ 		metaTime(meta, func(m *DevinSessionMeta) time.Time { return m.CreatedAt }),
+ 		rootStartedAt,
+@@ -404,25 +461,56 @@ func parseDevinSession(ctx context.Context, dbPath, rawSessionID, machine string
+ 	sess := buildDevinParsedSession(meta, rawSessionID, machine, cwd, firstMessage, startedAt, endedAt, userMsgCount, messages, fileInfo)
+ 	accumulateMessageTokenUsage(sess, messages)
+ 	applyDevinFinalMetrics(sess, root.Get("final_metrics"))
+-	return sess, messages, nil
++	return sess, messages, nodeSubagents, nil
+ }
+ 
+ func parseDevinSessionFromMessageNodes(ctx context.Context,
+ 	dbPath, rawSessionID, machine string,
+ 	meta *DevinSessionMeta,
+ ) (*ParsedSession, []ParsedMessage, bool, error) {
++	session, messages, _, ok, err :=
++		parseDevinSessionFromMessageNodesWithSubagents(
++			ctx, dbPath, rawSessionID, machine, meta,
++		)
++	return session, messages, ok, err
++}
++
++func parseDevinSessionFromMessageNodesWithSubagents(
++	ctx context.Context,
++	dbPath, rawSessionID, machine string,
++	meta *DevinSessionMeta,
++) (*ParsedSession, []ParsedMessage, []devinParsedSubagent, bool, error) {
+ 	rows, err := listDevinMessageNodes(ctx, dbPath, rawSessionID)
+ 	if err != nil {
+-		return nil, nil, false, err
++		return nil, nil, nil, false, err
+ 	}
+ 	if len(rows) == 0 {
+-		return nil, nil, false, nil
++		return nil, nil, nil, false, nil
+ 	}
+ 
+ 	model := metaValue(meta, func(m *DevinSessionMeta) string { return m.Model })
+ 	cwd := metaValue(meta, func(m *DevinSessionMeta) string { return m.CWD })
++	fileInfo := devinBaseFileInfo(dbPath, rawSessionID)
++	partition, err := partitionDevinSubagentMessageNodes(ctx, rows)
++	if err != nil {
++		return nil, nil, nil, false, err
++	}
++	subagents, err := parseDevinSubagentNodeTrees(
++		ctx, rawSessionID, machine, meta, fileInfo, partition.Trees,
++	)
++	if err != nil {
++		return nil, nil, nil, false, err
++	}
+ 
+ 	chain := devinMainChainRows(rows, meta)
++	recovered := devinRecoveredEraRows(rows, chain, meta)
++	if len(recovered) > 0 {
++		chain = devinTrimLeadingContinuationBoilerplate(chain)
++	}
++	ordered := devinDedupeNodeIDs(append(recovered, chain...))
++	ordered = devinMessageNodesWithout(
++		ordered, partition.ExcludedNodeIDs,
++	)
+ 
+ 	var (
+ 		messages     []ParsedMessage
+@@ -431,10 +519,10 @@ func parseDevinSessionFromMessageNodes(ctx context.Context,
+ 		lastStepAt   time.Time
+ 		userMsgCount int
+ 	)
+-	for _, row := range chain {
++	for _, row := range ordered {
+ 		msg, ok, err := parseDevinDBMessageNode(rawSessionID, row, len(messages), model)
+ 		if err != nil {
+-			return nil, nil, false, err
++			return nil, nil, subagents, false, err
+ 		}
+ 		if !ok {
+ 			continue
+@@ -454,7 +542,7 @@ func parseDevinSessionFromMessageNodes(ctx context.Context,
+ 		}
+ 	}
+ 	if len(messages) == 0 {
+-		return nil, nil, false, nil
++		return nil, nil, subagents, false, nil
+ 	}
+ 
+ 	startedAt := firstNonZeroTime(
+@@ -467,11 +555,10 @@ func parseDevinSessionFromMessageNodes(ctx context.Context,
+ 		startedAt,
+ 	)
+ 
+-	fileInfo := devinBaseFileInfo(dbPath, rawSessionID)
+ 	devinApplyFileInfoTimes(&fileInfo, meta, endedAt)
+ 	sess := buildDevinParsedSession(meta, rawSessionID, machine, cwd, firstMessage, startedAt, endedAt, userMsgCount, messages, fileInfo)
+ 	accumulateMessageTokenUsage(sess, messages)
+-	return sess, messages, true, nil
++	return sess, messages, subagents, true, nil
+ }
+ 
+ // devinMainChainRows returns the message-node rows along the session's main
+@@ -520,12 +607,25 @@ func devinMainChainRows(
+ 	return reversed
+ }
+ 
++func devinDedupeNodeIDs(nodes []devinMessageNodeRow) []devinMessageNodeRow {
++	seen := make(map[int64]bool, len(nodes))
++	out := make([]devinMessageNodeRow, 0, len(nodes))
++	for _, node := range nodes {
++		if !seen[node.NodeID] {
++			seen[node.NodeID] = true
++			out = append(out, node)
++		}
++	}
++	return out
++}
++
+ type devinMessageNodeRow struct {
+ 	RowID        int64
+ 	NodeID       int64
+ 	ParentNodeID sql.NullInt64
+ 	ChatMessage  string
+ 	CreatedAt    int64
++	Metadata     string
+ }
+ 
+ func listDevinMessageNodes(ctx context.Context, dbPath, rawSessionID string) ([]devinMessageNodeRow, error) {
+@@ -535,16 +635,54 @@ func listDevinMessageNodes(ctx context.Context, dbPath, rawSessionID string) ([]
+ 	}
+ 	defer db.Close()
+ 
+-	rows, err := db.QueryContext(ctx, `
++	// Older Devin databases can have session metadata without the message-node
++	// table, and partial schemas cannot provide a stable ordered representation.
++	var requiredColumns int
++	err = db.QueryRowContext(ctx, `
++		SELECT COUNT(*)
++		  FROM pragma_table_info('message_nodes')
++		 WHERE name IN ('row_id', 'session_id', 'node_id', 'parent_node_id', 'chat_message', 'created_at')
++	`).Scan(&requiredColumns)
++	if err != nil {
++		return nil, err
++	}
++	if requiredColumns != 6 {
++		return nil, nil
++	}
++
++	var hasMetadata int
++	_ = db.QueryRowContext(ctx, `
++		SELECT COUNT(*)
++		  FROM pragma_table_info('message_nodes')
++		 WHERE name = 'metadata'
++	`).Scan(&hasMetadata)
++
++	selectQuery := `
++		SELECT row_id,
++		       node_id,
++		       parent_node_id,
++		       chat_message,
++		       created_at,
++		       '' AS metadata
++		  FROM message_nodes
++		 WHERE session_id = ?
++		 ORDER BY created_at ASC, row_id ASC
++	`
++	if hasMetadata > 0 {
++		selectQuery = `
+ 		SELECT row_id,
+ 		       node_id,
+ 		       parent_node_id,
+ 		       chat_message,
+-		       created_at
++		       created_at,
++		       COALESCE(metadata, '') AS metadata
+ 		  FROM message_nodes
+ 		 WHERE session_id = ?
+ 		 ORDER BY created_at ASC, row_id ASC
+-	`, rawSessionID)
++		`
++	}
++
++	rows, err := db.QueryContext(ctx, selectQuery, rawSessionID)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -553,7 +691,7 @@ func listDevinMessageNodes(ctx context.Context, dbPath, rawSessionID string) ([]
+ 	var nodes []devinMessageNodeRow
+ 	for rows.Next() {
+ 		var row devinMessageNodeRow
+-		if err := rows.Scan(&row.RowID, &row.NodeID, &row.ParentNodeID, &row.ChatMessage, &row.CreatedAt); err != nil {
++		if err := rows.Scan(&row.RowID, &row.NodeID, &row.ParentNodeID, &row.ChatMessage, &row.CreatedAt, &row.Metadata); err != nil {
+ 			return nil, err
+ 		}
+ 		nodes = append(nodes, row)
+@@ -571,7 +709,7 @@ func parseDevinDBMessageNode(
+ 	model string,
+ ) (ParsedMessage, bool, error) {
+ 	if !gjson.Valid(row.ChatMessage) {
+-		return ParsedMessage{}, false, errors.New("invalid devin message_nodes chat_message")
++		return ParsedMessage{}, false, errInvalidDevinMessageNode
+ 	}
+ 	root := gjson.Parse(row.ChatMessage)
+ 	role, isSystem, ok := devinDBRole(root.Get("role").Str)
+@@ -580,14 +718,14 @@ func parseDevinDBMessageNode(
+ 	}
+ 
+ 	content, thinking, hasThinking, hasToolUse, toolCalls, toolResults := ExtractTextContent(context.Background(), root.Get("content"))
+-	topThinking := strings.TrimSpace(root.Get("thinking").Str)
++	topThinking := devinNodeThinking(root.Get("thinking"))
+ 	if topThinking != "" && topThinking != thinking {
+ 		thinking = joinNonEmpty(thinking, topThinking)
+ 		content = joinNonEmpty(content, "[Thinking]\n"+topThinking+"\n[/Thinking]")
+ 		hasThinking = true
+ 	}
+ 
+-	topLevelToolCalls, topLevelToolText := parseDevinDBToolCalls(root.Get("tool_calls"))
++	topLevelToolCalls, topLevelToolText := parseDevinToolCalls(root.Get("tool_calls"))
+ 	if len(topLevelToolCalls) > 0 {
+ 		toolCalls = append(toolCalls, topLevelToolCalls...)
+ 		hasToolUse = true
+@@ -642,9 +780,90 @@ func parseDevinDBMessageNode(
+ 	if row.ParentNodeID.Valid {
+ 		msg.SourceParentUUID = devinNodeSourceUUID(rawSessionID, row.ParentNodeID.Int64)
+ 	}
++	markDevinContinuationBoundary(&msg, role, isSystem, content)
+ 	return msg, true, nil
+ }
+ 
++// markDevinContinuationBoundary flags a continuation-summary message the same
++// way the Claude parser flags compact summaries: the frontend renders the
++// existing compact-boundary divider with the summary expandable underneath.
++func markDevinContinuationBoundary(msg *ParsedMessage, role RoleType, isSystem bool, content string) {
++	if !devinIsContinuationSummary(role, isSystem, content) {
++		return
++	}
++	msg.SourceType = "system"
++	msg.SourceSubtype = "compact_boundary"
++	msg.IsCompactBoundary = true
++}
++
++// devinTranscriptLostPreContinuation reports whether an exported transcript
++// opens with the continuation summary before any non-system step: the export
++// then covers only the post-compaction era and the earlier history must come
++// from the message_nodes forest. A transcript with real content before the
++// boundary already carries the full thread, so recovered eras are not added.
++func devinTranscriptLostPreContinuation(messages []ParsedMessage) bool {
++	for _, msg := range messages {
++		if msg.IsCompactBoundary {
++			return true
++		}
++		if !msg.IsSystem {
++			return false
++		}
++	}
++	return false
++}
++
++// devinRecoveredEraMessages parses pre-continuation era nodes from the
++// message_nodes forest for the transcript path, where the transcript itself
++// only covers the post-compaction era.
++func devinRecoveredEraMessages(
++	ctx context.Context,
++	dbPath, rawSessionID string,
++	meta *DevinSessionMeta,
++	model string,
++) ([]ParsedMessage, error) {
++	rows, err := listDevinMessageNodes(ctx, dbPath, rawSessionID)
++	if err != nil {
++		return nil, err
++	}
++	if len(rows) == 0 {
++		return nil, nil
++	}
++	partition, err := partitionDevinSubagentMessageNodes(ctx, rows)
++	if err != nil {
++		return nil, err
++	}
++	chain := devinMainChainRows(rows, meta)
++	var out []ParsedMessage
++	for _, row := range devinRecoveredEraRows(rows, chain, meta) {
++		if _, excluded := partition.ExcludedNodeIDs[row.NodeID]; excluded {
++			continue
++		}
++		msg, ok, err := parseDevinDBMessageNode(rawSessionID, row, len(out), model)
++		if err != nil {
++			if errors.Is(err, errInvalidDevinMessageNode) {
++				return nil, nil
++			}
++			return nil, err
++		}
++		if ok {
++			out = append(out, msg)
++		}
++	}
++	return out, nil
++}
++
++// devinNodeThinking extracts thinking text from a message node's thinking
++// field. Devin CLI stores it as an object
++// {"thinking": string, "signature": ..., "signature_type": ...}; a plain
++// string is accepted in case other versions serialize it directly.
++func devinNodeThinking(v gjson.Result) string {
++	if v.Type == gjson.String {
++		return strings.TrimSpace(v.Str)
++	}
++	return strings.TrimSpace(v.Get("thinking").Str)
++}
++
+ // devinNodeSourceUUID scopes a message_nodes identity to its session. Devin's
+ // node_id is a per-session sequence (UNIQUE(session_id, node_id)), so bare ids
+ // collide across sessions in usage deduplication; prefixing the session id
+@@ -717,7 +936,7 @@ func devinMetricInt(value gjson.Result) (int, bool) {
+ 	return 0, true
+ }
+ 
+-func parseDevinDBToolCalls(toolCalls gjson.Result) ([]ParsedToolCall, string) {
++func parseDevinToolCalls(toolCalls gjson.Result) ([]ParsedToolCall, string) {
+ 	if !toolCalls.IsArray() {
+ 		return nil, ""
+ 	}
+@@ -726,9 +945,9 @@ func parseDevinDBToolCalls(toolCalls gjson.Result) ([]ParsedToolCall, string) {
+ 		parts  []string
+ 	)
+ 	toolCalls.ForEach(func(_, tc gjson.Result) bool {
+-		parsedCall, ok := parseDevinDBToolCall(tc)
++		parsedCall, ok := parseDevinToolCall(tc)
+ 		if ok {
+-			if text := formatDevinDBToolCall(parsedCall); text != "" {
++			if text := formatDevinToolCall(parsedCall); text != "" {
+ 				parsedCall.Rendering = text
+ 				parts = append(parts, text)
+ 			}
+@@ -739,32 +958,35 @@ func parseDevinDBToolCalls(toolCalls gjson.Result) ([]ParsedToolCall, string) {
+ 	return parsed, strings.Join(parts, "\n")
+ }
+ 
+-func parseDevinDBToolCall(tc gjson.Result) (ParsedToolCall, bool) {
++func parseDevinToolCall(tc gjson.Result) (ParsedToolCall, bool) {
+ 	if parsed, ok := parseToolCall(context.Background(), tc); ok {
+ 		return parsed, true
+ 	}
+-	name := firstNonEmpty(tc.Get("function.name").Str, tc.Get("name").Str)
++	name := firstNonEmpty(
++		tc.Get("function.name").Str,
++		tc.Get("function_name").Str,
++		tc.Get("name").Str,
++	)
+ 	if name == "" {
+ 		return ParsedToolCall{}, false
+ 	}
+ 	input := tc.Get("function.arguments")
++	if !input.Exists() {
++		input = toolCallInput(tc)
++	}
+ 	inputJSON := input.Raw
+ 	if input.Type == gjson.String {
+ 		inputJSON = input.Str
+ 	}
+-	if inputJSON == "" {
+-		input = toolCallInput(tc)
+-		inputJSON = input.Raw
+-	}
+ 	return ParsedToolCall{
+-		ToolUseID: tc.Get("id").Str,
++		ToolUseID: firstNonEmpty(tc.Get("id").Str, tc.Get("tool_call_id").Str),
+ 		ToolName:  name,
+ 		Category:  NormalizeToolCategory(name),
+ 		InputJSON: inputJSON,
+ 	}, true
+ }
+ 
+-func formatDevinDBToolCall(tc ParsedToolCall) string {
++func formatDevinToolCall(tc ParsedToolCall) string {
+ 	block := map[string]any{"name": tc.ToolName}
+ 	if strings.TrimSpace(tc.InputJSON) != "" {
+ 		var input any
+@@ -790,6 +1012,371 @@ func parseDevinDBToolResult(toolCallID, content gjson.Result) (ParsedToolResult,
+ 	}, true
+ }
+ 
++func parseDevinObservationResults(observation gjson.Result) []ParsedToolResult {
++	results := observation.Get("results")
++	if !results.IsArray() {
++		return nil
++	}
++	var parsed []ParsedToolResult
++	results.ForEach(func(_, result gjson.Result) bool {
++		toolCallID := strings.TrimSpace(result.Get("source_call_id").Str)
++		content := result.Get("content")
++		if toolCallID == "" || !content.Exists() {
++			return true
++		}
++		parsed = append(parsed, ParsedToolResult{
++			ToolUseID:     toolCallID,
++			ContentLength: toolResultContentLength(content),
++			ContentRaw:    content.Raw,
++		})
++		return true
++	})
++	return parsed
++}
++
++// devinContinuationSummaryPrefix opens the system message Devin inserts when a
++// session continues from a compacted thread. On the message_nodes path its
++// presence also signals that the pre-continuation history may live on sibling
++// branches of the main chain rather than on the chain itself.
++const devinContinuationSummaryPrefix = "You are continuing work from a previous conversation thread"
++
++func devinIsContinuationSummary(role RoleType, isSystem bool, content string) bool {
++	return role == RoleSystem && isSystem &&
++		strings.HasPrefix(strings.TrimSpace(content), devinContinuationSummaryPrefix)
++}
++
++// devinNodeContinuationSummary reports whether a raw message_nodes chat_message
++// is the continuation-summary system node. It reads the role and text directly
++// so the recovery scan does not need a full parse of every row.
++func devinNodeContinuationSummary(chatMessage string) bool {
++	if gjson.Get(chatMessage, "role").Str != "system" {
++		return false
++	}
++	return strings.HasPrefix(
++		strings.TrimSpace(devinNodeText(chatMessage)),
++		devinContinuationSummaryPrefix,
++	)
++}
++
++// devinNodeText extracts the text of a chat_message content field, which is a
++// plain string for system/user nodes and a block array for assistant nodes.
++func devinNodeText(chatMessage string) string {
++	content := gjson.Get(chatMessage, "content")
++	if content.Type == gjson.String {
++		return content.Str
++	}
++	var b strings.Builder
++	content.ForEach(func(_, item gjson.Result) bool {
++		if item.Get("type").Str == "text" {
++			b.WriteString(item.Get("text").Str)
++		}
++		return true
++	})
++	return b.String()
++}
++
++func devinNodeMessageID(chatMessage string) string {
++	return gjson.Get(chatMessage, "message_id").Str
++}
++
++func devinNodeSummarizedFrom(metadata string) int64 {
++	if metadata == "" {
++		return 0
++	}
++	res := gjson.Get(metadata, "summarized_from")
++	if !res.Exists() || res.Type == gjson.Null {
++		return 0
++	}
++	return res.Int()
++}
++
++func devinRecoverErasFromSummarizedFrom(
++	rows []devinMessageNodeRow,
++	chain []devinMessageNodeRow,
++) []devinMessageNodeRow {
++	byNodeID := make(map[int64]devinMessageNodeRow, len(rows))
++	for _, r := range rows {
++		byNodeID[r.NodeID] = r
++	}
++
++	findSummary := func(nodes []devinMessageNodeRow) (int64, bool) {
++		for i := range nodes {
++			if devinNodeContinuationSummary(nodes[i].ChatMessage) {
++				sf := devinNodeSummarizedFrom(nodes[i].Metadata)
++				if sf > 0 {
++					return sf, true
++				}
++			}
++		}
++		return 0, false
++	}
++
++	targetID, ok := findSummary(chain)
++	if !ok {
++		return nil
++	}
++
++	walkUp := func(leafID int64) []devinMessageNodeRow {
++		var path []devinMessageNodeRow
++		visited := make(map[int64]bool)
++		curID := leafID
++		for {
++			if visited[curID] {
++				break
++			}
++			visited[curID] = true
++			node, exists := byNodeID[curID]
++			if !exists {
++				break
++			}
++			path = append(path, node)
++			if !node.ParentNodeID.Valid {
++				break
++			}
++			curID = node.ParentNodeID.Int64
++		}
++		for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
++			path[i], path[j] = path[j], path[i]
++		}
++		return path
++	}
++
++	var priorEras [][]devinMessageNodeRow
++	visitedTargets := make(map[int64]bool)
++	for targetID > 0 && !visitedTargets[targetID] {
++		visitedTargets[targetID] = true
++		era := walkUp(targetID)
++		if len(era) == 0 {
++			break
++		}
++		priorEras = append(priorEras, era)
++		nextTarget, hasNext := findSummary(era)
++		if !hasNext {
++			break
++		}
++		targetID = nextTarget
++	}
++
++	if len(priorEras) == 0 {
++		return nil
++	}
++
++	for i, j := 0, len(priorEras)-1; i < j; i, j = i+1, j-1 {
++		priorEras[i], priorEras[j] = priorEras[j], priorEras[i]
++	}
++
++	seenNodeIDs := make(map[int64]bool, len(rows))
++	seenMessageIDs := make(map[string]bool, len(rows))
++	var out []devinMessageNodeRow
++
++	for eraIdx, era := range priorEras {
++		if eraIdx > 0 {
++			era = devinTrimLeadingContinuationBoilerplate(era)
++		}
++		for _, node := range era {
++			if seenNodeIDs[node.NodeID] {
++				continue
++			}
++			mid := devinNodeMessageID(node.ChatMessage)
++			if mid != "" && seenMessageIDs[mid] {
++				continue
++			}
++			seenNodeIDs[node.NodeID] = true
++			if mid != "" {
++				seenMessageIDs[mid] = true
++			}
++			out = append(out, node)
++		}
++	}
++	return out
++}
++
++// devinIsBoilerplateSystemPrompt reports whether chatMessage is a standard Devin
++// system prompt (e.g. agent instructions, subagent profiles, model notice,
++// tool calling rules, skills, rules) that Devin repeats upon context compaction.
++func devinIsBoilerplateSystemPrompt(chatMessage string) bool {
++	if gjson.Get(chatMessage, "role").Str != "system" {
++		return false
++	}
++	text := strings.TrimSpace(devinNodeText(chatMessage))
++	text = strings.Trim(text, "'\"")
++	text = strings.TrimSpace(text)
++	prefixes := []string{
++		"You are Devin, an interactive command line agent",
++		"Available subagent profiles for",
++		"You are powered by",
++		"## Parallel tool calls",
++		"<available_skills>",
++		"<system_info>",
++		"<rules",
++		"<planning_guidance>",
++		"## Mode: Plan",
++		"The session mode has changed:",
++	}
++	for _, p := range prefixes {
++		if strings.HasPrefix(text, p) {
++			return true
++		}
++	}
++	return false
++}
++
++// devinTrimLeadingContinuationBoilerplate trims repetitive Devin CLI boilerplate
++// system prompt nodes that precede the continuation summary in a continuation era.
++func devinTrimLeadingContinuationBoilerplate(nodes []devinMessageNodeRow) []devinMessageNodeRow {
++	summaryIdx := -1
++	for i, n := range nodes {
++		if devinNodeContinuationSummary(n.ChatMessage) {
++			summaryIdx = i
++			break
++		}
++	}
++	if summaryIdx <= 0 {
++		return nodes
++	}
++	out := make([]devinMessageNodeRow, 0, len(nodes))
++	for i := 0; i < summaryIdx; i++ {
++		if !devinIsBoilerplateSystemPrompt(nodes[i].ChatMessage) {
++			out = append(out, nodes[i])
++		}
++	}
++	out = append(out, nodes[summaryIdx:]...)
++	return out
++}
++
++// devinRecoveredEraRows returns pre-continuation message nodes that live on
++// sibling branches of the main chain, ordered era-by-era root-to-leaf.
++//
++// When Devin continues a compacted session it writes a fresh context chain and
++// points sessions.main_chain_id at its leaf, so walking parents from the leaf
++// never reaches the earlier thread: the chain forks where the new context
++// re-roots, and each previous era survives as a sibling subtree whose head is a
++// re-captured system context block. Sibling subtrees headed by user or
++// assistant nodes are edits and abandoned retries -- Devin keeps those off the
++// main chain in every session -- so only system-headed subtrees qualify, and
++// only at forks that precede an on-chain continuation summary.
++//
++// Inside an era subtree, sibling nodes sharing one message_id are
++// pending/committed duplicates of the same logical message; the higher node_id
++// wins. Siblings with distinct message_ids are alternate timelines (retries,
++// edited turns); the era's surviving line is the deepest subtree.
++func devinRecoveredEraRows(
++	rows []devinMessageNodeRow,
++	chain []devinMessageNodeRow,
++	meta *DevinSessionMeta,
++) []devinMessageNodeRow {
++	if meta == nil || !meta.MainChainID.Valid || len(chain) == 0 ||
++		chain[len(chain)-1].NodeID != meta.MainChainID.Int64 {
++		// No resolvable main chain: devinMainChainRows fell back to the
++		// flat node list, so nothing is missing to recover.
++		return nil
++	}
++
++	if recovered := devinRecoverErasFromSummarizedFrom(rows, chain); len(recovered) > 0 {
++		return recovered
++	}
++
++	inChain := make(map[int64]bool, len(chain))
++	lastSummaryIdx := -1
++	for i, row := range chain {
++		inChain[row.NodeID] = true
++		if devinNodeContinuationSummary(row.ChatMessage) {
++			lastSummaryIdx = i
++		}
++	}
++	if lastSummaryIdx < 0 {
++		return nil
++	}
++
++	children := make(map[int64][]devinMessageNodeRow, len(rows))
++	for _, row := range rows {
++		if row.ParentNodeID.Valid {
++			children[row.ParentNodeID.Int64] =
++				append(children[row.ParentNodeID.Int64], row)
++		}
++	}
++
++	var roots []devinMessageNodeRow
++	for i := 0; i < lastSummaryIdx; i++ {
++		for _, child := range children[chain[i].NodeID] {
++			if inChain[child.NodeID] {
++				continue
++			}
++			if gjson.Get(child.ChatMessage, "role").Str != "system" {
++				continue
++			}
++			roots = append(roots, child)
++		}
++	}
++	if len(roots) == 0 {
++		return nil
++	}
++	slices.SortFunc(roots, func(a, b devinMessageNodeRow) int {
++		return cmp.Compare(a.NodeID, b.NodeID)
++	})
++
++	depthMemo := make(map[int64]int, len(rows))
++	visiting := make(map[int64]bool)
++	var depth func(id int64) int
++	depth = func(id int64) int {
++		if d, ok := depthMemo[id]; ok {
++			return d
++		}
++		if visiting[id] {
++			return 0
++		}
++		visiting[id] = true
++		d := 1
++		for _, child := range children[id] {
++			if cd := depth(child.NodeID) + 1; cd > d {
++				d = cd
++			}
++		}
++		delete(visiting, id)
++		depthMemo[id] = d
++		return d
++	}
++
++	seen := make(map[string]bool, len(rows))
++	for _, row := range chain {
++		if mid := devinNodeMessageID(row.ChatMessage); mid != "" {
++			seen[mid] = true
++		}
++	}
++
++	var out []devinMessageNodeRow
++	for _, root := range roots {
++		cur := root
++		for walked := 0; walked <= len(rows); walked++ {
++			mid := devinNodeMessageID(cur.ChatMessage)
++			if mid == "" || !seen[mid] {
++				out = append(out, cur)
++				if mid != "" {
++					seen[mid] = true
++				}
++			}
++			kids := children[cur.NodeID]
++			if len(kids) == 0 {
++				break
++			}
++			distinct := make(map[string]bool, len(kids))
++			for _, kid := range kids {
++				distinct[devinNodeMessageID(kid.ChatMessage)] = true
++			}
++			if len(distinct) == 1 {
++				cur = slices.MaxFunc(kids, func(a, b devinMessageNodeRow) int {
++					return cmp.Compare(a.NodeID, b.NodeID)
++				})
++				continue
++			}
++			cur = slices.MaxFunc(kids, func(a, b devinMessageNodeRow) int {
++				return cmp.Compare(depth(a.NodeID), depth(b.NodeID))
++			})
++		}
++	}
++	return out
++}
++
+ func devinDBRole(role string) (RoleType, bool, bool) {
+ 	switch role {
+ 	case "user":
+@@ -979,6 +1566,13 @@ func parseDevinStep(rawSessionID string, step gjson.Result, ordinal int, model s
+ 	}
+ 	toolCalls = append(toolCalls, topLevelToolCalls...)
+ 	toolResults = append(toolResults, extractTopLevelToolResults(step.Get("tool_result"))...)
++	exportToolCalls, exportToolText := parseDevinToolCalls(step.Get("tool_calls"))
++	if exportToolText != "" {
++		content = joinNonEmpty(content, exportToolText)
++		hasToolUse = true
++	}
++	toolCalls = append(toolCalls, exportToolCalls...)
++	toolResults = append(toolResults, parseDevinObservationResults(step.Get("observation"))...)
+ 
+ 	if strings.TrimSpace(content) == "" && len(toolCalls) == 0 && len(toolResults) == 0 {
+ 		return ParsedMessage{}, false
+@@ -994,7 +1588,7 @@ func parseDevinStep(rawSessionID string, step gjson.Result, ordinal int, model s
+ 		model,
+ 	)
+ 
+-	return ParsedMessage{
++	msg := ParsedMessage{
+ 		Ordinal:          ordinal,
+ 		Role:             role,
+ 		Content:          content,
+@@ -1013,7 +1607,9 @@ func parseDevinStep(rawSessionID string, step gjson.Result, ordinal int, model s
+ 		HasContextTokens: hasContextTokens,
+ 		HasOutputTokens:  hasOutputTokens,
+ 		SourceUUID:       devinStepSourceUUID(rawSessionID, step.Get("step_id")),
+-	}, true
++	}
++	markDevinContinuationBoundary(&msg, role, isSystem, content)
++	return msg, true
+ }
+ 
+ func devinTokenUsageFromMetrics(metrics gjson.Result) (
+diff --git a/internal/parser/devin_provider.go b/internal/parser/devin_provider.go
+index 66a44621..4ba14b5f 100644
+--- a/internal/parser/devin_provider.go
++++ b/internal/parser/devin_provider.go
+@@ -105,7 +105,9 @@ func (p *devinProvider) Parse(
+ 		return ParseOutcome{}, fmt.Errorf("stat %s: %w", src.DBPath, err)
+ 	}
+ 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
+-	sess, msgs, err := parseDevinSession(ctx, src.DBPath, src.SessionID, machine)
++	sess, msgs, subagents, err := parseDevinSessionWithSubagents(
++		ctx, src.DBPath, src.SessionID, machine,
++	)
+ 	if errors.Is(err, sql.ErrNoRows) {
+ 		return ParseOutcome{
+ 			ResultSetComplete: true,
+@@ -129,11 +131,22 @@ func (p *devinProvider) Parse(
+ 	if req.Fingerprint.Hash != "" {
+ 		sess.File.Hash = req.Fingerprint.Hash
+ 	}
+-	return ParseOutcome{
+-		Results: []ParseResultOutcome{{
+-			Result:      ParseResult{Session: *sess, Messages: msgs},
++	results := make([]ParseResultOutcome, 0, 1+len(subagents))
++	results = append(results, ParseResultOutcome{
++		Result:      ParseResult{Session: *sess, Messages: msgs},
++		DataVersion: DataVersionCurrent,
++	})
++	for _, subagent := range subagents {
++		results = append(results, ParseResultOutcome{
++			Result: ParseResult{
++				Session:  subagent.Session,
++				Messages: subagent.Messages,
++			},
+ 			DataVersion: DataVersionCurrent,
+-		}},
++		})
++	}
++	return ParseOutcome{
++		Results:           results,
+ 		ResultSetComplete: true,
+ 		ForceReplace:      true,
+ 	}, nil
+@@ -228,7 +241,8 @@ func (s devinSourceSet) SourcesForChangedPath(
+ 			continue
+ 		}
+ 		if ref, ok := s.sourceRef(root, req.Path, true); ok {
+-			return []SourceRef{ref}, nil
++			src := ref.Opaque.(devinSource)
++			return []SourceRef{s.newSourceRef(root, src.DBPath, src.SessionID)}, nil
+ 		}
+ 		if dbPath, ok := s.dbPathForEvent(root, req.Path); ok {
+ 			metas, err := ListDevinSessionMeta(dbPath)
+@@ -249,7 +263,7 @@ func (s devinSourceSet) SourcesForChangedPath(
+ 				if !samePath(src.DBPath, dbPath) {
+ 					continue
+ 				}
+-				addJSONLSource(ref, &sources, seen)
++				addJSONLSource(s.newSourceRef(root, src.DBPath, src.SessionID), &sources, seen)
+ 			}
+ 			sortJSONLSources(sources)
+ 			return sources, nil
+@@ -267,7 +281,7 @@ func (s devinSourceSet) SourcesForChangedPath(
+ 				}
+ 				src := ref.Opaque.(devinSource)
+ 				if src.SessionID == sessionID {
+-					return []SourceRef{ref}, nil
++					return []SourceRef{s.newSourceRef(root, src.DBPath, src.SessionID)}, nil
+ 				}
+ 			}
+ 		}
+@@ -285,7 +299,10 @@ func (s devinSourceSet) StoredSourceHintScopes(
+ 			continue
+ 		}
+ 		if ref, ok := s.sourceRef(root, req.Path, true); ok {
+-			return []StoredSourceHintScope{{Path: ref.DisplayPath}}
++			return []StoredSourceHintScope{{
++				Path:                  ref.DisplayPath,
++				IncludeVirtualMembers: true,
++			}}
+ 		}
+ 		if dbPath, ok := s.dbPathForEvent(root, req.Path); ok {
+ 			return []StoredSourceHintScope{{
+@@ -295,7 +312,8 @@ func (s devinSourceSet) StoredSourceHintScopes(
+ 		if sessionID, ok := s.transcriptSessionIDForEvent(root, req.Path); ok {
+ 			dbPath := filepath.Join(root, "cli", devinDBFilename)
+ 			return []StoredSourceHintScope{{
+-				Path: VirtualSourcePath(dbPath, sessionID),
++				Path:                  VirtualSourcePath(dbPath, sessionID),
++				IncludeVirtualMembers: true,
+ 			}}
+ 		}
+ 	}
+@@ -309,17 +327,35 @@ func (s devinSourceSet) FindSource(
+ 	if err := ctx.Err(); err != nil {
+ 		return SourceRef{}, false, err
+ 	}
++	reqParentSessionID, reqSubagentNodeID, reqIsSubagent := parseDevinSubagentRawSessionID(req.RawSessionID)
++
+ 	for _, path := range []string{req.StoredFilePath, req.FingerprintKey} {
+ 		if path == "" {
+ 			continue
+ 		}
++		rawSessionID := req.RawSessionID
++		parentSessionID := reqParentSessionID
++		subagentNodeID := reqSubagentNodeID
++		isSubagent := reqIsSubagent
++
+ 		for _, root := range s.roots {
+ 			ref, ok := s.sourceRef(root, path, true)
+ 			if !ok {
+ 				continue
+ 			}
+ 			src := ref.Opaque.(devinSource)
+-			if req.RawSessionID != "" && src.SessionID != req.RawSessionID {
++			if !isSubagent {
++				if _, pathSessionID, nodeID, subOk := parseDevinSubagentVirtualSourcePath(path); subOk {
++					parentSessionID = pathSessionID
++					subagentNodeID = nodeID
++					isSubagent = true
++				}
++			}
++			targetSessionID := rawSessionID
++			if isSubagent {
++				targetSessionID = parentSessionID
++			}
++			if targetSessionID != "" && src.SessionID != targetSessionID {
+ 				continue
+ 			}
+ 			if req.RequireFreshSource {
+@@ -331,18 +367,47 @@ func (s devinSourceSet) FindSource(
+ 					continue
+ 				}
+ 			}
++			if isSubagent {
++				exists, err := devinSubagentExists(ctx, src.DBPath, src.SessionID, subagentNodeID)
++				if err != nil {
++					return SourceRef{}, false, err
++				}
++				if !exists {
++					continue
++				}
++			}
+ 			return ref, true, nil
+ 		}
+ 	}
+-	if req.RawSessionID == "" {
++	rawSessionID := req.RawSessionID
++	parentSessionID := reqParentSessionID
++	subagentNodeID := reqSubagentNodeID
++	isSubagent := reqIsSubagent
++
++	lookupSessionID := rawSessionID
++	if isSubagent {
++		lookupSessionID = parentSessionID
++	}
++	if lookupSessionID == "" {
+ 		return SourceRef{}, false, nil
+ 	}
+ 	for _, root := range s.roots {
+-		ref, ok, err := s.findByRawSessionID(ctx, root, req.RawSessionID, req.RequireFreshSource)
++		ref, ok, err := s.findByRawSessionID(ctx, root, lookupSessionID, req.RequireFreshSource)
+ 		if err != nil {
+ 			return SourceRef{}, false, err
+ 		}
+ 		if ok {
++			if isSubagent {
++				src := ref.Opaque.(devinSource)
++				exists, err := devinSubagentExists(ctx, src.DBPath, src.SessionID, subagentNodeID)
++				if err != nil {
++					return SourceRef{}, false, err
++				}
++				if !exists {
++					continue
++				}
++				return s.newSubagentSourceRef(root, src.DBPath, src.SessionID, subagentNodeID, ref.DiscoveryMTimeNS), true, nil
++			}
+ 			return ref, true, nil
+ 		}
+ 	}
+@@ -534,7 +599,12 @@ func (s devinSourceSet) sourceRef(root, path string, allowMissing bool) (SourceR
+ 	root = filepath.Clean(root)
+ 	path = filepath.Clean(path)
+ 	dbPath, sessionID, ok := ParseVirtualSourcePathForBase(path, devinDBFilename)
+-	if !ok || sessionID == "" {
++	var rootNodeID int64
++	var isSubagent bool
++	if !ok {
++		dbPath, sessionID, rootNodeID, isSubagent = parseDevinSubagentVirtualSourcePath(path)
++	}
++	if (!ok && !isSubagent) || sessionID == "" {
+ 		return SourceRef{}, false
+ 	}
+ 	if !samePath(dbPath, filepath.Join(root, "cli", devinDBFilename)) {
+@@ -543,6 +613,9 @@ func (s devinSourceSet) sourceRef(root, path string, allowMissing bool) (SourceR
+ 	if !allowMissing && !IsRegularFile(dbPath) {
+ 		return SourceRef{}, false
+ 	}
++	if isSubagent {
++		return s.newSubagentSourceRef(root, dbPath, sessionID, rootNodeID, 0), true
++	}
+ 	return s.newSourceRef(root, dbPath, sessionID), true
+ }
+ 
+@@ -632,6 +705,22 @@ func (s devinSourceSet) newSourceRefWithMTime(root, dbPath, sessionID string, mt
+ 	}
+ }
+ 
++func (s devinSourceSet) newSubagentSourceRef(root, dbPath, sessionID string, rootNodeID int64, mtimeNS int64) SourceRef {
++	virtualPath := devinSubagentVirtualSourcePath(VirtualSourcePath(dbPath, sessionID), rootNodeID)
++	return SourceRef{
++		Provider:         AgentDevin,
++		Key:              virtualPath,
++		DisplayPath:      virtualPath,
++		FingerprintKey:   virtualPath,
++		DiscoveryMTimeNS: mtimeNS,
++		Opaque: devinSource{
++			Root:      root,
++			DBPath:    dbPath,
++			SessionID: sessionID,
++		},
++	}
++}
++
+ func (s devinSource) virtualPath() string {
+ 	return VirtualSourcePath(s.DBPath, s.SessionID)
+ }
+diff --git a/internal/parser/devin_provider_test.go b/internal/parser/devin_provider_test.go
+index ab6b4de9..5b532278 100644
+--- a/internal/parser/devin_provider_test.go
++++ b/internal/parser/devin_provider_test.go
+@@ -1,6 +1,7 @@
+ package parser
+ 
+ import (
++	"fmt"
+ 	"os"
+ 	"path/filepath"
+ 	"testing"
+@@ -706,3 +707,63 @@ func TestDevinProviderMissingDBSkipsAndPreservesSessions(t *testing.T) {
+ 	assert.Equal(t, SkipNoSession, outcome.SkipReason)
+ 	assert.Empty(t, outcome.Results)
+ }
++
++func TestDevinProviderFindSourceSubagentValidation(t *testing.T) {
++	t.Parallel()
++
++	const sessionID = "session-subagent-find"
++	fixture := newDevinTestFixture(t, devinSessionRow{
++		ID:               sessionID,
++		Title:            "Subagent FindSource",
++		WorkingDirectory: "/tmp/devin-subagent",
++		Model:            "claude-opus-4-8-medium",
++		CreatedAt:        new(int64(1704103200)),
++		LastActivityAt:   new(int64(1704103210)),
++		MainChainID:      new(int64(1)),
++	})
++	fixture.insertMessageNodes(t,
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"Main task"}`, CreatedAt: 1704103201},
++		// Subagent root node (NodeID 10) with a child (NodeID 11)
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 10, ChatMessage: `{"role":"system","content":"You are a subagent of Devin"}`, CreatedAt: 1704103202},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 11, ParentNodeID: new(int64(10)), ChatMessage: `{"role":"user","content":"Subagent prompt"}`, CreatedAt: 1704103203},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 12, ParentNodeID: new(int64(11)), ChatMessage: `{"role":"assistant","content":"Subagent reply"}`, CreatedAt: 1704103204},
++	)
++
++	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{fixture.Root}})
++	require.True(t, ok)
++
++	parentVirtualPath := VirtualSourcePath(fixture.DBPath, sessionID)
++	subagentVirtualPath := devinSubagentVirtualSourcePath(parentVirtualPath, 10)
++	subagentRawID := fmt.Sprintf("%s:agent-10", sessionID)
++	nonExistentRawID := fmt.Sprintf("%s:agent-9999", sessionID)
++	nonExistentVirtualPath := devinSubagentVirtualSourcePath(parentVirtualPath, 9999)
++
++	// 1. Existing subagent should be found via RawSessionID, FullSessionID, and StoredFilePath
++	sourceRaw, found, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: subagentRawID})
++	require.NoError(t, err)
++	require.True(t, found)
++	assert.Equal(t, subagentVirtualPath, sourceRaw.DisplayPath)
++
++	sourceFull, found, err := provider.FindSource(t.Context(), FindSourceRequest{FullSessionID: "devin:" + subagentRawID})
++	require.NoError(t, err)
++	require.True(t, found)
++	assert.Equal(t, subagentVirtualPath, sourceFull.DisplayPath)
++
++	sourcePath, found, err := provider.FindSource(t.Context(), FindSourceRequest{StoredFilePath: subagentVirtualPath})
++	require.NoError(t, err)
++	require.True(t, found)
++	assert.Equal(t, subagentVirtualPath, sourcePath.DisplayPath)
++
++	// 2. Non-existent subagent must return found=false even if the parent session exists
++	_, found, err = provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: nonExistentRawID})
++	require.NoError(t, err)
++	assert.False(t, found, "non-existent subagent raw ID should not be found")
++
++	_, found, err = provider.FindSource(t.Context(), FindSourceRequest{FullSessionID: "devin:" + nonExistentRawID})
++	require.NoError(t, err)
++	assert.False(t, found, "non-existent subagent full ID should not be found")
++
++	_, found, err = provider.FindSource(t.Context(), FindSourceRequest{StoredFilePath: nonExistentVirtualPath})
++	require.NoError(t, err)
++	assert.False(t, found, "non-existent subagent stored path should not be found")
++}
+diff --git a/internal/parser/devin_subagent.go b/internal/parser/devin_subagent.go
+new file mode 100644
+index 00000000..7070208e
+--- /dev/null
++++ b/internal/parser/devin_subagent.go
+@@ -0,0 +1,391 @@
++package parser
++
++import (
++	"context"
++	"fmt"
++	"sort"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/tidwall/gjson"
++)
++
++const (
++	devinSubagentRootMarker   = "You are a subagent of Devin"
++	devinSummarizerRootMarker = "You are a Summarizer"
++)
++
++type devinSubagentNodeTree struct {
++	RootNodeID int64
++	Rows       []devinMessageNodeRow
++}
++
++type devinSubagentNodePartition struct {
++	Trees           []devinSubagentNodeTree
++	ExcludedNodeIDs map[int64]struct{}
++}
++
++type devinParsedSubagent struct {
++	Session  ParsedSession
++	Messages []ParsedMessage
++}
++
++type devinSubagentParseError struct {
++	RootNodeID int64
++	Err        error
++}
++
++func (e *devinSubagentParseError) Error() string {
++	return fmt.Sprintf(
++		"parsing Devin subagent root node %d: %v", e.RootNodeID, e.Err,
++	)
++}
++
++func (e *devinSubagentParseError) Unwrap() error {
++	return e.Err
++}
++
++func partitionDevinSubagentMessageNodes(
++	ctx context.Context,
++	rows []devinMessageNodeRow,
++) (devinSubagentNodePartition, error) {
++	partition := devinSubagentNodePartition{
++		ExcludedNodeIDs: make(map[int64]struct{}),
++	}
++	if len(rows) == 0 {
++		return partition, nil
++	}
++
++	indexByNodeID := make(map[int64]int, len(rows))
++	childrenByParent := make(map[int64][]int64, len(rows))
++	treeIndexByPromptMessageID := make(map[string]int)
++	for i, row := range rows {
++		indexByNodeID[row.NodeID] = i
++		if row.ParentNodeID.Valid {
++			childrenByParent[row.ParentNodeID.Int64] = append(
++				childrenByParent[row.ParentNodeID.Int64], row.NodeID,
++			)
++		}
++	}
++
++	for i, row := range rows {
++		if err := ctx.Err(); err != nil {
++			return devinSubagentNodePartition{}, err
++		}
++		if row.ParentNodeID.Valid {
++			continue
++		}
++		kind := devinMessageNodeRootKind(ctx, row.ChatMessage)
++		if kind == devinMessageNodeRootNone {
++			continue
++		}
++
++		rootNodeID := row.NodeID
++		visited := map[int64]struct{}{rootNodeID: {}}
++		stack := []int64{rootNodeID}
++		indices := []int{i}
++		for len(stack) > 0 {
++			current := stack[len(stack)-1]
++			stack = stack[:len(stack)-1]
++			for _, childNodeID := range childrenByParent[current] {
++				if _, seen := visited[childNodeID]; seen {
++					continue
++				}
++				childIndex, exists := indexByNodeID[childNodeID]
++				if !exists {
++					continue
++				}
++				visited[childNodeID] = struct{}{}
++				indices = append(indices, childIndex)
++				stack = append(stack, childNodeID)
++			}
++		}
++		sort.Ints(indices)
++		treeRows := make([]devinMessageNodeRow, 0, len(indices))
++		for _, rowIndex := range indices {
++			treeRows = append(treeRows, rows[rowIndex])
++			partition.ExcludedNodeIDs[rows[rowIndex].NodeID] = struct{}{}
++		}
++		if kind == devinMessageNodeRootSubagent && len(treeRows) > 1 {
++			tree := devinSubagentNodeTree{
++				RootNodeID: rootNodeID,
++				Rows:       treeRows,
++			}
++			promptMessageID := devinSubagentTreePromptMessageID(treeRows)
++			if promptMessageID == "" {
++				partition.Trees = append(partition.Trees, tree)
++				continue
++			}
++			if existingIndex, exists := treeIndexByPromptMessageID[promptMessageID]; exists {
++				existing := partition.Trees[existingIndex]
++				if len(tree.Rows) > len(existing.Rows) ||
++					(len(tree.Rows) == len(existing.Rows) && tree.RootNodeID > existing.RootNodeID) {
++					partition.Trees[existingIndex] = tree
++				}
++				continue
++			}
++			treeIndexByPromptMessageID[promptMessageID] = len(partition.Trees)
++			partition.Trees = append(partition.Trees, tree)
++		}
++	}
++	sort.Slice(partition.Trees, func(i, j int) bool {
++		return partition.Trees[i].RootNodeID < partition.Trees[j].RootNodeID
++	})
++	return partition, nil
++}
++
++// devinSubagentTreePromptMessageID identifies copies of the same logical
++// subagent transcript. Devin can persist multiple disconnected roots for one
++// task; those copies retain the message_id of their first user prompt while
++// receiving different root node IDs.
++func devinSubagentTreePromptMessageID(rows []devinMessageNodeRow) string {
++	var (
++		messageID   string
++		firstNodeID int64
++	)
++	for _, row := range rows {
++		if gjson.Get(row.ChatMessage, "role").Str != "user" {
++			continue
++		}
++		candidate := strings.TrimSpace(devinNodeMessageID(row.ChatMessage))
++		if candidate == "" {
++			continue
++		}
++		if messageID == "" || row.NodeID < firstNodeID {
++			messageID = candidate
++			firstNodeID = row.NodeID
++		}
++	}
++	return messageID
++}
++
++type devinMessageNodeRoot int
++
++const (
++	devinMessageNodeRootNone devinMessageNodeRoot = iota
++	devinMessageNodeRootSubagent
++	devinMessageNodeRootSummarizer
++)
++
++func devinMessageNodeRootKind(
++	ctx context.Context,
++	chatMessage string,
++) devinMessageNodeRoot {
++	if !gjson.Valid(chatMessage) {
++		return devinMessageNodeRootNone
++	}
++	message := gjson.Parse(chatMessage)
++	if message.Get("role").Str != "system" {
++		return devinMessageNodeRootNone
++	}
++	content, _, _, _, _, _ := ExtractTextContent(ctx, message.Get("content"))
++	switch {
++	case strings.Contains(content, devinSubagentRootMarker):
++		return devinMessageNodeRootSubagent
++	case strings.Contains(content, devinSummarizerRootMarker):
++		return devinMessageNodeRootSummarizer
++	default:
++		return devinMessageNodeRootNone
++	}
++}
++
++func parseDevinSubagentNodeTrees(
++	ctx context.Context,
++	rawSessionID, machine string,
++	meta *DevinSessionMeta,
++	parentFile FileInfo,
++	trees []devinSubagentNodeTree,
++) ([]devinParsedSubagent, error) {
++	parsed := make([]devinParsedSubagent, 0, len(trees))
++	for _, tree := range trees {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++		child, ok, err := parseDevinSubagentNodeTree(
++			ctx, rawSessionID, machine, meta, parentFile, tree,
++		)
++		if err != nil {
++			return nil, err
++		}
++		if ok {
++			parsed = append(parsed, child)
++		}
++	}
++	return parsed, nil
++}
++
++func parseDevinSubagentNodeTree(
++	ctx context.Context,
++	rawSessionID, machine string,
++	meta *DevinSessionMeta,
++	parentFile FileInfo,
++	tree devinSubagentNodeTree,
++) (devinParsedSubagent, bool, error) {
++	model := metaValue(meta, func(m *DevinSessionMeta) string { return m.Model })
++	messages := make([]ParsedMessage, 0, len(tree.Rows))
++	var (
++		firstMessage string
++		firstStepAt  = time.Time{}
++		lastStepAt   = time.Time{}
++		userMsgCount int
++	)
++	for _, row := range tree.Rows {
++		if err := ctx.Err(); err != nil {
++			return devinParsedSubagent{}, false, err
++		}
++		message, ok, err := parseDevinDBMessageNode(
++			rawSessionID, row, len(messages), model,
++		)
++		if err != nil {
++			return devinParsedSubagent{}, false, &devinSubagentParseError{
++				RootNodeID: tree.RootNodeID,
++				Err:        err,
++			}
++		}
++		if !ok {
++			continue
++		}
++		messages = append(messages, message)
++		if firstStepAt.IsZero() && !message.Timestamp.IsZero() {
++			firstStepAt = message.Timestamp
++		}
++		if message.Timestamp.After(lastStepAt) {
++			lastStepAt = message.Timestamp
++		}
++		if message.Role == RoleUser && !message.IsSystem &&
++			strings.TrimSpace(message.Content) != "" {
++			userMsgCount++
++			if firstMessage == "" {
++				firstMessage = truncate(
++					strings.ReplaceAll(message.Content, "\n", " "), 300,
++				)
++			}
++		}
++	}
++	if len(messages) == 0 {
++		return devinParsedSubagent{}, false, nil
++	}
++
++	sourceSessionID := devinSubagentRawSessionID(rawSessionID, tree.RootNodeID)
++	sessionID := string(AgentDevin) + ":" + sourceSessionID
++	startedAt := firstNonZeroTime(
++		firstStepAt,
++		devinUnixSec(tree.Rows[0].CreatedAt),
++		metaTime(meta, func(m *DevinSessionMeta) time.Time { return m.CreatedAt }),
++	)
++	endedAt := firstNonZeroTime(lastStepAt, startedAt)
++	sessionName := firstMessage
++	if sessionName == "" {
++		sessionName = fmt.Sprintf("Subagent %d", tree.RootNodeID)
++	}
++	fileInfo := parentFile
++	fileInfo.Path = devinSubagentVirtualSourcePath(parentFile.Path, tree.RootNodeID)
++	devinApplyFileInfoTimes(&fileInfo, meta, endedAt)
++
++	session := ParsedSession{
++		ID:               sessionID,
++		Project:          ExtractProjectFromCwd(metaValue(meta, func(m *DevinSessionMeta) string { return m.CWD })),
++		Machine:          machine,
++		Agent:            AgentDevin,
++		ParentSessionID:  string(AgentDevin) + ":" + rawSessionID,
++		RelationshipType: RelSubagent,
++		Cwd:              metaValue(meta, func(m *DevinSessionMeta) string { return m.CWD }),
++		SourceSessionID:  sourceSessionID,
++		FirstMessage:     firstMessage,
++		SessionName:      sessionName,
++		StartedAt:        startedAt,
++		EndedAt:          endedAt,
++		MessageCount:     len(messages),
++		UserMessageCount: userMsgCount,
++		File:             fileInfo,
++	}
++	accumulateMessageTokenUsage(&session, messages)
++	return devinParsedSubagent{Session: session, Messages: messages}, true, nil
++}
++
++func devinSubagentRawSessionID(parentSessionID string, rootNodeID int64) string {
++	return fmt.Sprintf("%s:agent-%d", parentSessionID, rootNodeID)
++}
++
++func parseDevinSubagentRawSessionID(rawSessionID string) (
++	parentSessionID string,
++	rootNodeID int64,
++	ok bool,
++) {
++	separator := strings.LastIndex(rawSessionID, ":agent-")
++	if separator <= 0 {
++		return "", 0, false
++	}
++	rootNodeID, err := strconv.ParseInt(rawSessionID[separator+len(":agent-"):], 10, 64)
++	if err != nil || rootNodeID < 0 {
++		return "", 0, false
++	}
++	return rawSessionID[:separator], rootNodeID, true
++}
++
++func devinSubagentVirtualSourcePath(parentPath string, rootNodeID int64) string {
++	return VirtualSourcePath(parentPath, fmt.Sprintf("agent-%d", rootNodeID))
++}
++
++func parseDevinSubagentVirtualSourcePath(
++	path string,
++) (dbPath, parentSessionID string, rootNodeID int64, ok bool) {
++	parentPath, memberID, ok := ParseVirtualSourcePath(path)
++	if !ok {
++		return "", "", 0, false
++	}
++	dbPath, parentSessionID, ok = ParseVirtualSourcePathForBase(
++		parentPath, devinDBFilename,
++	)
++	if !ok || parentSessionID == "" {
++		return "", "", 0, false
++	}
++	memberID = strings.TrimPrefix(memberID, "agent-")
++	rootNodeID, err := strconv.ParseInt(memberID, 10, 64)
++	if err != nil || rootNodeID < 0 {
++		return "", "", 0, false
++	}
++	return dbPath, parentSessionID, rootNodeID, true
++}
++
++func devinMessageNodesWithout(
++	rows []devinMessageNodeRow,
++	excludedNodeIDs map[int64]struct{},
++) []devinMessageNodeRow {
++	if len(excludedNodeIDs) == 0 {
++		return rows
++	}
++	filtered := make([]devinMessageNodeRow, 0, len(rows))
++	for _, row := range rows {
++		if _, excluded := excludedNodeIDs[row.NodeID]; excluded {
++			continue
++		}
++		filtered = append(filtered, row)
++	}
++	return filtered
++}
++
++func devinSubagentExists(
++	ctx context.Context,
++	dbPath, rawSessionID string,
++	rootNodeID int64,
++) (bool, error) {
++	rows, err := listDevinMessageNodes(ctx, dbPath, rawSessionID)
++	if err != nil {
++		return false, err
++	}
++	if len(rows) == 0 {
++		return false, nil
++	}
++	partition, err := partitionDevinSubagentMessageNodes(ctx, rows)
++	if err != nil {
++		return false, err
++	}
++	for _, tree := range partition.Trees {
++		if tree.RootNodeID == rootNodeID {
++			return true, nil
++		}
++	}
++	return false, nil
++}
+diff --git a/internal/parser/devin_test.go b/internal/parser/devin_test.go
+index 88c79ebf..2dfe51da 100644
+--- a/internal/parser/devin_test.go
++++ b/internal/parser/devin_test.go
+@@ -502,7 +502,7 @@ func TestParseDevinSessionMissingTranscriptFallsBackToMessageNodes(t *testing.T)
+ 	})
+ 	fixture.insertMessageNodes(t,
+ 		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"Recover from SQLite fallback"}`, CreatedAt: 1704103201},
+-		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ChatMessage: `{"role":"assistant","content":"I'll use the database transcript fallback.","thinking":"checking message_nodes","tool_calls":[{"id":"call-1","function":{"name":"read_file","arguments":"{\"file_path\":\"main.go\"}"}}]}`, CreatedAt: 1704103205},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ChatMessage: `{"role":"assistant","content":"I'll use the database transcript fallback.","thinking":{"thinking":"checking message_nodes","signature":"sig","signature_type":"symmetric"},"tool_calls":[{"id":"call-1","function":{"name":"read_file","arguments":"{\"file_path\":\"main.go\"}"}}]}`, CreatedAt: 1704103205},
+ 		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 3, ChatMessage: `{"role":"tool","content":"package main\n","tool_call_id":"call-1"}`, CreatedAt: 1704103207},
+ 	)
+ 
+@@ -519,6 +519,7 @@ func TestParseDevinSessionMissingTranscriptFallsBackToMessageNodes(t *testing.T)
+ 	assert.Equal(t, "Recover from SQLite fallback", msgs[0].Content)
+ 	assert.Equal(t, RoleAssistant, msgs[1].Role)
+ 	assert.True(t, msgs[1].HasThinking)
++	assert.Equal(t, "checking message_nodes", msgs[1].ThinkingText)
+ 	assert.True(t, msgs[1].HasToolUse)
+ 	assert.Contains(t, msgs[1].Content, "[Thinking]\nchecking message_nodes\n[/Thinking]")
+ 	assert.Contains(t, msgs[1].Content, "[Read: main.go]")
+@@ -830,35 +831,89 @@ func TestParseDevinSessionMessageNodesMissingParentFallsBackToAllNodes(t *testin
+ 	assert.Equal(t, 7, sess.PeakContextTokens)
+ }
+ 
+-func TestParseDevinSessionTranscriptStillWinsOverMessageNodes(t *testing.T) {
+-	const sessionID = "session-transcript-wins"
++func TestParseDevinSessionPrefersMessageNodesOverTranscript(t *testing.T) {
++	const sessionID = "session-message-nodes-win"
+ 	fixture := newDevinTestFixture(t, devinSessionRow{
+ 		ID:               sessionID,
+-		Title:            "Transcript wins",
+-		WorkingDirectory: "/tmp/transcript-wins",
++		Title:            "Message nodes win",
++		WorkingDirectory: "/tmp/message-nodes-win",
+ 		Model:            "db-model",
+ 		CreatedAt:        new(int64(1704103200)),
+ 		LastActivityAt:   new(int64(1704103209)),
++		MainChainID:      new(int64(2)),
+ 	})
+ 	fixture.writeTranscript(t, sessionID, `{
+ 		"agent":{"model_name":"transcript-model"},
+ 		"steps":[
+-			{"step_id":"step-1","source":"user","timestamp":"2024-01-01T10:00:01Z","message":"Use transcript"},
+-			{"step_id":"step-2","source":"agent","timestamp":"2024-01-01T10:00:05Z","message":"Transcript answer"}
++			{"step_id":"step-1","source":"user","timestamp":"2024-01-01T10:00:01Z","message":"Stale exported request"},
++			{"step_id":"step-2","source":"agent","timestamp":"2024-01-01T10:00:05Z","message":"Stale exported answer"}
+ 		]
+ 	}`)
+ 	fixture.insertMessageNodes(t,
+-		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"Use fallback instead"}`, CreatedAt: 1704103201},
+-		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ChatMessage: `{"role":"assistant","content":"Fallback answer"}`, CreatedAt: 1704103205},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"Current message_nodes request"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ParentNodeID: new(int64(1)), ChatMessage: `{"role":"assistant","content":"Current message_nodes answer"}`, CreatedAt: 1704103205},
+ 	)
+ 
+ 	sess, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
+ 	require.NoError(t, err)
+ 	require.Len(t, msgs, 2)
+-	assert.Equal(t, "Use transcript", sess.FirstMessage)
+-	assert.Equal(t, "transcript-model", msgs[0].Model)
+-	assert.Equal(t, "Use transcript", msgs[0].Content)
+-	assert.Equal(t, "Transcript answer", msgs[1].Content)
++	assert.Equal(t, "Current message_nodes request", sess.FirstMessage)
++	assert.Equal(t, "db-model", msgs[0].Model)
++	assert.Equal(t, "Current message_nodes request", msgs[0].Content)
++	assert.Equal(t, "Current message_nodes answer", msgs[1].Content)
++	assert.Equal(t, "session-message-nodes-win:1", msgs[0].SourceUUID)
++}
++
++func TestParseDevinSessionFallsBackToTranscriptWhenMessageNodeSchemaIsUnavailable(t *testing.T) {
++	const sessionID = "session-transcript-schema-fallback"
++	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{
++		ID:               sessionID,
++		Title:            "Transcript fallback",
++		WorkingDirectory: "/tmp/transcript-fallback",
++		Model:            "db-model",
++		CreatedAt:        new(int64(1704103200)),
++		LastActivityAt:   new(int64(1704103209)),
++	}, `{
++		"steps":[
++			{"step_id":"step-1","source":"user","timestamp":"2024-01-01T10:00:01Z","message":"Use the exported transcript"},
++			{"step_id":"step-2","source":"agent","timestamp":"2024-01-01T10:00:05Z","message":"Transcript fallback works"}
++		]
++	}`)
++	execDevinTestSQL(t, dbPath, `DROP TABLE message_nodes`)
++
++	sess, msgs, err := parseDevinSession(t.Context(), dbPath, sessionID, "local")
++	require.NoError(t, err)
++	require.Len(t, msgs, 2)
++	assert.Equal(t, "Use the exported transcript", sess.FirstMessage)
++	assert.Equal(t, "Transcript fallback works", msgs[1].Content)
++}
++
++func TestParseDevinSessionFallsBackToTranscriptWhenNodeMessageIsInvalid(t *testing.T) {
++	const sessionID = "session-invalid-node-fallback"
++	fixture := newDevinTestFixture(t, devinSessionRow{
++		ID:               sessionID,
++		Title:            "Transcript fallback",
++		WorkingDirectory: "/tmp/invalid-node-fallback",
++		Model:            "db-model",
++		CreatedAt:        new(int64(1704103200)),
++		LastActivityAt:   new(int64(1704103209)),
++		MainChainID:      new(int64(1)),
++	})
++	fixture.writeTranscript(t, sessionID, `{
++		"steps":[
++			{"step_id":"step-1","source":"user","timestamp":"2024-01-01T10:00:01Z","message":"Use the exported transcript"},
++			{"step_id":"step-2","source":"agent","timestamp":"2024-01-01T10:00:05Z","message":"Transcript fallback works"}
++		]
++	}`)
++	fixture.insertMessageNodes(t,
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `not valid JSON`, CreatedAt: 1704103201},
++	)
++
++	sess, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
++	require.NoError(t, err)
++	require.Len(t, msgs, 2)
++	assert.Equal(t, "Use the exported transcript", sess.FirstMessage)
++	assert.Equal(t, "Transcript fallback works", msgs[1].Content)
+ }
+ 
+ func TestParseDevinSessionMissingTranscriptWithoutDBMessagesReturnsRedactedError(t *testing.T) {
+@@ -882,6 +937,81 @@ func TestParseDevinSessionMissingTranscriptWithoutDBMessagesReturnsRedactedError
+ 	assert.NotContains(t, err.Error(), sessionID)
+ }
+ 
++func TestParseDevinMessageNodeSubagentCallsAndRoleToolResults(t *testing.T) {
++	const sessionID = "session-node-subagents"
++	fixture := newDevinTestFixture(t, devinSessionRow{
++		ID:               sessionID,
++		Title:            "Node subagents",
++		WorkingDirectory: "/tmp/node-subagents",
++		Model:            "db-model",
++		CreatedAt:        new(int64(1704103200)),
++		LastActivityAt:   new(int64(1704103209)),
++		MainChainID:      new(int64(4)),
++	})
++	fixture.insertMessageNodes(t,
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"Implement this task"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ParentNodeID: new(int64(1)), ChatMessage: `{"role":"assistant","tool_calls":[{"id":"run-1","name":"run_subagent","arguments":{"title":"Review parser behavior","task":"Review the parser and summarize its current behavior."}}]}`, CreatedAt: 1704103202},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 3, ParentNodeID: new(int64(2)), ChatMessage: `{"role":"assistant","tool_calls":[{"id":"read-1","name":"read_subagent","arguments":{"agent_id":"agent-fixture-1"}}]}`, CreatedAt: 1704103203},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 4, ParentNodeID: new(int64(3)), ChatMessage: `{"role":"tool","tool_call_id":"read-1","content":"Subagent task complete.\nSummary ready."}`, CreatedAt: 1704103204},
++	)
++
++	_, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
++	require.NoError(t, err)
++	require.Len(t, msgs, 4)
++
++	runCalls := msgs[1].ToolCalls
++	require.Len(t, runCalls, 1)
++	assert.Equal(t, "run-1", runCalls[0].ToolUseID)
++	assert.Equal(t, "run_subagent", runCalls[0].ToolName)
++	assert.JSONEq(t, `{"title":"Review parser behavior","task":"Review the parser and summarize its current behavior."}`, runCalls[0].InputJSON)
++
++	readCalls := msgs[2].ToolCalls
++	require.Len(t, readCalls, 1)
++	assert.Equal(t, "read_subagent", readCalls[0].ToolName)
++	assert.JSONEq(t, `{"agent_id":"agent-fixture-1"}`, readCalls[0].InputJSON)
++
++	toolResults := msgs[3].ToolResults
++	require.Len(t, toolResults, 1)
++	assert.Equal(t, "read-1", toolResults[0].ToolUseID)
++	assert.Equal(t, "Subagent task complete.\nSummary ready.", DecodeContent(toolResults[0].ContentRaw))
++}
++
++func TestParseDevinTranscriptSubagentToolCallsAndObservationResults(t *testing.T) {
++	const sessionID = "session-transcript-subagents"
++	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{
++		ID:               sessionID,
++		Title:            "Transcript subagents",
++		WorkingDirectory: "/tmp/transcript-subagents",
++		Model:            "db-model",
++		CreatedAt:        new(int64(1704103200)),
++		LastActivityAt:   new(int64(1704103209)),
++	}, `{
++		"steps":[
++			{"step_id":"run-1","source":"agent","timestamp":"2024-01-01T10:00:01Z","message":"Starting the requested work.","tool_calls":[{"tool_call_id":"run-1","function_name":"run_subagent","arguments":{"title":"Review parser behavior","task":"Review the parser and summarize its current behavior."}}]},
++			{"step_id":"read-1","source":"agent","timestamp":"2024-01-01T10:00:02Z","message":"Collecting the completed report.","tool_calls":[{"tool_call_id":"read-1","function_name":"read_subagent","arguments":{"agent_id":"agent-fixture-1"}}],"observation":{"results":[{"source_call_id":"read-1","content":"Subagent task complete.\nSummary ready."}]}}
++		]
++	}`)
++
++	_, msgs, err := parseDevinSession(t.Context(), dbPath, sessionID, "local")
++	require.NoError(t, err)
++	require.Len(t, msgs, 2)
++
++	runCalls := msgs[0].ToolCalls
++	require.Len(t, runCalls, 1)
++	assert.Equal(t, "run-1", runCalls[0].ToolUseID)
++	assert.Equal(t, "run_subagent", runCalls[0].ToolName)
++	assert.JSONEq(t, `{"title":"Review parser behavior","task":"Review the parser and summarize its current behavior."}`, runCalls[0].InputJSON)
++
++	readCalls := msgs[1].ToolCalls
++	require.Len(t, readCalls, 1)
++	assert.Equal(t, "read_subagent", readCalls[0].ToolName)
++	assert.JSONEq(t, `{"agent_id":"agent-fixture-1"}`, readCalls[0].InputJSON)
++	toolResults := msgs[1].ToolResults
++	require.Len(t, toolResults, 1)
++	assert.Equal(t, "read-1", toolResults[0].ToolUseID)
++	assert.Equal(t, "Subagent task complete.\nSummary ready.", DecodeContent(toolResults[0].ContentRaw))
++}
++
+ func TestParseDevinSessionFallbackErrorsStayRedacted(t *testing.T) {
+ 	const (
+ 		sessionID      = "secret-session"
+@@ -982,3 +1112,277 @@ func TestParseDevinSessionRedactsCredentialPathsAndTokenLikeValues(t *testing.T)
+ 		transcriptPath,
+ 	)
+ }
++
++// A continued (compacted) Devin session stores the pre-continuation thread on
++// sibling branches of the main chain: the chain itself opens with a fresh
++// context snapshot plus the continuation summary, so the original user message
++// is unreachable from main_chain_id. The parser recovers system-headed sibling
++// subtrees as earlier eras, keeps edits/retries out, and marks the summary as
++// a compact boundary.
++func TestParseDevinSessionMessageNodesRecoversPreContinuationEra(t *testing.T) {
++	const sessionID = "session-continued"
++	fixture := newDevinTestFixture(t, devinSessionRow{
++		ID:               sessionID,
++		Title:            "Continued session",
++		WorkingDirectory: "/tmp/continued",
++		Model:            "db-model",
++		CreatedAt:        new(int64(1704103200)),
++		LastActivityAt:   new(int64(1704103300)),
++		MainChainID:      new(int64(12)),
++	})
++	// Main chain: 1 -> 2 -> 10 -> 11 -> 12. Node 2 is the fork point where
++	// the post-continuation context re-roots.
++	fixture.insertMessageNodes(t,
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"message_id":"m-ctx-a","role":"system","content":"system prompt a"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ParentNodeID: new(int64(1)), ChatMessage: `{"message_id":"m-ctx-b","role":"system","content":"system prompt b"}`, CreatedAt: 1704103201},
++
++		// Era 1: sibling subtree headed by a re-captured context block.
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 3, ParentNodeID: new(int64(2)), ChatMessage: `{"message_id":"m-era1-ctx","role":"system","content":"era one context"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 4, ParentNodeID: new(int64(3)), ChatMessage: `{"message_id":"m-era1-user","role":"user","content":"original user prompt"}`, CreatedAt: 1704103201},
++		// Pending/committed duplicate pair sharing one message_id: the
++		// higher node_id (6) wins.
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 5, ParentNodeID: new(int64(4)), ChatMessage: `{"message_id":"m-era1-work","role":"assistant","content":"era one work pending","metadata":{"metrics":{"output_tokens":3}}}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 6, ParentNodeID: new(int64(4)), ChatMessage: `{"message_id":"m-era1-work","role":"assistant","content":"era one work committed","metadata":{"metrics":{"output_tokens":7}}}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 7, ParentNodeID: new(int64(6)), ChatMessage: `{"message_id":"m-era1-final","role":"assistant","content":"era one final answer"}`, CreatedAt: 1704103201},
++
++		// Abandoned user-edit branch: not an era, stays excluded.
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 8, ParentNodeID: new(int64(2)), ChatMessage: `{"message_id":"m-edit","role":"user","content":"edited prompt superseded"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 9, ParentNodeID: new(int64(8)), ChatMessage: `{"message_id":"m-edit-reply","role":"assistant","content":"answer to edited prompt"}`, CreatedAt: 1704103201},
++
++		// Current era on the main chain: fresh context, continuation
++		// summary, then post-compaction work.
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 10, ParentNodeID: new(int64(2)), ChatMessage: `{"message_id":"m-era2-ctx","role":"system","content":"era two context"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 11, ParentNodeID: new(int64(10)), ChatMessage: `{"message_id":"m-summary","role":"system","content":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nFull conversation history saved at /tmp/history_x.md.\nSummary: did work"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 12, ParentNodeID: new(int64(11)), ChatMessage: `{"message_id":"m-era2-work","role":"assistant","content":"post-compaction work","metadata":{"metrics":{"output_tokens":5}}}`, CreatedAt: 1704103201},
++	)
++
++	sess, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
++	require.NoError(t, err)
++	require.NotNil(t, sess)
++
++	require.Len(t, msgs, 9)
++
++	// Era 1 comes first, linearized to its committed line.
++	assert.Equal(t, RoleSystem, msgs[0].Role)
++	assert.Equal(t, "era one context", msgs[0].Content)
++	assert.Equal(t, RoleUser, msgs[1].Role)
++	assert.Equal(t, "original user prompt", msgs[1].Content)
++	assert.Equal(t, "era one work committed", msgs[2].Content)
++	assert.Equal(t, "era one final answer", msgs[3].Content)
++
++	// The abandoned edit branch is not part of the output.
++	for _, m := range msgs {
++		assert.NotContains(t, m.Content, "edited prompt superseded")
++		assert.NotContains(t, m.Content, "answer to edited prompt")
++	}
++
++	// Then the current era: context, boundary, work.
++	assert.Equal(t, "era two context", msgs[6].Content)
++	boundary := msgs[7]
++	assert.Equal(t, RoleSystem, boundary.Role)
++	assert.True(t, boundary.IsSystem)
++	assert.True(t, boundary.IsCompactBoundary)
++	assert.Equal(t, "system", boundary.SourceType)
++	assert.Equal(t, "compact_boundary", boundary.SourceSubtype)
++	assert.Contains(t, boundary.Content, "continuing work from a previous conversation thread")
++	assert.Equal(t, "post-compaction work", msgs[8].Content)
++
++	assert.Equal(t, "original user prompt", sess.FirstMessage)
++	assert.Equal(t, 1, sess.UserMessageCount)
++	assert.Equal(t, 9, sess.MessageCount)
++
++	// Token metrics from the recovered era count toward session totals.
++	assert.True(t, sess.HasTotalOutputTokens)
++	assert.Equal(t, 12, sess.TotalOutputTokens) // 7 + 5
++}
++
++// When Devin appends the continuation in place, the earlier thread stays on
++// the main chain: nothing is recovered, but the summary is still marked as a
++// compact boundary.
++func TestParseDevinSessionMessageNodesMarksAppendedContinuation(t *testing.T) {
++	const sessionID = "session-appended-continuation"
++	fixture := newDevinTestFixture(t, devinSessionRow{
++		ID:               sessionID,
++		Title:            "Appended continuation",
++		WorkingDirectory: "/tmp/appended",
++		Model:            "db-model",
++		CreatedAt:        new(int64(1704103200)),
++		LastActivityAt:   new(int64(1704103300)),
++		MainChainID:      new(int64(5)),
++	})
++	fixture.insertMessageNodes(t,
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"message_id":"m-a","role":"system","content":"context"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ParentNodeID: new(int64(1)), ChatMessage: `{"message_id":"m-b","role":"user","content":"first prompt"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 3, ParentNodeID: new(int64(2)), ChatMessage: `{"message_id":"m-c","role":"assistant","content":"first work"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 4, ParentNodeID: new(int64(3)), ChatMessage: `{"message_id":"m-d","role":"system","content":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: earlier work"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 5, ParentNodeID: new(int64(4)), ChatMessage: `{"message_id":"m-e","role":"assistant","content":"continued work"}`, CreatedAt: 1704103201},
++	)
++
++	sess, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
++	require.NoError(t, err)
++	require.NotNil(t, sess)
++	require.Len(t, msgs, 5)
++
++	assert.True(t, msgs[3].IsCompactBoundary)
++	assert.Equal(t, "compact_boundary", msgs[3].SourceSubtype)
++	assert.Equal(t, "first prompt", sess.FirstMessage)
++	assert.Equal(t, 1, sess.UserMessageCount)
++}
++
++// A transcript export that opens with the continuation summary can lag the
++// valid node history. The parser uses the recovered eras and current chain.
++func TestParseDevinSessionPrefersMessageNodesForContinuedTranscript(t *testing.T) {
++	const sessionID = "session-continued-export"
++	fixture := newDevinTestFixture(t, devinSessionRow{
++		ID:               sessionID,
++		Title:            "Continued export",
++		WorkingDirectory: "/tmp/continued-export",
++		Model:            "db-model",
++		CreatedAt:        new(int64(1704103200)),
++		LastActivityAt:   new(int64(1704103300)),
++		MainChainID:      new(int64(12)),
++	})
++	fixture.insertMessageNodes(t,
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"message_id":"m-ctx","role":"system","content":"context"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 3, ParentNodeID: new(int64(1)), ChatMessage: `{"message_id":"m-era1-ctx","role":"system","content":"era one context"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 4, ParentNodeID: new(int64(3)), ChatMessage: `{"message_id":"m-era1-user","role":"user","content":"original user prompt"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 5, ParentNodeID: new(int64(4)), ChatMessage: `{"message_id":"m-era1-work","role":"assistant","content":"era one work"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 10, ParentNodeID: new(int64(1)), ChatMessage: `{"message_id":"m-era2-ctx","role":"system","content":"era two context"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 11, ParentNodeID: new(int64(10)), ChatMessage: `{"message_id":"m-summary","role":"system","content":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: earlier work"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 12, ParentNodeID: new(int64(11)), ChatMessage: `{"message_id":"m-era2-work","role":"assistant","content":"post-compaction work"}`, CreatedAt: 1704103201},
++	)
++	fixture.writeTranscript(t, sessionID, `{
++		"created_at":"2024-01-01T10:00:00Z",
++		"updated_at":"2024-01-01T10:01:05Z",
++		"steps":[
++			{"step_id":1,"source":"system","timestamp":"2024-01-01T10:00:00Z","message":"era two context"},
++			{"step_id":2,"source":"system","timestamp":"2024-01-01T10:00:01Z","message":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: earlier work"},
++			{"step_id":3,"source":"agent","timestamp":"2024-01-01T10:00:05Z","message":[{"type":"text","text":"post-compaction work"}]}
++		]
++	}`)
++
++	sess, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
++	require.NoError(t, err)
++	require.NotNil(t, sess)
++
++	// Recovered era first, then the complete current chain from message_nodes.
++	require.Len(t, msgs, 7)
++	assert.Equal(t, RoleSystem, msgs[0].Role)
++	assert.Equal(t, RoleUser, msgs[1].Role)
++	assert.Equal(t, "original user prompt", msgs[1].Content)
++	assert.Equal(t, "era one work", msgs[2].Content)
++	assert.Equal(t, "context", msgs[3].Content)
++	assert.Equal(t, "era two context", msgs[4].Content)
++	assert.True(t, msgs[5].IsCompactBoundary)
++	assert.Equal(t, "compact_boundary", msgs[5].SourceSubtype)
++	assert.Equal(t, "post-compaction work", msgs[6].Content)
++
++	assert.Equal(t, "original user prompt", sess.FirstMessage)
++	assert.Equal(t, 1, sess.UserMessageCount)
++	for i, m := range msgs {
++		assert.Equal(t, i, m.Ordinal)
++	}
++}
++
++// A full export can contain rows missing from a valid native node
++// representation; the parser still selects the node history as one source.
++func TestParseDevinSessionPrefersMessageNodesOverFullTranscript(t *testing.T) {
++	const sessionID = "session-full-export"
++	fixture := newDevinTestFixture(t, devinSessionRow{
++		ID:               sessionID,
++		Title:            "Full export",
++		WorkingDirectory: "/tmp/full-export",
++		Model:            "db-model",
++		CreatedAt:        new(int64(1704103200)),
++		LastActivityAt:   new(int64(1704103300)),
++		MainChainID:      new(int64(12)),
++	})
++	fixture.insertMessageNodes(t,
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"message_id":"m-ctx","role":"system","content":"context"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 3, ParentNodeID: new(int64(1)), ChatMessage: `{"message_id":"m-era1-ctx","role":"system","content":"era one context"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 4, ParentNodeID: new(int64(3)), ChatMessage: `{"message_id":"m-era1-user","role":"user","content":"original user prompt"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 10, ParentNodeID: new(int64(1)), ChatMessage: `{"message_id":"m-era2-ctx","role":"system","content":"era two context"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 11, ParentNodeID: new(int64(10)), ChatMessage: `{"message_id":"m-summary","role":"system","content":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: earlier work"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 12, ParentNodeID: new(int64(11)), ChatMessage: `{"message_id":"m-era2-work","role":"assistant","content":"post-compaction work"}`, CreatedAt: 1704103201},
++	)
++	fixture.writeTranscript(t, sessionID, `{
++		"created_at":"2024-01-01T10:00:00Z",
++		"updated_at":"2024-01-01T10:01:05Z",
++		"steps":[
++			{"step_id":1,"source":"system","timestamp":"2024-01-01T10:00:00Z","message":"context"},
++			{"step_id":2,"source":"user","timestamp":"2024-01-01T10:00:01Z","message":"original user prompt"},
++			{"step_id":3,"source":"agent","timestamp":"2024-01-01T10:00:02Z","message":[{"type":"text","text":"era one work"}]},
++			{"step_id":4,"source":"system","timestamp":"2024-01-01T10:00:03Z","message":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: earlier work"},
++			{"step_id":5,"source":"agent","timestamp":"2024-01-01T10:00:05Z","message":[{"type":"text","text":"post-compaction work"}]}
++		]
++	}`)
++
++	sess, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
++	require.NoError(t, err)
++	require.NotNil(t, sess)
++
++	require.Len(t, msgs, 6)
++	assert.Equal(t, "era one context", msgs[0].Content)
++	assert.Equal(t, "original user prompt", msgs[1].Content)
++	assert.Equal(t, "context", msgs[2].Content)
++	assert.Equal(t, "era two context", msgs[3].Content)
++	assert.True(t, msgs[4].IsCompactBoundary)
++	assert.Equal(t, "post-compaction work", msgs[5].Content)
++	assert.Equal(t, 1, sess.UserMessageCount)
++}
++
++func TestParseDevinSessionRecoversMultiGenerationCompactedRoots(t *testing.T) {
++	const sessionID = "session-multi-compact"
++	fixture := newDevinTestFixture(t, devinSessionRow{
++		ID:               sessionID,
++		Title:            "Multi-generation compact",
++		WorkingDirectory: "/tmp/multi-compact",
++		Model:            "db-model",
++		CreatedAt:        new(int64(1704103200)),
++		LastActivityAt:   new(int64(1704103500)),
++		MainChainID:      new(int64(303)),
++	})
++
++	fixture.insertMessageNodes(t,
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 100, ChatMessage: `{"message_id":"m-100","role":"system","content":"era 1 system"}`, CreatedAt: 1704103201},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 101, ParentNodeID: new(int64(100)), ChatMessage: `{"message_id":"m-101","role":"user","content":"original user prompt"}`, CreatedAt: 1704103202},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 102, ParentNodeID: new(int64(101)), ChatMessage: `{"message_id":"m-102","role":"assistant","content":"era one work"}`, CreatedAt: 1704103203},
++
++		// Era 2 re-injects Devin boilerplate prompts before the continuation summary.
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 200, ChatMessage: `{"message_id":"m-200","role":"system","content":"You are Devin, an interactive command line agent from Cognition."}`, CreatedAt: 1704103301},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 201, ParentNodeID: new(int64(200)), ChatMessage: `{"message_id":"m-201","role":"system","content":"Available subagent profiles for the ` + "`run_subagent`" + ` tool."}`, CreatedAt: 1704103301},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 202, ParentNodeID: new(int64(201)), ChatMessage: `{"message_id":"m-202","role":"system","content":"You are powered by SWE-2 Max."}`, CreatedAt: 1704103301},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 203, ParentNodeID: new(int64(202)), ChatMessage: `{"message_id":"m-203","role":"system","content":"## Parallel tool calls\n\nBefore each response, first privately list what you need next"}`, CreatedAt: 1704103301},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 204, ParentNodeID: new(int64(203)), ChatMessage: `{"message_id":"m-204","role":"system","content":"<available_skills>\nThe following skills can be invoked"}`, CreatedAt: 1704103301},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 205, ParentNodeID: new(int64(204)), ChatMessage: `{"message_id":"m-205","role":"system","content":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: era 1"}`, CreatedAt: 1704103302, MetadataJSON: `{"summarized_from": 102}`},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 206, ParentNodeID: new(int64(205)), ChatMessage: `{"message_id":"m-206","role":"assistant","content":"era two work"}`, CreatedAt: 1704103303},
++
++		// Era 3 also re-injects Devin boilerplate prompts before its continuation summary.
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 300, ChatMessage: `{"message_id":"m-300","role":"system","content":"You are Devin, an interactive command line agent from Cognition."}`, CreatedAt: 1704103401},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 301, ParentNodeID: new(int64(300)), ChatMessage: `{"message_id":"m-301","role":"system","content":"<rules type=\"always-on\">\n<rule name=\"r1\" path=\"/tmp\"/>\n</rules>"}`, CreatedAt: 1704103401},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 302, ParentNodeID: new(int64(301)), ChatMessage: `{"message_id":"m-302","role":"system","content":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: era 2"}`, CreatedAt: 1704103402, MetadataJSON: `{"summarized_from": 206}`},
++		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 303, ParentNodeID: new(int64(302)), ChatMessage: `{"message_id":"m-303","role":"assistant","content":"era three work"}`, CreatedAt: 1704103403},
++	)
++
++	sess, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
++	require.NoError(t, err)
++	require.NotNil(t, sess)
++
++	// Boilerplate system prompts in era 2 and era 3 are suppressed, while era 1's
++	// initial system prompt and each era's continuation summary are preserved.
++	require.Len(t, msgs, 7)
++	assert.Equal(t, "era 1 system", msgs[0].Content)
++	assert.Equal(t, "original user prompt", msgs[1].Content)
++	assert.Equal(t, "era one work", msgs[2].Content)
++	assert.True(t, msgs[3].IsCompactBoundary)
++	assert.Equal(t, "compact_boundary", msgs[3].SourceSubtype)
++	assert.Equal(t, "era two work", msgs[4].Content)
++	assert.True(t, msgs[5].IsCompactBoundary)
++	assert.Equal(t, "compact_boundary", msgs[5].SourceSubtype)
++	assert.Equal(t, "era three work", msgs[6].Content)
++	assert.Equal(t, "original user prompt", sess.FirstMessage)
++	assert.Equal(t, 1, sess.UserMessageCount)
++	for i, m := range msgs {
++		assert.Equal(t, i, m.Ordinal)
++	}
++}

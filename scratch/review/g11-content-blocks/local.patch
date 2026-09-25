@@ -1,0 +1,2386 @@
+diff --git a/frontend/e2e/message-content.spec.ts b/frontend/e2e/message-content.spec.ts
+index 7460a4ac..449f4dad 100644
+--- a/frontend/e2e/message-content.spec.ts
++++ b/frontend/e2e/message-content.spec.ts
+@@ -11,7 +11,9 @@ const LOC = {
+ const COLD_WEBKIT_TEST_TIMEOUT_MS = 30_000;
+ 
+ const MIXED_CONTENT_SESSION_ID = "test-session-mixed-content-7";
+-const MIXED_CONTENT_DISPLAY_ROWS = 6;
++// Three prompt rows plus a turn-header/final-output pair for each of the
++// two collapsed assistant turns.
++const MIXED_CONTENT_DISPLAY_ROWS = 7;
+ 
+ const TOOL_BLOCK_PATH =
+   "/workspace/packages/agentsview/frontend/src/lib/components/content/ToolBlock.svelte";
+@@ -36,13 +38,50 @@ async function expectSessionLoaded(page: Page, sessionId: string, expectedRows?:
+   }
+ }
+ 
++/** Opens the nth assistant-turn header so its child event rows mount. */
++async function expandTurn(page: Page, index: number): Promise<Locator> {
++  const header = page.locator(".turn-header").nth(index);
++  await expect(header).toBeVisible();
++  await header.click();
++  await expect(header).toHaveAttribute("aria-expanded", "true");
++  return header;
++}
++
+ test.describe("Mixed content rendering", () => {
+   test.describe.configure({ timeout: COLD_WEBKIT_TEST_TIMEOUT_MS });
+ 
++  test("assistant turn starts collapsed and final output remains visible", async ({ page }) => {
++    const sid = await selectSession(page);
++    await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
++
++    const headers = page.locator(".turn-header");
++    await expect(headers).toHaveCount(2);
++    await expect(headers.nth(0)).toHaveAttribute("aria-expanded", "false");
++    await expect(headers.nth(1)).toHaveAttribute("aria-expanded", "false");
++
++    // The answer stays readable while the intermediate work stays folded:
++    // each collapsed turn still renders its final-output row.
++    const outputs = page.locator(".turn-output");
++    await expect(outputs).toHaveCount(2);
++    await expect(outputs.nth(0)).toContainText("Here is my analysis.");
++    await expect(outputs.nth(1)).toContainText("visible response after thinking");
++
++    // Thinking and tool blocks only mount inside an expanded turn.
++    await expect(page.locator(".thinking-block")).toHaveCount(0);
++    await expect(page.locator(".tool-block")).toHaveCount(0);
++
++    await expandTurn(page, 0);
++    await expect(page.locator(".thinking-block").first()).toBeVisible();
++    await expect(page.locator(".tool-block")).toHaveCount(0);
++  });
++
+   test("tool group renders for consecutive tool-only messages", async ({ page }) => {
+     const sid = await selectSession(page);
+     await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
+ 
++    // The tool rollup lives inside the collapsed second assistant turn.
++    await expandTurn(page, 1);
++
+     const toolGroup = page.locator(".tool-group");
+     await expect(toolGroup).toBeVisible();
+     await expect(toolGroup).toContainText(/tool calls?/i);
+@@ -59,6 +98,7 @@ test.describe("Mixed content rendering", () => {
+   test("tool block expands on click and text is selectable", async ({ page }) => {
+     const sid = await selectSession(page);
+     await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
++    await expandTurn(page, 1);
+ 
+     const toolBlock = page.locator(".tool-block").first();
+     await expect(toolBlock).toBeVisible();
+@@ -97,6 +137,7 @@ test.describe("Mixed content rendering", () => {
+         await page.setViewportSize({ width, height: 900 });
+         const sid = await selectSession(page);
+         await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
++        await expandTurn(page, 1);
+         const pathTool = page
+           .locator(".tool-block")
+           .filter({
+@@ -130,6 +171,7 @@ test.describe("Mixed content rendering", () => {
+   test("text selection does not collapse tool block", async ({ page }) => {
+     const sid = await selectSession(page);
+     await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
++    await expandTurn(page, 1);
+ 
+     // Expand the tool block first
+     const toolBlock = page.locator(".tool-block").first();
+@@ -162,6 +204,8 @@ test.describe("Mixed content rendering", () => {
+   test("thinking block is collapsed by default", async ({ page }) => {
+     const sid = await selectSession(page);
+     await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
++    // The thinking block mounts inside the expanded first turn.
++    await expandTurn(page, 0);
+ 
+     const thinkingBlock = page.locator(".thinking-block").first();
+     await expect(thinkingBlock).toBeVisible();
+@@ -194,6 +238,10 @@ test.describe("Mixed content rendering", () => {
+   test("response text remains after toggling thinking off", async ({ page }) => {
+     const sid = await selectSession(page);
+     await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
++    // Mount a thinking block inside the first turn so toggling its filter
++    // below is exercised rather than vacuous on a collapsed turn.
++    await expandTurn(page, 0);
++    await expect(page.locator(".thinking-block").first()).toBeVisible();
+ 
+     // Open block filter dropdown and toggle thinking off
+     await page.locator('button[aria-label="Filter block types"]').click();
+@@ -348,6 +396,12 @@ test.describe("retained tool images", () => {
+ 
+     await page.setViewportSize({ width: 1280, height: 900 });
+     await page.goto(`/sessions/${sessionId}`);
++    // The four tool-only messages fold into one collapsed assistant turn;
++    // expand it so the rollup's tool blocks mount.
++    const turnHeader = page.locator(".turn-header");
++    await expect(turnHeader).toBeVisible();
++    await turnHeader.click();
++    await expect(turnHeader).toHaveAttribute("aria-expanded", "true");
+     await expect(page.locator(".tool-block")).toHaveCount(4);
+ 
+     const retainedBlock = page
+diff --git a/frontend/src/lib/components/content/DevinSubagentToolBlock.test.ts b/frontend/src/lib/components/content/DevinSubagentToolBlock.test.ts
+new file mode 100644
+index 00000000..c96854fe
+--- /dev/null
++++ b/frontend/src/lib/components/content/DevinSubagentToolBlock.test.ts
+@@ -0,0 +1,113 @@
++// @vitest-environment jsdom
++import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
++import { mount, tick, unmount, type ComponentProps } from "svelte";
++import type { DbToolCall as ToolCall } from "../../api/generated/index.js";
++import { setLocale } from "../../i18n/index.js";
++import { displayToolName } from "../../utils/toolDisplay.js";
++import ToolBlock from "./ToolBlock.svelte";
++
++const copyToClipboardMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
++const searchState = vi.hoisted(() => ({ active: false, current: "", query: "" }));
++vi.mock("../../utils/clipboard.js", () => ({ copyToClipboard: copyToClipboardMock }));
++vi.mock("../../stores/inSessionSearch.svelte.js", () => ({
++  inSessionSearch: {
++    get isActive() {
++      return searchState.active;
++    },
++    get debouncedQuery() {
++      return searchState.query;
++    },
++    navigationRevision: 1,
++    isCurrentBlock: (key: string | undefined) => !!key && key === searchState.current,
++    countForBlock: (key: string | undefined) =>
++      key && key === searchState.current ? 1 : 0,
++    currentOccurrence: () => 0,
++  },
++}));
++
++const components: ReturnType<typeof mount>[] = [];
++
++async function render(props: Partial<ComponentProps<typeof ToolBlock>> = {}) {
++  components.push(mount(ToolBlock, { target: document.body, props: { content: "", ...props } }));
++  await tick();
++}
++
++async function click(selector: string) {
++  const button = document.querySelector<HTMLButtonElement>(selector);
++  expect(button).not.toBeNull();
++  button!.click();
++  await Promise.resolve();
++  await tick();
++}
++
++function call(
++  tool_name: string,
++  params: Record<string, unknown> = {},
++  rest: Partial<ToolCall> = {},
++): ToolCall {
++  return {
++    category: "",
++    tool_name,
++    input_json: JSON.stringify(params),
++    ...rest,
++  };
++}
++
++const text = (selector: string) => document.querySelector(selector)?.textContent ?? "";
++
++beforeEach(() => {
++  setLocale("en");
++  searchState.active = false;
++  searchState.current = "";
++  searchState.query = "";
++  copyToClipboardMock.mockClear();
++});
++
++afterEach(async () => {
++  for (const component of components.splice(0)) await unmount(component);
++  vi.unstubAllGlobals();
++  document.body.replaceChildren();
++  setLocale("en");
++});
++
++describe("Devin subagent tool blocks", () => {
++  it("shows the title and keeps the full task expandable", async () => {
++    const toolCall = call(
++      "run_subagent",
++      {
++        title: "Review parser behavior",
++        task: "Review the parser and summarize the current changes.\nInclude relevant checks.",
++      },
++      { category: "Task" },
++    );
++    await render({ toolCall, label: displayToolName(toolCall) });
++
++    expect(text(".tool-header .tool-label")).toBe("Subagent:");
++    expect(text(".tool-header .tool-preview")).toBe("Review parser behavior");
++    expect(document.querySelector(".tool-content")).toBeNull();
++
++    await click(".tool-header");
++    expect(text(".tool-content")).toContain("Review the parser and summarize the current changes.");
++    expect(text(".tool-content")).toContain("Include relevant checks.");
++  });
++
++  it("previews the result and keeps the full report expandable", async () => {
++    const report = "Subagent task complete.\n## Summary\nThe full implementation report.";
++    const toolCall = call(
++      "read_subagent",
++      { agent_id: "agent-fixture-1" },
++      { category: "Task", result_content: report },
++    );
++    await render({ toolCall, label: displayToolName(toolCall) });
++
++    expect(text(".tool-header .tool-label")).toBe("Subagent result:");
++    expect(text(".tool-header .tool-preview")).toBe("Subagent task complete.");
++    expect(text(".tool-header .tool-preview")).not.toContain("Summary");
++    expect(document.querySelector(".tool-content")).toBeNull();
++
++    await click(".tool-header");
++    expect(text(".output-header .tool-preview")).toBe("Subagent task complete.");
++    await click(".output-header");
++    expect(text(".output-content")).toBe(report);
++  });
++});
+diff --git a/frontend/src/lib/components/content/MessageContent.svelte b/frontend/src/lib/components/content/MessageContent.svelte
+index 96e7b8a5..1add1eab 100644
+--- a/frontend/src/lib/components/content/MessageContent.svelte
++++ b/frontend/src/lib/components/content/MessageContent.svelte
+@@ -1,36 +1,39 @@
+ <script lang="ts">
+   import type { Session } from "../../api/types.js";
+-import type { DbMessage as Message } from "../../api/generated/index.js";
++  import type { DbMessage as Message } from "../../api/generated/index.js";
+   import type { DbCallTiming as CallTiming, DbTurnTiming as TurnTiming } from "../../api/generated/index.js";
+-  import { parseContent, enrichSegments } from "../../utils/content-parser.js";
++  import {
++    parseContent,
++    enrichSegments,
++    splitPromptAttachments,
++    PROMPT_TRUNCATE_POINTS,
++    PROMPT_PREVIEW_POINTS,
++    type ContentSegment,
++  } from "../../utils/content-parser.js";
+   import { formatTimestamp, formatTokenUsage } from "../../utils/format.js";
+   import { formatDuration } from "../../utils/duration.js";
+-  import { copyToClipboard } from "../../utils/clipboard.js";
+-  import { formatMessageForCopy } from "../../utils/copy-message.js";
+   import { sessionAncestryMatches } from "../../utils/session-ancestry.js";
+   import { messages as messagesStore } from "../../stores/messages.svelte.js";
+   import { sessionTiming } from "../../stores/sessionTiming.svelte.js";
+   import { liveTick } from "../../stores/liveTick.svelte.js";
+-  import { isRemoteConnection } from "../../api/runtime.js";
+-  import { SessionsService, type ResumeRequest, type ResumeResponse } from "../../api/generated/index";
+   import ThinkingBlock from "./ThinkingBlock.svelte";
+   import ToolBlock from "./ToolBlock.svelte";
+   import ParallelGroup from "./ParallelGroup.svelte";
+   import CodeBlock from "./CodeBlock.svelte";
+   import MermaidBlock from "./MermaidBlock.svelte";
+   import SkillBlock from "./SkillBlock.svelte";
+-  import { Button, CopyButton } from "@kenn-io/kit-ui";
++  import MessageSourceActions from "./MessageSourceActions.svelte";
++  import { Button } from "@kenn-io/kit-ui";
+   import { ui } from "../../stores/ui.svelte.js";
+-  import { pins } from "../../stores/pins.svelte.js";
+   import { sessions } from "../../stores/sessions.svelte.js";
+-  import { sync } from "../../stores/sync.svelte.js";
+   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
++  import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
+   import { blockKey } from "../../search/block-text.js";
+   import { searchBlock } from "../../search/session-block.svelte.js";
+   import { highlightCodeFences } from "../../utils/highlight-fences.js";
+   import { loadAssetImages, renderMarkdown } from "../../utils/markdown.js";
+   import { displayToolName } from "../../utils/toolDisplay.js";
+-  import { ChevronDownIcon, ChevronRightIcon, CirclePlayIcon, PinIcon } from "../../icons.js";
++  import { ChevronDownIcon, ChevronRightIcon } from "../../icons.js";
+   import { m } from "../../i18n/index.js";
+ 
+   interface Props {
+@@ -40,13 +43,31 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
+     searchOrdinal?: number;
+     compact?: boolean;
+     allowMutations?: boolean;
++    /** Subset of the message's enriched segments to render (assistant-turn
++     *  event rows). Contiguous in the source, so `eventSegmentStart` recovers
++     *  the original search-key indexes. */
++    eventSegments?: readonly ContentSegment[];
++    /** Index of `eventSegments[0]` in the source message's segment array. */
++    eventSegmentStart?: number;
++    /** Suppress the message header; the event row owns actions and metadata. */
++    hideMessageHeader?: boolean;
+   }
+-  let { message, session, isSubagentContext = false, searchOrdinal, compact = false, allowMutations = true }: Props = $props();
+-  let copied = $state(false);
+-  let segments = $derived(enrichSegments(
++  let {
++    message,
++    session,
++    isSubagentContext = false,
++    searchOrdinal,
++    compact = false,
++    allowMutations = true,
++    eventSegments,
++    eventSegmentStart = 0,
++    hideMessageHeader = false,
++  }: Props = $props();
++  let allSegments = $derived(enrichSegments(
+     parseContent(message.content, message.has_tool_use, message.id, message.content_length),
+     message.tool_calls,
+   ));
++  let segments = $derived(eventSegments ?? allSegments);
+   // Embedded subagents have their own ordinal namespace and are never searched here.
+   let activeSearchOrdinal = $derived(isSubagentContext ? undefined : searchOrdinal);
+   let hasSearchQuery = $derived(activeSearchOrdinal !== undefined && inSessionSearch.isActive);
+@@ -112,13 +133,34 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
+       : m.message_content_code_collapsed();
+   }
+ 
+-  let showText = $derived(ui.isBlockVisible(isUser ? "user" : "assistant"));
++  let showText = $derived(
++    inSessionSearch.isBlockEffectivelyVisible(isUser ? "user" : "assistant"),
++  );
++
++  let promptPoints = $derived(Array.from(message.content));
++  let promptTruncated = $derived(
++    isUser && eventSegments === undefined && promptPoints.length > PROMPT_TRUNCATE_POINTS,
++  );
++  let promptExpanded = $derived(turnCollapse.isUserPromptExpanded(message.id));
++  let promptCollapsed = $derived(promptTruncated && !promptExpanded);
++  // Attachment references lift out of the collapsed prompt so they keep
++  // rendering outside the disclosure; code-aware splitting leaves markers
++  // inside code spans and fenced blocks in the body. The preview slices the
++  // body after extraction so markers render once, in the attachment region.
++  let promptSplit = $derived(splitPromptAttachments(message.content));
++  let promptAttachmentText = $derived(promptSplit.attachments.join("\n\n"));
++  let promptPreview = $derived(
++    Array.from(promptSplit.body).slice(0, PROMPT_PREVIEW_POINTS).join("").trimEnd(),
++  );
++  let promptSearchKey = $derived.by(() => {
++    if (activeSearchOrdinal === undefined) return undefined;
++    const textIndex = segments.findIndex((segment) => segment.type === "text");
++    if (textIndex < 0) return undefined;
++    return blockKey(activeSearchOrdinal, "text", textIndex);
++  });
+   let accentColor = $derived(isUser ? "var(--accent-blue)" : "var(--accent-purple)");
+   let accentForeground = $derived(isUser ? "var(--accent-blue-foreground)" : "var(--accent-purple-foreground)");
+   let roleBg = $derived(isUser ? "var(--user-bg)" : "var(--assistant-bg)");
+-  let pinned = $derived(pins.isPinned(message.id));
+-  let pinFeedback = $state("");
+-  let forkFeedback = $state("");
+   let turnByMessage = $derived.by(() => {
+     const map = new Map<number, TurnTiming>();
+     for (const turn of sessionTiming.timing?.turns ?? []) map.set(turn.message_id, turn);
+@@ -163,89 +205,45 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
+     }
+     return null;
+   });
+-  let copyTimer: ReturnType<typeof setTimeout>;
+-  let pinTimer: ReturnType<typeof setTimeout>;
+-  let forkTimer: ReturnType<typeof setTimeout>;
+-  async function handleCopy() {
+-    const ok = await copyToClipboard(formatMessageForCopy(message));
+-    if (ok) {
+-      clearTimeout(copyTimer); copied = true;
+-      copyTimer = setTimeout(() => { copied = false; }, 1500);
+-    }
+-  }
+-  async function handleTogglePin() {
+-    const wasPinned = pinned;
+-    try {
+-      await pins.togglePin(message.session_id, message.id, message.ordinal);
+-      clearTimeout(pinTimer);
+-      pinFeedback = wasPinned ? m.message_content_unpinned() : m.message_content_pinned();
+-      pinTimer = setTimeout(() => { pinFeedback = ""; }, 1500);
+-    } catch { /* Preserve the existing non-blocking pin interaction. */ }
+-  }
+-  let canForkFromMessage = $derived(allowMutations && owningSession?.agent === "claude" &&
+-    !(owningSession?.id ?? "").includes("~") && !(sync.readOnly && isRemoteConnection()));
+-  async function handleForkFromHere() {
+-    if (!canForkFromMessage) return;
+-    clearTimeout(forkTimer);
+-    try {
+-      const resp = await SessionsService.postApiV1SessionsByIdResume(
+-        { id: message.session_id },
+-        {
+-          ...(sync.readOnly && !isRemoteConnection() ? { command_only: true } : {}),
+-          from_ordinal: message.ordinal, fork_session: true,
+-        } satisfies ResumeRequest,
+-      ) as ResumeResponse;
+-      if (resp.launched) {
+-        forkFeedback = m.session_breadcrumb_resumed_in({ target: resp.terminal ?? "terminal" });
+-        forkTimer = setTimeout(() => { forkFeedback = ""; }, 2000);
+-        return;
+-      }
+-      if (resp.command) {
+-        const ok = await copyToClipboard(resp.command);
+-        forkFeedback = ok ? m.session_breadcrumb_command_copied() : m.session_breadcrumb_failed();
+-        forkTimer = setTimeout(() => { forkFeedback = ""; }, 2000);
+-        return;
+-      }
+-    } catch { /* Show the existing failure feedback below. */ }
+-    forkFeedback = m.session_breadcrumb_failed();
+-    forkTimer = setTimeout(() => { forkFeedback = ""; }, 2000);
+-  }
+ </script>
+ 
+ <div class="message" class:is-user={isUser} class:compact style:border-left-color={accentColor} style:background={roleBg}>
+-  <div class="message-header">
+-    <span class="role-icon" style:background={accentColor} style:color={accentForeground}>{roleIcon}</span>
+-    <span class="role-label" style:color={accentColor}>{roleLabel}</span>
+-    <CopyButton revealOnHover {copied} ariaLabel={m.message_content_copy_message()}
+-      copiedAriaLabel={m.message_content_copied_message()} title={m.message_content_copy_message()}
+-      copiedTitle={m.message_content_copied()} onclick={handleCopy} />
+-    {#if allowMutations}
+-    <button type="button" class="pin-btn" class:pinned
+-      title={pinned ? m.message_content_unpin_message() : m.message_content_pin_message()} onclick={handleTogglePin}>
+-      <PinIcon size="14" strokeWidth="1.8" aria-hidden="true" />
+-    </button>
+-    {/if}
+-    {#if canForkFromMessage}
+-      <button type="button" class="pin-btn fork-btn" title={m.session_breadcrumb_resume_session()}
+-        aria-label={m.session_breadcrumb_resume_session()} onclick={handleForkFromHere}>
+-        <CirclePlayIcon size="14" strokeWidth="1.8" aria-hidden="true" />
+-      </button>
+-    {/if}
+-    {#if pinFeedback}<span class="pin-feedback">{pinFeedback}</span>{/if}
+-    {#if forkFeedback}<span class="fork-feedback">{forkFeedback}</span>{/if}
+-    <div class="header-meta">
+-      {#if tokenSummary}<span class="message-tokens">{tokenSummary}</span>{/if}
+-      {#if turnSummary}<span class="turn-summary" class:slow={turnSummary.slow} class:running={turnSummary.running}>{turnSummary.text}</span>{/if}
+-      <span class="timestamp">{formatTimestamp(message.timestamp)}</span>
+-      {#if offMainModel}<span class="message-model" title={offMainModel}>{offMainModel}</span>{/if}
++  {#if !hideMessageHeader}
++    <div class="message-header">
++      <span class="role-icon" style:background={accentColor} style:color={accentForeground}>{roleIcon}</span>
++      <span class="role-label" style:color={accentColor}>{roleLabel}</span>
++      <MessageSourceActions {message} {session} {allowMutations} />
++      <div class="header-meta">
++        {#if tokenSummary}<span class="message-tokens">{tokenSummary}</span>{/if}
++        {#if turnSummary}<span class="turn-summary" class:slow={turnSummary.slow} class:running={turnSummary.running}>{turnSummary.text}</span>{/if}
++        <span class="timestamp">{formatTimestamp(message.timestamp)}</span>
++        {#if offMainModel}<span class="message-model" title={offMainModel}>{offMainModel}</span>{/if}
++      </div>
+     </div>
+-  </div>
++  {/if}
+   <div class="message-body">
++    {#if promptCollapsed && showText}
++      <div class="text-content markdown" {@attach searchBlock(promptSearchKey)}
++        use:highlightCodeFences={{ content: promptPreview }} use:loadAssetImages={promptPreview}>
++        {@html renderMarkdown(promptPreview, { renderUnknownXmlBlocksAsPreformatted: ui.renderUnknownXmlBlocksAsPreformatted })}
++      </div>
++      {#if promptAttachmentText}
++        <div class="prompt-attachments markdown" use:loadAssetImages={promptAttachmentText}>
++          {@html renderMarkdown(promptAttachmentText, { renderUnknownXmlBlocksAsPreformatted: ui.renderUnknownXmlBlocksAsPreformatted })}
++        </div>
++      {/if}
++    {/if}
++    <!-- A collapsed prompt renders only its preview, attachments, and the
++      disclosure toggle; every parsed segment stays folded behind it. -->
++    {#if !promptCollapsed}
+     {#each segments as segment, segmentIndex}
++      <!-- `sourceIndex` recovers the segment's index in the source message so
++        search keys stay stable when `eventSegments` carries a subset. -->
++      {@const sourceIndex = eventSegments === undefined ? segmentIndex : eventSegmentStart + segmentIndex}
+       {@const searchKey = activeSearchOrdinal === undefined || segment.type === "tool"
+-        ? undefined : blockKey(activeSearchOrdinal, segment.type, segmentIndex)}
++        ? undefined : blockKey(activeSearchOrdinal, segment.type, sourceIndex)}
+       {#if segment.type === "thinking"}
+-        {#if ui.isBlockVisible("thinking")}
++        {#if inSessionSearch.isBlockEffectivelyVisible("thinking")}
+           <ThinkingBlock content={segment.content} {searchKey} />
+         {/if}
+       {:else if segment.type === "tool"}
+@@ -253,14 +251,14 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
+       {:else if segment.type === "code"}
+         {@const codeLabel = segment.label?.trim().toLowerCase()}
+         {@const language = segment.label?.trim() ?? ""}
+-        {#if ui.isBlockVisible("code")}
++        {#if inSessionSearch.isBlockEffectivelyVisible("code")}
+           {#if codeLabel === "mermaid" && !hasSearchQuery}
+             <MermaidBlock content={segment.content} />
+           {:else}
+             <CodeBlock content={segment.content} language={segment.label} {searchKey} />
+           {/if}
+         {:else}
+-          {@const expanded = expandedCodeBlocks.has(segmentIndex)}
++          {@const expanded = expandedCodeBlocks.has(sourceIndex)}
+           {@const toggleLabel = codeFenceToggleLabel(language, expanded)}
+           <div class="code-fence-block">
+             <Button
+@@ -270,7 +268,7 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
+               ariaExpanded={expanded}
+               label={toggleLabel}
+               title={toggleLabel}
+-              onclick={() => toggleCodeBlock(segmentIndex)}
++              onclick={() => toggleCodeBlock(sourceIndex)}
+             >
+               {#snippet trailing()}
+                 {#if expanded}
+@@ -303,7 +301,31 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
+         {/if}
+       {/if}
+     {/each}
+-    {#if ui.isBlockVisible("tool")}
++    {/if}
++    {#if promptTruncated && showText}
++      <Button
++        class="prompt-toggle"
++        size="sm"
++        surface="soft"
++        ariaExpanded={promptExpanded}
++        label={promptExpanded ? m.message_content_show_less() : m.message_content_show_full_prompt()}
++        title={promptExpanded ? m.message_content_show_less() : m.message_content_show_full_prompt()}
++        onclick={() => turnCollapse.setUserPromptExpanded(message.id, !promptExpanded)}
++      >
++        {#snippet trailing()}
++          {#if promptExpanded}
++            <ChevronDownIcon size="14" strokeWidth="2" aria-hidden="true" />
++          {:else}
++            <ChevronRightIcon size="14" strokeWidth="2" aria-hidden="true" />
++          {/if}
++        {/snippet}
++      </Button>
++    {/if}
++    <!-- Tool segments and structured calls render through the trailing tool
++      block in standalone mode; event rows render their own tool events, so
++      a segment subset must not re-emit them here. A collapsed prompt folds
++      them behind the disclosure too. -->
++    {#if !promptCollapsed && eventSegments === undefined && inSessionSearch.isBlockEffectivelyVisible("tool")}
+       {@const turn = turnByMessage.get(message.id)}
+       {@const structuredCalls = message.tool_calls ?? []}
+       {#if structuredCalls.length === 1}
+@@ -352,20 +374,10 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
+   }
+   .turn-summary.slow { color: var(--slow-fg); background: var(--slow-bg); border-color: var(--slow-ring); }
+   .turn-summary.running { color: var(--running-fg); background: var(--running-bg); border-color: var(--running-ring); animation: duration-pulse 1.6s ease-in-out infinite; }
+-  .message:hover :global(.kit-copy-btn) { opacity: 1; }
+-  .pin-btn {
+-    display: flex; align-items: center; justify-content: center; width: 26px; height: 26px;
+-    border: none; border-radius: var(--radius-sm, 4px); background: transparent;
+-    color: var(--text-muted); cursor: pointer; opacity: 0;
+-    transition: opacity 0.15s, background 0.15s, color 0.15s; flex-shrink: 0;
+-  }
+-  .message:hover .pin-btn, .pin-btn:focus-visible, .pin-btn.pinned { opacity: 1; }
+-  @media (hover: none) { .pin-btn { opacity: 1; } }
+-  .pin-btn:hover { background: var(--bg-surface-hover); color: var(--text-secondary); }
+-  .pin-btn.pinned { color: var(--accent-blue); }
+-  .pin-btn:active { transform: var(--press-transform); }
+-  .pin-feedback, .fork-feedback { font-size: 11px; color: var(--text-muted); animation: fade-in-out 1.5s ease-in-out; }
+-  @keyframes fade-in-out { 0% { opacity: 0; } 15% { opacity: 1; } 75% { opacity: 1; } 100% { opacity: 0; } }
++  /* The extracted source actions hide their pin/fork buttons until hover;
++   * the reveal trigger still covers the whole message row. */
++  .message:hover :global(.kit-copy-btn),
++  .message:hover :global(.pin-btn) { opacity: 1; }
+   .text-content { font-size: 14px; line-height: 1.7; color: var(--text-primary); word-wrap: break-word; }
+   .code-fence-block {
+     display: flex;
+@@ -379,6 +391,14 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
+   }
+ 
+   .message-body { display: flex; flex-direction: column; gap: 8px; }
++  .prompt-attachments {
++    font-size: 13px;
++    color: var(--text-secondary);
++    border-left: 2px solid var(--border-muted);
++    padding-left: 10px;
++  }
++  .prompt-attachments :global(img) { max-width: 240px; display: block; }
++  :global(.prompt-toggle) { align-self: flex-start; max-width: 100%; }
+   .markdown :global(p) { margin: 0.5em 0; }
+   .markdown :global(p:first-child) { margin-top: 0; }
+   .markdown :global(p:last-child) { margin-bottom: 0; }
+diff --git a/frontend/src/lib/components/content/MessageContent.test.ts b/frontend/src/lib/components/content/MessageContent.test.ts
+index e4a4bffe..aa4f798b 100644
+--- a/frontend/src/lib/components/content/MessageContent.test.ts
++++ b/frontend/src/lib/components/content/MessageContent.test.ts
+@@ -7,6 +7,7 @@ import type {
+   DbSessionTiming as SessionTiming,
+ } from "../../api/generated/index.js";
+ import { setLocale } from "../../i18n/index.js";
++import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
+ import MessageContent from "./MessageContent.svelte";
+ 
+ const timingState = vi.hoisted(() => ({ timing: null as SessionTiming | null }));
+@@ -54,6 +55,7 @@ vi.mock("../../stores/inSessionSearch.svelte.js", () => ({
+     isCurrentBlock: () => false,
+     countForBlock: () => 0,
+     currentOccurrence: () => -1,
++    isBlockEffectivelyVisible: (type: string) => uiState.isBlockVisible(type),
+   },
+ }));
+ vi.mock("../../api/runtime.js", () => ({ isRemoteConnection: () => state.remote }));
+@@ -161,6 +163,7 @@ afterEach(async () => {
+   state.remote = false;
+   state.searching = false;
+   uiState.showAllBlocks();
++  turnCollapse.activateSession(null);
+ });
+ 
+ describe("MessageContent", () => {
+@@ -663,3 +666,229 @@ describe("MessageContent filtered code fences", () => {
+     unmount(component);
+   });
+ });
++
++describe("MessageContent event segments", () => {
++  it("renders only the provided segments with original search indexes", async () => {
++    const content = [
++      "[Thinking]",
++      "plan",
++      "[/Thinking]",
++      "",
++      "Visible answer.",
++      "",
++      "```ts",
++      "const n = 1;",
++      "```",
++    ].join("\n");
++    await render(message({ content, has_thinking: true, ordinal: 5 }), {
++      eventSegments: [
++        { type: "text", content: "Visible answer." },
++        { type: "code", content: "const n = 1;\n", label: "ts" },
++      ],
++      eventSegmentStart: 1,
++      hideMessageHeader: true,
++      searchOrdinal: 5,
++    });
++
++    expect(document.querySelector(".message-header")).toBeNull();
++    expect(document.querySelector(".thinking-block")).toBeNull();
++    expect(text(".text-content")).toContain("Visible answer.");
++    expect(text(".code-content")).toContain("const n = 1;");
++    expect(document.querySelector('[data-search-block="5:text:1"]')).not.toBeNull();
++    expect(document.querySelector('[data-search-block="5:code:2"]')).not.toBeNull();
++  });
++
++  it("skips the trailing tool block while rendering event segments", async () => {
++    await render(
++      message({
++        content: "Working.",
++        has_tool_use: true,
++        tool_calls: [
++          {
++            tool_use_id: "c1",
++            tool_name: "Bash",
++            category: "Bash",
++            input_json: '{"command":"pwd"}',
++          },
++        ],
++      }),
++      {
++        eventSegments: [{ type: "text", content: "Working." }],
++        hideMessageHeader: true,
++      },
++    );
++
++    expect(text(".text-content")).toContain("Working.");
++    expect(document.querySelector(".tool-block")).toBeNull();
++    expect(document.querySelector(".parallel-group")).toBeNull();
++  });
++});
++
++describe("MessageContent user prompt disclosure", () => {
++  const toggle = () => document.querySelector<HTMLButtonElement>("button.prompt-toggle");
++
++  it("renders a 600-code-point prompt in full without a disclosure", async () => {
++    const content = "a".repeat(600);
++    await render(message({ role: "user", content }));
++    expect(toggle()).toBeNull();
++    expect(text(".text-content")).toBe(content);
++  });
++
++  it("previews a 601-code-point prompt at exactly 500 code points", async () => {
++    const content = "a".repeat(500) + "b".repeat(101);
++    await render(message({ role: "user", content }));
++
++    expect(text(".text-content")).toBe("a".repeat(500));
++    expect(toggle()).not.toBeNull();
++    expect(toggle()!.textContent).toContain("Show full prompt");
++    expect(toggle()!.getAttribute("aria-expanded")).toBe("false");
++
++    await click("button.prompt-toggle");
++    expect(text(".text-content")).toBe(content);
++    expect(toggle()!.textContent).toContain("Show less");
++    expect(toggle()!.getAttribute("aria-expanded")).toBe("true");
++
++    await click("button.prompt-toggle");
++    expect(text(".text-content")).toBe("a".repeat(500));
++  });
++
++  it("counts an emoji-only 601-point prompt without splitting surrogate pairs", async () => {
++    const content = "🙂".repeat(601); // 601 code points, 1202 UTF-16 units
++    await render(message({ role: "user", content }));
++
++    expect(toggle()).not.toBeNull();
++    expect(text(".text-content")).toBe("🙂".repeat(500));
++
++    await click("button.prompt-toggle");
++    expect(text(".text-content")).toBe(content);
++  });
++
++  it("renders a 600-emoji prompt in full without a disclosure", async () => {
++    const content = "🙂".repeat(600);
++    await render(message({ role: "user", content }));
++    expect(toggle()).toBeNull();
++    expect(text(".text-content")).toBe(content);
++  });
++
++  it("keeps attachment references visible outside the collapsed disclosure", async () => {
++    const content = `${"p".repeat(601)}\n\n![shot](asset://img-1.png)\n\n[Image #1]`;
++    await render(message({ role: "user", content }));
++
++    expect(text(".text-content")).toBe("p".repeat(500));
++    const attachments = document.querySelector(".prompt-attachments");
++    expect(attachments).not.toBeNull();
++    expect(attachments!.querySelector("img")?.getAttribute("alt")).toBe("shot");
++    expect(attachments!.textContent).toContain("[Image #1]");
++
++    // Expanded, the references render in place like any other prompt.
++    await click("button.prompt-toggle");
++    expect(text(".text-content")).toContain("p".repeat(601));
++    expect(document.querySelector(".prompt-attachments")).toBeNull();
++    expect(document.querySelector(".text-content img")?.getAttribute("alt")).toBe("shot");
++    expect(text(".text-content")).toContain("[Image #1]");
++  });
++
++  it("does not truncate assistant messages or assistant event segments", async () => {
++    const content = "a".repeat(601);
++    await render(message({ role: "assistant", content }));
++    expect(toggle()).toBeNull();
++    expect(text(".text-content")).toBe(content);
++
++    document.body.replaceChildren();
++    await render(message({ role: "assistant", content }), {
++      eventSegments: [{ type: "text", content }],
++      hideMessageHeader: true,
++    });
++    expect(toggle()).toBeNull();
++    expect(text(".text-content")).toBe(content);
++  });
++
++  it("ignores the Expand all bulk baseline for prompt disclosures", async () => {
++    const content = "a".repeat(601);
++    const source = message({ role: "user", content });
++    await render(source);
++
++    turnCollapse.expandAll();
++    await tick();
++    expect(text(".text-content")).toBe("a".repeat(500));
++    expect(turnCollapse.isUserPromptExpanded(source.id)).toBe(false);
++
++    turnCollapse.setUserPromptExpanded(source.id, true);
++    await tick();
++    expect(text(".text-content")).toBe(content);
++  });
++
++  it("renders a marker inside the preview slice once, in the attachment region", async () => {
++    const content = "a".repeat(100) + " [Image #1] " + "b".repeat(601);
++    await render(message({ role: "user", content }));
++
++    expect(text(".text-content")).not.toContain("[Image #1]");
++    const attachments = document.querySelector(".prompt-attachments");
++    expect(attachments).not.toBeNull();
++    expect(attachments!.textContent).toContain("[Image #1]");
++    const messageBody = document.querySelector(".message-body")!;
++    expect(messageBody.textContent!.match(/\[Image #1\]/g) ?? []).toHaveLength(1);
++  });
++
++  it("lifts line-anchored audio and document markers out of the preview", async () => {
++    const content = "please review\n[audio]\n[document notes.pdf]\n" + "b".repeat(601);
++    await render(message({ role: "user", content }));
++
++    expect(text(".text-content")).not.toContain("[audio]");
++    expect(text(".text-content")).not.toContain("[document notes.pdf]");
++    const attachments = document.querySelector(".prompt-attachments")!;
++    expect(attachments).not.toBeNull();
++    expect(attachments.textContent).toContain("[audio]");
++    expect(attachments.textContent).toContain("[document notes.pdf]");
++  });
++
++  it("leaves markers inside code spans and fenced blocks in the body", async () => {
++    const content = "a".repeat(601) + "\n\n`[Image #1]`\n\n```\n[file]\n```";
++    await render(message({ role: "user", content }));
++
++    // Collapsed: nothing extracts, and the tail stays folded entirely.
++    expect(document.querySelector(".prompt-attachments")).toBeNull();
++    expect(document.querySelector(".code-content")).toBeNull();
++
++    await click("button.prompt-toggle");
++    expect(document.querySelector(".prompt-attachments")).toBeNull();
++    expect(document.querySelector(".text-content code")?.textContent).toBe("[Image #1]");
++    expect(text(".code-content")).toContain("[file]");
++  });
++
++  it("renders a fence inside the preview slice once, without a parsed CodeBlock", async () => {
++    const content = "a".repeat(100) + "\n\n```sh\necho early\n```\n\n" + "b".repeat(500);
++    await render(message({ role: "user", content }));
++
++    const messageBody = document.querySelector(".message-body")!;
++    expect(messageBody.textContent!.match(/echo early/g) ?? []).toHaveLength(1);
++    expect(document.querySelector(".code-content")).toBeNull();
++
++    // Expanded, the fence renders through the parsed-segment CodeBlock path.
++    await click("button.prompt-toggle");
++    expect(document.querySelector(".code-content")).not.toBeNull();
++    expect(text(".code-content")).toContain("echo early");
++  });
++
++  it("keeps a fence past the preview fully folded while collapsed", async () => {
++    const content = "a".repeat(620) + "\n\n```sh\necho tail\n```";
++    await render(message({ role: "user", content }));
++
++    expect(text(".message-body")).not.toContain("echo tail");
++    expect(document.querySelector(".code-content")).toBeNull();
++
++    await click("button.prompt-toggle");
++    expect(text(".code-content")).toContain("echo tail");
++  });
++
++  it("keeps a marker-looking markdown link as a link", async () => {
++    const content = "a".repeat(601) + "\n\n[file](https://example.com)";
++    await render(message({ role: "user", content }));
++
++    expect(document.querySelector(".prompt-attachments")).toBeNull();
++    await click("button.prompt-toggle");
++    const link = document.querySelector(".text-content a");
++    expect(link?.getAttribute("href")).toBe("https://example.com");
++    expect(link?.textContent).toBe("file");
++  });
++});
+diff --git a/frontend/src/lib/components/content/MessageSourceActions.svelte b/frontend/src/lib/components/content/MessageSourceActions.svelte
+new file mode 100644
+index 00000000..41a7b8a2
+--- /dev/null
++++ b/frontend/src/lib/components/content/MessageSourceActions.svelte
+@@ -0,0 +1,210 @@
++<!-- ABOUTME: Copy, pin, and fork controls for one source message. -->
++<!-- ABOUTME: Shared by standalone message headers and assistant-turn event rows. -->
++<script lang="ts">
++  import type { Session } from "../../api/types.js";
++  import type { DbMessage as Message } from "../../api/generated/index.js";
++  import { copyToClipboard } from "../../utils/clipboard.js";
++  import { formatMessageForCopy } from "../../utils/copy-message.js";
++  import { isRemoteConnection } from "../../api/runtime.js";
++  import {
++    SessionsService,
++    type ResumeRequest,
++    type ResumeResponse,
++  } from "../../api/generated/index";
++  import { pins } from "../../stores/pins.svelte.js";
++  import { sessions } from "../../stores/sessions.svelte.js";
++  import { sync } from "../../stores/sync.svelte.js";
++  import { CopyButton } from "@kenn-io/kit-ui";
++  import { CirclePlayIcon, PinIcon } from "../../icons.js";
++  import { m } from "../../i18n/index.js";
++
++  interface Props {
++    message: Message;
++    session?: Session | null;
++    allowMutations?: boolean;
++  }
++
++  let { message, session, allowMutations = true }: Props = $props();
++
++  let copied = $state(false);
++  let pinned = $derived(pins.isPinned(message.id));
++  let pinFeedback = $state("");
++  let forkFeedback = $state("");
++  let copyTimer: ReturnType<typeof setTimeout>;
++  let pinTimer: ReturnType<typeof setTimeout>;
++  let forkTimer: ReturnType<typeof setTimeout>;
++
++  let owningSession = $derived(
++    session !== undefined
++      ? session
++      : (sessions.sessions.find((s) => s.id === message.session_id) ??
++        sessions.activeSession),
++  );
++  let canForkFromMessage = $derived(
++    allowMutations &&
++      owningSession?.agent === "claude" &&
++      !(owningSession?.id ?? "").includes("~") &&
++      !(sync.readOnly && isRemoteConnection()),
++  );
++
++  async function handleCopy() {
++    const ok = await copyToClipboard(formatMessageForCopy(message));
++    if (ok) {
++      clearTimeout(copyTimer);
++      copied = true;
++      copyTimer = setTimeout(() => {
++        copied = false;
++      }, 1500);
++    }
++  }
++
++  async function handleTogglePin() {
++    const wasPinned = pinned;
++    try {
++      await pins.togglePin(message.session_id, message.id, message.ordinal);
++      clearTimeout(pinTimer);
++      pinFeedback = wasPinned
++        ? m.message_content_unpinned()
++        : m.message_content_pinned();
++      pinTimer = setTimeout(() => {
++        pinFeedback = "";
++      }, 1500);
++    } catch {
++      /* Preserve the existing non-blocking pin interaction. */
++    }
++  }
++
++  async function handleForkFromHere() {
++    if (!canForkFromMessage) return;
++    clearTimeout(forkTimer);
++    try {
++      const resp = (await SessionsService.postApiV1SessionsByIdResume(
++        { id: message.session_id },
++        {
++          ...(sync.readOnly && !isRemoteConnection() ? { command_only: true } : {}),
++          from_ordinal: message.ordinal,
++          fork_session: true,
++        } satisfies ResumeRequest,
++      )) as ResumeResponse;
++      if (resp.launched) {
++        forkFeedback = m.session_breadcrumb_resumed_in({
++          target: resp.terminal ?? "terminal",
++        });
++        forkTimer = setTimeout(() => {
++          forkFeedback = "";
++        }, 2000);
++        return;
++      }
++      if (resp.command) {
++        const ok = await copyToClipboard(resp.command);
++        forkFeedback = ok
++          ? m.session_breadcrumb_command_copied()
++          : m.session_breadcrumb_failed();
++        forkTimer = setTimeout(() => {
++          forkFeedback = "";
++        }, 2000);
++        return;
++      }
++    } catch {
++      /* Show the existing failure feedback below. */
++    }
++    forkFeedback = m.session_breadcrumb_failed();
++    forkTimer = setTimeout(() => {
++      forkFeedback = "";
++    }, 2000);
++  }
++</script>
++
++<CopyButton
++  revealOnHover
++  {copied}
++  ariaLabel={m.message_content_copy_message()}
++  copiedAriaLabel={m.message_content_copied_message()}
++  title={m.message_content_copy_message()}
++  copiedTitle={m.message_content_copied()}
++  onclick={handleCopy}
++/>
++{#if allowMutations}
++  <button
++    type="button"
++    class="pin-btn"
++    class:pinned
++    title={pinned ? m.message_content_unpin_message() : m.message_content_pin_message()}
++    onclick={handleTogglePin}
++  >
++    <PinIcon size="14" strokeWidth="1.8" aria-hidden="true" />
++  </button>
++{/if}
++{#if canForkFromMessage}
++  <button
++    type="button"
++    class="pin-btn fork-btn"
++    title={m.session_breadcrumb_resume_session()}
++    aria-label={m.session_breadcrumb_resume_session()}
++    onclick={handleForkFromHere}
++  >
++    <CirclePlayIcon size="14" strokeWidth="1.8" aria-hidden="true" />
++  </button>
++{/if}
++{#if pinFeedback}<span class="pin-feedback">{pinFeedback}</span>{/if}
++{#if forkFeedback}<span class="fork-feedback">{forkFeedback}</span>{/if}
++
++<style>
++  .pin-btn {
++    display: flex;
++    align-items: center;
++    justify-content: center;
++    width: 26px;
++    height: 26px;
++    border: none;
++    border-radius: var(--radius-sm, 4px);
++    background: transparent;
++    color: var(--text-muted);
++    cursor: pointer;
++    opacity: 0;
++    transition:
++      opacity 0.15s,
++      background 0.15s,
++      color 0.15s;
++    flex-shrink: 0;
++  }
++  .pin-btn:focus-visible,
++  .pin-btn.pinned {
++    opacity: 1;
++  }
++  @media (hover: none) {
++    .pin-btn {
++      opacity: 1;
++    }
++  }
++  .pin-btn:hover {
++    background: var(--bg-surface-hover);
++    color: var(--text-secondary);
++  }
++  .pin-btn.pinned {
++    color: var(--accent-blue);
++  }
++  .pin-btn:active {
++    transform: var(--press-transform);
++  }
++  .pin-feedback,
++  .fork-feedback {
++    font-size: 11px;
++    color: var(--text-muted);
++    animation: fade-in-out 1.5s ease-in-out;
++  }
++  @keyframes fade-in-out {
++    0% {
++      opacity: 0;
++    }
++    15% {
++      opacity: 1;
++    }
++    75% {
++      opacity: 1;
++    }
++    100% {
++      opacity: 0;
++    }
++  }
++</style>
+diff --git a/frontend/src/lib/components/content/MessageSourceActions.test.ts b/frontend/src/lib/components/content/MessageSourceActions.test.ts
+new file mode 100644
+index 00000000..f47ee189
+--- /dev/null
++++ b/frontend/src/lib/components/content/MessageSourceActions.test.ts
+@@ -0,0 +1,163 @@
++// @vitest-environment jsdom
++import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
++import { mount, tick, unmount } from "svelte";
++import type { Session } from "../../api/types.js";
++import type { DbMessage as Message } from "../../api/generated/index.js";
++import { setLocale } from "../../i18n/index.js";
++import MessageSourceActions from "./MessageSourceActions.svelte";
++
++const copyMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
++const pinMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
++const pinnedState = vi.hoisted(() => ({ pinned: false }));
++const forkMock = vi.hoisted(() => vi.fn());
++const state = vi.hoisted(() => ({
++  sessions: [] as Session[],
++  activeSession: null as Session | null,
++  readOnly: false,
++  remote: false,
++}));
++
++vi.mock("../../stores/pins.svelte.js", () => ({
++  pins: {
++    isPinned: () => pinnedState.pinned,
++    togglePin: pinMock,
++  },
++}));
++vi.mock("../../stores/sessions.svelte.js", () => ({ sessions: state }));
++vi.mock("../../stores/sync.svelte.js", () => ({ sync: state }));
++vi.mock("../../api/runtime.js", () => ({ isRemoteConnection: () => state.remote }));
++vi.mock("../../api/generated/index", async (importOriginal) => ({
++  ...(await importOriginal<typeof import("../../api/generated/index")>()),
++  SessionsService: { postApiV1SessionsByIdResume: forkMock },
++}));
++vi.mock("../../utils/clipboard.js", () => ({ copyToClipboard: copyMock }));
++
++const components: ReturnType<typeof mount>[] = [];
++function msg(overrides: Partial<Message> = {}): Message {
++  const content = overrides.content ?? "Full source message.";
++  return {
++    has_context_tokens: false,
++    has_output_tokens: false,
++    id: 11,
++    session_id: "s1",
++    ordinal: 1,
++    role: "assistant",
++    content,
++    timestamp: "2026-02-20T12:30:00Z",
++    has_thinking: false,
++    thinking_text: "",
++    has_tool_use: false,
++    content_length: content.length,
++    model: "claude-sonnet",
++    token_usage: null,
++    context_tokens: 0,
++    output_tokens: 0,
++    is_system: false,
++    ...overrides,
++  };
++}
++function session(overrides: Partial<Session> = {}): Session {
++  return {
++    compaction_count: 0,
++    consecutive_failure_max: 0,
++    edit_churn_count: 0,
++    ended_with_role: "",
++    final_failure_streak: 0,
++    has_peak_context_tokens: false,
++    has_total_output_tokens: false,
++    mid_task_compaction_count: 0,
++    outcome: "",
++    outcome_confidence: "",
++    secret_leak_count: 0,
++    tool_failure_signal_count: 0,
++    tool_retry_count: 0,
++    id: "s1",
++    agent: "claude",
++    project: "proj-a",
++    machine: "test",
++    first_message: "hello",
++    started_at: "2026-02-20T12:30:00Z",
++    ended_at: "2026-02-20T12:31:00Z",
++    message_count: 3,
++    user_message_count: 2,
++    total_output_tokens: 0,
++    peak_context_tokens: 0,
++    is_automated: false,
++    created_at: "2026-02-20T12:30:00Z",
++    ...overrides,
++  } as Session;
++}
++async function render(message = msg(), props: Record<string, unknown> = {}) {
++  components.push(
++    mount(MessageSourceActions, {
++      target: document.body,
++      props: { message, ...props },
++    }),
++  );
++  await tick();
++}
++async function click(selector: string) {
++  const button = document.querySelector<HTMLButtonElement>(selector);
++  expect(button).not.toBeNull();
++  button!.click();
++  await Promise.resolve();
++  await tick();
++}
++
++beforeEach(() => setLocale("en"));
++afterEach(async () => {
++  for (const component of components.splice(0)) await unmount(component);
++  document.body.replaceChildren();
++  setLocale("en");
++  vi.clearAllMocks();
++  pinnedState.pinned = false;
++  state.sessions = [];
++  state.activeSession = null;
++  state.readOnly = false;
++  state.remote = false;
++});
++
++describe("MessageSourceActions", () => {
++  it("copies the full source message", async () => {
++    const content = "[Thinking]\nplan\n[/Thinking]\n\nVisible answer.";
++    await render(msg({ content, has_thinking: true }));
++    await click('button[aria-label="Copy message"]');
++    const copied = copyMock.mock.calls[0]?.[0] as string;
++    expect(copied).toContain("plan");
++    expect(copied).toContain("Visible answer.");
++    expect(document.querySelector('button[aria-label="Copied message"]')).not.toBeNull();
++  });
++
++  it("pins and unpins the source message by id and ordinal", async () => {
++    await render(msg({ ordinal: 7 }));
++    await click(".pin-btn:not(.fork-btn)");
++    expect(pinMock).toHaveBeenCalledWith("s1", 11, 7);
++    expect(document.querySelector(".pin-feedback")?.textContent).toContain("Pinned");
++  });
++
++  it("forks the source message from its original ordinal", async () => {
++    state.sessions = [session()];
++    forkMock.mockResolvedValueOnce({
++      launched: false,
++      command: "claude < /tmp/fork.txt",
++      cwd: "/tmp",
++    });
++    await render(msg({ ordinal: 7 }));
++    await click(".fork-btn");
++    expect(forkMock).toHaveBeenCalledWith({ id: "s1" }, { from_ordinal: 7, fork_session: true });
++    await vi.waitFor(() => expect(copyMock).toHaveBeenCalledWith("claude < /tmp/fork.txt"));
++  });
++
++  it("hides pin and fork controls when mutations are disallowed", async () => {
++    state.sessions = [session()];
++    await render(msg(), { allowMutations: false });
++    expect(document.querySelector(".pin-btn")).toBeNull();
++    expect(document.querySelector('button[aria-label="Copy message"]')).not.toBeNull();
++  });
++
++  it("hides forking when the session cannot fork", async () => {
++    state.sessions = [session({ agent: "codex" })];
++    await render(msg());
++    expect(document.querySelector(".fork-btn")).toBeNull();
++  });
++});
+diff --git a/frontend/src/lib/components/content/SkillBlock.svelte b/frontend/src/lib/components/content/SkillBlock.svelte
+index b7306b68..1fd10322 100644
+--- a/frontend/src/lib/components/content/SkillBlock.svelte
++++ b/frontend/src/lib/components/content/SkillBlock.svelte
+@@ -2,6 +2,7 @@
+   import { searchBlock } from "../../search/session-block.svelte.js";
+   import { searchCollapsed } from "../../search/component-state.js";
+   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
++  import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
+   import SearchMatchCount from "./SearchMatchCount.svelte";
+   import { m } from "../../i18n/index.js";
+   import { loadAssetImages, renderMarkdown } from "../../utils/markdown.js";
+@@ -13,19 +14,33 @@
+     content: string;
+     name?: string;
+     searchKey?: string;
++    /** Turn-event disclosure key; when present, expansion state resolves
++     *  through `turnCollapse` instead of only local state. */
++    collapseKey?: string;
++    /** Default expansion used when no override or bulk baseline applies. */
++    defaultExpanded?: boolean;
+   }
+ 
+-  let { content, name, searchKey }: Props = $props();
++  let { content, name, searchKey, collapseKey, defaultExpanded = false }: Props = $props();
+   let userCollapsed = $state(true);
+   let overrideSeq = $state(-1);
++  let baseCollapsed = $derived(
++    collapseKey === undefined
++      ? userCollapsed
++      : !turnCollapse.isEventExpanded(collapseKey, defaultExpanded),
++  );
+   let collapsed = $derived(searchCollapsed(
+-    userCollapsed, inSessionSearch.isCurrentBlock(searchKey),
++    baseCollapsed, inSessionSearch.isCurrentBlock(searchKey),
+     inSessionSearch.navigationRevision, overrideSeq,
+   ));
+ 
+-  let previewLine = $derived(
+-    content.split("\n")[0]?.slice(0, 80) ?? "",
+-  );
++  /** First content line, truncated at 80 Unicode code points — an emoji
++   *  counts as one point and surrogate pairs are never split. */
++  let previewLine = $derived.by(() => {
++    const first = content.split("\n")[0] ?? "";
++    const points = Array.from(first);
++    return points.length > 80 ? `${points.slice(0, 80).join("")}…` : first;
++  });
+ </script>
+ 
+ <div class="skill-block">
+@@ -37,6 +52,9 @@
+       if (sel && sel.toString().length > 0) return;
+       userCollapsed = !collapsed;
+       overrideSeq = inSessionSearch.navigationRevision;
++      if (collapseKey !== undefined) {
++        turnCollapse.setEventExpanded(collapseKey, !userCollapsed);
++      }
+     }}
+   >
+     <span class="skill-chevron" class:open={!collapsed}>
+diff --git a/frontend/src/lib/components/content/SkillBlock.test.ts b/frontend/src/lib/components/content/SkillBlock.test.ts
+index c5fab721..f1c9cd4c 100644
+--- a/frontend/src/lib/components/content/SkillBlock.test.ts
++++ b/frontend/src/lib/components/content/SkillBlock.test.ts
+@@ -1,7 +1,8 @@
+ // @vitest-environment jsdom
+ import { mount, unmount, tick } from "svelte";
+-import { afterEach, describe, expect, it } from "vite-plus/test";
++import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
+ import { setLocale } from "../../i18n/index.js";
++import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
+ 
+ // @ts-ignore
+ import SkillBlock from "./SkillBlock.svelte";
+@@ -28,3 +29,32 @@ describe("SkillBlock", () => {
+     expect(document.querySelector(".skill-label")?.textContent).toBe("技能：未知");
+   });
+ });
++
++describe("SkillBlock turn-scoped collapse", () => {
++  let component: ReturnType<typeof mount> | undefined;
++
++  beforeEach(() => {
++    turnCollapse.activateSession(null);
++    turnCollapse.activateSession("s1");
++  });
++  afterEach(() => {
++    if (component) unmount(component);
++    component = undefined;
++    document.body.innerHTML = "";
++    turnCollapse.activateSession(null);
++    setLocale("en");
++  });
++
++  it("drives expansion from the store when keyed", async () => {
++    component = mount(SkillBlock, {
++      target: document.body,
++      props: { content: "Use the guide.", collapseKey: "s1:11:skill:0" },
++    });
++    await tick();
++    expect(document.querySelector(".skill-content")).toBeNull();
++
++    turnCollapse.setEventExpanded("s1:11:skill:0", true);
++    await tick();
++    expect(document.querySelector(".skill-content")).not.toBeNull();
++  });
++});
+diff --git a/frontend/src/lib/components/content/ThinkingBlock.svelte b/frontend/src/lib/components/content/ThinkingBlock.svelte
+index 372b612f..79ebeb10 100644
+--- a/frontend/src/lib/components/content/ThinkingBlock.svelte
++++ b/frontend/src/lib/components/content/ThinkingBlock.svelte
+@@ -2,6 +2,7 @@
+   import { searchBlock } from "../../search/session-block.svelte.js";
+   import { searchCollapsed } from "../../search/component-state.js";
+   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
++  import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
+   import SearchMatchCount from "./SearchMatchCount.svelte";
+   import { ChevronRightIcon } from "../../icons.js";
+   import { m } from "../../i18n/index.js";
+@@ -9,15 +10,33 @@
+   interface Props {
+     content: string;
+     searchKey?: string;
++    /** Turn-event disclosure key; when present, expansion state resolves
++     *  through `turnCollapse` instead of only local state. */
++    collapseKey?: string;
++    /** Default expansion used when no override or bulk baseline applies. */
++    defaultExpanded?: boolean;
+   }
+ 
+-  let { content, searchKey }: Props = $props();
++  let { content, searchKey, collapseKey, defaultExpanded = false }: Props = $props();
+   let userCollapsed = $state(true);
+   let overrideSeq = $state(-1);
++  let baseCollapsed = $derived(
++    collapseKey === undefined
++      ? userCollapsed
++      : !turnCollapse.isEventExpanded(collapseKey, defaultExpanded),
++  );
+   let collapsed = $derived(searchCollapsed(
+-    userCollapsed, inSessionSearch.isCurrentBlock(searchKey),
++    baseCollapsed, inSessionSearch.isCurrentBlock(searchKey),
+     inSessionSearch.navigationRevision, overrideSeq,
+   ));
++
++  /** First content line, truncated at 80 Unicode code points — an emoji
++   *  counts as one point and surrogate pairs are never split. */
++  let previewLine = $derived.by(() => {
++    const first = content.split("\n")[0] ?? "";
++    const points = Array.from(first);
++    return points.length > 80 ? `${points.slice(0, 80).join("")}…` : first;
++  });
+ </script>
+ 
+ <div class="thinking-block">
+@@ -27,6 +46,9 @@
+     onclick={() => {
+       userCollapsed = !collapsed;
+       overrideSeq = inSessionSearch.navigationRevision;
++      if (collapseKey !== undefined) {
++        turnCollapse.setEventExpanded(collapseKey, !userCollapsed);
++      }
+     }}
+   >
+     <span class="thinking-chevron" class:open={!collapsed}>
+@@ -34,6 +56,9 @@
+     </span>
+     <span class="thinking-label">{m.thinking_block_label()}</span>
+     <SearchMatchCount {searchKey} />
++    {#if collapsed && previewLine}
++      <span class="thinking-preview">{previewLine}</span>
++    {/if}
+   </button>
+   {#if !collapsed}
+     <div
+@@ -64,6 +89,7 @@
+     letter-spacing: 0.01em;
+     border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+     transition: background 0.1s;
++    min-width: 0;
+   }
+ 
+   .thinking-header:hover {
+@@ -75,12 +101,24 @@
+     align-items: center;
+     transition: transform 0.15s;
+     color: var(--text-muted);
++    flex-shrink: 0;
+   }
+ 
+   .thinking-chevron.open {
+     transform: rotate(90deg);
+   }
+ 
++  .thinking-preview {
++    font-weight: 400;
++    font-style: italic;
++    font-size: 12px;
++    color: var(--text-muted);
++    white-space: nowrap;
++    overflow: hidden;
++    text-overflow: ellipsis;
++    min-width: 0;
++  }
++
+   .thinking-content {
+     padding: 8px 14px 12px;
+     font-size: 13px;
+diff --git a/frontend/src/lib/components/content/ThinkingBlock.test.ts b/frontend/src/lib/components/content/ThinkingBlock.test.ts
+new file mode 100644
+index 00000000..28d80858
+--- /dev/null
++++ b/frontend/src/lib/components/content/ThinkingBlock.test.ts
+@@ -0,0 +1,70 @@
++// @vitest-environment jsdom
++import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
++import { mount, tick, unmount } from "svelte";
++import { setLocale } from "../../i18n/index.js";
++import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
++import ThinkingBlock from "./ThinkingBlock.svelte";
++
++const components: ReturnType<typeof mount>[] = [];
++async function render(props: Record<string, unknown> = {}) {
++  components.push(
++    mount(ThinkingBlock, {
++      target: document.body,
++      props: { content: "plan first", ...props },
++    }),
++  );
++  await tick();
++}
++async function click(selector: string) {
++  const button = document.querySelector<HTMLButtonElement>(selector);
++  expect(button).not.toBeNull();
++  button!.click();
++  await Promise.resolve();
++  await tick();
++}
++
++beforeEach(() => {
++  turnCollapse.activateSession(null);
++  turnCollapse.activateSession("s1");
++  setLocale("en");
++});
++afterEach(async () => {
++  for (const component of components.splice(0)) await unmount(component);
++  document.body.replaceChildren();
++  turnCollapse.activateSession(null);
++  setLocale("en");
++});
++
++describe("ThinkingBlock", () => {
++  it("starts collapsed and toggles its content", async () => {
++    await render();
++    expect(document.querySelector(".thinking-content")).toBeNull();
++    await click(".thinking-header");
++    expect(document.querySelector(".thinking-content")?.textContent).toContain("plan first");
++  });
++
++  it("drives expansion from the turn-collapse store when keyed", async () => {
++    await render({ collapseKey: "s1:11:thinking:0" });
++    expect(document.querySelector(".thinking-content")).toBeNull();
++
++    turnCollapse.setEventExpanded("s1:11:thinking:0", true);
++    await tick();
++    expect(document.querySelector(".thinking-content")).not.toBeNull();
++
++    // Clicking collapses back through the store override.
++    await click(".thinking-header");
++    expect(document.querySelector(".thinking-content")).toBeNull();
++    expect(turnCollapse.isEventExpanded("s1:11:thinking:0", true)).toBe(false);
++  });
++
++  it("honours the caller's default expansion for keyed blocks", async () => {
++    await render({ collapseKey: "s1:11:thinking:0", defaultExpanded: true });
++    expect(document.querySelector(".thinking-content")).not.toBeNull();
++  });
++
++  it("shows a one-line preview limited to 80 code points", async () => {
++    const line = `${"z".repeat(80)}🙂`;
++    await render({ content: `${line}\nmore detail` });
++    expect(document.querySelector(".thinking-preview")?.textContent).toBe(`${"z".repeat(80)}…`);
++  });
++});
+diff --git a/frontend/src/lib/components/content/ToolBlock.svelte b/frontend/src/lib/components/content/ToolBlock.svelte
+index 4945677b..90dbe0c9 100644
+--- a/frontend/src/lib/components/content/ToolBlock.svelte
++++ b/frontend/src/lib/components/content/ToolBlock.svelte
+@@ -9,6 +9,7 @@
+   import { searchBlock } from "../../search/session-block.svelte.js";
+   import { searchCollapsed, toolSearchKey, type ToolSearchScope } from "../../search/component-state.js";
+   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
++  import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
+   import SearchMatchCount from "./SearchMatchCount.svelte";
+   import { m } from "../../i18n/index.js";
+   import { copyToClipboard } from "../../utils/clipboard.js";
+@@ -34,6 +35,13 @@
+     isRunning?: boolean;
+     /** Flatten outer spacing when inside a parallel group. */
+     inGroup?: boolean;
++    /** Turn-event disclosure key; when present, the header and the
++     *  output/history drawers resolve state through `turnCollapse`. */
++    collapseKey?: string;
++    /** Default expansion for the outer header when no override or bulk
++     *  baseline applies. Output/history drawers keep their own fixed
++     *  defaults: error output opens, everything else stays closed. */
++    defaultExpanded?: boolean;
+   }
+ 
+   type Params = Record<string, unknown>;
+@@ -95,7 +103,8 @@
+   }
+ 
+   let { content, label, toolCall, searchScope, durationLabel,
+-    isSlow = false, isRunning = false, inGroup = false }: Props = $props();
++    isSlow = false, isRunning = false, inGroup = false,
++    collapseKey, defaultExpanded = false }: Props = $props();
+   let userCollapsed = $state(true);
+   let userOutputCollapsed = $state(true);
+   let userHistoryCollapsed = $state(true);
+@@ -119,17 +128,35 @@
+   let resultEvents = $derived((toolCall?.result_events ?? [])
+     .map((event, rawIndex) => ({ ...event, content: displayToolResult(event.content), rawIndex }))
+     .filter((event) => !(event.source === "tool_execution" && event.content === "" && event.status !== "errored")));
++  /** Result-event statuses that mean the call failed; the output drawer
++   *  defaults open for these even inside collapsed turns. */
++  const ERROR_STATUSES = new Set(["error", "errored", "failed"]);
++  let isErrorResult = $derived(
++    resultEvents.some((event) => ERROR_STATUSES.has(event.status)),
++  );
++  let outputSectionKey = $derived(
++    collapseKey === undefined ? undefined : `${collapseKey}:output`,
++  );
++  let historySectionKey = $derived(
++    collapseKey === undefined ? undefined : `${collapseKey}:history`,
++  );
+   let historyKeys = $derived(resultEvents.map((event) => toolSearchKey(searchScope, "tool-history", event.rawIndex)));
+   let currentInput = $derived(inSessionSearch.isCurrentBlock(inputKey));
+   let currentOutput = $derived(inSessionSearch.isCurrentBlock(outputKey));
+   let currentHistory = $derived(historyKeys.some((key) => inSessionSearch.isCurrentBlock(key)));
+   let historyCount = $derived(historyKeys.reduce((count, key) => count + inSessionSearch.countForBlock(key), 0));
+   let matchCount = $derived(inSessionSearch.countForBlock(inputKey) + inSessionSearch.countForBlock(outputKey) + historyCount);
+-  let collapsed = $derived(searchCollapsed(userCollapsed,
++  let blockBaseCollapsed = $derived(collapseKey === undefined ? userCollapsed
++    : !turnCollapse.isEventExpanded(collapseKey, defaultExpanded));
++  let outputBaseCollapsed = $derived(outputSectionKey === undefined ? userOutputCollapsed
++    : !turnCollapse.isToolSectionExpanded(outputSectionKey, isErrorResult));
++  let historyBaseCollapsed = $derived(historySectionKey === undefined ? userHistoryCollapsed
++    : !turnCollapse.isToolSectionExpanded(historySectionKey, false));
++  let collapsed = $derived(searchCollapsed(blockBaseCollapsed,
+     currentInput || currentOutput || currentHistory, inSessionSearch.navigationRevision, overrideSeq));
+-  let outputCollapsed = $derived(searchCollapsed(userOutputCollapsed,
++  let outputCollapsed = $derived(searchCollapsed(outputBaseCollapsed,
+     currentOutput, inSessionSearch.navigationRevision, outputOverrideSeq));
+-  let historyCollapsed = $derived(searchCollapsed(userHistoryCollapsed,
++  let historyCollapsed = $derived(searchCollapsed(historyBaseCollapsed,
+     currentHistory, inSessionSearch.navigationRevision, historyOverrideSeq));
+   let contentFullyExpanded = $derived(
+     contentOverrideSeq === inSessionSearch.navigationRevision ? userContentFullyExpanded
+@@ -247,6 +274,9 @@
+       if (sel && sel.toString().length > 0) return;
+       userCollapsed = !collapsed;
+       overrideSeq = inSessionSearch.navigationRevision;
++      if (collapseKey !== undefined) {
++        turnCollapse.setEventExpanded(collapseKey, !userCollapsed);
++      }
+       if (userCollapsed) {
+         userContentFullyExpanded = false;
+         contentOverrideSeq = inSessionSearch.navigationRevision;
+@@ -301,6 +331,9 @@
+           if (sel && sel.toString().length > 0) return;
+           userOutputCollapsed = !outputCollapsed;
+           outputOverrideSeq = inSessionSearch.navigationRevision;
++          if (outputSectionKey !== undefined) {
++            turnCollapse.setToolSectionExpanded(outputSectionKey, !userOutputCollapsed);
++          }
+         }}>
+           <span class="tool-chevron" class:open={!outputCollapsed}><ChevronRightIcon size="10" strokeWidth="2.4" aria-hidden="true" /></span>
+           <span class="output-label">{m.tool_block_output()}</span>
+@@ -336,6 +369,9 @@
+         if (sel && sel.toString().length > 0) return;
+         userHistoryCollapsed = !historyCollapsed;
+         historyOverrideSeq = inSessionSearch.navigationRevision;
++        if (historySectionKey !== undefined) {
++          turnCollapse.setToolSectionExpanded(historySectionKey, !userHistoryCollapsed);
++        }
+       }}>
+         <span class="tool-chevron" class:open={!historyCollapsed}><ChevronRightIcon size="10" strokeWidth="2.4" aria-hidden="true" /></span>
+         <span class="output-label">{m.tool_block_history()}</span>
+diff --git a/frontend/src/lib/components/content/ToolBlock.test.ts b/frontend/src/lib/components/content/ToolBlock.test.ts
+index 38eb86bd..45a4046b 100644
+--- a/frontend/src/lib/components/content/ToolBlock.test.ts
++++ b/frontend/src/lib/components/content/ToolBlock.test.ts
+@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
+ import { mount, tick, unmount, type ComponentProps } from "svelte";
+ import type { DbToolCall as ToolCall } from "../../api/generated/index.js";
+ import { setLocale } from "../../i18n/index.js";
++import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
+ import retainedFixtureSource from "../../utils/__fixtures__/retained-tool-image-1735.json?raw";
+ const SMALL_PNG_DATA_URI =
+   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+@@ -670,3 +671,116 @@ describe("ToolBlock collapsed previews", () => {
+     expect(text(".tool-preview")).not.toContain("legacy todo");
+   });
+ });
++
++describe("ToolBlock turn-scoped collapse keys", () => {
++  beforeEach(() => {
++    turnCollapse.activateSession(null);
++    turnCollapse.activateSession("s1");
++  });
++  afterEach(() => turnCollapse.activateSession(null));
++
++  it("drives block expansion from the store when keyed", async () => {
++    await render({
++      toolCall: call("Bash", { command: "pwd" }),
++      collapseKey: "s1:9:tool:1",
++      defaultExpanded: true,
++    });
++    expect(document.querySelector(".tool-content")).not.toBeNull();
++
++    turnCollapse.setEventExpanded("s1:9:tool:1", false);
++    await tick();
++    expect(document.querySelector(".tool-content")).toBeNull();
++    expect(turnCollapse.isEventExpanded("s1:9:tool:1", true)).toBe(false);
++  });
++
++  it("opens error output by default while keeping history collapsed", async () => {
++    await render({
++      toolCall: call(
++        "Bash",
++        { command: "false" },
++        {
++          result_content: "boom",
++          result_events: [
++            {
++              event_index: 0,
++              status: "errored",
++              source: "result",
++              content: "boom",
++              content_length: 4,
++            },
++          ],
++        },
++      ),
++      collapseKey: "s1:9:tool:1",
++      defaultExpanded: true,
++    });
++    expect(document.querySelector(".output-content")?.textContent).toContain("boom");
++    expect(document.querySelector(".result-history")).toBeNull();
++
++    turnCollapse.setToolSectionExpanded("s1:9:tool:1:history", true);
++    await tick();
++    expect(document.querySelector(".result-history")).not.toBeNull();
++  });
++
++  it("keeps normal output and history collapsed when keyed", async () => {
++    await render({
++      toolCall: call(
++        "Read",
++        { file_path: "a.ts" },
++        {
++          result_content: "fine",
++          result_events: [
++            {
++              event_index: 0,
++              status: "completed",
++              source: "result",
++              content: "fine",
++              content_length: 4,
++            },
++          ],
++        },
++      ),
++      collapseKey: "s1:9:tool:1",
++      defaultExpanded: true,
++    });
++    expect(document.querySelector(".output-content")).toBeNull();
++    expect(document.querySelector(".result-history")).toBeNull();
++
++    await click(".output-header");
++    expect(document.querySelector(".output-content")?.textContent).toContain("fine");
++    expect(turnCollapse.isToolSectionExpanded("s1:9:tool:1:output", false)).toBe(true);
++  });
++
++  it("lets explicit store state close error output", async () => {
++    turnCollapse.setToolSectionExpanded("s1:9:tool:1:output", false);
++    await render({
++      toolCall: call(
++        "Bash",
++        { command: "false" },
++        {
++          result_content: "boom",
++          result_events: [
++            {
++              event_index: 0,
++              status: "errored",
++              source: "result",
++              content: "boom",
++              content_length: 4,
++            },
++          ],
++        },
++      ),
++      collapseKey: "s1:9:tool:1",
++      defaultExpanded: true,
++    });
++    expect(document.querySelector(".output-content")).toBeNull();
++  });
++
++  it("leaves unkeyed blocks fully collapsed regardless of result status", async () => {
++    await render({
++      toolCall: call("Bash", { command: "false" }, { result_content: "boom" }),
++    });
++    expect(document.querySelector(".tool-content")).toBeNull();
++    expect(document.querySelector(".output-content")).toBeNull();
++  });
++});
+diff --git a/frontend/src/lib/components/content/ToolCallGroup-thinking.test.ts b/frontend/src/lib/components/content/ToolCallGroup-thinking.test.ts
+index 7b487cc4..3415e9bf 100644
+--- a/frontend/src/lib/components/content/ToolCallGroup-thinking.test.ts
++++ b/frontend/src/lib/components/content/ToolCallGroup-thinking.test.ts
+@@ -104,7 +104,7 @@ describe("thinking inside tool groups", () => {
+       expect(document.querySelectorAll(".thinking-content")).toHaveLength(0);
+     },
+   );
+-  it("keeps hidden thinking out of the group index and the DOM", async () => {
++  it("temporarily reveals hidden thinking for matches without saving filters", async () => {
+     ui.visibleBlocks = new Set(["user", "assistant", "tool"]);
+     await mountGroup(true, false);
+     expect(document.querySelector(".thinking-header")).toBeNull();
+@@ -113,10 +113,16 @@ describe("thinking inside tool groups", () => {
+     await tick();
+     await vi.advanceTimersByTimeAsync(150);
+     await tick();
+-    expect(inSessionSearch.total).toBe(0);
+-    expect(inSessionSearch.countForBlock("7:thinking:0")).toBe(0);
++    // Filter-hidden thinking stays in the index and its type is revealed for
++    // the open find view; the saved filter itself is untouched.
++    expect(inSessionSearch.total).toBe(4);
++    expect(inSessionSearch.countForBlock("7:thinking:0")).toBe(2);
++    expect(document.querySelectorAll(".thinking-header")).toHaveLength(2);
++    expect(document.querySelector("[data-search-current]")).not.toBeNull();
++    expect(ui.visibleBlocks.has("thinking")).toBe(false);
++    inSessionSearch.close();
++    await tick();
+     expect(document.querySelector(".thinking-header")).toBeNull();
+-    expect(document.querySelector("[data-search-current]")).toBeNull();
+   });
+   it("keeps manual collapse until the next occurrence is selected", async () => {
+     await render(true, false);
+diff --git a/frontend/src/lib/components/content/ToolCallGroup.svelte b/frontend/src/lib/components/content/ToolCallGroup.svelte
+index 55cb1fa0..17346e95 100644
+--- a/frontend/src/lib/components/content/ToolCallGroup.svelte
++++ b/frontend/src/lib/components/content/ToolCallGroup.svelte
+@@ -11,7 +11,7 @@
+   import ToolBlock from "./ToolBlock.svelte";
+   import ThinkingBlock from "./ThinkingBlock.svelte";
+   import { collectSearchBlocks } from "../../search/block-text.js";
+-  import { ui } from "../../stores/ui.svelte.js";
++  import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+   import ParallelGroup from "./ParallelGroup.svelte";
+   import { CopyButton } from "@kenn-io/kit-ui";
+   import { displayToolName } from "../../utils/toolDisplay.js";
+@@ -24,9 +24,15 @@
+     searchable?: boolean;
+     sortNewestFirst?: boolean;
+     divider?: { ordinal: number; label: string };
++    /** Turn-event key prefix; each member block derives its disclosure key
++     *  as `${collapseKeyPrefix}:${message.id}` plus the call index. */
++    collapseKeyPrefix?: string;
++    /** Default expansion for member blocks when the prefix is set. */
++    defaultExpanded?: boolean;
+   }
+ 
+-  let { messages, timestamp, searchable = false, sortNewestFirst = false, divider }: Props = $props();
++  let { messages, timestamp, searchable = false, sortNewestFirst = false, divider,
++    collapseKeyPrefix, defaultExpanded = false }: Props = $props();
+   let copied = $state(false);
+ 
+   function messageToolCount(message: Message): number {
+@@ -108,10 +114,15 @@
+       {/if}
+       {@const calls = message.tool_calls ?? []}
+       {@const turn = turnByMessage.get(message.id)}
++      {@const messageScope = collapseKeyPrefix === undefined ? undefined : `${collapseKeyPrefix}:${message.id}`}
+       <div data-message-ordinal={message.ordinal}>
+-        {#if ui.isBlockVisible("thinking")}
++        {#if inSessionSearch.isBlockEffectivelyVisible("thinking")}
+           {#each collectSearchBlocks(message).filter((block) => block.kind === "thinking") as block (block.key)}
+-            <ThinkingBlock content={block.text} searchKey={searchable ? block.key : undefined} />
++            <!-- block.key is `${ordinal}:thinking:${segmentIndex}`; reuse the
++              trailing segment index so the disclosure key stays stable. -->
++            <ThinkingBlock content={block.text} searchKey={searchable ? block.key : undefined}
++              collapseKey={messageScope === undefined ? undefined : `${messageScope}:thinking:${block.key.split(":").pop()}`}
++              {defaultExpanded} />
+           {/each}
+         {/if}
+         {#if calls.length === 1}
+@@ -127,6 +138,8 @@
+             )}
+             isRunning={isRunningTurn(message)}
+             searchScope={searchable ? { ordinal: message.ordinal, callIdx: 0 } : undefined}
++            collapseKey={messageScope === undefined ? undefined : `${messageScope}:0`}
++            {defaultExpanded}
+           />
+         {:else if calls.length >= 2}
+           <ParallelGroup
+@@ -134,6 +147,8 @@
+             callTimingByID={callByToolUseID}
+             isRunning={isRunningTurn(message)}
+             searchOrdinal={searchable ? message.ordinal : undefined}
++            collapseKeyPrefix={messageScope}
++            {defaultExpanded}
+           />
+         {:else}
+           {#each enrichSegments(parseContent(message.content, message.has_tool_use, message.id, message.content_length), message.tool_calls).filter((s) => s.type === "tool") as seg, segIdx (`${message.id}-${segIdx}`)}
+@@ -142,6 +157,8 @@
+               label={seg.label}
+               toolCall={seg.toolCall}
+               searchScope={searchable ? { ordinal: message.ordinal, callIdx: `seg${segIdx}` } : undefined}
++              collapseKey={messageScope === undefined ? undefined : `${messageScope}:seg${segIdx}`}
++              {defaultExpanded}
+             />
+           {/each}
+         {/if}
+diff --git a/frontend/src/lib/components/content/ToolCallGroup.test.ts b/frontend/src/lib/components/content/ToolCallGroup.test.ts
+index ea2b0976..c28a60db 100644
+--- a/frontend/src/lib/components/content/ToolCallGroup.test.ts
++++ b/frontend/src/lib/components/content/ToolCallGroup.test.ts
+@@ -1,6 +1,7 @@
+ // @vitest-environment jsdom
+-import { afterEach, describe, expect, it } from "vite-plus/test";
++import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
+ import { sessionTiming } from "../../stores/sessionTiming.svelte.js";
++import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
+ import { mount, tick, unmount } from "svelte";
+ import type { DbMessage as Message } from "../../api/generated/index.js";
+ // @ts-ignore
+@@ -143,3 +144,52 @@ describe("ToolCallGroup", () => {
+     unmount(component);
+   });
+ });
++
++describe("ToolCallGroup turn-scoped collapse", () => {
++  beforeEach(() => {
++    turnCollapse.activateSession(null);
++    turnCollapse.activateSession("s1");
++  });
++  afterEach(() => turnCollapse.activateSession(null));
++
++  it("forwards collapse keys to inner tool blocks", async () => {
++    const message = makeToolMessage(1);
++    message.tool_calls = [
++      {
++        category: "Bash",
++        tool_name: "Bash",
++        input_json: '{"command":"false"}',
++        result_content: "boom",
++        result_events: [
++          {
++            event_index: 0,
++            status: "errored",
++            source: "result",
++            content: "boom",
++            content_length: 4,
++          },
++        ],
++      },
++    ];
++    const component = mount(ToolCallGroup, {
++      target: document.body,
++      props: {
++        messages: [message],
++        timestamp: message.timestamp,
++        collapseKeyPrefix: "s1:20:tool-rollup:0",
++        defaultExpanded: true,
++      },
++    });
++    await tick();
++
++    // The inner block expands from the store default and opens its error
++    // output drawer while the result history stays collapsed.
++    expect(document.querySelector(".output-content")?.textContent).toContain("boom");
++    expect(document.querySelector(".result-history")).toBeNull();
++
++    turnCollapse.setEventExpanded("s1:20:tool-rollup:0:2:0", false);
++    await tick();
++    expect(document.querySelector(".output-content")).toBeNull();
++    unmount(component);
++  });
++});
+diff --git a/frontend/src/lib/utils/content-parser.test.ts b/frontend/src/lib/utils/content-parser.test.ts
+index 8f7ef3ab..7e6ee8da 100644
+--- a/frontend/src/lib/utils/content-parser.test.ts
++++ b/frontend/src/lib/utils/content-parser.test.ts
+@@ -1,5 +1,11 @@
+ import { describe, it, expect } from "vite-plus/test";
+-import { parseContent, isToolOnly, enrichSegments, hasVisibleSegments } from "./content-parser.js";
++import {
++  parseContent,
++  isToolOnly,
++  enrichSegments,
++  hasVisibleSegments,
++  splitPromptAttachments,
++} from "./content-parser.js";
+ import type { DbMessage as Message, DbToolCall as ToolCall } from "../api/generated/index.js";
+ 
+ let nextId = 1;
+@@ -447,6 +453,74 @@ describe("parseContent - Skill tool", () => {
+   });
+ });
+ 
++describe("parseContent - XML skill envelopes", () => {
++  it("collapses a Devin-style skill injection with Instructions header", () => {
++    const text =
++      'Instructions for the "diagnosing-bugs" skill:\n\n' +
++      '<skill name="diagnosing-bugs" status="running">\n' +
++      "Source: skills/diagnosing-bugs/SKILL.md\n\n" +
++      "Diagnosing Bugs\nA discipline for hard bugs.\n</skill>";
++    const segments = parseContent(text);
++    expect(segments).toEqual([
++      {
++        type: "skill",
++        content:
++          "Source: skills/diagnosing-bugs/SKILL.md\n\n" +
++          "Diagnosing Bugs\nA discipline for hard bugs.",
++        label: "diagnosing-bugs",
++      },
++    ]);
++  });
++
++  it("collapses a bare <skill> block without the header", () => {
++    const segments = parseContent('<skill name="brainstorming" status="running">\nBody\n</skill>');
++    expect(segments).toEqual([{ type: "skill", content: "Body", label: "brainstorming" }]);
++  });
++
++  it("captures an unclosed <skill> block to end of text", () => {
++    const text =
++      '<skill name="big-skill" status="running">\n' +
++      "This skill's instructions are too large to return inline.";
++    const segments = parseContent(text);
++    expect(segments).toEqual([
++      {
++        type: "skill",
++        content: "This skill's instructions are too large to return inline.",
++        label: "big-skill",
++      },
++    ]);
++  });
++
++  it("keeps text before and after the injection visible", () => {
++    const text =
++      "Intro text.\n\n" + '<skill name="x" status="running">\nBody\n</skill>\n\n' + "Tail text.";
++    const segments = parseContent(text);
++    expect(segments.map((s) => s.type)).toEqual(["text", "skill", "text"]);
++    expect(segments[0]!.content).toBe("Intro text.");
++    expect(segments[2]!.content).toBe("Tail text.");
++  });
++
++  it("handles multiple injections in one message", () => {
++    const text =
++      '<skill name="a" status="running">\nfirst\n</skill>\n\n' +
++      '<skill name="b" status="done">\nsecond\n</skill>';
++    const segments = parseContent(text);
++    expect(segments.map((s) => s.label)).toEqual(["a", "b"]);
++  });
++
++  it("does not match a <skill> mention mid-line", () => {
++    const text = 'Use the <skill name="x"> envelope in transcripts.';
++    const segments = parseContent(text);
++    expect(segments.every((s) => s.type === "text")).toBe(true);
++  });
++
++  it("does not match inside an inline code span", () => {
++    const text = '`example envelope:\n<skill name="x" status="running">\nbody\n</skill>`';
++    const segments = parseContent(text);
++    expect(segments.every((s) => s.type === "text")).toBe(true);
++  });
++});
++
+ describe("parseContent - TaskCreate/TaskUpdate/SendMessage tools", () => {
+   it("recognizes TaskCreate as a tool block", () => {
+     const segments = parseContent("[TaskCreate: Fix bug]");
+@@ -1221,3 +1295,44 @@ describe("hasVisibleSegments", () => {
+     expect(hasVisibleSegments(m, noTool)).toBe(true);
+   });
+ });
++
++describe("splitPromptAttachments", () => {
++  it("lifts line-anchored markers and markdown images out of the body", () => {
++    const { body, attachments } = splitPromptAttachments(
++      "please review\n[audio]\n[document notes.pdf]\n![shot](asset://i.png)\ndone",
++    );
++    expect(attachments).toEqual(["[audio]", "[document notes.pdf]", "![shot](asset://i.png)"]);
++    // An image marker keeps its paragraph break where a bare marker's line
++    // is removed entirely.
++    expect(body).toBe("please review\n\ndone");
++  });
++
++  it("extracts payload-bearing inline markers anywhere in the text", () => {
++    const { body, attachments } = splitPromptAttachments(
++      "look [Image #2] and [Attachment: report.pdf] here",
++    );
++    expect(attachments).toEqual(["[Image #2]", "[Attachment: report.pdf]"]);
++    expect(body).toBe("look  and  here");
++  });
++
++  it("leaves bare marker words inside prose", () => {
++    const { body, attachments } = splitPromptAttachments("see [file] here\nsee [image] there");
++    expect(attachments).toEqual([]);
++    expect(body).toBe("see [file] here\nsee [image] there");
++  });
++
++  it("keeps a marker-looking markdown link as link text", () => {
++    const { body, attachments } = splitPromptAttachments(
++      "see [file](https://example.com)\n[file](https://example.com)",
++    );
++    expect(attachments).toEqual([]);
++    expect(body).toBe("see [file](https://example.com)\n[file](https://example.com)");
++  });
++
++  it("leaves markers inside inline code spans and fenced blocks in the body", () => {
++    const content = "before `[file]`\n\n```\n[audio]\n```\nafter";
++    const { body, attachments } = splitPromptAttachments(content);
++    expect(attachments).toEqual([]);
++    expect(body).toBe(content);
++  });
++});
+diff --git a/frontend/src/lib/utils/content-parser.ts b/frontend/src/lib/utils/content-parser.ts
+index f2dc31c1..626e46fb 100644
+--- a/frontend/src/lib/utils/content-parser.ts
++++ b/frontend/src/lib/utils/content-parser.ts
+@@ -31,6 +31,16 @@ const THINKING_LEGACY_RE = /\[Thinking\]\n?([\s\S]*?)(?=\n\[|\n\n|$)/g;
+  */
+ const SKILL_RE = /\[Skill: (.+?)\]\n?([\s\S]*?)\n?\[\/Skill\]/g;
+ 
++/**
++ * Skill injections emitted as XML envelopes (Devin, Claude-based
++ * harnesses): an optional "Instructions for the "name" skill:"
++ * header line followed by a <skill name="…" …> block. The closing
++ * tag may be absent, in which case the block runs to end of text.
++ * The <skill tag must start a line so inline mentions stay text.
++ */
++const SKILL_XML_RE =
++  /(?:^|\n)[ \t]*(?:Instructions for the[^\n]*\n(?:[ \t]*\n)*)?<skill\b[^>]*?\bname="([^"]*)"[^>]*>([\s\S]*?)(?:<\/skill>|$)/g;
++
+ const TOOL_NAMES =
+   "Tool|Read|Write|Edit|Patch|Bash|Glob|Grep|Other|TaskCreate|TaskUpdate|TaskGet|TaskList|Task|Agent|Skill|" +
+   "SendMessage|Question|Todo List|Entering Plan Mode|" +
+@@ -304,6 +314,24 @@ function extractMatches(text: string, parseTools = true): Match[] {
+     });
+   }
+ 
++  // Skill injection envelopes (<skill name="…" …>…</skill>)
++  for (const m of text.matchAll(SKILL_XML_RE)) {
++    const start = m.index!;
++    const end = start + m[0].length;
++    if (insideInlineCode(start, codeSpans)) continue;
++    const overlaps = matches.some((o) => start >= o.start && start < o.end);
++    if (overlaps) continue;
++    matches.push({
++      start,
++      end,
++      segment: {
++        type: "skill",
++        content: (m[2] ?? "").trim(),
++        label: m[1] ?? "",
++      },
++    });
++  }
++
+   if (parseTools) {
+     for (const m of text.matchAll(TOOL_RE)) {
+       if (insideInlineCode(m.index!, codeSpans)) continue;
+@@ -527,8 +555,9 @@ export function enrichSegments(
+  * Returns true when at least one segment of the message would be
+  * rendered given the supplied visibility predicate.
+  *
+- * `isVisible` is called with a BlockType string -- the component
+- * passes `ui.isBlockVisible`, but tests can supply any predicate.
++ * `isVisible` is called with a BlockType string -- the session scope
++ * passes its reveal-aware effective-visibility predicate, but tests can
++ * supply any predicate.
+  */
+ export function hasVisibleSegments(
+   msg: Message,
+@@ -553,3 +582,81 @@ export function hasVisibleSegments(
+     return isVisible(s.type);
+   });
+ }
++
++// --- Prompt disclosure -------------------------------------------------------
++// User prompts longer than PROMPT_TRUNCATE_POINTS collapse behind a
++// disclosure; the preview renders the first PROMPT_PREVIEW_POINTS code
++// points. Counted in Unicode code points, not UTF-16 code units, so emoji
++// and CJK text never split mid-glyph.
++export const PROMPT_TRUNCATE_POINTS = 600;
++export const PROMPT_PREVIEW_POINTS = 500;
++
++export function promptIsTruncated(content: string): boolean {
++  return Array.from(content).length > PROMPT_TRUNCATE_POINTS;
++}
++
++// Stored messages carry attached media as literal marker text (no separate
++// attachment field exists), so a collapsed preview lifts the markers out of
++// the body and renders them beside it. Two vocabularies exist:
++//
++// - Bare bracket words parsers write on their own line — `[image]`,
++//   `[Image]`, `[file]`, `[binary content]`, `[audio]`, `[document]`,
++//   `[document name]`. They count only when the line holds nothing else,
++//   so prose like `see [file] here` keeps its bracket.
++// - Payload-bearing forms that may sit inline — `![alt](src)` markdown
++//   images, `[Image #2]`, `[Image attached]`, `[Image: ...]`,
++//   `[image: ...]`, `[Attachment: ...]`.
++//
++// A trailing `(` keeps a bracket as markdown link text (`[file](url)` stays
++// a link), and nothing inside inline code spans or fenced code blocks counts
++// as a marker.
++const PROMPT_ATTACHMENT_LINE_RE =
++  /(?:^|\n)[ \t]*(\[(?:image|file|binary content|audio|document(?: [^\]\n]*)?|Image)\])[ \t]*(?=\n|$)/g;
++const PROMPT_ATTACHMENT_INLINE_RE =
++  /!\[[^\]\n]*\]\([^)\n]*\)|\[(?:Image #\d+|Image attached|[Ii]mage:[^\]\n]*|[Aa]ttachment:[^\]\n]*)\](?!\()/g;
++
++/** Split user prompt text into body text and embedded attachment markers.
++ *  Markers inside inline code spans or fenced code blocks are left in the
++ *  body so they render as code like any other literal. */
++export function splitPromptAttachments(text: string): {
++  body: string;
++  attachments: string[];
++} {
++  const codeSpans = scanInlineCodeSpans(text);
++  const fenceRanges = codeBlockMatches(text).map((match) => [match.start, match.end] as const);
++  const insideCode = (start: number, end: number): boolean =>
++    codeSpans.some(([s, e]) => start < e && end > s) ||
++    fenceRanges.some(([s, e]) => start < e && end > s);
++
++  const hits: { start: number; end: number; marker: string }[] = [];
++  for (const match of text.matchAll(PROMPT_ATTACHMENT_LINE_RE)) {
++    const marker = match[1]!;
++    const markerStart = match.index! + match[0].indexOf(marker);
++    if (insideCode(markerStart, markerStart + marker.length)) continue;
++    // Remove the marker's whole line so no empty paragraph remains.
++    hits.push({
++      start: match.index!,
++      end: match.index! + match[0].length,
++      marker,
++    });
++  }
++  for (const match of text.matchAll(PROMPT_ATTACHMENT_INLINE_RE)) {
++    const start = match.index!;
++    const end = start + match[0].length;
++    if (insideCode(start, end)) continue;
++    hits.push({ start, end, marker: match[0] });
++  }
++
++  hits.sort((a, b) => a.start - b.start);
++  const attachments: string[] = [];
++  let body = "";
++  let pos = 0;
++  for (const hit of hits) {
++    if (hit.start < pos) continue;
++    body += text.slice(pos, hit.start);
++    attachments.push(hit.marker);
++    pos = hit.end;
++  }
++  body += text.slice(pos);
++  return { body: body.replace(/\n{3,}/g, "\n\n").trim(), attachments };
++}
+diff --git a/frontend/src/lib/utils/messages.ts b/frontend/src/lib/utils/messages.ts
+index fd14fc27..749c6a5a 100644
+--- a/frontend/src/lib/utils/messages.ts
++++ b/frontend/src/lib/utils/messages.ts
+@@ -45,6 +45,24 @@ export function isSystemBoundaryMessage(m: Message): m is Message & { source_sub
+   return !!m.source_subtype && m.source_subtype !== "compact_boundary";
+ }
+ 
++// System rows that arrive while the assistant is still working on the
++// current prompt. The Claude parser keeps them on role "user" so analytics
++// do not count them as replies, but they are not prompts: a task
++// notification reports a background agent finishing, and stop hook feedback
++// is injected by tooling. Treating them as turn boundaries split one
++// exchange into many and promoted every "still waiting" status line before
++// them to a final answer.
++const MID_TURN_SYSTEM_SUBTYPES = new Set(["task_notification", "stop_hook"]);
++
++/**
++ * Reports whether the message is a mid-turn system row — a task
++ * notification or stop-hook feedback card that belongs inside the
++ * current assistant turn instead of acting as a turn boundary.
++ */
++export function isMidTurnSystemMessage(m: Message): boolean {
++  return isSystemBoundaryMessage(m) && MID_TURN_SYSTEM_SUBTYPES.has(m.source_subtype);
++}
++
+ /**
+  * Returns true if the message is system-injected and should be
+  * hidden from the UI. Checks the backend is_system flag first,
+diff --git a/frontend/src/lib/utils/tool-summary.test.ts b/frontend/src/lib/utils/tool-summary.test.ts
+index 40dbdd27..2759ca4d 100644
+--- a/frontend/src/lib/utils/tool-summary.test.ts
++++ b/frontend/src/lib/utils/tool-summary.test.ts
+@@ -34,6 +34,48 @@ describe("summarizeToolCall", () => {
+     ).toBeNull();
+   });
+ 
++  describe("Devin subagents", () => {
++    it("prefers run_subagent title to its full task prompt", () => {
++      expect(
++        summarizeToolCall(
++          call({
++            tool_name: "run_subagent",
++            category: "Task",
++            input_json: JSON.stringify({
++              title: "Review parser behavior",
++              task: "Review the parser and summarize its current behavior.\nSecond line.",
++            }),
++          }),
++        ),
++      ).toBe("Review parser behavior");
++    });
++
++    it("uses the first task line when run_subagent has no title", () => {
++      expect(
++        summarizeToolCall(
++          call({
++            tool_name: "run_subagent",
++            category: "Task",
++            input_json: JSON.stringify({ task: "Inspect the parser.\nReport findings." }),
++          }),
++        ),
++      ).toBe("Inspect the parser.");
++    });
++
++    it("previews the first line of a read_subagent result", () => {
++      expect(
++        summarizeToolCall(
++          call({
++            tool_name: "read_subagent",
++            category: "Task",
++            input_json: JSON.stringify({ agent_id: "agent-fixture-1" }),
++            result_content: "Subagent task complete.\n## Summary\nFull report.",
++          }),
++        ),
++      ).toBe("Subagent task complete.");
++    });
++  });
++
+   describe("Bash", () => {
+     it("shows the command", () => {
+       expect(
+diff --git a/frontend/src/lib/utils/tool-summary.ts b/frontend/src/lib/utils/tool-summary.ts
+index b2191ed6..7cb59caa 100644
+--- a/frontend/src/lib/utils/tool-summary.ts
++++ b/frontend/src/lib/utils/tool-summary.ts
+@@ -119,12 +119,26 @@ function isTaskCall(name: string, cat: string | undefined): boolean {
+  * input_json and reads result_content; never throws.
+  */
+ export function summarizeToolCall(toolCall: ToolCall): string | null {
++  if (toolCall.tool_name === "read_subagent") {
++    const result = asString(toolCall.result_content);
++    return result ? firstLine(result) : null;
++  }
++
+   const p = parseParams(toolCall);
+   if (!p) return null;
+ 
+   const name = toolCall.tool_name;
+   const cat = toolCall.category;
+ 
++  if (name === "run_subagent") {
++    const summary =
++      asString(p.title) ??
++      asString(p.task) ??
++      asString(p.description) ??
++      asString(p.prompt);
++    return summary ? firstLine(summary) : null;
++  }
++
+   const special = specialSummary(name, p);
+   if (special) return special;
+ 
+diff --git a/frontend/src/lib/utils/toolDisplay.test.ts b/frontend/src/lib/utils/toolDisplay.test.ts
+index a3bc60cb..42217e76 100644
+--- a/frontend/src/lib/utils/toolDisplay.test.ts
++++ b/frontend/src/lib/utils/toolDisplay.test.ts
+@@ -4,6 +4,7 @@ import {
+   displayToolName,
+   displayToolResult,
+ } from "./toolDisplay.js";
++import { setLocale } from "../i18n/index.js";
+ import retainedFixtureSource from "./__fixtures__/retained-tool-image-1735.json?raw";
+ 
+ const SMALL_PNG_DATA_URI =
+@@ -41,6 +42,12 @@ describe("displayToolName", () => {
+   it("returns tool_name when category is empty string", () => {
+     expect(displayToolName({ tool_name: "Read", category: "" })).toBe("Read");
+   });
++
++  it("uses localized labels for Devin subagent calls and results", () => {
++    setLocale("en");
++    expect(displayToolName({ tool_name: "run_subagent", category: "Task" })).toBe("Subagent:");
++    expect(displayToolName({ tool_name: "read_subagent", category: "Task" })).toBe("Subagent result:");
++  });
+ });
+ 
+ describe("displayToolResult", () => {
+diff --git a/frontend/src/lib/utils/toolDisplay.ts b/frontend/src/lib/utils/toolDisplay.ts
+index 7f6b641e..fd6ac9e9 100644
+--- a/frontend/src/lib/utils/toolDisplay.ts
++++ b/frontend/src/lib/utils/toolDisplay.ts
+@@ -1,3 +1,5 @@
++import { m } from "../i18n/index.js";
++
+ /** Returns the user-facing label for a tool call.
+  *
+  *  Prefers the normalized category (e.g. "Bash" for codex's
+@@ -9,6 +11,8 @@
+  *  informative than its category (e.g. "Skill" inside the
+  *  Tool category). */
+ export function displayToolName(call: { tool_name: string; category?: string | null }): string {
++  if (call.tool_name === "run_subagent") return m.tool_block_subagent_label();
++  if (call.tool_name === "read_subagent") return m.tool_block_subagent_result_label();
+   const cat = call.category;
+   if (cat && cat !== "Other" && cat !== "Tool") return cat;
+   return call.tool_name;
+diff --git a/frontend/src/lib/utils/transcript-mode.ts b/frontend/src/lib/utils/transcript-mode.ts
+index b6ef0537..86a3b328 100644
+--- a/frontend/src/lib/utils/transcript-mode.ts
++++ b/frontend/src/lib/utils/transcript-mode.ts
+@@ -1,20 +1,6 @@
+ import type { DisplayItem, MessageItem } from "./display-items.js";
+ import type { DbMessage as Message } from "../api/generated/index.js";
+-
+-// System rows that arrive while the assistant is still working on the
+-// current prompt. The Claude parser keeps them on role "user" so analytics
+-// do not count them as replies, but they are not prompts: a task
+-// notification reports a background agent finishing, and stop hook feedback
+-// is injected by tooling. Treating them as turn boundaries split one
+-// exchange into many and promoted every "still waiting" status line before
+-// them to a final answer.
+-const MID_TURN_SYSTEM_SUBTYPES = new Set(["task_notification", "stop_hook"]);
+-
+-function isMidTurnSystemMessage(m: Message): boolean {
+-  return (
+-    m.is_system === true && !!m.source_subtype && MID_TURN_SYSTEM_SUBTYPES.has(m.source_subtype)
+-  );
+-}
++import { isMidTurnSystemMessage } from "./messages.js";
+ 
+ export function filterDisplayItemsByTranscriptMode(
+   items: DisplayItem[],

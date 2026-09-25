@@ -1,0 +1,1153 @@
+<script module lang="ts">
+  import type {
+    DisplayItem as PromptDisplayItem,
+  } from "./lib/utils/display-items.js";
+
+  export function findUserPromptOrdinal(
+    items: PromptDisplayItem[],
+    selected: number | null,
+    delta: number,
+    userVisible: boolean,
+  ): number | undefined {
+    if (!userVisible) return;
+
+    const isUserPrompt = (item: PromptDisplayItem) =>
+      item.kind === "message" &&
+      item.message.role === "user" &&
+      !item.message.is_system;
+    const selectedIndex = items.findIndex((item) =>
+      item.ordinals.includes(selected ?? -1),
+    );
+    if (selectedIndex < 0) {
+      const prompts = items.filter(isUserPrompt);
+      return (delta > 0 ? prompts[0] : prompts[prompts.length - 1])
+        ?.ordinals[0];
+    }
+
+    for (
+      let index = selectedIndex + delta;
+      index >= 0 && index < items.length;
+      index += delta
+    ) {
+      const item = items[index]!;
+      if (isUserPrompt(item)) {
+        return item.ordinals[0];
+      }
+    }
+  }
+</script>
+
+<script lang="ts">
+  import { FlashBanner, showFlash } from "@kenn-io/kit-ui";
+  import { onMount, untrack } from "svelte";
+  import AppHeader from "./lib/components/layout/AppHeader.svelte";
+  import ThreeColumnLayout from "./lib/components/layout/ThreeColumnLayout.svelte";
+  import SessionBreadcrumb from "./lib/components/layout/SessionBreadcrumb.svelte";
+  import StatusBar from "./lib/components/layout/StatusBar.svelte";
+  import SessionList from "./lib/components/sidebar/SessionList.svelte";
+  import MessageList from "./lib/components/content/MessageList.svelte";
+  import SessionVitals from "./lib/components/content/SessionVitals.svelte";
+  import { sessionActivity } from "./lib/stores/sessionActivity.svelte.js";
+  import { sessionTiming } from "./lib/stores/sessionTiming.svelte.js";
+  import CommandPalette from "./lib/components/command-palette/CommandPalette.svelte";
+  import AboutModal from "./lib/components/modals/AboutModal.svelte";
+  import GoToSessionModal from "./lib/components/modals/GoToSessionModal.svelte";
+  import ShortcutsModal from "./lib/components/modals/ShortcutsModal.svelte";
+  import PublishModal from "./lib/components/modals/PublishModal.svelte";
+  import ResyncModal from "./lib/components/modals/ResyncModal.svelte";
+  import UpdateModal from "./lib/components/modals/UpdateModal.svelte";
+  import ConfirmDeleteModal from "./lib/components/modals/ConfirmDeleteModal.svelte";
+  import PerfDebugPanel from "./lib/components/debug/PerfDebugPanel.svelte";
+  import AnalyticsPage from "./lib/components/analytics/AnalyticsPage.svelte";
+  import UsagePage from "./lib/components/usage/UsagePage.svelte";
+  import ActivityPage from "./lib/components/activity/ActivityPage.svelte";
+  import TrendsPage from "./lib/components/trends/TrendsPage.svelte";
+  import RecallPage from "./lib/components/recall/RecallPage.svelte";
+  import QualityPage from "./lib/components/quality/QualityPage.svelte";
+  import PinnedPage from "./lib/components/pinned/PinnedPage.svelte";
+  import TrashPage from "./lib/components/trash/TrashPage.svelte";
+  import RecentEditsPage from "./lib/components/recentedits/RecentEditsPage.svelte";
+  import DataPage from "./lib/components/data/DataPage.svelte";
+  import SettingsPage from "./lib/components/settings/SettingsPage.svelte";
+  import { sessions, filtersToParams } from "./lib/stores/sessions.svelte.js";
+  import { messages } from "./lib/stores/messages.svelte.js";
+  import { sync } from "./lib/stores/sync.svelte.js";
+  import { ui } from "./lib/stores/ui.svelte.js";
+  import { router } from "./lib/stores/router.svelte.js";
+  import { starred } from "./lib/stores/starred.svelte.js";
+  import { pins } from "./lib/stores/pins.svelte.js";
+  import { settings } from "./lib/stores/settings.svelte.js";
+  import { analyticsPageDates } from "./lib/stores/analyticsPageDates.js";
+  import {
+    yokedDates,
+    panelDateToSessionFilterParams,
+    rangeToPanelDate,
+    sessionParamsToPanelDate,
+    type PanelDateState,
+  } from "./lib/stores/yokedDates.svelte.js";
+  import { m } from "./lib/i18n/index.js";
+  import { setAuthToken, getAuthToken, setServerUrl } from "./lib/api/runtime.js";
+  import { setupVisibilityHealthCheck } from "./lib/utils/health.js";
+  import { setupAppOpenedReporting } from "./lib/utils/app-opened.js";
+  import { reportTelemetry } from "./lib/utils/telemetry.js";
+  import { registerShortcuts } from "./lib/utils/keyboard.js";
+  import { shouldAutoSwitchTranscriptModeToNormal } from "./lib/utils/transcript-mode.js";
+  import {
+    filterParamsEqual,
+    hasFilterParams,
+    hasSessionDateIntent,
+    SESSION_ANALYTICS_WINDOW_PARAM,
+    sessionDateIntentCleared,
+    sessionRouteParamsForDetailExit,
+    sessionRouteParamsForFilters,
+  } from "./lib/stores/sessionRouteParams.js";
+
+  let globalAuthToken: string = $state("");
+  function handleGlobalAuth() {
+    const token = globalAuthToken.trim();
+    if (!token) return;
+    setAuthToken(token);
+    // Full reload ensures all stores (settings, sessions, starred,
+    // sync, pins, etc.) reinitialize with the new credentials.
+    window.location.reload();
+  }
+  import type { DisplayItem } from "./lib/utils/display-items.js";
+  import {
+    parseContent,
+    enrichSegments,
+  } from "./lib/utils/content-parser.js";
+
+  let messageListRef:
+    | {
+        scrollToOrdinal: (o: number) => void;
+        getDisplayItems: () => DisplayItem[];
+        getNormalDisplayItems: () => DisplayItem[];
+      }
+    | undefined = $state(undefined);
+
+  // Load active session's messages when selection changes.
+  // Only track activeSessionId and activeSessionLoadVersion (bumped
+  // when a not-found session recovers, so the same id reloads) —
+  // untrack the rest to prevent reactive loops from
+  // messages.loading / messages.messages.
+  let lastMessageLoadSessionId: string | null = null;
+  $effect(() => {
+    const route = router.route;
+    const id = sessions.activeSessionId;
+    void sessions.activeSessionLoadVersion;
+    untrack(() => {
+      const idChanged = id !== lastMessageLoadSessionId;
+      lastMessageLoadSessionId = id;
+      if (route !== "sessions") {
+        sessions.cancelRouteReads();
+        messages.cancelInFlight();
+        sessionActivity.cancelInFlight();
+        sessionTiming.cancelInFlight();
+        pins.cancelSessionPinsRead();
+        sync.unwatchSession();
+        return;
+      }
+      // Preserve selection when a pending scroll is queued
+      // for this specific session. Route-first navigation
+      // (search results, insight evidence) queues ordinal +
+      // URL before the deep-link effect selects the target,
+      // so also match the routed session — but only when this
+      // run wasn't triggered by a local selection change,
+      // otherwise a stale URL would preserve the previous
+      // navigation's intent across the user's new selection.
+      // Clear if the pending scroll targets a different
+      // session or there is no pending scroll.
+      const pendingMatchesSession =
+        ui.pendingScrollOrdinal !== null &&
+        (ui.pendingScrollSession === null ||
+          ui.pendingScrollSession === id ||
+          (!idChanged && ui.pendingScrollSession === router.sessionId));
+      if (!pendingMatchesSession) {
+        ui.clearSelection();
+        ui.pendingScrollOrdinal = null;
+        ui.pendingScrollSession = null;
+      }
+      if (id) {
+        if (ui.isMobileViewport) {
+          ui.closeSidebar();
+        }
+        messages.loadSession(id);
+        sessions.loadChildSessions(id);
+        sessionTiming.load(id);
+        sync.watchSession(
+          id,
+          () => {
+            messages.reload();
+            sessions.refreshActiveSession();
+            sessions.loadChildSessions(id);
+            if (ui.vitalsOpen) {
+              sessionActivity.reload(id);
+            } else {
+              sessionActivity.invalidate();
+            }
+          },
+          (t) => {
+            sessionTiming.applyEvent(t);
+          },
+        );
+        pins.loadForSession(id);
+      } else {
+        sessionActivity.clear();
+        sessionTiming.reset();
+        messages.clear();
+        sessions.childSessions = new Map();
+        sync.unwatchSession();
+        pins.clearSession();
+      }
+    });
+  });
+
+  // Scroll to pending ordinal once messages finish loading.
+  // If the target message is hidden specifically because thinking
+  // is disabled, auto-enable thinking so the message becomes visible.
+  // Messages hidden by other block filters (tool/code/user/assistant)
+  // are left alone — auto-changing unrelated filters is unexpected.
+  $effect(() => {
+    const ordinal = ui.pendingScrollOrdinal;
+    const loading = messages.loading;
+    const thinkingVisible = ui.isBlockVisible("thinking");
+    untrack(() => {
+      if (ordinal === null || loading || !messageListRef) return;
+      // A missing session keeps the anchor armed: recovery reloads
+      // messages and re-runs this effect with them present.
+      if (
+        sessions.activeSessionNotFound && messages.messages.length === 0
+      ) {
+        return;
+      }
+
+      const items = messageListRef.getDisplayItems();
+      const normalItems =
+        messageListRef.getNormalDisplayItems();
+      const found = items.some((item) =>
+        item.ordinals.includes(ordinal),
+      );
+
+      if (!found) {
+        if (
+          shouldAutoSwitchTranscriptModeToNormal(
+            ui.transcriptMode,
+            ordinal,
+            items,
+            normalItems,
+          )
+        ) {
+          ui.setTranscriptMode("normal");
+          return; // effect re-runs with normal transcript mode
+        }
+
+        // Only auto-enable thinking if the ordinal is loaded
+        // but filtered out *specifically* due to hidden thinking.
+        // If it's outside the loaded window, don't change filters.
+        // Auto-enable thinking filter when navigating to a message
+        // that contains a thinking block.
+        const msg = messages.messages.find(
+          (m) => m.ordinal === ordinal,
+        );
+        if (msg && !thinkingVisible) {
+          const segs = enrichSegments(
+            parseContent(
+              msg.content,
+              msg.has_tool_use,
+              msg.id,
+              msg.content_length,
+            ),
+            msg.tool_calls,
+          );
+          const hasThinkingSegment = segs.some(
+            (s) => s.type === "thinking",
+          );
+          if (hasThinkingSegment) {
+            ui.setBlockVisible("thinking", true);
+            return; // effect re-runs with thinking visible
+          }
+        }
+      }
+
+      messageListRef.scrollToOrdinal(ordinal);
+      // Ensure highlight is set (the session-change effect
+      // may have cleared it before this effect ran).
+      ui.selectedOrdinal = ordinal;
+      ui.pendingScrollOrdinal = null;
+      ui.pendingScrollSession = null;
+    });
+  });
+
+  function navigateMessage(delta: number) {
+    const items = messageListRef?.getDisplayItems();
+    if (!items || items.length === 0) return;
+
+    const sorted = ui.sortNewestFirst
+      ? [...items].reverse()
+      : items;
+
+    const selected = ui.selectedOrdinal;
+    if (selected === null) {
+      const first = sorted[0]!;
+      navigateToMessageOrdinal(first.ordinals[0]!);
+      return;
+    }
+
+    const curIdx = sorted.findIndex((item) =>
+      item.ordinals.includes(selected),
+    );
+    const nextIdx = Math.max(
+      0,
+      Math.min(sorted.length - 1, curIdx + delta),
+    );
+    if (nextIdx === curIdx) return;
+
+    const next = sorted[nextIdx]!;
+    navigateToMessageOrdinal(next.ordinals[0]!);
+  }
+
+  function navigateUserPrompt(delta: number) {
+    const items = messageListRef?.getDisplayItems();
+    if (!items || items.length === 0) return;
+
+    const ordinal = findUserPromptOrdinal(
+      items,
+      ui.selectedOrdinal,
+      ui.sortNewestFirst ? -delta : delta,
+      ui.isBlockVisible("user"),
+    );
+    if (ordinal !== undefined) navigateToMessageOrdinal(ordinal);
+  }
+
+  function navigateToMessageOrdinal(ordinal: number) {
+    if (ui.followLatest) {
+      ui.setFollowLatest(false);
+    }
+    ui.selectOrdinal(ordinal);
+    messageListRef?.scrollToOrdinal(ordinal);
+  }
+
+  function clearYokeForClearedSessionDates(
+    nextParams: Record<string, string>,
+  ): void {
+    if (sessionDateIntentCleared(router.params, nextParams)) {
+      yokedDates.clear();
+    }
+  }
+
+  // Session route params composed from filters must carry the rolling
+  // intent: a URL with concrete dates but no window_days re-enters
+  // initFromParams as an explicit fixed range, so the rolling
+  // persistence would be lost after one reload.
+  function sessionFilterRouteParams(): Record<string, string> {
+    const params = filtersToParams(sessions.filters);
+    if (starred.filterOnly) params.starred = "true";
+    if (sessions.dateFiltersWindowDays !== null) {
+      params[SESSION_ANALYTICS_WINDOW_PARAM] = String(
+        sessions.dateFiltersWindowDays,
+      );
+    }
+    return params;
+  }
+
+  function applySessionDateState(
+    state: PanelDateState,
+    routeParams: Record<string, string>,
+  ): Record<string, string> | null {
+    const dateParams = panelDateToSessionFilterParams(state);
+    if (Object.keys(dateParams).length === 0) return null;
+    sessions.applyPanelDateFilters(
+      dateParams,
+      state.mode === "rolling" ? state.windowDays ?? null : null,
+    );
+    const params = { ...routeParams };
+    for (const key of [
+      "date",
+      "date_from",
+      "date_to",
+      SESSION_ANALYTICS_WINDOW_PARAM,
+    ]) {
+      delete params[key];
+    }
+    Object.assign(params, sessionFilterRouteParams());
+    if (
+      state.mode === "rolling" &&
+      state.windowDays
+    ) {
+      params[SESSION_ANALYTICS_WINDOW_PARAM] = String(
+        state.windowDays,
+      );
+    }
+    return params;
+  }
+
+  function sessionEntryDateParams(
+    routeParams: Record<string, string>,
+  ): Record<string, string> | null {
+    if (hasSessionDateIntent(routeParams)) return null;
+    const retained = analyticsPageDates.restoreWithIntent("sessions");
+    const shared = yokedDates.seedForPanel();
+    const state = shared
+      ? rangeToPanelDate(shared)
+      : retained.explicitDateIntent
+        ? retained.state
+        : null;
+    return state ? applySessionDateState(state, routeParams) : null;
+  }
+
+  let lastDetailFilterParamsSignature: string | null = $state(null);
+  let previousDateRestoreRoute: string | null = null;
+  let previousRootLanding = false;
+  let rootResetPending = $state(false);
+  let rootDetailOpened = false;
+  let rootDetailDateRestoreSuppressed = $state(false);
+  let rootDetailExitDateRestorePending = $state(false);
+  let previousSessionId: string | null = null;
+  let previousActiveSessionId: string | null = null;
+
+  function clearRootDetailDateRestoreSuppressed(): void {
+    rootDetailDateRestoreSuppressed = false;
+    rootDetailExitDateRestorePending = false;
+  }
+
+  function clearRootFilterProvenance(): void {
+    rootResetPending = false;
+    rootDetailOpened = false;
+    clearRootDetailDateRestoreSuppressed();
+  }
+
+  // React to route changes: reload sessions and apply URL params.
+  // Only apply URL deep-link params (initFromParams) when the URL
+  // actually contains filter keys — a bare /sessions preserves the
+  // current store state (restored from localStorage).
+  // Only track route and params — NOT sessionId.
+  $effect.pre(() => {
+    const route = router.route;
+    const params = router.params;
+    const hasSessionFilterParams =
+      route === "sessions" && hasFilterParams(params);
+    const rootLanding = router.isRootPath && !hasSessionFilterParams;
+    const sessionFiltersDiverged = route !== "sessions" &&
+      Object.keys(sessionFilterRouteParams()).length > 0;
+    const enteringRootLanding = rootLanding && !previousRootLanding;
+    const leavingRootLanding =
+      previousRootLanding &&
+      route === "sessions" &&
+      !hasSessionFilterParams &&
+      !rootLanding;
+    const enteringSessionsRoute =
+      route === "sessions" && previousDateRestoreRoute !== "sessions";
+    const leavingSessionsRoute =
+      previousDateRestoreRoute === "sessions" && route !== "sessions";
+    const wasRootLanding = previousRootLanding;
+    const wasSessionsRoute = previousDateRestoreRoute === "sessions";
+    untrack(() => {
+      let effectiveParams = params;
+      previousDateRestoreRoute = route;
+      previousRootLanding = rootLanding;
+      const sid = router.sessionId;
+      const directRootToList = leavingRootLanding && sid === null;
+      const enteringSessions = enteringSessionsRoute || directRootToList;
+      const closingRootDetail =
+        rootDetailOpened && previousSessionId !== null && sid === null &&
+        route === "sessions";
+      const openingRootDerivedDetail =
+        rootResetPending && sid !== null && route === "sessions" &&
+        !hasSessionFilterParams &&
+        (wasRootLanding ||
+          (wasSessionsRoute && previousSessionId === null));
+      const enteringUnfilteredSessionDetail =
+        rootResetPending && !wasRootLanding && enteringSessionsRoute &&
+        route === "sessions" && sid !== null && !hasSessionFilterParams;
+      if (enteringRootLanding) {
+        sessions.resetFiltersForRoot();
+        rootResetPending = true;
+        rootDetailOpened = false;
+        rootDetailDateRestoreSuppressed = false;
+        rootDetailExitDateRestorePending = false;
+      } else if (enteringUnfilteredSessionDetail) {
+        sessions.restoreSavedFilters();
+        clearRootFilterProvenance();
+      } else if (
+        !rootLanding &&
+        !hasSessionFilterParams &&
+        route === "sessions" &&
+        sid === null &&
+        enteringSessions &&
+        rootResetPending &&
+        !rootDetailOpened
+      ) {
+        sessions.restoreSavedFilters();
+        clearRootFilterProvenance();
+      } else if (hasSessionFilterParams) {
+        if (rootResetPending) {
+          effectiveParams = sessionEntryDateParams(params) ?? params;
+          if (!filterParamsEqual(params, effectiveParams)) {
+            router.replaceParams(effectiveParams);
+          }
+        }
+        clearRootFilterProvenance();
+      } else if (rootResetPending && sessionFiltersDiverged) {
+        clearRootFilterProvenance();
+      }
+      if (leavingSessionsRoute) {
+        rootDetailOpened = false;
+        rootDetailDateRestoreSuppressed = false;
+        rootDetailExitDateRestorePending = false;
+      } else if (openingRootDerivedDetail) {
+        rootDetailOpened = true;
+        rootDetailDateRestoreSuppressed = true;
+        rootDetailExitDateRestorePending = false;
+      } else if (
+        closingRootDetail &&
+        !rootLanding &&
+        !hasSessionFilterParams
+      ) {
+        rootDetailOpened = false;
+        rootDetailDateRestoreSuppressed = true;
+        rootDetailExitDateRestorePending = true;
+      }
+      previousSessionId = sid;
+      if (
+        route === "sessions" &&
+        hasFilterParams(effectiveParams) &&
+        (!sid || enteringSessions)
+      ) {
+        sessions.initFromParams(effectiveParams);
+      }
+      if (enteringSessions && !rootLanding) {
+        const explicitState = sessionParamsToPanelDate(effectiveParams);
+        if (explicitState) yokedDates.updateFromPanel(explicitState);
+        const entryParams =
+          explicitState?.mode === "rolling"
+            ? applySessionDateState(explicitState, effectiveParams)
+            : sessionEntryDateParams(effectiveParams);
+        if (entryParams) router.replaceParams(entryParams);
+      }
+      if (route === "sessions") {
+        sessions.load();
+      }
+      sessions.loadProjects();
+      sessions.loadAgents();
+      sessions.loadMachines();
+    });
+  });
+
+  // The active session clears before the URL sync clears the routed id. Mark
+  // the root-detail exit before AnalyticsPage remounts for that transition.
+  $effect.pre(() => {
+    const activeSessionId = sessions.activeSessionId;
+    untrack(() => {
+      const activeSessionChanged =
+        previousActiveSessionId !== activeSessionId;
+      const hadActiveSession = previousActiveSessionId !== null;
+      previousActiveSessionId = activeSessionId;
+      if (
+        activeSessionChanged &&
+        hadActiveSession &&
+        activeSessionId === null &&
+        router.route === "sessions" &&
+        router.sessionId !== null &&
+        rootDetailDateRestoreSuppressed
+      ) {
+        rootDetailExitDateRestorePending = true;
+      }
+    });
+  });
+
+  // Deep-link: select and hydrate the routed session. Tracking
+  // activeSession (not just the URL) makes hydration self-healing:
+  // if a sidebar reload rebuilds the list mid-flight and the routed
+  // row is lost or reverts to index-only, this re-fires and
+  // re-hydrates. Refires caused by session-state changes (rather
+  // than a URL change) act only while the routed session is still
+  // the active one, so a newer local selection that has not synced
+  // to the URL yet is never snapped back. navigateToSession dedupes
+  // in-flight requests, and a failed fetch changes no state this
+  // effect tracks, so this cannot loop.
+  let lastRoutedSessionId: string | null = null;
+  $effect(() => {
+    const sid = router.sessionId;
+    const hydrated = sessions.activeSession !== undefined;
+    untrack(() => {
+      if (!sid) {
+        lastRoutedSessionId = null;
+        return;
+      }
+      const sidChanged = sid !== lastRoutedSessionId;
+      lastRoutedSessionId = sid;
+      if (sidChanged) {
+        if (sid !== sessions.activeSessionId || !hydrated) {
+          void sessions.navigateToSession(sid);
+        }
+      } else if (sid === sessions.activeSessionId && !hydrated) {
+        void sessions.navigateToSession(sid);
+      }
+    });
+  });
+
+  // Telemetry: one session_viewed per transcript visit, sent once the
+  // session's metadata hydrates. The store keeps the active id while
+  // another page shows, so leaving the transcript resets the visit.
+  let viewedSessionId: string | null = null;
+  let selectedSessionId: string | null = null;
+  $effect(() => {
+    const route = router.route;
+    const activeId = sessions.activeSessionId;
+    const session = sessions.activeSession;
+    const routedId = router.sessionId;
+    untrack(() => {
+      if (activeId !== selectedSessionId) {
+        selectedSessionId = activeId;
+        viewedSessionId = null;
+      }
+      if (route !== "sessions" || activeId === null) {
+        viewedSessionId = null;
+        return;
+      }
+      // Wait for the URL to name the session, so a stale selection left from another page is not counted.
+      if (session && session.id === activeId && routedId === activeId && activeId !== viewedSessionId) {
+        viewedSessionId = activeId;
+        reportTelemetry("session_viewed", { agent: session.agent });
+      }
+    });
+  });
+
+  // Telemetry: one analytics_viewed per analytics page visit; token-usage is the usage page.
+  let lastAnalyticsPage: string | null = null;
+  $effect(() => {
+    const route = router.route;
+    let page: string | null = null;
+    if (route === "usage" || route === "token-usage") {
+      page = "usage";
+    } else if (route === "activity" || route === "trends" || route === "quality") {
+      page = route;
+    }
+    untrack(() => {
+      if (page !== null && page !== lastAnalyticsPage) {
+        reportTelemetry("analytics_viewed", { page });
+      }
+      lastAnalyticsPage = page;
+    });
+  });
+
+  // Deep-link: clear the selection when the URL drops its session.
+  // Tracks the route alongside the session id: entering bare /sessions
+  // from a non-session page leaves the id null both sides, so a
+  // session-id-only dependency would not rerun and a stale active
+  // session would keep showing instead of the list. Route is
+  // authoritative URL state that local selection does not mutate, so
+  // tracking it cannot trigger a spurious deselect.
+  $effect(() => {
+    const sid = router.sessionId;
+    const route = router.route;
+    untrack(() => {
+      if (
+        !sid && route === "sessions" &&
+        sessions.activeSessionId !== null
+      ) {
+        sessions.deselectSession();
+      }
+    });
+  });
+
+  // Deep-link: apply the ?msg param. Kept separate from the
+  // hydration effect above so scroll intent is not re-applied
+  // every time hydration state changes.
+  $effect(() => {
+    const sid = router.sessionId;
+    const msgParam = router.params["msg"] ?? null;
+    untrack(() => {
+      if (!sid || !msgParam) return;
+      if (msgParam === "last") {
+        ui.pendingScrollOrdinal = -1;
+        ui.pendingScrollSession = sid;
+      } else {
+        const ordinal = parseInt(msgParam, 10);
+        if (Number.isFinite(ordinal)) {
+          ui.scrollToOrdinal(ordinal, sid);
+        }
+      }
+    });
+  });
+
+  // Resolve msg=last once messages are loaded.
+  $effect(() => {
+    const pending = ui.pendingScrollOrdinal;
+    const loading = messages.loading;
+    const msgs = messages.messages;
+    untrack(() => {
+      if (pending !== -1 || loading || msgs.length === 0) return;
+      const target = ui.pendingScrollSession;
+      if (target !== null && target !== messages.sessionId) return;
+      const lastOrdinal = msgs[msgs.length - 1]!.ordinal;
+      ui.scrollToOrdinal(lastOrdinal, target ?? undefined);
+    });
+  });
+
+  // Sync active session to URL.
+  $effect(() => {
+    const activeId = sessions.activeSessionId;
+    const currentUrlSessionId = router.sessionId;
+    const filterParams = sessionFilterRouteParams();
+    const filterParamsSignature = JSON.stringify(filterParams);
+    untrack(() => {
+      if (router.route !== "sessions") {
+        lastDetailFilterParamsSignature = null;
+        return;
+      }
+      if (activeId) {
+        const nextParams = sessionRouteParamsForFilters(
+          filterParams,
+          router.params,
+        );
+        if (activeId === currentUrlSessionId) {
+          if (
+            lastDetailFilterParamsSignature !== null &&
+            lastDetailFilterParamsSignature !== filterParamsSignature &&
+            !filterParamsEqual(router.params, nextParams)
+          ) {
+            clearYokeForClearedSessionDates(nextParams);
+            router.replaceParams(nextParams);
+          }
+          lastDetailFilterParamsSignature = filterParamsSignature;
+          return;
+        }
+        clearYokeForClearedSessionDates(nextParams);
+        router.navigateToSession(activeId, nextParams);
+        lastDetailFilterParamsSignature = filterParamsSignature;
+      } else {
+        if (currentUrlSessionId === null) {
+          lastDetailFilterParamsSignature = null;
+          return;
+        }
+        const filterChangedOnDetail =
+          lastDetailFilterParamsSignature !== null &&
+          lastDetailFilterParamsSignature !== filterParamsSignature;
+        const nextParams = filterChangedOnDetail
+          ? sessionRouteParamsForFilters(
+              filterParams,
+              router.params,
+            )
+          : sessionRouteParamsForDetailExit(
+              filterParams,
+              router.params,
+            );
+        clearYokeForClearedSessionDates(nextParams);
+        router.navigateFromSession(nextParams);
+        lastDetailFilterParamsSignature = null;
+      }
+    });
+  });
+
+  // URL write-back: keep query string in sync with filter state
+  // when on /sessions with no session selected, so users can
+  // share/bookmark the view and the URL reflects what's shown.
+  // Tracks route so a tab switch back to /sessions also syncs
+  // the URL with localStorage-restored filters.
+  $effect(() => {
+    const route = router.route;
+    const rootLanding = router.isRootPath && !hasFilterParams(router.params);
+    const sessionFilterParams = sessionFilterRouteParams();
+    const newParams = sessionRouteParamsForFilters(
+      sessionFilterParams,
+      router.params,
+    );
+    untrack(() => {
+      if (route !== "sessions") return;
+      if (router.sessionId) return;
+      if (rootLanding && Object.keys(sessionFilterParams).length === 0) {
+        return;
+      }
+      if (rootLanding) {
+        clearYokeForClearedSessionDates(newParams);
+        router.navigateToSessions(newParams);
+        return;
+      }
+      if (!router.isRootPath && filterParamsEqual(router.params, newParams)) {
+        return;
+      }
+      clearYokeForClearedSessionDates(newParams);
+      router.replaceParams(newParams);
+    });
+  });
+
+  function showAbout() {
+    if (ui.activeModal === "resync" && sync.syncing) return;
+    ui.activeModal = "about";
+  }
+
+  $effect(() => {
+    const saveError = settings.saveError;
+    if (saveError) {
+      untrack(() => showFlash(saveError, { tone: "danger" }));
+    }
+  });
+
+  onMount(() => {
+    globalAuthToken = getAuthToken();
+    settings.load();
+    starred.load();
+    sync.loadStatus();
+    sync.loadStats();
+    sync.loadVersion();
+    sync.checkForUpdate();
+    sync.startPolling();
+    const appOpenedCleanup = setupAppOpenedReporting();
+
+    const healthCleanup = setupVisibilityHealthCheck({
+      onBackendDegraded: () => sync.markBackendDegraded(),
+    });
+
+    window.addEventListener("show-about", showAbout);
+    const cleanup = registerShortcuts({
+      navigateMessage,
+      navigateUserPrompt,
+    });
+    return () => {
+      appOpenedCleanup();
+      healthCleanup();
+      cleanup();
+      window.removeEventListener("show-about", showAbout);
+      sync.stopPolling();
+      sync.unwatchSession();
+    };
+  });
+
+</script>
+
+{#if settings.needsAuth && router.route !== "settings"}
+  <div class="auth-overlay">
+    <div class="auth-card">
+      <h2 class="auth-card-title">{m.app_auth_title()}</h2>
+      <p class="auth-card-desc">
+        {m.app_auth_description()}
+      </p>
+      <div class="auth-card-field">
+        <input
+          class="auth-card-input"
+          type="password"
+          placeholder={m.app_auth_placeholder()}
+          bind:value={globalAuthToken}
+          onkeydown={(e) => { if (e.key === "Enter") handleGlobalAuth(); }}
+        />
+        <button
+          class="auth-card-btn"
+          disabled={!globalAuthToken.trim()}
+          onclick={handleGlobalAuth}
+        >
+          {m.app_auth_authenticate()}
+        </button>
+      </div>
+      <button
+        class="auth-card-disconnect"
+        onclick={() => {
+          setAuthToken("");
+          setServerUrl("");
+          settings.needsAuth = false;
+          settings.load();
+        }}
+      >
+        {m.app_auth_disconnect_reset()}
+      </button>
+    </div>
+  </div>
+{:else}
+
+<AppHeader />
+
+<FlashBanner toneLabels={{ danger: m.settings_save_error_label() }} />
+
+{#if router.route === "usage" || router.route === "token-usage"}
+  <div class="page-scroll">
+    <UsagePage />
+  </div>
+{:else if router.route === "activity"}
+  <div class="page-scroll">
+    <ActivityPage />
+  </div>
+{:else if router.route === "trends"}
+  <div class="page-scroll">
+    <TrendsPage />
+  </div>
+{:else if router.route === "recall"}
+  <div class="page-scroll">
+    <RecallPage />
+  </div>
+{:else if router.route === "quality"}
+  <div class="page-scroll">
+    <QualityPage />
+  </div>
+{:else if router.route === "pinned"}
+  <div class="page-scroll">
+    <PinnedPage />
+  </div>
+{:else if router.route === "trash"}
+  <div class="page-scroll">
+    <TrashPage />
+  </div>
+{:else if router.route === "recent-edits"}
+  <div class="page-scroll">
+    <RecentEditsPage />
+  </div>
+{:else if router.route === "data"}
+  <div class="page-scroll data-page-host">
+    <DataPage />
+  </div>
+{:else if router.route === "settings"}
+  <div class="page-scroll settings-page-host">
+    <SettingsPage />
+  </div>
+{:else}
+  <ThreeColumnLayout>
+    {#snippet sidebar()}
+      <SessionList />
+    {/snippet}
+
+    {#snippet content()}
+      {#if sessions.activeSessionId}
+        {@const session = sessions.activeSession}
+        <SessionBreadcrumb
+          session={session}
+          onBack={() => sessions.deselectSession()}
+        />
+        <MessageList bind:this={messageListRef} />
+      {:else}
+        <AnalyticsPage
+          suppressSessionDateRestore={rootDetailDateRestoreSuppressed}
+          suppressSessionDateRefresh={rootResetPending}
+          onSessionDateRestoreSuppressed={
+            rootDetailExitDateRestorePending
+              ? clearRootDetailDateRestoreSuppressed
+              : undefined
+          }
+        />
+      {/if}
+    {/snippet}
+
+    {#snippet vitals()}
+      {#if sessions.activeSessionId}
+        <SessionVitals
+          sessionId={sessions.activeSessionId}
+          session={sessions.activeSession}
+        />
+      {/if}
+    {/snippet}
+  </ThreeColumnLayout>
+{/if}
+
+<StatusBar />
+<PerfDebugPanel />
+
+{#if ui.activeModal === "about"}
+  <AboutModal />
+{/if}
+
+{#if ui.activeModal === "commandPalette"}
+  <CommandPalette />
+{/if}
+
+{#if ui.activeModal === "goToSession"}
+  <GoToSessionModal />
+{/if}
+
+{#if ui.activeModal === "shortcuts"}
+  <ShortcutsModal />
+{/if}
+
+{#if ui.activeModal === "publish"}
+  <PublishModal />
+{/if}
+
+{#if ui.activeModal === "resync"}
+  <ResyncModal />
+{/if}
+
+{#if ui.activeModal === "update"}
+  <UpdateModal />
+{/if}
+
+{#if ui.activeModal === "confirmDelete"}
+  <ConfirmDeleteModal />
+{/if}
+
+{/if}
+
+{#if sessions.recentlyDeleted.length > 0}
+  <!-- kit-ui-check-ignore: undo toast carries an inline restore action; kit-ui FlashBanner only supports text+dismiss today, so replacing this would change the delete/undo workflow. -->
+  <div class="undo-toast">
+    <span>{m.app_undo_session_deleted()}</span>
+    <button
+      class="undo-btn"
+      onclick={async (e) => {
+        const btn = e.currentTarget;
+        if (btn.disabled) return;
+        const last = sessions.recentlyDeleted[sessions.recentlyDeleted.length - 1];
+        if (!last) return;
+        btn.disabled = true;
+        try {
+          await sessions.restoreRecentlyDeleted(last);
+        } catch {
+          // restore failed — toast will remain
+        } finally {
+          btn.disabled = false;
+        }
+      }}
+    >
+      {m.app_undo_undo()}
+    </button>
+  </div>
+{/if}
+
+<style>
+  .page-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+  }
+
+  .settings-page-host {
+    display: flex;
+    overflow: hidden;
+  }
+
+  .data-page-host {
+    display: flex;
+    overflow: hidden;
+  }
+
+  /* kit-ui-check-ignore: undo toast carries an inline restore action; kit-ui FlashBanner only supports text+dismiss today, so replacing this would change the delete/undo workflow. */
+  .undo-toast {
+    position: fixed;
+    bottom: 40px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    border-radius: 8px;
+    padding: 10px 18px;
+    box-shadow: 0 6px 24px var(--overlay-bg);
+    z-index: var(--z-overlay);
+    font-size: 13px;
+    color: var(--text-primary);
+    animation: slide-up 0.2s ease-out;
+  }
+
+  @keyframes slide-up {
+    from {
+      opacity: 0;
+      transform: translateX(-50%) translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+  }
+
+  .undo-btn {
+    background: none;
+    border: none;
+    color: var(--accent-blue);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+
+  .undo-btn:hover {
+    background: color-mix(in srgb, var(--accent-blue) 12%, transparent);
+  }
+
+  .auth-overlay {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    background: var(--bg-default);
+  }
+
+  .auth-card {
+    text-align: center;
+    max-width: 420px;
+    padding: 32px 24px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    border-radius: 12px;
+    box-shadow: var(--shadow-lg);
+  }
+
+  .auth-card-title {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0 0 8px;
+  }
+
+  .auth-card-desc {
+    font-size: 13px;
+    color: var(--text-muted);
+    margin: 0 0 20px;
+  }
+
+  .auth-card-field {
+    display: flex;
+    gap: 8px;
+  }
+
+  .auth-card-input {
+    flex: 1;
+    height: 34px;
+    padding: 0 12px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-family: var(--font-mono, monospace);
+    color: var(--text-primary);
+    background: var(--bg-inset);
+    border: 1px solid var(--border-muted);
+  }
+
+  .auth-card-input:focus {
+    outline: none;
+    border-color: var(--accent-blue);
+  }
+
+  .auth-card-btn {
+    height: 34px;
+    padding: 0 16px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--accent-blue-foreground);
+    background: var(--accent-blue);
+    border: none;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .auth-card-btn:disabled {
+    opacity: var(--opacity-disabled);
+    cursor: default;
+  }
+
+  .auth-card-btn:hover:not(:disabled) {
+    opacity: 0.9;
+  }
+
+  .auth-card-disconnect {
+    margin-top: 12px;
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 12px;
+    cursor: pointer;
+    text-decoration: underline;
+  }
+
+  .auth-card-disconnect:hover {
+    color: var(--text-secondary);
+  }
+</style>

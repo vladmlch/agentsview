@@ -1,0 +1,641 @@
+import { SettingsUpdateRequestZoomLevel as ZoomLevel } from "../api/generated/models/settingsUpdateRequestZoomLevel.js";
+import {
+  getHighContrast,
+  initTheme,
+  isDark,
+  MEDIA,
+  setHighContrast,
+  setThemeMode,
+} from "@kenn-io/kit-ui";
+import {
+  SIDEBAR_WIDTH_DEFAULT,
+  SIDEBAR_WIDTH_KEY,
+  VITALS_WIDTH_DEFAULT,
+  VITALS_WIDTH_KEY,
+  clampStoredSidebarWidth,
+  clampStoredVitalsWidth,
+} from "../components/layout/sidebar-width.js";
+
+type Theme = "light" | "dark";
+export type MessageLayout = "default" | "compact" | "stream" | "skim";
+export type TranscriptMode = "normal" | "focused";
+export type PublishTarget =
+  | { kind: "session"; id: string }
+  | { kind: "insight"; id: number }
+  | null;
+type ModalType =
+  | "about"
+  | "commandPalette"
+  | "goToSession"
+  | "shortcuts"
+  | "publish"
+  | "resync"
+  | "update"
+  | "confirmDelete"
+  | null;
+
+/** Block types that can be toggled visible/hidden. */
+export type BlockType = "user" | "assistant" | "thinking" | "tool" | "code" | "system";
+
+export const ALL_BLOCK_TYPES: BlockType[] = [
+  "user",
+  "assistant",
+  "thinking",
+  "tool",
+  "code",
+  "system",
+];
+
+const BLOCK_FILTER_KEY = "agentsview-block-filters";
+const TRANSCRIPT_MODE_KEY = "agentsview-transcript-mode";
+const UNKNOWN_XML_PREFORMATTED_KEY = "agentsview-unknown-xml-preformatted";
+const VITALS_KEY = "agentsview-session-vitals";
+const VITALS_CALLS_EXPANDED_KEY = "agentsview-session-vitals-calls-expanded";
+const SIGNAL_PANEL_KEY = "agentsview-signal-panel";
+const FOLLOW_LATEST_KEY = "agentsview-follow-latest";
+
+/** Resolves the visible block types from a stored filter payload. */
+export function parseBlockFilters(raw: string | null): Set<BlockType> {
+  const hidden = parseHiddenBlocks(raw);
+  return new Set(ALL_BLOCK_TYPES.filter((type) => !hidden.has(type)));
+}
+
+/** Serializes the visible block types for storage. */
+export function serializeBlockFilters(visible: Set<BlockType>): string {
+  return JSON.stringify({
+    hidden: ALL_BLOCK_TYPES.filter((type) => !visible.has(type)),
+  });
+}
+
+function parseHiddenBlocks(raw: string | null): Set<BlockType> {
+  if (!raw) return new Set();
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && Array.isArray(parsed.hidden)) {
+      return new Set(knownBlockTypes(parsed.hidden));
+    }
+  } catch {
+    // ignore
+  }
+  return new Set();
+}
+
+function knownBlockTypes(values: unknown[]): BlockType[] {
+  return values.filter((value): value is BlockType => ALL_BLOCK_TYPES.includes(value as BlockType));
+}
+
+function readBlockFilters(): Set<BlockType> {
+  try {
+    return parseBlockFilters(localStorage?.getItem(BLOCK_FILTER_KEY) ?? null);
+  } catch {
+    return new Set(ALL_BLOCK_TYPES);
+  }
+}
+
+const LAYOUT_KEY = "agentsview-message-layout";
+const ZOOM_KEY = "agentsview-zoom-level";
+const VALID_TRANSCRIPT_MODES: TranscriptMode[] = ["normal", "focused"];
+
+const IS_DESKTOP =
+  typeof window !== "undefined" && new URLSearchParams(window.location.search).has("desktop");
+
+export const ZOOM_STEPS = Object.values(ZoomLevel);
+
+function isZoomLevel(level: number): level is ZoomLevel {
+  return ZOOM_STEPS.some((step) => step === level);
+}
+const ZOOM_DEFAULT = 100;
+const FONT_SCALE_KEY = "agentsview-font-scale";
+const HIGH_CONTRAST_KEY = "agentsview-high-contrast";
+const LEGACY_FONT_SCALE_STEPS = [90, 100, 110, 120, 130];
+let zoomRequest = 0;
+let nativeZoomQueue = Promise.resolve();
+let confirmedNativeZoom = 1;
+
+type DesktopTauriWebviewWindow = {
+  setZoom(scaleFactor: number): Promise<void>;
+};
+
+type DesktopTauriBridge = {
+  webviewWindow?: {
+    getCurrentWebviewWindow?: () => DesktopTauriWebviewWindow;
+  };
+};
+
+function currentDesktopWebviewWindow(): DesktopTauriWebviewWindow | undefined {
+  if (!IS_DESKTOP || typeof window === "undefined") return;
+  const tauri = (window as Window & { __TAURI__?: DesktopTauriBridge }).__TAURI__;
+  return tauri?.webviewWindow?.getCurrentWebviewWindow?.();
+}
+
+function syncDesktopZoom(scaleFactor: number): Promise<void> | undefined {
+  const webview = currentDesktopWebviewWindow();
+  if (!webview) return;
+  nativeZoomQueue = nativeZoomQueue
+    .catch(() => {})
+    .then(async () => {
+      await webview.setZoom(scaleFactor);
+      confirmedNativeZoom = scaleFactor;
+    });
+  return nativeZoomQueue;
+}
+
+function setCssZoom(factor: number): void {
+  document.documentElement.style.setProperty("zoom", String(factor));
+  document.documentElement.style.setProperty("--agentsview-zoom-compensation", String(1 / factor));
+}
+
+function readStoredZoom(): ZoomLevel | undefined {
+  try {
+    const zoom = Number(localStorage?.getItem(ZOOM_KEY));
+    if (isZoomLevel(zoom) && zoom !== ZOOM_DEFAULT) return zoom;
+    // Prefer a saved text size over the old store's automatic 100%.
+    const legacy = Number(localStorage?.getItem(FONT_SCALE_KEY));
+    if (isZoomLevel(legacy) && LEGACY_FONT_SCALE_STEPS.includes(legacy)) return legacy;
+    if (isZoomLevel(zoom)) return zoom;
+  } catch {
+    // ignore
+  }
+  return undefined;
+}
+
+const VALID_LAYOUTS: MessageLayout[] = ["default", "compact", "stream", "skim"];
+// Theme state lives in kit-ui's theme store (mode/high-contrast persistence,
+// root class management, and OS-preference tracking in "system" mode). Reuse
+// the app's historical "theme" storage key — its stored "light"/"dark" values
+// are valid kit-ui modes — and migrate the legacy high-contrast key to the
+// derived key kit-ui persists under.
+function migrateHighContrastKey(): void {
+  try {
+    if (
+      typeof localStorage === "undefined" ||
+      localStorage == null ||
+      typeof localStorage.getItem !== "function"
+    ) {
+      return;
+    }
+    const legacy = localStorage.getItem(HIGH_CONTRAST_KEY);
+    if (legacy !== null && localStorage.getItem("theme-high-contrast") === null) {
+      localStorage.setItem("theme-high-contrast", legacy);
+    }
+  } catch {
+    // Storage blocked — kit-ui falls back to in-memory state.
+  }
+}
+
+migrateHighContrastKey();
+initTheme({ storageKey: "theme" });
+
+function readStoredLayout(): MessageLayout {
+  try {
+    const raw = localStorage?.getItem(LAYOUT_KEY);
+    if (raw && VALID_LAYOUTS.includes(raw as MessageLayout)) {
+      return raw as MessageLayout;
+    }
+  } catch {
+    // ignore
+  }
+  return "default";
+}
+
+function readStoredTranscriptMode(): TranscriptMode {
+  try {
+    const raw = localStorage?.getItem(TRANSCRIPT_MODE_KEY);
+    if (raw && VALID_TRANSCRIPT_MODES.includes(raw as TranscriptMode)) {
+      return raw as TranscriptMode;
+    }
+  } catch {
+    // ignore
+  }
+  return "normal";
+}
+
+function readStoredSidebarWidth(): number {
+  try {
+    return clampStoredSidebarWidth(localStorage?.getItem(SIDEBAR_WIDTH_KEY));
+  } catch {
+    return SIDEBAR_WIDTH_DEFAULT;
+  }
+}
+
+function readStoredVitalsWidth(): number {
+  try {
+    return clampStoredVitalsWidth(localStorage?.getItem(VITALS_WIDTH_KEY));
+  } catch {
+    return VITALS_WIDTH_DEFAULT;
+  }
+}
+
+function readStoredBool(key: string, fallback: boolean): boolean {
+  try {
+    const raw = localStorage?.getItem(key);
+    if (raw === "true") return true;
+    if (raw === "false") return false;
+  } catch {
+    // ignore
+  }
+  return fallback;
+}
+class UIStore {
+  /** Resolved appearance from kit-ui's theme store; in "system" mode this
+   * tracks the OS preference. Assigning pins an explicit mode. */
+  get theme(): Theme {
+    return isDark() ? "dark" : "light";
+  }
+
+  set theme(value: Theme) {
+    setThemeMode(value);
+  }
+
+  get highContrast(): boolean {
+    return getHighContrast();
+  }
+
+  set highContrast(value: boolean) {
+    setHighContrast(value);
+  }
+
+  sortNewestFirst: boolean = $state(false);
+  messageLayout: MessageLayout = $state(readStoredLayout());
+  transcriptMode: TranscriptMode = $state(readStoredTranscriptMode());
+  sidebarWidth: number = $state(readStoredSidebarWidth());
+  vitalsWidth: number = $state(readStoredVitalsWidth());
+  activeModal: ModalType = $state(null);
+  /** Whether the next gist publish should be secret instead of public. */
+  publishSecret: boolean = $state(false);
+  publishTarget: PublishTarget = $state(null);
+  selectedOrdinal: number | null = $state(null);
+  pendingScrollOrdinal: number | null = $state(null);
+  pendingScrollSession: string | null = $state(null);
+
+  private localZoomLevel = readStoredZoom();
+  zoomLevel: ZoomLevel = $state(this.localZoomLevel ?? ZOOM_DEFAULT);
+  renderUnknownXmlBlocksAsPreformatted: boolean = $state(
+    readStoredBool(UNKNOWN_XML_PREFORMATTED_KEY, false),
+  );
+
+  sidebarOpen: boolean = $state(true);
+  isMobileViewport: boolean = $state(false);
+  vitalsOpen: boolean = $state(readStoredBool(VITALS_KEY, false));
+  vitalsCallsExpanded: boolean = $state(readStoredBool(VITALS_CALLS_EXPANDED_KEY, true));
+  signalPanelOpen: boolean = $state(readStoredBool(SIGNAL_PANEL_KEY, false));
+  followLatest: boolean = $state(readStoredBool(FOLLOW_LATEST_KEY, false));
+  followLatestRequest: number = $state(0);
+
+  /** Set of block types currently visible. */
+  visibleBlocks: Set<BlockType> = $state(readBlockFilters());
+
+  constructor() {
+    if (this.localZoomLevel !== undefined) this.persistZoomPreference();
+    $effect.root(() => {
+      // Theme and high-contrast classes/persistence are owned by kit-ui's
+      // theme store (initTheme above); no effects needed here.
+      $effect(() => {
+        try {
+          localStorage?.setItem(LAYOUT_KEY, this.messageLayout);
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(TRANSCRIPT_MODE_KEY, this.transcriptMode);
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(SIDEBAR_WIDTH_KEY, String(this.sidebarWidth));
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(VITALS_WIDTH_KEY, String(this.vitalsWidth));
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        const factor = this.zoomLevel / 100;
+        const request = ++zoomRequest;
+        const nativeZoom = syncDesktopZoom(factor);
+        if (nativeZoom) {
+          document.documentElement.style.setProperty("zoom", "1");
+          document.documentElement.style.setProperty("--agentsview-zoom-compensation", "1");
+          void nativeZoom.then(
+            () => {
+              if (request === zoomRequest) {
+                confirmedNativeZoom = factor;
+                setCssZoom(1);
+              }
+            },
+            () => {
+              if (request !== zoomRequest) return;
+              const reset = syncDesktopZoom(1);
+              if (!reset) {
+                setCssZoom(factor / confirmedNativeZoom);
+                return;
+              }
+              void reset.then(
+                () => {
+                  if (request === zoomRequest) {
+                    confirmedNativeZoom = 1;
+                    setCssZoom(factor);
+                  }
+                },
+                () => {
+                  if (request === zoomRequest) setCssZoom(factor / confirmedNativeZoom);
+                },
+              );
+            },
+          );
+        } else {
+          setCssZoom(factor);
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(
+            UNKNOWN_XML_PREFORMATTED_KEY,
+            String(this.renderUnknownXmlBlocksAsPreformatted),
+          );
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(VITALS_KEY, String(this.vitalsOpen));
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(VITALS_CALLS_EXPANDED_KEY, String(this.vitalsCallsExpanded));
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(SIGNAL_PANEL_KEY, String(this.signalPanelOpen));
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(FOLLOW_LATEST_KEY, String(this.followLatest));
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        if (this.activeModal !== "publish") {
+          this.publishTarget = null;
+        }
+      });
+
+      // Initialize sidebar based on viewport width. MEDIA.medium is the same
+      // 760px query the component CSS uses, so the store and stylesheets
+      // agree on where mobile layout starts.
+      if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
+        const mq = window.matchMedia(MEDIA.medium);
+        this.sidebarOpen = !mq.matches;
+        this.isMobileViewport = mq.matches;
+        const onChange = (e: MediaQueryListEvent) => {
+          this.sidebarOpen = !e.matches;
+          this.isMobileViewport = e.matches;
+        };
+        if (mq.addEventListener) {
+          mq.addEventListener("change", onChange);
+        } else {
+          mq.addListener(onChange);
+        }
+      }
+    });
+
+    // Allow parent windows to control theme via postMessage
+    if (typeof window !== "undefined") {
+      window.addEventListener("message", (event: MessageEvent) => {
+        if (
+          event.data &&
+          event.data.type === "theme:set" &&
+          (event.data.theme === "light" || event.data.theme === "dark")
+        ) {
+          this.theme = event.data.theme;
+        }
+      });
+    }
+  }
+
+  toggleTheme() {
+    this.theme = this.theme === "light" ? "dark" : "light";
+  }
+
+  isBlockVisible(type: BlockType): boolean {
+    return this.visibleBlocks.has(type);
+  }
+
+  setBlockVisible(type: BlockType, visible: boolean) {
+    const next = new Set(this.visibleBlocks);
+    if (visible) {
+      next.add(type);
+    } else {
+      next.delete(type);
+    }
+    this.visibleBlocks = next;
+    this.persistBlockFilters();
+  }
+
+  toggleBlock(type: BlockType) {
+    const next = new Set(this.visibleBlocks);
+    if (next.has(type)) {
+      next.delete(type);
+    } else {
+      next.add(type);
+    }
+    this.visibleBlocks = next;
+    this.persistBlockFilters();
+  }
+
+  showAllBlocks() {
+    this.visibleBlocks = new Set(ALL_BLOCK_TYPES);
+    this.persistBlockFilters();
+  }
+
+  get hiddenBlockCount(): number {
+    return ALL_BLOCK_TYPES.length - this.visibleBlocks.size;
+  }
+
+  get hasBlockFilters(): boolean {
+    return this.visibleBlocks.size < ALL_BLOCK_TYPES.length;
+  }
+
+  private persistBlockFilters() {
+    try {
+      localStorage?.setItem(BLOCK_FILTER_KEY, serializeBlockFilters(this.visibleBlocks));
+    } catch {
+      // ignore
+    }
+  }
+
+  toggleSort() {
+    this.sortNewestFirst = !this.sortNewestFirst;
+  }
+
+  cycleLayout() {
+    const idx = VALID_LAYOUTS.indexOf(this.messageLayout);
+    this.messageLayout = VALID_LAYOUTS[(idx + 1) % VALID_LAYOUTS.length]!;
+  }
+
+  setLayout(layout: MessageLayout) {
+    this.messageLayout = layout;
+  }
+
+  setTranscriptMode(mode: TranscriptMode) {
+    this.transcriptMode = mode;
+  }
+
+  toggleUnknownXmlBlocksAsPreformatted() {
+    this.renderUnknownXmlBlocksAsPreformatted = !this.renderUnknownXmlBlocksAsPreformatted;
+  }
+
+  setSidebarWidth(width: number) {
+    this.sidebarWidth = clampStoredSidebarWidth(width);
+  }
+
+  setVitalsWidth(width: number) {
+    this.vitalsWidth = clampStoredVitalsWidth(width);
+  }
+
+  setPublishTarget(target: Exclude<PublishTarget, null>) {
+    this.publishTarget = target;
+  }
+
+  clearPublishTarget() {
+    this.publishTarget = null;
+  }
+
+  selectOrdinal(ordinal: number) {
+    this.selectedOrdinal = ordinal;
+  }
+
+  clearSelection() {
+    this.selectedOrdinal = null;
+  }
+
+  clearScrollState() {
+    this.selectedOrdinal = null;
+    this.pendingScrollOrdinal = null;
+    this.pendingScrollSession = null;
+  }
+
+  scrollToOrdinal(ordinal: number, sessionId?: string) {
+    this.followLatest = false;
+    this.selectedOrdinal = ordinal;
+    this.pendingScrollOrdinal = ordinal;
+    this.pendingScrollSession = sessionId ?? null;
+  }
+
+  setFollowLatest(enabled: boolean) {
+    this.followLatest = enabled;
+    if (enabled) {
+      this.followLatestRequest += 1;
+      this.selectedOrdinal = null;
+      this.pendingScrollOrdinal = null;
+      this.pendingScrollSession = null;
+    }
+  }
+
+  toggleFollowLatest() {
+    this.setFollowLatest(!this.followLatest);
+  }
+
+  zoomIn() {
+    const idx = ZOOM_STEPS.indexOf(this.zoomLevel);
+    if (idx < ZOOM_STEPS.length - 1) {
+      this.setZoomLevel(ZOOM_STEPS[idx + 1]!);
+    }
+  }
+
+  zoomOut() {
+    const idx = ZOOM_STEPS.indexOf(this.zoomLevel);
+    if (idx > 0) {
+      this.setZoomLevel(ZOOM_STEPS[idx - 1]!);
+    }
+  }
+
+  resetZoom() {
+    this.setZoomLevel(ZOOM_DEFAULT);
+  }
+
+  setZoomLevel(level: number) {
+    if (!isZoomLevel(level)) return;
+    this.localZoomLevel = level;
+    this.zoomLevel = level;
+    this.persistZoomPreference();
+  }
+
+  applyZoomDefault(level?: number) {
+    this.zoomLevel =
+      this.localZoomLevel ?? (level !== undefined && isZoomLevel(level) ? level : ZOOM_DEFAULT);
+  }
+
+  private persistZoomPreference() {
+    try {
+      localStorage?.setItem(ZOOM_KEY, String(this.zoomLevel));
+      localStorage?.removeItem(FONT_SCALE_KEY);
+    } catch {
+      // ignore
+    }
+  }
+
+  toggleHighContrast() {
+    this.highContrast = !this.highContrast;
+  }
+
+  toggleSidebar() {
+    this.sidebarOpen = !this.sidebarOpen;
+  }
+
+  closeSidebar() {
+    this.sidebarOpen = false;
+  }
+
+  toggleVitals() {
+    this.vitalsOpen = !this.vitalsOpen;
+  }
+
+  closeVitals() {
+    this.vitalsOpen = false;
+  }
+
+  toggleVitalsCalls() {
+    this.vitalsCallsExpanded = !this.vitalsCallsExpanded;
+  }
+
+  toggleSignalPanel() {
+    this.signalPanelOpen = !this.signalPanelOpen;
+  }
+
+  closeAll() {
+    this.activeModal = null;
+  }
+}
+
+export const ui = new UIStore();

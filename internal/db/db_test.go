@@ -1042,7 +1042,6 @@ func TestCurrentDataVersionCursorContextTokens(t *testing.T) {
 	assert.GreaterOrEqual(t, CurrentDataVersion(), 134,
 		"Cursor context tokens distribution requires re-parsing sessions to populate per-message context tokens")
 }
-
 func TestCurrentDataVersionPositAssistantProviderIdentity(t *testing.T) {
 	assert.GreaterOrEqual(t, CurrentDataVersion(), 95,
 		"Posit Assistant provider identity requires re-parsing usage rows")

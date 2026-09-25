@@ -1,0 +1,1541 @@
+package parser
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// setupFileSystem creates a temporary directory and populates
+// it with the given relative file paths and contents.
+func setupFileSystem(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for path, content := range files {
+		fullPath := filepath.Join(dir, path)
+
+		require.NoError(t, os.MkdirAll(filepath.Dir(fullPath), 0o755),
+			"mkdir %s", filepath.Dir(fullPath))
+		require.NoError(t, os.WriteFile(fullPath, []byte(content), 0o644),
+			"write %s", fullPath)
+	}
+}
+
+// assertDiscoveredFiles verifies that the discovered files match the expected filenames and agent type.
+func assertDiscoveredFiles(t *testing.T, got []DiscoveredFile, wantFilenames []string, wantAgent AgentType) {
+	t.Helper()
+
+	want := make(map[string]bool)
+	for _, f := range wantFilenames {
+		want[f] = true
+	}
+
+	gotMap := make(map[string]bool)
+	for _, f := range got {
+		base := filepath.Base(f.Path)
+		gotMap[base] = true
+		assert.Equalf(t, wantAgent, f.Agent, "file %q: agent", base)
+	}
+
+	assert.Len(t, got, len(want), "files total")
+
+	for file := range want {
+		assert.Truef(t, gotMap[file], "missing expected file: %q", file)
+	}
+
+	// Check for unexpected files
+	for file := range gotMap {
+		assert.Truef(t, want[file], "got unexpected file: %q", file)
+	}
+}
+
+func assertSourceRefs(t *testing.T, got []SourceRef, wantFilenames []string, wantAgent AgentType) {
+	t.Helper()
+
+	want := make(map[string]bool)
+	for _, f := range wantFilenames {
+		want[f] = true
+	}
+
+	gotMap := make(map[string]bool)
+	for _, f := range got {
+		base := filepath.Base(f.DisplayPath)
+		gotMap[base] = true
+		assert.Equalf(t, wantAgent, f.Provider, "file %q: provider", base)
+	}
+
+	assert.Len(t, got, len(want), "files total")
+
+	for file := range want {
+		assert.Truef(t, gotMap[file], "missing expected file: %q", file)
+	}
+	for file := range gotMap {
+		assert.Truef(t, want[file], "got unexpected file: %q", file)
+	}
+}
+
+func TestDiscoverClaudeProjects(t *testing.T) {
+	tests := []struct {
+		name      string
+		files     map[string]string
+		wantFiles []string
+	}{
+		{
+			name: "Basic",
+			files: map[string]string{
+				filepath.Join("project-a", "abc.jsonl"):       "{}",
+				filepath.Join("project-a", "def.jsonl"):       "{}",
+				filepath.Join("project-a", "agent-123.jsonl"): "{}", // Should be ignored
+				filepath.Join("project-b", "xyz.jsonl"):       "{}",
+			},
+			wantFiles: []string{
+				"abc.jsonl",
+				"def.jsonl",
+				"xyz.jsonl",
+			},
+		},
+		{
+			name: "Subagents",
+			files: map[string]string{
+				filepath.Join("project-a", "parent-session.jsonl"):                           "{}",
+				filepath.Join("project-a", "parent-session", "subagents", "agent-abc.jsonl"): "{}",
+				filepath.Join("project-a", "parent-session", "subagents", "agent-def.jsonl"): "{}",
+				filepath.Join("project-a", "parent-session", "subagents", "not-agent.jsonl"): "{}",
+			},
+			wantFiles: []string{
+				"parent-session.jsonl",
+				"agent-abc.jsonl",
+				"agent-def.jsonl",
+			},
+		},
+		{
+			name: "Nested workflow subagents",
+			files: map[string]string{
+				filepath.Join("project-a", "parent-session.jsonl"):                                                       "{}",
+				filepath.Join("project-a", "parent-session", "subagents", "workflows", "wf-123", "agent-deep.jsonl"):     "{}",
+				filepath.Join("project-a", "parent-session", "subagents", "workflows", "wf-123", "agent-deep.meta.json"): "{}",
+				filepath.Join("project-a", "parent-session", "subagents", "workflows", "wf-123", "not-agent.jsonl"):      "{}",
+			},
+			wantFiles: []string{
+				"parent-session.jsonl",
+				"agent-deep.jsonl",
+			},
+		},
+		{
+			name:      "Empty",
+			files:     map[string]string{},
+			wantFiles: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			setupFileSystem(t, dir, tt.files)
+			files := ClaudeProjectSessionFiles(dir)
+
+			assertDiscoveredFiles(t, files, tt.wantFiles, AgentClaude)
+
+			if tt.name == "Subagents" {
+				for _, f := range files {
+					assert.Equalf(t, "project-a", f.Project,
+						"file %q: project", filepath.Base(f.Path))
+				}
+			}
+		})
+	}
+
+	t.Run("Nonexistent", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "does-not-exist")
+		files := ClaudeProjectSessionFiles(dir)
+		assert.Nil(t, files, "expected nil")
+	})
+}
+
+func TestDiscoverCodexSessions(t *testing.T) {
+	file1 := "rollout-123-abc-def-ghi-jkl-mno.jsonl"
+	file2 := "rollout-456-abc-def-ghi-jkl-mno.jsonl"
+	flat := "rollout-2026-05-04T02-10-04-019df19b-ad1a-7f82-bfc3-38701744cc66.jsonl"
+
+	tests := []struct {
+		name      string
+		files     map[string]string
+		wantFiles []string
+	}{
+		{
+			name: "Basic",
+			files: map[string]string{
+				filepath.Join("2024", "01", "15", file1): "{}",
+				filepath.Join("2024", "02", "01", file2): "{}",
+			},
+			wantFiles: []string{file1, file2},
+		},
+		{
+			name: "FlatArchivedDir",
+			files: map[string]string{
+				flat: "{}",
+			},
+			wantFiles: []string{flat},
+		},
+		{
+			name: "SkipsNonDigit",
+			files: map[string]string{
+				filepath.Join("notes", "01", "01", "x.jsonl"): "{}",
+			},
+			wantFiles: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			setupFileSystem(t, dir, tt.files)
+			files := discoverCodexTestSessions(t, dir)
+			assertDiscoveredFiles(t, files, tt.wantFiles, AgentCodex)
+		})
+	}
+}
+
+func TestAmpProviderDiscoversSessions(t *testing.T) {
+	tests := []struct {
+		name      string
+		files     map[string]string
+		wantFiles []string
+	}{
+		{
+			name: "Basic",
+			files: map[string]string{
+				"T-019ca26f-aaaa-bbbb-cccc-dddddddddddd.json": "{}",
+				"T-019ca26f-ffff-eeee-dddd-cccccccccccc.json": "{}",
+				"T-.json":         "{}",
+				"T--invalid.json": "{}",
+				"README.md":       "{}",
+				"T-not-json.txt":  "{}",
+			},
+			wantFiles: []string{
+				"T-019ca26f-aaaa-bbbb-cccc-dddddddddddd.json",
+				"T-019ca26f-ffff-eeee-dddd-cccccccccccc.json",
+			},
+		},
+		{
+			name:      "Empty",
+			files:     map[string]string{},
+			wantFiles: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			setupFileSystem(t, dir, tt.files)
+			provider, ok := NewProvider(AgentAmp, ProviderConfig{
+				Roots:   []string{dir},
+				Machine: "local",
+			})
+			require.True(t, ok)
+			files, err := provider.Discover(t.Context())
+			require.NoError(t, err)
+			assertSourceRefs(t, files, tt.wantFiles, AgentAmp)
+		})
+	}
+
+	t.Run("Nonexistent", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "does-not-exist")
+		provider, ok := NewProvider(AgentAmp, ProviderConfig{
+			Roots:   []string{dir},
+			Machine: "local",
+		})
+		require.True(t, ok)
+		files, err := provider.Discover(t.Context())
+		require.NoError(t, err)
+		assert.Empty(t, files, "expected empty")
+	})
+}
+
+func TestFindClaudeSourceFile(t *testing.T) {
+	tests := []struct {
+		name     string
+		files    map[string]string
+		targetID string
+		wantFile string
+	}{
+		{
+			name: "Found",
+			files: map[string]string{
+				filepath.Join("project-a", "session-abc.jsonl"): "{}",
+			},
+			targetID: "session-abc",
+			wantFile: filepath.Join("project-a", "session-abc.jsonl"),
+		},
+		{
+			name: "Subagent",
+			files: map[string]string{
+				filepath.Join("project-a", "parent-sess", "subagents", "agent-sub1.jsonl"): "{}",
+			},
+			targetID: "agent-sub1",
+			wantFile: filepath.Join("project-a", "parent-sess", "subagents", "agent-sub1.jsonl"),
+		},
+		{
+			name: "Nested workflow subagent",
+			files: map[string]string{
+				filepath.Join("project-a", "parent-sess", "subagents", "workflows", "wf-123", "agent-deep.jsonl"): "{}",
+			},
+			targetID: "agent-deep",
+			wantFile: filepath.Join("project-a", "parent-sess", "subagents", "workflows", "wf-123", "agent-deep.jsonl"),
+		},
+		{
+			name: "Nonexistent",
+			files: map[string]string{
+				filepath.Join("project-a", "session-abc.jsonl"): "{}",
+			},
+			targetID: "nonexistent",
+			wantFile: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			setupFileSystem(t, dir, tt.files)
+
+			got := claudeFindSourceFile(dir, tt.targetID)
+			want := ""
+			if tt.wantFile != "" {
+				want = filepath.Join(dir, tt.wantFile)
+			}
+
+			assert.Equal(t, want, got)
+		})
+	}
+
+	t.Run("Validation", func(t *testing.T) {
+		dir := t.TempDir()
+		tests := []string{"", "../etc/passwd", "a/b", "a b"}
+		for _, id := range tests {
+			got := claudeFindSourceFile(dir, id)
+			assert.Emptyf(t, got, "claudeFindSourceFile(%q)", id)
+		}
+	})
+}
+
+func TestAmpProviderFindsSourceFile(t *testing.T) {
+	t.Run("Found", func(t *testing.T) {
+		dir := t.TempDir()
+		rel := "T-019ca26f-aaaa-bbbb-cccc-dddddddddddd.json"
+		setupFileSystem(t, dir, map[string]string{
+			rel: "{}",
+		})
+		provider, ok := NewProvider(AgentAmp, ProviderConfig{
+			Roots:   []string{dir},
+			Machine: "local",
+		})
+		require.True(t, ok)
+		got, ok, err := provider.FindSource(
+			t.Context(),
+			FindSourceRequest{
+				RawSessionID: "T-019ca26f-aaaa-bbbb-cccc-dddddddddddd",
+			},
+		)
+		require.NoError(t, err)
+		require.True(t, ok)
+		want := filepath.Join(dir, rel)
+		assert.Equal(t, want, got.DisplayPath)
+	})
+
+	t.Run("Nonexistent", func(t *testing.T) {
+		dir := t.TempDir()
+		provider, ok := NewProvider(AgentAmp, ProviderConfig{
+			Roots:   []string{dir},
+			Machine: "local",
+		})
+		require.True(t, ok)
+		_, ok, err := provider.FindSource(
+			t.Context(),
+			FindSourceRequest{
+				RawSessionID: "T-019ca26f-aaaa-bbbb-cccc-dddddddddddd",
+			},
+		)
+		require.NoError(t, err)
+		assert.False(t, ok, "expected empty")
+	})
+
+	t.Run("Validation", func(t *testing.T) {
+		dir := t.TempDir()
+		provider, ok := NewProvider(AgentAmp, ProviderConfig{
+			Roots:   []string{dir},
+			Machine: "local",
+		})
+		require.True(t, ok)
+		tests := []string{
+			"",
+			"../bad",
+			"T bad",
+			"bad",
+			"T-",
+		}
+		for _, id := range tests {
+			_, ok, err := provider.FindSource(
+				t.Context(),
+				FindSourceRequest{RawSessionID: id},
+			)
+			require.NoError(t, err)
+			assert.Falsef(t, ok, "Amp provider FindSource(%q)", id)
+		}
+	})
+}
+
+func TestFindCodexSourceFile(t *testing.T) {
+	uuid := "abc12345-1234-5678-9abc-def012345678"
+	filename := "rollout-20240115-" + uuid + ".jsonl"
+	relPath := filepath.Join("2024", "01", "15", filename)
+	flatName := "rollout-2026-05-04T02-10-04-" + uuid + ".jsonl"
+
+	tests := []struct {
+		name     string
+		files    map[string]string
+		targetID string
+		wantFile string
+	}{
+		{
+			name:     "FoundDated",
+			files:    map[string]string{relPath: "{}"},
+			targetID: uuid,
+			wantFile: relPath,
+		},
+		{
+			name:     "FoundFlatArchived",
+			files:    map[string]string{flatName: "{}"},
+			targetID: uuid,
+			wantFile: flatName,
+		},
+		{
+			name: "PrefersDatedOverFlat",
+			files: map[string]string{
+				relPath:  "{}",
+				flatName: "{}",
+			},
+			targetID: uuid,
+			wantFile: relPath,
+		},
+		{
+			name:     "Nonexistent",
+			files:    map[string]string{relPath: "{}"},
+			targetID: "nonexistent-uuid",
+			wantFile: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			setupFileSystem(t, dir, tt.files)
+
+			got := findCodexTestSourceFile(t, dir, tt.targetID)
+			want := ""
+			if tt.wantFile != "" {
+				want = filepath.Join(dir, tt.wantFile)
+			}
+
+			assert.Equal(t, want, got)
+		})
+	}
+}
+
+func TestExtractUUIDFromRollout(t *testing.T) {
+	tests := []struct {
+		filename string
+		want     string
+	}{
+		{
+			"rollout-20240115-abc12345-1234-5678-9abc-def012345678.jsonl",
+			"abc12345-1234-5678-9abc-def012345678",
+		},
+		{
+			"rollout-20240115T100000-abc12345-1234-5678-9abc-def012345678.jsonl",
+			"abc12345-1234-5678-9abc-def012345678",
+		},
+		{
+			"short.jsonl",
+			"",
+		},
+		{
+			"rollout-20240115-12345678-1234-1234-1234-1234567890ab-abc12345-1234-5678-9abc-def012345678.jsonl",
+			"abc12345-1234-5678-9abc-def012345678",
+		},
+		{
+			"rollout-20240115-abc12345-1234-5678-9abc-def012345678-suffix.jsonl",
+			"",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.filename, func(t *testing.T) {
+			got := extractUUIDFromRollout(tt.filename)
+			assert.Equalf(t, tt.want, got, "extractUUID(%q)", tt.filename)
+		})
+	}
+}
+
+func TestIsValidSessionID(t *testing.T) {
+	tests := []struct {
+		id   string
+		want bool
+	}{
+		{"abc-123", true},
+		{"session_1", true},
+		{"abc123", true},
+		{"", false},
+		{"../etc", false},
+		{"a b", false},
+		{"a/b", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.id, func(t *testing.T) {
+			got := IsValidSessionID(tt.id)
+			assert.Equalf(t, tt.want, got, "IsValidSessionID(%q)", tt.id)
+		})
+	}
+}
+
+func TestIsDigits(t *testing.T) {
+	tests := []struct {
+		s    string
+		want bool
+	}{
+		{"123", true},
+		{"0", true},
+		{"", false},
+		{"12a", false},
+		{"abc", false},
+		{"\uff11\uff12\uff13", true}, // Fullwidth digits are supported
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.s, func(t *testing.T) {
+			got := IsDigits(tt.s)
+			assert.Equalf(t, tt.want, got, "IsDigits(%q)", tt.s)
+		})
+	}
+}
+
+func TestDiscoverGeminiSessions(t *testing.T) {
+	tests := []struct {
+		name      string
+		files     map[string]string
+		wantFiles []string
+	}{
+		{
+			name: "Basic",
+			files: map[string]string{
+				filepath.Join("tmp", "hash1", geminiChatsDir, "session-2026-01-01T10-00-abc123.json"): "{}",
+				filepath.Join("tmp", "hash1", geminiChatsDir, "session-2026-01-02T10-00-def456.json"): "{}",
+				filepath.Join("tmp", "hash2", geminiChatsDir, "session-2026-01-03T10-00-ghi789.json"): "{}",
+			},
+			wantFiles: []string{
+				filepath.Join("tmp", "hash1", geminiChatsDir, "session-2026-01-01T10-00-abc123.json"),
+				filepath.Join("tmp", "hash1", geminiChatsDir, "session-2026-01-02T10-00-def456.json"),
+				filepath.Join("tmp", "hash2", geminiChatsDir, "session-2026-01-03T10-00-ghi789.json"),
+			},
+		},
+		{
+			name: "NoChatDir",
+			files: map[string]string{
+				filepath.Join("tmp", "hash1", "other.txt"): "{}",
+			},
+			wantFiles: nil,
+		},
+		{
+			name: "SkipsNonSessionFiles",
+			files: map[string]string{
+				filepath.Join("tmp", "hash1", geminiChatsDir, "session-abc.json"):  "{}",
+				filepath.Join("tmp", "hash1", geminiChatsDir, "session-def.jsonl"): "{}",
+				filepath.Join("tmp", "hash1", geminiChatsDir, "other.json"):        "{}",
+				filepath.Join("tmp", "hash1", geminiChatsDir, "session-def.txt"):   "{}",
+			},
+			wantFiles: []string{
+				filepath.Join("tmp", "hash1", geminiChatsDir, "session-abc.json"),
+				filepath.Join("tmp", "hash1", geminiChatsDir, "session-def.jsonl"),
+			},
+		},
+		{
+			name: "NamedDirs",
+			files: map[string]string{
+				filepath.Join("tmp", "my-project", geminiChatsDir, "session-2026-01-01T10-00-abc.json"): "{}",
+			},
+			wantFiles: []string{
+				filepath.Join("tmp", "my-project", geminiChatsDir, "session-2026-01-01T10-00-abc.json"),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			setupFileSystem(t, dir, tt.files)
+
+			files := discoverGeminiTestSessions(t, dir)
+
+			require.Len(t, files, len(tt.wantFiles), "files count")
+
+			wantMap := make(map[string]bool)
+			for _, p := range tt.wantFiles {
+				wantMap[filepath.Join(dir, p)] = true
+			}
+
+			for _, f := range files {
+				assert.Equal(t, AgentGemini, f.Agent, "agent")
+				assert.Truef(t, wantMap[f.Path],
+					"unexpected file discovered: %q", f.Path)
+			}
+		})
+	}
+
+	t.Run("EmptyChatDir", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "tmp", "hash1", geminiChatsDir), 0o755), "mkdir")
+		files := discoverGeminiTestSessions(t, dir)
+		assert.Nil(t, files, "expected nil")
+	})
+
+	t.Run("Nonexistent", func(t *testing.T) {
+		files := discoverGeminiTestSessions(t, filepath.Join(t.TempDir(), "does-not-exist"))
+		assert.Nil(t, files, "expected nil")
+	})
+
+	t.Run("EmptyDir", func(t *testing.T) {
+		files := discoverGeminiTestSessions(t, "")
+		assert.Nil(t, files, "expected nil")
+	})
+}
+
+// TestDiscoverGeminiBuildsProjectMapOncePerRoot guards against rebuilding the
+// project map for every discovered source. The map depends only on the root,
+// and BuildGeminiProjectMap re-reads and SHA-256-hashes projects.json each
+// call, so a per-source rebuild makes discovery scale with session count.
+func TestDiscoverGeminiBuildsProjectMapOncePerRoot(t *testing.T) {
+	dir := t.TempDir()
+	setupFileSystem(t, dir, map[string]string{
+		filepath.Join("tmp", "hash1", geminiChatsDir, "session-2026-01-01T10-00-a.json"): "{}",
+		filepath.Join("tmp", "hash1", geminiChatsDir, "session-2026-01-02T10-00-b.json"): "{}",
+		filepath.Join("tmp", "hash2", geminiChatsDir, "session-2026-01-03T10-00-c.json"): "{}",
+		filepath.Join("tmp", "hash3", geminiChatsDir, "session-2026-01-04T10-00-d.json"): "{}",
+	})
+
+	var calls int
+	orig := buildGeminiProjectMap
+	buildGeminiProjectMap = func(root string) map[string]string {
+		calls++
+		return orig(root)
+	}
+	t.Cleanup(func() { buildGeminiProjectMap = orig })
+
+	got := discoverGeminiTestSessions(t, dir)
+	require.Len(t, got, 4, "expected all sessions discovered")
+	assert.Equal(t, 1, calls,
+		"project map should be built once per root, not once per source")
+}
+
+func TestFindGeminiSourceFile(t *testing.T) {
+	tests := []struct {
+		name     string
+		files    map[string]string
+		targetID string
+		wantFile string
+	}{
+		{
+			name: "Found",
+			files: map[string]string{
+				filepath.Join("tmp", "hash1", geminiChatsDir, "session-2026-01-19T18-21-b0a4eadd.json"): `{"sessionId":"b0a4eadd-cb99-4165-94d9-64cad5a66d24","messages":[]}`,
+			},
+			targetID: "b0a4eadd-cb99-4165-94d9-64cad5a66d24",
+			wantFile: filepath.Join("tmp", "hash1", geminiChatsDir, "session-2026-01-19T18-21-b0a4eadd.json"),
+		},
+		{
+			name: "FoundJSONL",
+			files: map[string]string{
+				filepath.Join("tmp", "hash1", geminiChatsDir, "session-2026-01-19T18-21-b0a4eadd.jsonl"): "{\"sessionId\":\"b0a4eadd-cb99-4165-94d9-64cad5a66d24\",\"kind\":\"main\"}\n",
+			},
+			targetID: "b0a4eadd-cb99-4165-94d9-64cad5a66d24",
+			wantFile: filepath.Join("tmp", "hash1", geminiChatsDir, "session-2026-01-19T18-21-b0a4eadd.jsonl"),
+		},
+		{
+			name: "Nonexistent",
+			files: map[string]string{
+				filepath.Join("tmp", "hash1", geminiChatsDir, "session-2026-01-19T18-21-b0a4eadd.json"): `{"sessionId":"b0a4eadd-cb99-4165-94d9-64cad5a66d24","messages":[]}`,
+			},
+			targetID: "nonexistent-uuid-1234",
+			wantFile: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			setupFileSystem(t, dir, tt.files)
+
+			got := findGeminiTestSourceFile(t, dir, tt.targetID)
+			want := ""
+			if tt.wantFile != "" {
+				want = filepath.Join(dir, tt.wantFile)
+			}
+
+			assert.Equal(t, want, got)
+		})
+	}
+
+	t.Run("ShortID", func(t *testing.T) {
+		dir := t.TempDir()
+		for _, id := range []string{"", "a", "abc", "1234567"} {
+			got := findGeminiTestSourceFile(t, dir, id)
+			assert.Emptyf(t, got, "FindGeminiSourceFile(%q)", id)
+		}
+	})
+
+	t.Run("EmptyDir", func(t *testing.T) {
+		got := findGeminiTestSourceFile(t, "", "b0a4eadd-cb99-4165-94d9-64cad5a66d24")
+		assert.Empty(t, got, "expected empty")
+	})
+}
+
+func TestGeminiPathHash(t *testing.T) {
+	hash := geminiPathHash("/Users/alice/code/sample-repo")
+	assert.Len(t, hash, 64, "hash length")
+	assert.Equal(t, hash, geminiPathHash("/Users/alice/code/sample-repo"),
+		"hash not deterministic")
+}
+
+func TestBuildGeminiProjectMap(t *testing.T) {
+	dir := t.TempDir()
+	projectsJSON := `{"projects":{"/Users/alice/code/my-app":"my-app"}}`
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "projects.json"),
+		[]byte(projectsJSON), 0o644,
+	), "write")
+
+	m := BuildGeminiProjectMap(dir)
+
+	hash := geminiPathHash("/Users/alice/code/my-app")
+	assert.Equal(t, "my_app", m[hash], "project for hash")
+	assert.Equal(t, "my_app", m["my-app"], "project for name")
+}
+
+func TestBuildGeminiProjectMapMissingFile(t *testing.T) {
+	m := BuildGeminiProjectMap(t.TempDir())
+	assert.Empty(t, m, "expected empty map")
+}
+
+func TestResolveGeminiProject(t *testing.T) {
+	projectMap := map[string]string{
+		geminiPathHash("/Users/alice/code/my-app"): "my_app",
+		"my-app":    "my_app",
+		"worktree1": "main_repo",
+	}
+
+	tests := []struct {
+		name    string
+		dirName string
+		want    string
+	}{
+		{
+			"HashLookupHit",
+			geminiPathHash("/Users/alice/code/my-app"),
+			"my_app",
+		},
+		{
+			"HashLookupMiss",
+			geminiPathHash("/Users/alice/code/other"),
+			"unknown",
+		},
+		{
+			"NamedDirInMap",
+			"my-app",
+			"my_app",
+		},
+		{
+			"NamedDirWorktreeResolved",
+			"worktree1",
+			"main_repo",
+		},
+		{
+			"NamedDirNotInMap",
+			"new-project",
+			"new_project",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ResolveGeminiProject(
+				tt.dirName, projectMap,
+			)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestBuildGeminiProjectMapTrustedFolders(t *testing.T) {
+	dir := t.TempDir()
+
+	tfJSON := `{"trustedFolders":["/Users/alice/code/my-app","/Users/alice/code/other"]}`
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "trustedFolders.json"),
+		[]byte(tfJSON), 0o644,
+	), "write")
+
+	m := BuildGeminiProjectMap(dir)
+
+	hash1 := geminiPathHash("/Users/alice/code/my-app")
+	assert.Equal(t, "my_app", m[hash1], "hash for my-app")
+	hash2 := geminiPathHash("/Users/alice/code/other")
+	assert.Equal(t, "other", m[hash2], "hash for other")
+}
+
+func TestBuildGeminiProjectMapBothFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	pJSON := `{"projects":{"/Users/alice/code/proj-a":"proj-a"}}`
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "projects.json"),
+		[]byte(pJSON), 0o644,
+	), "write")
+
+	tfJSON := `{"trustedFolders":["/Users/alice/code/proj-b"]}`
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "trustedFolders.json"),
+		[]byte(tfJSON), 0o644,
+	), "write")
+
+	m := BuildGeminiProjectMap(dir)
+
+	hashA := geminiPathHash("/Users/alice/code/proj-a")
+	assert.Equal(t, "proj_a", m[hashA], "proj-a hash")
+	hashB := geminiPathHash("/Users/alice/code/proj-b")
+	assert.Equal(t, "proj_b", m[hashB], "proj-b hash")
+}
+
+func TestBuildGeminiProjectMapProjectsWin(t *testing.T) {
+	dir := t.TempDir()
+
+	pJSON := `{"projects":{"/Users/alice/code/my-app":"my-app"}}`
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "projects.json"),
+		[]byte(pJSON), 0o644,
+	), "write")
+
+	tfJSON := `{"trustedFolders":["/Users/alice/code/my-app"]}`
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "trustedFolders.json"),
+		[]byte(tfJSON), 0o644,
+	), "write")
+
+	m := BuildGeminiProjectMap(dir)
+
+	hash := geminiPathHash("/Users/alice/code/my-app")
+	assert.Equal(t, "my_app", m[hash], "hash")
+	assert.Equal(t, "my_app", m["my-app"], "name key")
+}
+
+// --- Copilot discovery tests ---
+
+func TestDiscoverCopilotSessions(t *testing.T) {
+	tests := []struct {
+		name      string
+		files     map[string]string
+		wantFiles []string
+	}{
+		{
+			name: "BareFormat",
+			files: map[string]string{
+				filepath.Join(copilotStateDir, "abc-123.jsonl"): "{}",
+				filepath.Join(copilotStateDir, "def-456.jsonl"): "{}",
+			},
+			wantFiles: []string{
+				filepath.Join(copilotStateDir, "abc-123.jsonl"),
+				filepath.Join(copilotStateDir, "def-456.jsonl"),
+			},
+		},
+		{
+			name: "DirFormat",
+			files: map[string]string{
+				filepath.Join(copilotStateDir, "sess-1", "events.jsonl"): "{}",
+				filepath.Join(copilotStateDir, "sess-2", "events.jsonl"): "{}",
+			},
+			wantFiles: []string{
+				filepath.Join(copilotStateDir, "sess-1", "events.jsonl"),
+				filepath.Join(copilotStateDir, "sess-2", "events.jsonl"),
+			},
+		},
+		{
+			name: "Mixed",
+			files: map[string]string{
+				filepath.Join(copilotStateDir, "bare-1.jsonl"):          "{}",
+				filepath.Join(copilotStateDir, "dir-1", "events.jsonl"): "{}",
+			},
+			wantFiles: []string{
+				filepath.Join(copilotStateDir, "bare-1.jsonl"),
+				filepath.Join(copilotStateDir, "dir-1", "events.jsonl"),
+			},
+		},
+		{
+			name: "BareWithInvalidDir",
+			files: map[string]string{
+				filepath.Join(copilotStateDir, "invalid-dir-uuid.jsonl"):        "{}",
+				filepath.Join(copilotStateDir, "invalid-dir-uuid", "other.txt"): "{}",
+			},
+			wantFiles: []string{
+				filepath.Join(copilotStateDir, "invalid-dir-uuid.jsonl"),
+			},
+		},
+		{
+			name: "DedupBareAndDir",
+			files: map[string]string{
+				filepath.Join(copilotStateDir, "dup-uuid-1234.jsonl"):           "{}",
+				filepath.Join(copilotStateDir, "dup-uuid-1234", "events.jsonl"): "{}",
+			},
+			wantFiles: []string{
+				filepath.Join(copilotStateDir, "dup-uuid-1234", "events.jsonl"),
+			},
+		},
+		{
+			name: "DirWithoutEvents",
+			files: map[string]string{
+				filepath.Join(copilotStateDir, "no-events", "other.txt"): "{}",
+			},
+			wantFiles: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			setupFileSystem(t, dir, tt.files)
+
+			files := discoverCopilotTestSessions(t, dir)
+
+			require.Len(t, files, len(tt.wantFiles), "files count")
+
+			wantMap := make(map[string]bool)
+			for _, p := range tt.wantFiles {
+				wantMap[filepath.Join(dir, p)] = true
+			}
+
+			for _, f := range files {
+				assert.Equal(t, AgentCopilot, f.Agent, "agent")
+				assert.Truef(t, wantMap[f.Path],
+					"unexpected file discovered: %q", f.Path)
+			}
+		})
+	}
+
+	t.Run("EmptyDir", func(t *testing.T) {
+		files := discoverCopilotTestSessions(t, "")
+		assert.Nil(t, files, "expected nil")
+	})
+
+	t.Run("Nonexistent", func(t *testing.T) {
+		files := discoverCopilotTestSessions(t, filepath.Join(t.TempDir(), "does-not-exist"))
+		assert.Nil(t, files, "expected nil")
+	})
+}
+
+func TestFindCopilotSourceFile(t *testing.T) {
+	tests := []struct {
+		name     string
+		files    map[string]string
+		targetID string
+		wantFile string
+	}{
+		{
+			name:     "Bare",
+			files:    map[string]string{filepath.Join(copilotStateDir, "abc-123.jsonl"): "{}"},
+			targetID: "abc-123",
+			wantFile: filepath.Join(copilotStateDir, "abc-123.jsonl"),
+		},
+		{
+			name:     "DirFormat",
+			files:    map[string]string{filepath.Join(copilotStateDir, "sess-42", "events.jsonl"): "{}"},
+			targetID: "sess-42",
+			wantFile: filepath.Join(copilotStateDir, "sess-42", "events.jsonl"),
+		},
+		{
+			name:     "Nonexistent",
+			files:    map[string]string{filepath.Join(copilotStateDir, "abc-123.jsonl"): "{}"},
+			targetID: "nonexistent",
+			wantFile: "",
+		},
+		{
+			name: "DirPreferred",
+			files: map[string]string{
+				filepath.Join(copilotStateDir, "dual-1.jsonl"):           "{}",
+				filepath.Join(copilotStateDir, "dual-1", "events.jsonl"): "{}",
+			},
+			targetID: "dual-1",
+			wantFile: filepath.Join(copilotStateDir, "dual-1", "events.jsonl"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			setupFileSystem(t, dir, tt.files)
+
+			got := findCopilotTestSourceFile(t, dir, tt.targetID)
+			want := ""
+			if tt.wantFile != "" {
+				want = filepath.Join(dir, tt.wantFile)
+			}
+
+			assert.Equal(t, want, got)
+		})
+	}
+
+	t.Run("InvalidID", func(t *testing.T) {
+		dir := t.TempDir()
+		for _, id := range []string{"", "../etc/passwd", "a/b", "a b"} {
+			got := findCopilotTestSourceFile(t, dir, id)
+			assert.Emptyf(t, got, "FindCopilotSourceFile(%q)", id)
+		}
+	})
+
+	t.Run("EmptyDir", func(t *testing.T) {
+		got := findCopilotTestSourceFile(t, "", "abc-123")
+		assert.Empty(t, got, "expected empty")
+	})
+}
+
+// --- Symlink tests ---
+
+func TestIsDirOrSymlink(t *testing.T) {
+	dir := t.TempDir()
+
+	realDir := filepath.Join(dir, "real-dir")
+	require.NoError(t, os.MkdirAll(realDir, 0o755), "mkdir")
+
+	realFile := filepath.Join(dir, "file.txt")
+	require.NoError(t, os.WriteFile(realFile, []byte("hi"), 0o644), "write")
+
+	if err := os.Symlink(
+		realDir, filepath.Join(dir, "link-to-dir"),
+	); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	require.NoError(t, os.Symlink(
+		realFile, filepath.Join(dir, "link-to-file"),
+	), "symlink")
+
+	require.NoError(t, os.Symlink(
+		filepath.Join(dir, "gone"),
+		filepath.Join(dir, "broken"),
+	), "symlink")
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err, "readdir")
+
+	want := map[string]bool{
+		"real-dir":     true,
+		"file.txt":     false,
+		"link-to-dir":  true,
+		"link-to-file": false,
+		"broken":       false,
+	}
+
+	for _, e := range entries {
+		expected, ok := want[e.Name()]
+		if !ok {
+			continue
+		}
+		got := isDirOrSymlink(e, dir)
+		assert.Equalf(t, expected, got, "isDirOrSymlink(%q)", e.Name())
+	}
+}
+
+func TestFindClaudeSourceFile_Symlink(t *testing.T) {
+	externalDir := t.TempDir()
+	realDir := filepath.Join(externalDir, "real-project")
+	require.NoError(t, os.MkdirAll(realDir, 0o755), "mkdir")
+	require.NoError(t, os.WriteFile(
+		filepath.Join(realDir, "sess-abc.jsonl"),
+		[]byte("{}"), 0o644,
+	), "write")
+
+	searchDir := t.TempDir()
+	linkDir := filepath.Join(searchDir, "linked-project")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	got := claudeFindSourceFile(searchDir, "sess-abc")
+	require.NotEmpty(t, got, "expected to find session via symlink")
+	assert.Equal(t, linkDir, filepath.Dir(got),
+		"expected path through symlink")
+}
+
+func TestIsContainedIn(t *testing.T) {
+	tests := []struct {
+		name        string
+		child, root string
+		want        bool
+	}{
+		{
+			name:  "child under root",
+			child: "/a/b/c",
+			root:  "/a/b",
+			want:  true,
+		},
+		{
+			name:  "same path",
+			child: "/a/b",
+			root:  "/a/b",
+			want:  false,
+		},
+		{
+			name:  "child outside root",
+			child: "/a/x",
+			root:  "/a/b",
+			want:  false,
+		},
+		{
+			name:  "traversal",
+			child: "/a/b/../x",
+			root:  "/a/b",
+			want:  false,
+		},
+		{
+			name:  "parent of root",
+			child: "/a",
+			root:  "/a/b",
+			want:  false,
+		},
+		{
+			name:  "dotdot-prefixed name",
+			child: "/a/b/..hidden",
+			root:  "/a/b",
+			want:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isContainedIn(tt.child, tt.root)
+			assert.Equalf(t, tt.want, got,
+				"isContainedIn(%q, %q)", tt.child, tt.root)
+		})
+	}
+}
+
+func TestDiscoverCursorSessions(t *testing.T) {
+	cursorTranscripts := filepath.Join(
+		"proj-dir", "agent-transcripts",
+	)
+
+	tests := []struct {
+		name      string
+		files     map[string]string
+		wantCount int
+	}{
+		{
+			name: "TxtOnly",
+			files: map[string]string{
+				filepath.Join(cursorTranscripts, "aaa.txt"): "user:\nhi",
+			},
+			wantCount: 1,
+		},
+		{
+			name: "JsonlOnly",
+			files: map[string]string{
+				filepath.Join(cursorTranscripts, "bbb.jsonl"): `{"role":"user"}`,
+			},
+			wantCount: 1,
+		},
+		{
+			name: "BothExtensionsDedupToJsonl",
+			files: map[string]string{
+				filepath.Join(cursorTranscripts, "ccc.txt"):   "user:\nhi",
+				filepath.Join(cursorTranscripts, "ccc.jsonl"): `{"role":"user"}`,
+			},
+			wantCount: 1,
+		},
+		{
+			name: "IgnoresOtherExtensions",
+			files: map[string]string{
+				filepath.Join(cursorTranscripts, "ddd.json"): "{}",
+				filepath.Join(cursorTranscripts, "eee.log"):  "log",
+			},
+			wantCount: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			setupFileSystem(t, dir, tt.files)
+			set := newCursorSourceSet([]string{dir})
+			paths := set.discoverTranscriptPaths(dir)
+			require.Len(t, paths, tt.wantCount, "paths count")
+		})
+	}
+}
+
+func TestDiscoverCursorSessions_NestedLayout(t *testing.T) {
+	cursorTranscripts := filepath.Join(
+		"proj-dir", "agent-transcripts",
+	)
+
+	tests := []struct {
+		name      string
+		files     map[string]string
+		wantCount int
+	}{
+		{
+			name: "NestedJsonl",
+			files: map[string]string{
+				filepath.Join(cursorTranscripts, "aaa", "aaa.jsonl"): `{"role":"user"}`,
+			},
+			wantCount: 1,
+		},
+		{
+			name: "NestedTxt",
+			files: map[string]string{
+				filepath.Join(cursorTranscripts, "bbb", "bbb.txt"): "user:\nhi",
+			},
+			wantCount: 1,
+		},
+		{
+			name: "NestedWithSubagentsDiscovered",
+			files: map[string]string{
+				filepath.Join(cursorTranscripts, "ccc", "ccc.jsonl"):               `{"role":"user"}`,
+				filepath.Join(cursorTranscripts, "ccc", "subagents", "sub1.jsonl"): `{"role":"user"}`,
+				filepath.Join(cursorTranscripts, "ccc", "subagents", "sub2.jsonl"): `{"role":"user"}`,
+			},
+			wantCount: 3,
+		},
+		{
+			name: "NestedDedupPrefersJsonl",
+			files: map[string]string{
+				filepath.Join(cursorTranscripts, "ddd", "ddd.txt"):   "user:\nhi",
+				filepath.Join(cursorTranscripts, "ddd", "ddd.jsonl"): `{"role":"user"}`,
+			},
+			wantCount: 1,
+		},
+		{
+			name: "NestedIgnoresAuxiliaryFiles",
+			files: map[string]string{
+				filepath.Join(cursorTranscripts, "eee", "eee.jsonl"):   `{"role":"user"}`,
+				filepath.Join(cursorTranscripts, "eee", "other.jsonl"): `{"role":"user"}`,
+				filepath.Join(cursorTranscripts, "eee", "notes.txt"):   "notes",
+			},
+			wantCount: 1,
+		},
+		{
+			name: "MixedFlatAndNested",
+			files: map[string]string{
+				filepath.Join(cursorTranscripts, "flat.txt"):               "user:\nhi",
+				filepath.Join(cursorTranscripts, "nested", "nested.jsonl"): `{"role":"user"}`,
+			},
+			wantCount: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			setupFileSystem(t, dir, tt.files)
+			set := newCursorSourceSet([]string{dir})
+			paths := set.discoverTranscriptPaths(dir)
+			require.Len(t, paths, tt.wantCount, "paths count")
+		})
+	}
+}
+
+func TestDiscoverCursorSessions_DedupPrefersJsonl(t *testing.T) {
+	dir := t.TempDir()
+	transcripts := filepath.Join(
+		"proj-dir", "agent-transcripts",
+	)
+	setupFileSystem(t, dir, map[string]string{
+		filepath.Join(transcripts, "sess.txt"):   "user:\nhi",
+		filepath.Join(transcripts, "sess.jsonl"): `{"role":"user"}`,
+	})
+	set := newCursorSourceSet([]string{dir})
+	paths := set.discoverTranscriptPaths(dir)
+	require.Len(t, paths, 1, "paths count")
+	assert.True(t, strings.HasSuffix(paths[0], ".jsonl"),
+		"expected .jsonl path, got %q", paths[0])
+}
+
+func TestParseCursorTranscriptRelPath(t *testing.T) {
+	// Layout coverage lives in TestParseCursorTranscriptRel; this pins the
+	// exported wrapper's contract of returning only the project directory.
+	tests := []struct {
+		name        string
+		rel         string
+		wantProject string
+		wantOK      bool
+	}{
+		{
+			name:        "flat",
+			rel:         filepath.Join("proj-dir", "agent-transcripts", "sess.jsonl"),
+			wantProject: "proj-dir",
+			wantOK:      true,
+		},
+		{
+			name:        "subagent file",
+			rel:         filepath.Join("proj-dir", "agent-transcripts", "sess", "subagents", "child.jsonl"),
+			wantProject: "proj-dir",
+			wantOK:      true,
+		},
+		{
+			name:   "escapes root",
+			rel:    filepath.Join("..", "agent-transcripts", "sess.jsonl"),
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotProject, gotOK := ParseCursorTranscriptRelPath(tt.rel)
+			require.Equal(t, tt.wantOK, gotOK, "ok")
+			assert.Equal(t, tt.wantProject, gotProject, "project")
+		})
+	}
+}
+
+func TestFindCursorSourceFile(t *testing.T) {
+	cursorTranscripts := filepath.Join(
+		"proj-dir", "agent-transcripts",
+	)
+
+	t.Run("FindsTxt", func(t *testing.T) {
+		dir := t.TempDir()
+		setupFileSystem(t, dir, map[string]string{
+			filepath.Join(cursorTranscripts, "sess1.txt"): "data",
+		})
+		got := cursorFindSourceFile(dir, "sess1")
+		assert.NotEmpty(t, got, "expected to find .txt file")
+	})
+
+	t.Run("FindsJsonl", func(t *testing.T) {
+		dir := t.TempDir()
+		setupFileSystem(t, dir, map[string]string{
+			filepath.Join(cursorTranscripts, "sess2.jsonl"): "{}",
+		})
+		got := cursorFindSourceFile(dir, "sess2")
+		assert.NotEmpty(t, got, "expected to find .jsonl file")
+	})
+
+	t.Run("PrefersJsonlWhenBothExist", func(t *testing.T) {
+		dir := t.TempDir()
+		setupFileSystem(t, dir, map[string]string{
+			filepath.Join(cursorTranscripts, "sess3.txt"):   "old",
+			filepath.Join(cursorTranscripts, "sess3.jsonl"): "new",
+		})
+		jsonlPath := filepath.Join(
+			dir, cursorTranscripts, "sess3.jsonl",
+		)
+		got := cursorFindSourceFile(dir, "sess3")
+		assert.Equal(t, jsonlPath, got, "(.jsonl preferred)")
+	})
+
+	t.Run("FindsNestedJsonl", func(t *testing.T) {
+		dir := t.TempDir()
+		setupFileSystem(t, dir, map[string]string{
+			filepath.Join(cursorTranscripts, "sess4", "sess4.jsonl"): "{}",
+		})
+		got := cursorFindSourceFile(dir, "sess4")
+		require.NotEmpty(t, got, "expected to find nested .jsonl file")
+		assert.True(t, strings.HasSuffix(got, filepath.Join("sess4", "sess4.jsonl")),
+			"unexpected path %q", got)
+	})
+
+	t.Run("PrefersJsonlOverNestedTxt", func(t *testing.T) {
+		dir := t.TempDir()
+		setupFileSystem(t, dir, map[string]string{
+			filepath.Join(cursorTranscripts, "sess5", "sess5.txt"):   "old",
+			filepath.Join(cursorTranscripts, "sess5", "sess5.jsonl"): "new",
+		})
+		got := cursorFindSourceFile(dir, "sess5")
+		assert.True(t, strings.HasSuffix(got, "sess5.jsonl"),
+			"expected .jsonl path, got %q", got)
+	})
+
+	t.Run("NotFound", func(t *testing.T) {
+		dir := t.TempDir()
+		got := cursorFindSourceFile(dir, "nonexistent")
+		assert.Empty(t, got, "expected empty")
+	})
+}
+
+func TestIsPiSessionFile(t *testing.T) {
+	t.Run("ValidSession", func(t *testing.T) {
+		f, err := os.CreateTemp(t.TempDir(), "pi-*.jsonl")
+		require.NoError(t, err)
+		_, _ = f.WriteString(`{"type":"session","id":"abc"}` + "\n")
+		f.Close()
+		assert.True(t, IsPiSessionFile(f.Name()),
+			"expected true for valid session file")
+	})
+
+	t.Run("LongHeaderLine", func(t *testing.T) {
+		// Header line longer than 1 MiB — the old 1 MiB buffer would fail.
+		padding := strings.Repeat("x", 2*1024*1024)
+		line := `{"type":"session","id":"abc","pad":"` + padding + `"}` + "\n"
+		f, err := os.CreateTemp(t.TempDir(), "pi-*.jsonl")
+		require.NoError(t, err)
+		_, _ = f.WriteString(line)
+		f.Close()
+		assert.True(t, IsPiSessionFile(f.Name()),
+			"expected true for session file with long header line (>1 MiB)")
+	})
+
+	t.Run("LeadingBlankLines", func(t *testing.T) {
+		f, err := os.CreateTemp(t.TempDir(), "pi-*.jsonl")
+		require.NoError(t, err)
+		_, _ = f.WriteString("\n\n" + `{"type":"session","id":"abc"}` + "\n")
+		f.Close()
+		assert.True(t, IsPiSessionFile(f.Name()),
+			"expected true for session file with leading blank lines")
+	})
+
+	t.Run("NonSessionJSON", func(t *testing.T) {
+		f, err := os.CreateTemp(t.TempDir(), "pi-*.jsonl")
+		require.NoError(t, err)
+		_, _ = f.WriteString(`{"type":"message","id":"abc"}` + "\n")
+		f.Close()
+		assert.False(t, IsPiSessionFile(f.Name()),
+			"expected false for non-session JSON")
+	})
+
+	t.Run("OMPTitleSlotBeforeSession", func(t *testing.T) {
+		// OMP (Oh My Pi) v16.3+ writes a fixed-width rewritable title slot
+		// as the first line; the session header is on the second line.
+		f, err := os.CreateTemp(t.TempDir(), "omp-*.jsonl")
+		require.NoError(t, err)
+		_, _ = f.WriteString(
+			`{"type":"title","v":1,"title":"","updatedAt":"2026-07-02T09:48:32.328Z","pad":"      "}` + "\n" +
+				`{"type":"session","version":3,"id":"abc","timestamp":"2026-07-02T09:48:32.328Z","cwd":"/repos/x"}` + "\n")
+		f.Close()
+		assert.True(t, IsPiSessionFile(f.Name()),
+			"expected true for OMP file with title slot before session header")
+	})
+
+	t.Run("OMPTitleSlotWithoutSession", func(t *testing.T) {
+		f, err := os.CreateTemp(t.TempDir(), "omp-*.jsonl")
+		require.NoError(t, err)
+		_, _ = f.WriteString(
+			`{"type":"title","v":1,"title":"orphan","updatedAt":"2026-07-02T09:48:32.328Z","pad":" "}` + "\n")
+		f.Close()
+		assert.False(t, IsPiSessionFile(f.Name()),
+			"expected false for title slot with no session header")
+	})
+
+	t.Run("EmptyFile", func(t *testing.T) {
+		f, err := os.CreateTemp(t.TempDir(), "pi-*.jsonl")
+		require.NoError(t, err)
+		f.Close()
+		assert.False(t, IsPiSessionFile(f.Name()),
+			"expected false for empty file")
+	})
+}
+
+func TestDiscoverVibeSessionsIntegration(t *testing.T) {
+	// Test discovery with testdata
+	files := discoverVibeTestSessions(t, "testdata/vibe")
+
+	// Should find all session directories with messages.jsonl
+	require.NotEmpty(t, files)
+
+	// Verify all files are Vibe sessions
+	for _, f := range files {
+		assert.Equal(t, AgentVibe, f.Agent)
+		assert.Contains(t, f.Path, "messages.jsonl")
+	}
+
+	// Should find at least 3 sessions (basic, with_tools, empty)
+	assert.GreaterOrEqual(t, len(files), 3)
+}
+
+func TestFindVibeSourceFileIntegration(t *testing.T) {
+	// Test with actual testdata
+	sessionID := "session_basic"
+	result := findVibeTestSourceFile(t, "testdata/vibe", sessionID)
+
+	expected := filepath.Join("testdata", "vibe", sessionID, "messages.jsonl")
+	assert.Equal(t, expected, result)
+}
+
+func TestClaudeSubagentTranscriptPaths(t *testing.T) {
+	files := map[string]string{
+		filepath.Join("project-a", "parent-session.jsonl"): "{}",
+		filepath.Join("project-a", "parent-session", "subagents",
+			"agent-abc.jsonl"): "{}",
+		filepath.Join("project-a", "parent-session", "subagents",
+			"agent-abc.meta.json"): "{}",
+		filepath.Join("project-a", "parent-session", "subagents",
+			"not-agent.jsonl"): "{}",
+		filepath.Join("project-a", "parent-session", "subagents",
+			"workflows", "wf-1", "agent-deep.jsonl"): "{}",
+		// A sibling session's subagents must not leak in.
+		filepath.Join("project-a", "other-session.jsonl"): "{}",
+		filepath.Join("project-a", "other-session", "subagents",
+			"agent-other.jsonl"): "{}",
+	}
+	dir := t.TempDir()
+	setupFileSystem(t, dir, files)
+	projectDir := filepath.Join(dir, "project-a")
+
+	tests := []struct {
+		name  string
+		path  string
+		want  []string
+		empty bool
+	}{
+		{
+			name: "walks the whole subagents tree",
+			path: filepath.Join(projectDir, "parent-session.jsonl"),
+			want: []string{
+				filepath.Join(projectDir, "parent-session", "subagents",
+					"agent-abc.jsonl"),
+				filepath.Join(projectDir, "parent-session", "subagents",
+					"workflows", "wf-1", "agent-deep.jsonl"),
+			},
+		},
+		{
+			name:  "session without a subagents directory",
+			path:  filepath.Join(projectDir, "other-session-2.jsonl"),
+			empty: true,
+		},
+		{
+			name: "subagent scans the enclosing root tree",
+			path: filepath.Join(projectDir, "parent-session", "subagents", "agent-abc.jsonl"),
+			want: []string{
+				filepath.Join(projectDir, "parent-session", "subagents",
+					"workflows", "wf-1", "agent-deep.jsonl"),
+			},
+		},
+		{
+			name:  "non-transcript path",
+			path:  filepath.Join(projectDir, "parent-session.meta.json"),
+			empty: true,
+		},
+		{
+			name:  "empty path",
+			path:  "",
+			empty: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ClaudeSubagentTranscriptPaths(tt.path)
+			if tt.empty {
+				assert.Empty(t, got)
+				return
+			}
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}

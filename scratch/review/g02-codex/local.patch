@@ -1,0 +1,1971 @@
+diff --git a/internal/parser/codex.go b/internal/parser/codex.go
+index 82a489c1..f323e0ae 100644
+--- a/internal/parser/codex.go
++++ b/internal/parser/codex.go
+@@ -2,14 +2,18 @@ package parser
+ 
+ import (
+ 	"bufio"
++	"bytes"
+ 	"context"
++	"database/sql"
+ 	"encoding/base64"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+ 	"os"
+ 	"path/filepath"
+ 	"regexp"
++	"slices"
+ 	"sort"
+ 	"strconv"
+ 	"strings"
+@@ -62,6 +66,7 @@ type codexSessionBuilder struct {
+ 	sink                        CodexSessionSink
+ 	projectContext              context.Context
+ 	resolveParentTurns          codexParentTurnResolver
++	resolveCanonicalParent      codexParentSessionResolver
+ 	parentTurnIDs               map[string]struct{}
+ 	firstMessage                string
+ 	startedAt                   time.Time
+@@ -128,6 +133,7 @@ func (g *codexForkGate) retryReason() string {
+ }
+ 
+ type codexParentTurnResolver func(string) (map[string]struct{}, bool)
++type codexParentSessionResolver func(string) string
+ 
+ // armFromMeta records explicit lineage and activates replay filtering only
+ // when the referenced parent transcript was resolved. Missing parents fail
+@@ -241,8 +247,14 @@ func (b *codexSessionBuilder) armForkGate(payload gjson.Result) {
+ 		parentID = codexSubagentParentThreadID(payload)
+ 	}
+ 	resolved := false
+-	if parentID != "" && b.resolveParentTurns != nil {
+-		b.parentTurnIDs, resolved = b.resolveParentTurns(parentID)
++	if parentID != "" {
++		canonicalParent := parentID
++		if b.resolveCanonicalParent != nil {
++			canonicalParent = b.resolveCanonicalParent(parentID)
++		}
++		if b.resolveParentTurns != nil {
++			b.parentTurnIDs, resolved = b.resolveParentTurns(canonicalParent)
++		}
+ 	}
+ 	b.forkGate.armFromMeta(payload, resolved)
+ }
+@@ -253,7 +265,11 @@ func (b *codexSessionBuilder) suppresses(
+ ) bool {
+ 	if b.forkGate.active && b.parentTurnIDs == nil &&
+ 		b.resolveParentTurns != nil {
+-		b.parentTurnIDs, _ = b.resolveParentTurns(b.forkGate.parentSessionID)
++		parentID := b.forkGate.parentSessionID
++		if b.resolveCanonicalParent != nil {
++			parentID = b.resolveCanonicalParent(parentID)
++		}
++		b.parentTurnIDs, _ = b.resolveParentTurns(parentID)
+ 	}
+ 	return b.forkGate.suppresses(lineType, payload, b.parentTurnIDs)
+ }
+@@ -413,9 +429,20 @@ func (b *codexSessionBuilder) handleSessionMeta(
+ 			payload.Get("source.subagent.thread_spawn.agent_path").Str,
+ 		)
+ 	}
+-	b.parentSessionID = codexSubagentParentThreadID(payload)
+-	if b.parentSessionID != "" {
+-		b.parentSessionID = codexSubagentSessionID(b.parentSessionID)
++	forkedFromID := strings.TrimSpace(payload.Get("forked_from_id").Str)
++	if forkedFromID != "" {
++		canonicalParent := forkedFromID
++		if b.resolveCanonicalParent != nil {
++			canonicalParent = b.resolveCanonicalParent(forkedFromID)
++		}
++		b.parentSessionID = codexSubagentSessionID(canonicalParent)
++		b.relationshipType = RelFork
++	} else if parentThreadID := codexSubagentParentThreadID(payload); parentThreadID != "" {
++		canonicalParent := parentThreadID
++		if b.resolveCanonicalParent != nil {
++			canonicalParent = b.resolveCanonicalParent(parentThreadID)
++		}
++		b.parentSessionID = codexSubagentSessionID(canonicalParent)
+ 		b.relationshipType = RelSubagent
+ 	}
+ 	if payload.Get("originator").Str == codexOriginatorExec {
+@@ -427,9 +454,13 @@ func (b *codexSessionBuilder) handleSessionMeta(
+ 
+ 	if cwd := payload.Get("cwd").Str; cwd != "" {
+ 		b.cwd = cwd
+-		branch := payload.Get("git.branch").Str
++	}
++	if branch := payload.Get("git.branch").Str; branch != "" {
++		b.gitBranch = branch
++	}
++	if b.cwd != "" {
+ 		if proj := ExtractProjectFromCwdWithBranchContext(
+-			b.projectContext, cwd, branch,
++			b.projectContext, b.cwd, b.gitBranch,
+ 		); proj != "" {
+ 			b.project = proj
+ 		} else {
+@@ -1568,6 +1599,21 @@ func IsCodexExecSessionFile(path string) bool {
+ 			return true
+ 		}
+ 	}
++	if _, seekErr := f.Seek(0, io.SeekStart); seekErr == nil {
++		dec := json.NewDecoder(f)
++		var raw json.RawMessage
++		if decErr := dec.Decode(&raw); decErr == nil {
++			trimmed := bytes.TrimSpace(raw)
++			if bytes.HasPrefix(trimmed, []byte("[")) {
++				var items []json.RawMessage
++				if err := json.Unmarshal(trimmed, &items); err == nil && len(items) > 0 {
++					return gjson.Get(string(items[0]), "payload.originator").Str == codexOriginatorExec
++				}
++			} else {
++				return gjson.Get(string(raw), "payload.originator").Str == codexOriginatorExec
++			}
++		}
++	}
+ 	return false
+ }
+ 
+@@ -1625,6 +1671,68 @@ func (p *codexProvider) parseSessionWithCursor(
+ 	)
+ }
+ 
++func (p *codexProvider) resolveCanonicalParentID(
++	ctx context.Context, childPath, parentID string,
++) string {
++	curr := strings.TrimPrefix(strings.TrimSpace(parentID), "codex:")
++	if curr == "" || !IsValidSessionID(curr) {
++		return parentID
++	}
++	visited := make(map[string]struct{})
++	for i := 0; i < 20; i++ {
++		if ctx.Err() != nil {
++			return curr
++		}
++		if _, seen := visited[curr]; seen {
++			break
++		}
++		visited[curr] = struct{}{}
++
++		pf := p.sources.findContinuationParentFile(childPath, curr)
++		if pf == "" {
++			for _, root := range p.sources.roots {
++				if cand := p.sources.findSourceFile(root, curr); cand != "" {
++					pf = cand
++					break
++				}
++			}
++		}
++		if pf == "" {
++			break
++		}
++		bname := filepath.Base(pf)
++		rootUUID := extractUUIDFromRollout(bname)
++		if rootUUID != "" && rootUUID != curr {
++			curr = rootUUID
++			continue
++		}
++		header, err := readCodexSessionMetaHeader(pf)
++		if err != nil {
++			break
++		}
++		if header.Get("history_mode").Str == "paginated" {
++			hb := header.Get("history_base")
++			if hb.Exists() && hb.Type != gjson.Null {
++				nextID := strings.TrimSpace(hb.Get("thread_id").Str)
++				if nextID != "" && nextID != curr {
++					curr = nextID
++					continue
++				}
++			}
++		}
++		break
++	}
++	return curr
++}
++
++func (p *codexProvider) canonicalParentResolver(
++	ctx context.Context, childPath string,
++) codexParentSessionResolver {
++	return func(parentID string) string {
++		return p.resolveCanonicalParentID(ctx, childPath, parentID)
++	}
++}
++
+ func (p *codexProvider) parentTurnResolver(
+ 	ctx context.Context, childPath string,
+ ) codexParentTurnResolver {
+@@ -1632,7 +1740,8 @@ func (p *codexProvider) parentTurnResolver(
+ 		if ctx.Err() != nil {
+ 			return nil, false
+ 		}
+-		parentKey := strings.Join(p.sources.roots, "\x00") + "\x00" + parentID
++		canonicalParent := p.resolveCanonicalParentID(ctx, childPath, parentID)
++		parentKey := strings.Join(p.sources.roots, "\x00") + "\x00" + canonicalParent
+ 		if turnIDs, ok := p.parentTurnCache.GetParent(parentKey); ok {
+ 			return turnIDs, true
+ 		}
+@@ -1641,13 +1750,19 @@ func (p *codexProvider) parentTurnResolver(
+ 			if ctx.Err() != nil {
+ 				return nil, false
+ 			}
+-			candidate := p.sources.findSourceFile(root, parentID)
++			candidate := p.sources.findSourceFile(root, canonicalParent)
+ 			if candidate == "" || filepath.Clean(candidate) == filepath.Clean(childPath) {
+ 				continue
+ 			}
+ 			parentPath = candidate
+ 			break
+ 		}
++		if parentPath == "" {
++			candidate := p.sources.findContinuationParentFile(childPath, canonicalParent)
++			if candidate != "" && filepath.Clean(candidate) != filepath.Clean(childPath) {
++				parentPath = candidate
++			}
++		}
+ 		if parentPath == "" {
+ 			return nil, false
+ 		}
+@@ -1661,15 +1776,33 @@ func (p *codexProvider) parentTurnResolver(
+ 		}
+ 
+ 		turnIDs := make(map[string]struct{})
+-		_, err = readCodexJSONLFromContext(ctx, parentPath, 0, func(line string) {
+-			if gjson.Get(line, "type").Str != codexTypeTurnContext {
+-				return
+-			}
+-			turnIDs[gjson.Get(line, "payload.turn_id").Str] = struct{}{}
+-		})
++		collectTurns := func(filePath string) error {
++			_, err := readCodexJSONLFromContext(ctx, filePath, 0, func(line string) {
++				if gjson.Get(line, "type").Str != codexTypeTurnContext {
++					return
++				}
++				turnIDs[gjson.Get(line, "payload.turn_id").Str] = struct{}{}
++			})
++			return err
++		}
++		err = collectTurns(parentPath)
+ 		if err != nil && !errors.Is(err, errCodexIncrementalNeedsFullParse) {
+ 			return nil, false
+ 		}
++		if parentHeader, headErr := readCodexSessionMetaHeader(parentPath); headErr == nil && parentHeader.Get("history_mode").Str == "paginated" {
++			pBase := parentHeader.Get("history_base")
++			if pBase.Exists() && pBase.Type != gjson.Null {
++				nextID := strings.TrimSpace(pBase.Get("thread_id").Str)
++				if nextID != "" {
++					chain, chainErr := p.resolveContinuationChain(ctx, parentPath, nextID, pBase.Get("end_ordinal_exclusive").Int())
++					if chainErr == nil {
++						for _, seg := range chain {
++							_ = collectTurns(seg.path)
++						}
++					}
++				}
++			}
++		}
+ 		p.parentTurnCache.PutParent(parentKey, cacheKey, turnIDs)
+ 		return turnIDs, true
+ 	}
+@@ -1771,6 +1904,151 @@ func (p *codexProvider) parseSessionSnapshotWithCursor(
+ 	)
+ }
+ 
++type codexContinuationSegment struct {
++	path                string
++	endOrdinalExclusive int64
++}
++
++func readCodexSessionMetaHeader(path string) (gjson.Result, error) {
++	f, err := os.Open(path)
++	if err != nil {
++		return gjson.Result{}, err
++	}
++	defer f.Close()
++
++	reader := bufio.NewReader(f)
++	line, err := reader.ReadBytes('\n')
++	if err != nil && len(line) == 0 {
++		return gjson.Result{}, err
++	}
++	if gjson.Get(string(line), "type").Str == codexTypeSessionMeta {
++		return gjson.Get(string(line), "payload"), nil
++	}
++	if _, seekErr := f.Seek(0, io.SeekStart); seekErr == nil {
++		dec := json.NewDecoder(f)
++		for {
++			var raw json.RawMessage
++			if decErr := dec.Decode(&raw); decErr != nil {
++				break
++			}
++			trimmed := bytes.TrimSpace(raw)
++			if bytes.HasPrefix(trimmed, []byte("[")) {
++				var items []json.RawMessage
++				if err := json.Unmarshal(trimmed, &items); err == nil {
++					for _, item := range items {
++						if gjson.Get(string(item), "type").Str == codexTypeSessionMeta {
++							return gjson.Get(string(item), "payload"), nil
++						}
++					}
++				}
++			} else if gjson.Get(string(raw), "type").Str == codexTypeSessionMeta {
++				return gjson.Get(string(raw), "payload"), nil
++			}
++		}
++	}
++	return gjson.Result{}, nil
++}
++
++func (p *codexProvider) resolveContinuationChain(
++	ctx context.Context, leafPath, initialThreadID string, initialEndOrdinal int64,
++) ([]codexContinuationSegment, error) {
++	var chain []codexContinuationSegment
++	visited := map[string]struct{}{
++		filepath.Clean(leafPath): {},
++	}
++
++	currThreadID := initialThreadID
++	currEndOrd := initialEndOrdinal
++	currPath := leafPath
++
++	for {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++		parentPath := p.sources.findContinuationParentFile(currPath, currThreadID)
++		if parentPath == "" {
++			break
++		}
++		cleanParent := filepath.Clean(parentPath)
++		if _, seen := visited[cleanParent]; seen {
++			break
++		}
++		visited[cleanParent] = struct{}{}
++
++		chain = append(chain, codexContinuationSegment{
++			path:                parentPath,
++			endOrdinalExclusive: currEndOrd,
++		})
++
++		parentHeader, err := readCodexSessionMetaHeader(parentPath)
++		if err != nil {
++			break
++		}
++		if parentHeader.Get("history_mode").Str != "paginated" {
++			break
++		}
++		pBase := parentHeader.Get("history_base")
++		if !pBase.Exists() || pBase.Type == gjson.Null {
++			break
++		}
++		nextThreadID := strings.TrimSpace(pBase.Get("thread_id").Str)
++		if nextThreadID == "" {
++			break
++		}
++		currThreadID = nextThreadID
++		currEndOrd = pBase.Get("end_ordinal_exclusive").Int()
++		currPath = parentPath
++	}
++
++	slices.Reverse(chain)
++	return chain, nil
++}
++
++func (p *codexProvider) feedContinuationSegment(
++	ctx context.Context,
++	seg codexContinuationSegment,
++	b *codexSessionBuilder,
++	malformedLines *int,
++) error {
++	f, err := os.Open(seg.path)
++	if err != nil {
++		return nil
++	}
++	defer f.Close()
++
++	info, err := f.Stat()
++	if err != nil {
++		return nil
++	}
++
++	lr := newLineReaderContext(ctx, io.LimitReader(f, info.Size()), maxLineSize)
++	defer releaseLineReader(lr)
++
++	for {
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++		line, ok := lr.next()
++		if !ok {
++			break
++		}
++		if !gjson.Valid(line) {
++			if malformedLines != nil {
++				*malformedLines++
++			}
++			continue
++		}
++		if seg.endOrdinalExclusive > 0 {
++			ordResult := gjson.Get(line, "ordinal")
++			if ordResult.Exists() && ordResult.Int() >= seg.endOrdinalExclusive {
++				break
++			}
++		}
++		b.processLine(ctx, line)
++	}
++	return lr.Err()
++}
++
+ // parseCodexSessionSnapshotStreaming decodes one snapshot, emitting every
+ // normalized operation into the caller's sink instead of accumulating a
+ // full message slice inside the parser. The returned message slice comes
+@@ -1792,7 +2070,9 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
+ 	b := newCodexSessionBuilder(
+ 		ctx, includeExec, p.parentTurnResolver(ctx, path), sink,
+ 	)
++	b.resolveCanonicalParent = p.canonicalParentResolver(ctx, path)
+ 	malformedLines := 0
++	continuationLoaded := false
+ 
+ 	for {
+ 		if err := ctx.Err(); err != nil {
+@@ -1816,6 +2096,29 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
+ 			}
+ 			continue
+ 		}
++		if !continuationLoaded && gjson.Get(line, "type").Str == codexTypeSessionMeta {
++			continuationLoaded = true
++			payload := gjson.Get(line, "payload")
++			if payload.Get("history_mode").Str == "paginated" {
++				historyBase := payload.Get("history_base")
++				if historyBase.Exists() && historyBase.Type != gjson.Null {
++					threadID := strings.TrimSpace(historyBase.Get("thread_id").Str)
++					if threadID != "" {
++						chain, chainErr := p.resolveContinuationChain(
++							ctx, path, threadID, historyBase.Get("end_ordinal_exclusive").Int(),
++						)
++						if chainErr != nil {
++							return nil, nil, codexCursorState{}, false, nil, "", "", chainErr
++						}
++						for _, seg := range chain {
++							if err := p.feedContinuationSegment(ctx, seg, b, &malformedLines); err != nil {
++								return nil, nil, codexCursorState{}, false, nil, "", "", err
++							}
++						}
++					}
++				}
++			}
++		}
+ 		if b.processLine(ctx, line) {
+ 			return nil, nil, codexCursorState{}, false, nil, "", "", nil
+ 		}
+@@ -1827,6 +2130,91 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
+ 			fmt.Errorf("reading codex %s: %w", path, err)
+ 	}
+ 
++	if b.sessionID == "" && malformedLines > 0 {
++		if _, seekErr := f.Seek(0, io.SeekStart); seekErr == nil {
++			sink.Reset()
++			tee = newCodexHashAnchorTee(io.LimitReader(f, info.Size()))
++			b = newCodexSessionBuilder(
++				ctx, includeExec, p.parentTurnResolver(ctx, path), sink,
++			)
++			b.resolveCanonicalParent = p.canonicalParentResolver(ctx, path)
++			malformedLines = 0
++			continuationLoaded = false
++
++			dec := json.NewDecoder(tee)
++			for {
++				if err := ctx.Err(); err != nil {
++					return nil, nil, codexCursorState{}, false, nil, "", "", err
++				}
++				var raw json.RawMessage
++				if err := dec.Decode(&raw); err != nil {
++					if errors.Is(err, io.EOF) {
++						break
++					}
++					malformedLines++
++					break
++				}
++				trimmed := bytes.TrimSpace(raw)
++				if bytes.HasPrefix(trimmed, []byte("[")) {
++					var items []json.RawMessage
++					if err := json.Unmarshal(trimmed, &items); err == nil {
++						for _, item := range items {
++							line := string(item)
++							if !continuationLoaded && gjson.Get(line, "type").Str == codexTypeSessionMeta {
++								continuationLoaded = true
++								payload := gjson.Get(line, "payload")
++								if payload.Get("history_mode").Str == "paginated" {
++									historyBase := payload.Get("history_base")
++									if historyBase.Exists() && historyBase.Type != gjson.Null {
++										threadID := strings.TrimSpace(historyBase.Get("thread_id").Str)
++										if threadID != "" {
++											chain, chainErr := p.resolveContinuationChain(
++												ctx, path, threadID, historyBase.Get("end_ordinal_exclusive").Int(),
++											)
++											if chainErr == nil {
++												for _, seg := range chain {
++													_ = p.feedContinuationSegment(ctx, seg, b, &malformedLines)
++												}
++											}
++										}
++									}
++								}
++							}
++							if b.processLine(ctx, line) {
++								return nil, nil, codexCursorState{}, false, nil, "", "", nil
++							}
++						}
++					}
++					continue
++				}
++				line := string(raw)
++				if !continuationLoaded && gjson.Get(line, "type").Str == codexTypeSessionMeta {
++					continuationLoaded = true
++					payload := gjson.Get(line, "payload")
++					if payload.Get("history_mode").Str == "paginated" {
++						historyBase := payload.Get("history_base")
++						if historyBase.Exists() && historyBase.Type != gjson.Null {
++							threadID := strings.TrimSpace(historyBase.Get("thread_id").Str)
++							if threadID != "" {
++								chain, chainErr := p.resolveContinuationChain(
++									ctx, path, threadID, historyBase.Get("end_ordinal_exclusive").Int(),
++								)
++								if chainErr == nil {
++									for _, seg := range chain {
++										_ = p.feedContinuationSegment(ctx, seg, b, &malformedLines)
++									}
++								}
++							}
++						}
++					}
++				}
++				if b.processLine(ctx, line) {
++					return nil, nil, codexCursorState{}, false, nil, "", "", nil
++				}
++			}
++		}
++	}
++
+ 	if err := b.flushPendingAgentResultsContext(ctx); err != nil {
+ 		return nil, nil, codexCursorState{}, false, nil, "", "", err
+ 	}
+@@ -1892,15 +2280,23 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
+ 		sessionName = codexAgentPathLeaf(b.agentPath)
+ 	}
+ 
++	parentSessionID := b.parentSessionID
++	if b.resolveCanonicalParent != nil && parentSessionID != "" {
++		rawParent := strings.TrimPrefix(parentSessionID, "codex:")
++		canonical := b.resolveCanonicalParent(rawParent)
++		parentSessionID = codexSubagentSessionID(canonical)
++	}
++
+ 	sess := &ParsedSession{
+ 		ID:                 sessionID,
+ 		Project:            b.project,
+ 		Machine:            machine,
+ 		Agent:              AgentCodex,
+-		ParentSessionID:    b.parentSessionID,
++		ParentSessionID:    parentSessionID,
+ 		RelationshipType:   b.relationshipType,
+ 		SessionKind:        b.sessionKind,
+ 		Cwd:                b.cwd,
++		GitBranch:          b.gitBranch,
+ 		FirstMessage:       b.firstMessage,
+ 		SessionName:        sessionName,
+ 		SessionNamePresent: sessionNamePresent,
+@@ -2055,6 +2451,35 @@ func codexSessionIndexPath(sessionPath string) string {
+ 	return ""
+ }
+ 
++func loadCodexSessionIndexSQLite(dbPath string) (map[string]string, error) {
++	var titles map[string]string
++	err := WithSQLiteReadOnly(context.Background(), dbPath, sqliteReadOptions{busyTimeoutMS: 3000}, func(db *sql.DB) error {
++		rows, err := db.Query("SELECT id, title FROM threads WHERE id != '' AND title != ''")
++		if err != nil {
++			return err
++		}
++		defer rows.Close()
++
++		t := make(map[string]string)
++		for rows.Next() {
++			var id, title string
++			if err := rows.Scan(&id, &title); err != nil {
++				return err
++			}
++			t[id] = title
++		}
++		if err := rows.Err(); err != nil {
++			return err
++		}
++		titles = t
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return titles, nil
++}
++
+ func loadCodexSessionIndex(indexPath string) (map[string]string, error) {
+ 	info, err := os.Stat(indexPath)
+ 	if err != nil {
+@@ -2075,15 +2500,25 @@ func loadCodexSessionIndex(indexPath string) (map[string]string, error) {
+ 	}
+ 	codexSessionIndexCache.mu.Unlock()
+ 
+-	f, err := os.Open(indexPath)
+-	if err != nil {
+-		return nil, err
+-	}
+-	defer f.Close()
++	var titles map[string]string
++	if strings.HasSuffix(indexPath, ".sqlite") || strings.HasSuffix(indexPath, ".db") {
++		var sqErr error
++		titles, sqErr = loadCodexSessionIndexSQLite(indexPath)
++		if sqErr != nil {
++			return nil, sqErr
++		}
++	} else {
++		f, err := os.Open(indexPath)
++		if err != nil {
++			return nil, err
++		}
++		defer f.Close()
+ 
+-	titles, err := ParseCodexSessionIndexTitles(f)
+-	if err != nil {
+-		return nil, err
++		var parseErr error
++		titles, parseErr = ParseCodexSessionIndexTitles(f)
++		if parseErr != nil {
++			return nil, parseErr
++		}
+ 	}
+ 
+ 	codexSessionIndexCache.mu.Lock()
+@@ -2553,6 +2988,7 @@ func (p *codexProvider) parseSessionFromWithSources(ctx context.Context,
+ 		p.parentTurnResolver(ctx, path),
+ 		NewCodexCollectingSink(startOrdinal),
+ 	)
++	b.resolveCanonicalParent = p.canonicalParentResolver(ctx, path)
+ 	b.codexCursorState = seed.codexCursorState
+ 	b.overflowPendingCalls = seed.overflowPendingCalls
+ 	if committedUsageTarget != nil {
+diff --git a/internal/parser/codex_checkpoint_test.go b/internal/parser/codex_checkpoint_test.go
+index a3f9bc54..d8fcc2ed 100644
+--- a/internal/parser/codex_checkpoint_test.go
++++ b/internal/parser/codex_checkpoint_test.go
+@@ -15,6 +15,7 @@ func TestCodexCursorStateCheckpointRoundTrip(t *testing.T) {
+ 	seed := codexCursorState{
+ 		model:                    "gpt-5.6-luna",
+ 		cwd:                      "/workspace/project-a",
++		gitBranch:                "feature/test-branch",
+ 		agentPath:                "codex/agents/a",
+ 		firstUserSeen:            true,
+ 		sawUserTurnAfterFirst:    true,
+diff --git a/internal/parser/codex_collecting_sink.go b/internal/parser/codex_collecting_sink.go
+index 82d7b724..b728a77d 100644
+--- a/internal/parser/codex_collecting_sink.go
++++ b/internal/parser/codex_collecting_sink.go
+@@ -250,6 +250,15 @@ func (s *CodexCollectingSink) Finalize() {
+ 	}
+ }
+ 
++func (s *CodexCollectingSink) Reset() {
++	s.messages = nil
++	s.callRefs = make(map[string]codexToolCallRef)
++	s.callRefsByPosition = make(map[ParsedToolCallPosition]codexToolCallRef)
++	s.toolCallUpdates = nil
++	s.orphanNotificationIx = make(map[string]int)
++	s.nextOrdinal = 0
++}
++
+ func (s *CodexCollectingSink) Messages() []ParsedMessage {
+ 	return s.messages
+ }
+diff --git a/internal/parser/codex_cursor.go b/internal/parser/codex_cursor.go
+index dbf1f301..6f4d89f4 100644
+--- a/internal/parser/codex_cursor.go
++++ b/internal/parser/codex_cursor.go
+@@ -20,12 +20,13 @@ const (
+ 	// codexCursorCheckpointVersion is the wire version for the persisted
+ 	// cursor encoding. Bump when the encoding changes; decode failures fall
+ 	// back to a full parse.
++	// Version 5 stores git branch alongside cwd and agentPath.
+ 	// Version 4 stores the current reasoning effort alongside the model.
+ 	// Version 3 replaces duplicate IDs with their latest occurrence, matching
+ 	// full parsing; version 2 retained the oldest unresolved occurrence.
+ 	// The fork replay gate is process-only state: it is re-armed from the
+ 	// transcript on every parse and is not part of the persisted cursor.
+-	codexCursorCheckpointVersion   = 4
++	codexCursorCheckpointVersion   = 5
+ 	codexCursorCheckpointMaxString = 1 << 20
+ 
+ 	// Account for the map bucket, list element, pointers, string headers, and
+@@ -53,6 +54,7 @@ type codexCursorState struct {
+ 	model                    string
+ 	reasoningEffort          string
+ 	cwd                      string
++	gitBranch                string
+ 	agentPath                string
+ 	firstUserDigest          [sha256.Size]byte
+ 	firstUserSeen            bool
+@@ -92,7 +94,7 @@ func (s *codexCursorState) MarshalBinary() ([]byte, error) {
+ 	if err := write(uint8(codexCursorCheckpointVersion)); err != nil {
+ 		return nil, err
+ 	}
+-	for _, str := range []string{s.model, s.reasoningEffort, s.cwd, s.agentPath} {
++	for _, str := range []string{s.model, s.reasoningEffort, s.cwd, s.gitBranch, s.agentPath} {
+ 		if err := writeStr(str); err != nil {
+ 			return nil, err
+ 		}
+@@ -196,6 +198,9 @@ func (s *codexCursorState) UnmarshalBinary(data []byte) error {
+ 	if s.cwd, err = readStr(); err != nil {
+ 		return err
+ 	}
++	if s.gitBranch, err = readStr(); err != nil {
++		return err
++	}
+ 	if s.agentPath, err = readStr(); err != nil {
+ 		return err
+ 	}
+@@ -531,6 +536,7 @@ func cloneCodexCursorState(state codexCursorState) codexCursorState {
+ 	state.model = strings.Clone(state.model)
+ 	state.reasoningEffort = strings.Clone(state.reasoningEffort)
+ 	state.cwd = strings.Clone(state.cwd)
++	state.gitBranch = strings.Clone(state.gitBranch)
+ 	state.agentPath = strings.Clone(state.agentPath)
+ 	state.lastTaskEvent = strings.Clone(state.lastTaskEvent)
+ 	for i := range state.pendingCallCount {
+@@ -552,6 +558,7 @@ func estimateCodexCursorEntryBytes(
+ 			len(state.model)+
+ 			len(state.reasoningEffort)+
+ 			len(state.cwd)+
++			len(state.gitBranch)+
+ 			len(state.agentPath)+
+ 			len(state.lastTaskEvent)+
+ 			codexPendingCallStringBytes(state)+
+diff --git a/internal/parser/codex_cursor_test.go b/internal/parser/codex_cursor_test.go
+index 721d38f8..c430b232 100644
+--- a/internal/parser/codex_cursor_test.go
++++ b/internal/parser/codex_cursor_test.go
+@@ -289,3 +289,17 @@ func TestCodexCursorFullParseSeedBoundaries(t *testing.T) {
+ 		assert.False(t, ok)
+ 	})
+ }
++
++func TestCodexCursorStateGitBranch(t *testing.T) {
++	orig := codexCursorState{
++		model:     "gpt-5",
++		cwd:       "/workspace",
++		gitBranch: "feature/remediation",
++	}
++	cloned := cloneCodexCursorState(orig)
++	assert.Equal(t, orig.gitBranch, cloned.gitBranch)
++
++	key := codexCursorKey{path: "/tmp/test.jsonl"}
++	bytes := estimateCodexCursorEntryBytes(key, orig)
++	assert.Greater(t, bytes, int64(codexCursorEntryOverheadBytes+len(orig.gitBranch)))
++}
+diff --git a/internal/parser/codex_metadata.go b/internal/parser/codex_metadata.go
+index 254735a9..153affb5 100644
+--- a/internal/parser/codex_metadata.go
++++ b/internal/parser/codex_metadata.go
+@@ -2,6 +2,7 @@ package parser
+ 
+ import (
+ 	"errors"
++	"log"
+ 	"maps"
+ 	"os"
+ 	"path/filepath"
+@@ -33,6 +34,13 @@ func (m CodexMetadata) IndexFiles(root string) []string {
+ 	var paths []string
+ 	for _, dir := range m.dirs(root) {
+ 		paths = append(paths, filepath.Join(dir, CodexSessionIndexFilename))
++		for _, pattern := range []string{"state_*.sqlite", "state_*.db"} {
++			matches, err := filepath.Glob(filepath.Join(dir, pattern))
++			if err == nil && len(matches) > 0 {
++				sort.Strings(matches)
++				paths = append(paths, matches...)
++			}
++		}
+ 	}
+ 	return paths
+ }
+@@ -58,26 +66,34 @@ func loadCodexSessionIndexes(paths []string) (map[string]string, error) {
+ 		titles map[string]string
+ 	}
+ 	var found []loaded
++	var lastErr error
+ 	for _, path := range paths {
+ 		info, err := os.Stat(path)
+ 		if errors.Is(err, os.ErrNotExist) {
+ 			continue
+ 		}
+ 		if err != nil {
+-			return nil, err
++			log.Printf("codex: loading session index %s: %v", path, err)
++			lastErr = err
++			continue
+ 		}
+ 		titles, err := loadCodexSessionIndex(path)
+ 		if errors.Is(err, os.ErrNotExist) {
+ 			continue
+ 		}
+ 		if err != nil {
+-			return nil, err
++			log.Printf("codex: loading session index %s: %v", path, err)
++			lastErr = err
++			continue
+ 		}
+ 		found = append(found, loaded{
+ 			mtime: info.ModTime().UnixNano(), titles: titles,
+ 		})
+ 	}
+ 	if len(found) == 0 {
++		if lastErr != nil {
++			return nil, lastErr
++		}
+ 		return nil, os.ErrNotExist
+ 	}
+ 	if len(found) == 1 {
+diff --git a/internal/parser/codex_metadata_test.go b/internal/parser/codex_metadata_test.go
+index eaf3f21f..e2a023f1 100644
+--- a/internal/parser/codex_metadata_test.go
++++ b/internal/parser/codex_metadata_test.go
+@@ -1,6 +1,8 @@
+ package parser
+ 
+ import (
++	"database/sql"
++	"errors"
+ 	"maps"
+ 	"os"
+ 	"path/filepath"
+@@ -198,3 +200,59 @@ func TestCodexProvidersKeepIndependentMetadata(t *testing.T) {
+ 		assert.Equal(t, tc.title, result.Results[0].Result.Session.SessionName)
+ 	}
+ }
++
++func TestCodexMetadata_StateSQLiteIndex(t *testing.T) {
++	primary, _ := aliasedCodexHomes(t)
++	const id = "019f0000-0000-7000-8000-000000000042"
++	session := filepath.Join(primary, "sessions", "2026", "09", "03",
++		"rollout-2026-09-03T10-00-00-"+id+".jsonl")
++
++	dbPath := filepath.Join(primary, "state_5.sqlite")
++	db, err := sql.Open("sqlite3", dbPath)
++	require.NoError(t, err)
++	_, err = db.Exec("CREATE TABLE threads (id text primary key, title text)")
++	require.NoError(t, err)
++	_, err = db.Exec("INSERT INTO threads (id, title) VALUES (?, ?)", id, "SQLite Title From Threads")
++	require.NoError(t, err)
++	require.NoError(t, db.Close())
++
++	sessionRoot := filepath.Join(primary, "sessions")
++	metadata := CodexMetadata{roots: map[string][]string{sessionRoot: {primary}}}
++	files := metadata.IndexFiles(sessionRoot)
++	assert.Contains(t, files, dbPath)
++
++	name, ok, err := metadata.ReadThreadName(session, id)
++	require.NoError(t, err)
++	assert.True(t, ok)
++	assert.Equal(t, "SQLite Title From Threads", name)
++}
++
++func TestCodexMetadata_ToleratesCorruptIndexFile(t *testing.T) {
++	primary, _ := aliasedCodexHomes(t)
++	const id = "019f0000-0000-7000-8000-000000000043"
++	session := filepath.Join(primary, "sessions", "2026", "09", "03",
++		"rollout-2026-09-03T10-00-00-"+id+".jsonl")
++
++	// Create a corrupt state_corrupt.sqlite file with junk bytes.
++	corruptDBPath := filepath.Join(primary, "state_corrupt.sqlite")
++	require.NoError(t, os.WriteFile(corruptDBPath, []byte("NOT_A_VALID_SQLITE_DATABASE_HEADER"), 0o644))
++
++	// Also write a valid session_index.jsonl containing the session title.
++	writeIndex(t, primary, `{"id":"`+id+`","thread_name":"Title from valid jsonl"}`+"\n", time.Now())
++
++	sessionRoot := filepath.Join(primary, "sessions")
++	metadata := CodexMetadata{roots: map[string][]string{sessionRoot: {primary}}}
++	files := metadata.IndexFiles(sessionRoot)
++	assert.Contains(t, files, corruptDBPath)
++
++	// ReadThreadName must tolerate the corrupt sqlite file and read the title from session_index.jsonl.
++	name, ok, err := metadata.ReadThreadName(session, id)
++	require.NoError(t, err)
++	assert.True(t, ok)
++	assert.Equal(t, "Title from valid jsonl", name)
++
++	// If only corrupt index files exist, loadCodexSessionIndexes should return an error.
++	_, errOnlyCorrupt := loadCodexSessionIndexes([]string{corruptDBPath})
++	require.Error(t, errOnlyCorrupt)
++	assert.False(t, errors.Is(errOnlyCorrupt, os.ErrNotExist))
++}
+diff --git a/internal/parser/codex_parser_test.go b/internal/parser/codex_parser_test.go
+index 28cadf8c..6db92270 100644
+--- a/internal/parser/codex_parser_test.go
++++ b/internal/parser/codex_parser_test.go
+@@ -1,6 +1,7 @@
+ package parser
+ 
+ import (
++	"database/sql"
+ 	"errors"
+ 	"fmt"
+ 	"os"
+@@ -3874,3 +3875,433 @@ func TestCodexDuplicateCallIDsAttachOutputsToLatestCall(t *testing.T) {
+ 	assert.Equal(t, "first result", msgs[2].ToolCalls[0].ResultEvents[0].Content)
+ 	assert.Equal(t, "second result", msgs[2].ToolCalls[0].ResultEvents[1].Content)
+ }
++
++func TestCodexContinuationStitching_TwoSegments(t *testing.T) {
++	tmpDir := t.TempDir()
++	dayDir := filepath.Join(tmpDir, "2026", "09", "25")
++	require.NoError(t, os.MkdirAll(dayDir, 0o755))
++
++	parentName := "rollout-2026-09-25T23-27-50-01a0da77-5113-7a91-a159-a02da927e59f_01a0da77-ab21-7ae3-9b15-89aaa174b1d5.jsonl"
++	parentPath := filepath.Join(dayDir, parentName)
++	parentContent := strings.Join([]string{
++		`{"timestamp":"2026-09-25T23:27:50Z","ordinal":0,"type":"session_meta","payload":{"id":"01a0da77-5113-7a91-a159-a02da927e59f","history_mode":"paginated","history_base":null}}`,
++		`{"timestamp":"2026-09-25T23:27:51Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Initial user prompt in parent"}]}}`,
++		`{"timestamp":"2026-09-25T23:27:52Z","ordinal":2,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Assistant response in parent"}]}}`,
++		`{"timestamp":"2026-09-25T23:27:53Z","ordinal":3,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Aborted user turn"}]}}`,
++		`{"timestamp":"2026-09-25T23:27:54Z","ordinal":4,"type":"event_msg","payload":{"type":"turn_aborted"}}`,
++	}, "\n") + "\n"
++	require.NoError(t, os.WriteFile(parentPath, []byte(parentContent), 0o644))
++
++	leafName := "rollout-2026-09-25T23-54-13-01a0da77-5113-7a91-a159-a02da927e59f_01a0da8f-d2a9-7fa1-85e4-d0ee0f72587d.jsonl"
++	leafPath := filepath.Join(dayDir, leafName)
++	leafContent := strings.Join([]string{
++		`{"timestamp":"2026-09-25T23:54:13Z","ordinal":3,"type":"session_meta","payload":{"id":"01a0da77-5113-7a91-a159-a02da927e59f","history_mode":"paginated","history_base":{"thread_id":"01a0da77-ab21-7ae3-9b15-89aaa174b1d5","end_ordinal_exclusive":3}}}`,
++		`{"timestamp":"2026-09-25T23:54:14Z","ordinal":4,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"4 ok\n5 ok"}]}}`,
++		`{"timestamp":"2026-09-25T23:54:15Z","ordinal":5,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Accepted both choices"}]}}`,
++	}, "\n") + "\n"
++	require.NoError(t, os.WriteFile(leafPath, []byte(leafContent), 0o644))
++
++	provider := newCodexTestProvider(t, tmpDir)
++	source := requireCodexProviderSource(t, provider, "01a0da77-5113-7a91-a159-a02da927e59f")
++	outcome, err := provider.Parse(t.Context(), ParseRequest{
++		Source: source,
++	})
++	require.NoError(t, err)
++	require.Len(t, outcome.Results, 1)
++
++	sess := outcome.Results[0].Result.Session
++	msgs := outcome.Results[0].Result.Messages
++
++	assert.Equal(t, "codex:01a0da77-5113-7a91-a159-a02da927e59f", sess.ID)
++	assert.Equal(t, "Initial user prompt in parent", sess.FirstMessage)
++	assert.Equal(t, 2, sess.UserMessageCount)
++	assert.Equal(t, 4, sess.MessageCount)
++
++	require.Len(t, msgs, 4)
++	assert.Equal(t, 0, msgs[0].Ordinal)
++	assert.Equal(t, RoleUser, msgs[0].Role)
++	assert.Equal(t, "Initial user prompt in parent", msgs[0].Content)
++
++	assert.Equal(t, 1, msgs[1].Ordinal)
++	assert.Equal(t, RoleAssistant, msgs[1].Role)
++	assert.Equal(t, "Assistant response in parent", msgs[1].Content)
++
++	assert.Equal(t, 2, msgs[2].Ordinal)
++	assert.Equal(t, RoleUser, msgs[2].Role)
++	assert.Equal(t, "4 ok\n5 ok", msgs[2].Content)
++
++	assert.Equal(t, 3, msgs[3].Ordinal)
++	assert.Equal(t, RoleAssistant, msgs[3].Role)
++	assert.Equal(t, "Accepted both choices", msgs[3].Content)
++
++	for _, m := range msgs {
++		assert.NotContains(t, m.Content, "Aborted user turn")
++	}
++}
++
++func TestCodexContinuationStitching_ThreeSegments(t *testing.T) {
++	tmpDir := t.TempDir()
++	dayDir := filepath.Join(tmpDir, "2026", "09", "25")
++	require.NoError(t, os.MkdirAll(dayDir, 0o755))
++
++	seg1Name := "rollout-2026-09-25T10-00-00-01a00000-0000-0000-0000-000000000001_01a00000-0000-0000-0000-000000000011.jsonl"
++	seg1Path := filepath.Join(dayDir, seg1Name)
++	seg1Content := strings.Join([]string{
++		`{"timestamp":"2026-09-25T10:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"01a00000-0000-0000-0000-000000000001","history_mode":"paginated","history_base":null}}`,
++		`{"timestamp":"2026-09-25T10:00:01Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Prompt 1"}]}}`,
++		`{"timestamp":"2026-09-25T10:00:02Z","ordinal":2,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reply 1"}]}}`,
++	}, "\n") + "\n"
++	require.NoError(t, os.WriteFile(seg1Path, []byte(seg1Content), 0o644))
++
++	seg2Name := "rollout-2026-09-25T11-00-00-01a00000-0000-0000-0000-000000000001_01a00000-0000-0000-0000-000000000022.jsonl"
++	seg2Path := filepath.Join(dayDir, seg2Name)
++	seg2Content := strings.Join([]string{
++		`{"timestamp":"2026-09-25T11:00:00Z","ordinal":3,"type":"session_meta","payload":{"id":"01a00000-0000-0000-0000-000000000001","history_mode":"paginated","history_base":{"thread_id":"01a00000-0000-0000-0000-000000000011","end_ordinal_exclusive":3}}}`,
++		`{"timestamp":"2026-09-25T11:00:01Z","ordinal":4,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Prompt 2"}]}}`,
++		`{"timestamp":"2026-09-25T11:00:02Z","ordinal":5,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reply 2"}]}}`,
++	}, "\n") + "\n"
++	require.NoError(t, os.WriteFile(seg2Path, []byte(seg2Content), 0o644))
++
++	leafName := "rollout-2026-09-25T12-00-00-01a00000-0000-0000-0000-000000000001_01a00000-0000-0000-0000-000000000033.jsonl"
++	leafPath := filepath.Join(dayDir, leafName)
++	leafContent := strings.Join([]string{
++		`{"timestamp":"2026-09-25T12:00:00Z","ordinal":6,"type":"session_meta","payload":{"id":"01a00000-0000-0000-0000-000000000001","history_mode":"paginated","history_base":{"thread_id":"01a00000-0000-0000-0000-000000000022","end_ordinal_exclusive":6}}}`,
++		`{"timestamp":"2026-09-25T12:00:01Z","ordinal":7,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Prompt 3"}]}}`,
++		`{"timestamp":"2026-09-25T12:00:02Z","ordinal":8,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reply 3"}]}}`,
++	}, "\n") + "\n"
++	require.NoError(t, os.WriteFile(leafPath, []byte(leafContent), 0o644))
++
++	provider := newCodexTestProvider(t, tmpDir)
++	source := requireCodexProviderSource(t, provider, "01a00000-0000-0000-0000-000000000001")
++	outcome, err := provider.Parse(t.Context(), ParseRequest{
++		Source: source,
++	})
++	require.NoError(t, err)
++	require.Len(t, outcome.Results, 1)
++
++	sess := outcome.Results[0].Result.Session
++	msgs := outcome.Results[0].Result.Messages
++
++	assert.Equal(t, "Prompt 1", sess.FirstMessage)
++	assert.Equal(t, 3, sess.UserMessageCount)
++	assert.Equal(t, 6, sess.MessageCount)
++	require.Len(t, msgs, 6)
++
++	assert.Equal(t, "Prompt 1", msgs[0].Content)
++	assert.Equal(t, "Reply 1", msgs[1].Content)
++	assert.Equal(t, "Prompt 2", msgs[2].Content)
++	assert.Equal(t, "Reply 2", msgs[3].Content)
++	assert.Equal(t, "Prompt 3", msgs[4].Content)
++	assert.Equal(t, "Reply 3", msgs[5].Content)
++
++	for i := range msgs {
++		assert.Equal(t, i, msgs[i].Ordinal)
++	}
++}
++
++func TestCodexContinuationStitching_PatternB_DirectUUID(t *testing.T) {
++	tmpDir := t.TempDir()
++	dayDir := filepath.Join(tmpDir, "2026", "08", "26")
++	require.NoError(t, os.MkdirAll(dayDir, 0o755))
++
++	parentUUID := "01a03d68-37cf-7030-9390-bb41fd9cc84a"
++	parentName := fmt.Sprintf("rollout-2026-08-26T11-30-35-%s.jsonl", parentUUID)
++	parentPath := filepath.Join(dayDir, parentName)
++	parentContent := strings.Join([]string{
++		fmt.Sprintf(`{"timestamp":"2026-08-26T11:30:35Z","ordinal":0,"type":"session_meta","payload":{"id":"%s"}}`, parentUUID),
++		`{"timestamp":"2026-08-26T11:30:36Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Pattern B Question"}]}}`,
++		`{"timestamp":"2026-08-26T11:30:37Z","ordinal":2,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Pattern B Answer"}]}}`,
++	}, "\n") + "\n"
++	require.NoError(t, os.WriteFile(parentPath, []byte(parentContent), 0o644))
++
++	leafUUID := "01a03d6a-4380-7720-a740-f136201c821f"
++	leafName := fmt.Sprintf("rollout-2026-08-26T11-32-49-%s.jsonl", leafUUID)
++	leafPath := filepath.Join(dayDir, leafName)
++	leafContent := strings.Join([]string{
++		fmt.Sprintf(`{"timestamp":"2026-08-26T11:32:49Z","ordinal":3,"type":"session_meta","payload":{"id":"%s","history_mode":"paginated","history_base":{"thread_id":"%s","end_ordinal_exclusive":3}}}`, leafUUID, parentUUID),
++		`{"timestamp":"2026-08-26T11:32:50Z","ordinal":4,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Followup Question"}]}}`,
++		`{"timestamp":"2026-08-26T11:32:51Z","ordinal":5,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Followup Answer"}]}}`,
++	}, "\n") + "\n"
++	require.NoError(t, os.WriteFile(leafPath, []byte(leafContent), 0o644))
++
++	provider := newCodexTestProvider(t, tmpDir)
++	source := requireCodexProviderSource(t, provider, leafUUID)
++	outcome, err := provider.Parse(t.Context(), ParseRequest{
++		Source: source,
++	})
++	require.NoError(t, err)
++	require.Len(t, outcome.Results, 1)
++
++	sess := outcome.Results[0].Result.Session
++	msgs := outcome.Results[0].Result.Messages
++
++	assert.Equal(t, "Pattern B Question", sess.FirstMessage)
++	assert.Equal(t, 2, sess.UserMessageCount)
++	assert.Equal(t, 4, sess.MessageCount)
++	require.Len(t, msgs, 4)
++
++	assert.Equal(t, "Pattern B Question", msgs[0].Content)
++	assert.Equal(t, "Pattern B Answer", msgs[1].Content)
++	assert.Equal(t, "Followup Question", msgs[2].Content)
++	assert.Equal(t, "Followup Answer", msgs[3].Content)
++}
++
++func TestCodexContinuationStitching_MissingParent_FailOpen(t *testing.T) {
++	tmpDir := t.TempDir()
++	dayDir := filepath.Join(tmpDir, "2026", "09", "25")
++	require.NoError(t, os.MkdirAll(dayDir, 0o755))
++
++	leafUUID := "01a09999-5113-7a91-a159-a02da927e59f"
++	leafName := fmt.Sprintf("rollout-2026-09-25T23-54-13-%s.jsonl", leafUUID)
++	leafPath := filepath.Join(dayDir, leafName)
++	leafContent := strings.Join([]string{
++		fmt.Sprintf(`{"timestamp":"2026-09-25T23:54:13Z","ordinal":0,"type":"session_meta","payload":{"id":"%s","history_mode":"paginated","history_base":{"thread_id":"nonexistent-uuid","end_ordinal_exclusive":10}}}`, leafUUID),
++		`{"timestamp":"2026-09-25T23:54:14Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Only message available"}]}}`,
++	}, "\n") + "\n"
++	require.NoError(t, os.WriteFile(leafPath, []byte(leafContent), 0o644))
++
++	provider := newCodexTestProvider(t, tmpDir)
++	source := requireCodexProviderSource(t, provider, leafUUID)
++	outcome, err := provider.Parse(t.Context(), ParseRequest{
++		Source: source,
++	})
++	require.NoError(t, err)
++	require.Len(t, outcome.Results, 1)
++
++	sess := outcome.Results[0].Result.Session
++	msgs := outcome.Results[0].Result.Messages
++
++	assert.Equal(t, "Only message available", sess.FirstMessage)
++	require.Len(t, msgs, 1)
++	assert.Equal(t, "Only message available", msgs[0].Content)
++}
++
++func TestCodexGitBranch(t *testing.T) {
++	content := strings.Join([]string{
++		`{"timestamp":"2026-09-25T23:54:13Z","ordinal":0,"type":"session_meta","payload":{"id":"01a09999-5113-7a91-a159-a02da927e59f","git":{"branch":"feature/remediation-work"}}}`,
++		`{"timestamp":"2026-09-25T23:54:14Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Check git branch"}]}}`,
++	}, "\n") + "\n"
++	sess, msgs := runCodexParserTest(t, "", content, false)
++	require.NotEmpty(t, msgs)
++	assert.Equal(t, "feature/remediation-work", sess.GitBranch)
++}
++
++func TestCodexMultilineJSONRollout(t *testing.T) {
++	content := `[
++  {
++    "timestamp": "2026-09-25T23:54:13Z",
++    "ordinal": 0,
++    "type": "session_meta",
++    "payload": {
++      "id": "01a09999-5113-7a91-a159-a02da927e59f",
++      "cwd": "/work/project",
++      "git": {
++        "branch": "main"
++      }
++    }
++  },
++  {
++    "timestamp": "2026-09-25T23:54:14Z",
++    "ordinal": 1,
++    "type": "response_item",
++    "payload": {
++      "type": "message",
++      "role": "user",
++      "content": [
++        {
++          "type": "input_text",
++          "text": "Hello multiline JSON rollout"
++        }
++      ]
++    }
++  }
++]`
++	sess, msgs := runCodexParserTest(t, "", content, false)
++	require.NotEmpty(t, msgs)
++	assert.Equal(t, "codex:01a09999-5113-7a91-a159-a02da927e59f", sess.ID)
++	assert.Equal(t, "/work/project", sess.Cwd)
++	assert.Equal(t, "main", sess.GitBranch)
++	assert.Equal(t, "Hello multiline JSON rollout", msgs[0].Content)
++}
++
++func TestCodexMultilineJSONMetaNotFirst(t *testing.T) {
++	content := `[
++  {
++    "timestamp": "2026-09-25T23:54:12Z",
++    "ordinal": 0,
++    "type": "turn_context",
++    "payload": {
++      "context": "starting"
++    }
++  },
++  {
++    "timestamp": "2026-09-25T23:54:13Z",
++    "ordinal": 1,
++    "type": "session_meta",
++    "payload": {
++      "id": "01a09999-5113-7a91-a159-a02da927e59f",
++      "cwd": "/work/project",
++      "git": {
++        "branch": "feature/branch"
++      }
++    }
++  },
++  {
++    "timestamp": "2026-09-25T23:54:14Z",
++    "ordinal": 2,
++    "type": "response_item",
++    "payload": {
++      "type": "message",
++      "role": "user",
++      "content": [
++        {
++          "type": "input_text",
++          "text": "Hello non-first meta"
++        }
++      ]
++    }
++  }
++]`
++	sess, msgs := runCodexParserTest(t, "", content, false)
++	require.NotEmpty(t, msgs)
++	assert.Equal(t, "codex:01a09999-5113-7a91-a159-a02da927e59f", sess.ID)
++	assert.Equal(t, "/work/project", sess.Cwd)
++	assert.Equal(t, "feature/branch", sess.GitBranch)
++	assert.Equal(t, "Hello non-first meta", msgs[0].Content)
++	assert.Len(t, msgs, 1)
++}
++
++func TestLoadCodexSessionIndexSQLite_ContentionFallback(t *testing.T) {
++	dir := t.TempDir()
++	dbPath := filepath.Join(dir, "state_1.sqlite")
++
++	writer, err := sql.Open("sqlite3", dbPath)
++	require.NoError(t, err)
++	defer writer.Close()
++	writer.SetMaxOpenConns(1)
++
++	_, err = writer.ExecContext(t.Context(), `
++		PRAGMA journal_mode=WAL;
++		CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT);
++		INSERT INTO threads VALUES ('019f0000-0000-7000-8000-000000000001', 'Committed Codex Title');
++	`)
++	require.NoError(t, err)
++
++	_, err = writer.ExecContext(t.Context(), "PRAGMA locking_mode=EXCLUSIVE")
++	require.NoError(t, err)
++
++	tx, err := writer.BeginTx(t.Context(), nil)
++	require.NoError(t, err)
++	defer func() { _ = tx.Rollback() }()
++
++	_, err = tx.ExecContext(t.Context(), "INSERT INTO threads VALUES ('019f0000-0000-7000-8000-000000000002', 'Uncommitted Title')")
++	require.NoError(t, err)
++
++	// loadCodexSessionIndexSQLite must succeed via WithSQLiteReadOnly scratch copy fallback despite lock contention.
++	titles, err := loadCodexSessionIndexSQLite(dbPath)
++	require.NoError(t, err, "loadCodexSessionIndexSQLite must succeed via scratch copy fallback")
++	assert.Equal(t, "Committed Codex Title", titles["019f0000-0000-7000-8000-000000000001"])
++}
++
++func TestCodexContinuationStitching_ChildForkRemapsParentID_PatternA(t *testing.T) {
++	tmpDir := t.TempDir()
++	dayDir := filepath.Join(tmpDir, "2026", "09", "25")
++	require.NoError(t, os.MkdirAll(dayDir, 0o755))
++
++	rootUUID := "01a00000-0000-0000-0000-000000000001"
++	seg1UUID := "01a00000-0000-0000-0000-000000000011"
++	seg2UUID := "01a00000-0000-0000-0000-000000000022"
++
++	seg1Name := fmt.Sprintf("rollout-2026-09-25T10-00-00-%s_%s.jsonl", rootUUID, seg1UUID)
++	seg1Path := filepath.Join(dayDir, seg1Name)
++	seg1Content := strings.Join([]string{
++		fmt.Sprintf(`{"timestamp":"2026-09-25T10:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"%s","history_mode":"paginated","history_base":null}}`, rootUUID),
++		`{"timestamp":"2026-09-25T10:00:01Z","ordinal":1,"type":"turn_context","payload":{"turn_id":"turn-p1"}}`,
++		`{"timestamp":"2026-09-25T10:00:02Z","ordinal":2,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Prompt 1"}]}}`,
++	}, "\n") + "\n"
++	require.NoError(t, os.WriteFile(seg1Path, []byte(seg1Content), 0o644))
++
++	seg2Name := fmt.Sprintf("rollout-2026-09-25T11-00-00-%s_%s.jsonl", rootUUID, seg2UUID)
++	seg2Path := filepath.Join(dayDir, seg2Name)
++	seg2Content := strings.Join([]string{
++		fmt.Sprintf(`{"timestamp":"2026-09-25T11:00:00Z","ordinal":3,"type":"session_meta","payload":{"id":"%s","history_mode":"paginated","history_base":{"thread_id":"%s","end_ordinal_exclusive":3}}}`, rootUUID, seg1UUID),
++		`{"timestamp":"2026-09-25T11:00:01Z","ordinal":4,"type":"turn_context","payload":{"turn_id":"turn-p2"}}`,
++		`{"timestamp":"2026-09-25T11:00:02Z","ordinal":5,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Prompt 2"}]}}`,
++	}, "\n") + "\n"
++	require.NoError(t, os.WriteFile(seg2Path, []byte(seg2Content), 0o644))
++
++	// Child forks from seg2UUID (an intermediate rollout segment)
++	childUUID := "01a00000-0000-0000-0000-000000000099"
++	childName := fmt.Sprintf("rollout-2026-09-25T12-00-00-%s.jsonl", childUUID)
++	childPath := filepath.Join(dayDir, childName)
++	childContent := strings.Join([]string{
++		fmt.Sprintf(`{"timestamp":"2026-09-25T12:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"%s","forked_from_id":"%s"}}`, childUUID, seg2UUID),
++		`{"timestamp":"2026-09-25T12:00:01Z","ordinal":1,"type":"turn_context","payload":{"turn_id":"turn-p2"}}`,
++		`{"timestamp":"2026-09-25T12:00:02Z","ordinal":2,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Prompt 2"}]}}`,
++		`{"timestamp":"2026-09-25T12:00:03Z","ordinal":3,"type":"turn_context","payload":{"turn_id":"turn-c1"}}`,
++		`{"timestamp":"2026-09-25T12:00:04Z","ordinal":4,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Child fork prompt"}]}}`,
++	}, "\n") + "\n"
++	require.NoError(t, os.WriteFile(childPath, []byte(childContent), 0o644))
++
++	provider := newCodexTestProvider(t, tmpDir)
++	source := requireCodexProviderSource(t, provider, childUUID)
++	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
++	require.NoError(t, err)
++	require.Len(t, outcome.Results, 1)
++
++	sess := outcome.Results[0].Result.Session
++	msgs := outcome.Results[0].Result.Messages
++
++	assert.Equal(t, RelFork, sess.RelationshipType)
++	assert.Equal(t, "codex:"+rootUUID, sess.ParentSessionID, "fork parent session ID must be remapped to root UUID")
++	require.Len(t, msgs, 1)
++	assert.Equal(t, "Child fork prompt", msgs[0].Content)
++}
++
++func TestCodexContinuationStitching_ChildForkRemapsParentID_PatternB(t *testing.T) {
++	tmpDir := t.TempDir()
++	dayDir := filepath.Join(tmpDir, "2026", "08", "26")
++	require.NoError(t, os.MkdirAll(dayDir, 0o755))
++
++	parentUUID := "01a03d68-37cf-7030-9390-bb41fd9cc84a"
++	parentName := fmt.Sprintf("rollout-2026-08-26T11-30-35-%s.jsonl", parentUUID)
++	parentPath := filepath.Join(dayDir, parentName)
++	parentContent := strings.Join([]string{
++		fmt.Sprintf(`{"timestamp":"2026-08-26T11:30:35Z","ordinal":0,"type":"session_meta","payload":{"id":"%s"}}`, parentUUID),
++		`{"timestamp":"2026-08-26T11:30:36Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Pattern B Question"}]}}`,
++	}, "\n") + "\n"
++	require.NoError(t, os.WriteFile(parentPath, []byte(parentContent), 0o644))
++
++	leafUUID := "01a03d6a-4380-7720-a740-f136201c821f"
++	leafName := fmt.Sprintf("rollout-2026-08-26T11-32-49-%s.jsonl", leafUUID)
++	leafPath := filepath.Join(dayDir, leafName)
++	leafContent := strings.Join([]string{
++		fmt.Sprintf(`{"timestamp":"2026-08-26T11:32:49Z","ordinal":2,"type":"session_meta","payload":{"id":"%s","history_mode":"paginated","history_base":{"thread_id":"%s","end_ordinal_exclusive":2}}}`, leafUUID, parentUUID),
++		`{"timestamp":"2026-08-26T11:32:50Z","ordinal":3,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Followup Question"}]}}`,
++	}, "\n") + "\n"
++	require.NoError(t, os.WriteFile(leafPath, []byte(leafContent), 0o644))
++
++	// Child subagent spawned referencing leafUUID as parent_thread_id
++	childUUID := "01a03d6b-5e6f-75f0-ab75-bdcbc99c3de7"
++	childName := fmt.Sprintf("rollout-2026-08-26T11-34-01-%s.jsonl", childUUID)
++	childPath := filepath.Join(dayDir, childName)
++	childContent := strings.Join([]string{
++		fmt.Sprintf(`{"timestamp":"2026-08-26T11:34:01Z","ordinal":0,"type":"session_meta","payload":{"id":"%s","source":{"subagent":{"thread_spawn":{"parent_thread_id":"%s"}}}}}`, childUUID, leafUUID),
++		`{"timestamp":"2026-08-26T11:34:02Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Subagent task"}]}}`,
++	}, "\n") + "\n"
++	require.NoError(t, os.WriteFile(childPath, []byte(childContent), 0o644))
++
++	provider := newCodexTestProvider(t, tmpDir)
++	source := requireCodexProviderSource(t, provider, childUUID)
++	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
++	require.NoError(t, err)
++	require.Len(t, outcome.Results, 1)
++
++	sess := outcome.Results[0].Result.Session
++	msgs := outcome.Results[0].Result.Messages
++
++	assert.Equal(t, RelSubagent, sess.RelationshipType)
++	assert.Equal(t, "codex:"+parentUUID, sess.ParentSessionID, "subagent parent session ID must be remapped to root UUID")
++	require.Len(t, msgs, 1)
++	assert.Equal(t, "Subagent task", msgs[0].Content)
++}
+diff --git a/internal/parser/codex_provider.go b/internal/parser/codex_provider.go
+index c8be8db0..6c283e5a 100644
+--- a/internal/parser/codex_provider.go
++++ b/internal/parser/codex_provider.go
+@@ -190,8 +190,7 @@ func (p *codexProvider) RawCaptureSourcesForChangedPath(
+ 	if err := ctx.Err(); err != nil {
+ 		return nil, err
+ 	}
+-	if p.sources.ownsCodexSidecars() &&
+-		filepath.Base(req.Path) == CodexSessionIndexFilename {
++	if p.sources.ownsCodexSidecars() && isCodexIndexPath(req.Path) {
+ 		return nil, nil
+ 	}
+ 	roots := p.sources.roots
+@@ -950,7 +949,9 @@ func (s codexSourceSet) discoverSessionPaths(sessionsDir string) []string {
+ // findSourceFile resolves a Codex session file by UUID under sessionsDir.
+ // It prefers the standard year/month/day live path when present, then falls
+ // back to a flat archived directory entry, matching the lookup precedence the
+-// package-level entrypoint provided before the fold.
++// package-level entrypoint provided before the fold. When multiple files match
++// the same session UUID (e.g. paginated continuation segments), it prefers the
++// latest file.
+ func (s codexSourceSet) findSourceFile(sessionsDir, sessionID string) string {
+ 	if !IsValidSessionID(sessionID) {
+ 		return ""
+@@ -968,17 +969,16 @@ func (s codexSourceSet) findSourceFile(sessionsDir, sessionID string) string {
+ 				continue
+ 			}
+ 			if extractUUIDFromRollout(name) == sessionID {
+-				archived = filepath.Join(sessionsDir, name)
+-				break
++				path := filepath.Join(sessionsDir, name)
++				if archived == "" || path > archived {
++					archived = path
++				}
+ 			}
+ 		}
+ 	}
+ 
+ 	var live string
+ 	walkCodexDayDirs(sessionsDir, func(dayPath string) bool {
+-		if live != "" {
+-			return false
+-		}
+ 		dayEntries, err := os.ReadDir(dayPath)
+ 		if err != nil {
+ 			return true
+@@ -992,8 +992,10 @@ func (s codexSourceSet) findSourceFile(sessionsDir, sessionID string) string {
+ 				continue
+ 			}
+ 			if extractUUIDFromRollout(name) == sessionID {
+-				live = filepath.Join(dayPath, name)
+-				return false
++				path := filepath.Join(dayPath, name)
++				if live == "" || path > live {
++					live = path
++				}
+ 			}
+ 		}
+ 		return true
+@@ -1004,6 +1006,75 @@ func (s codexSourceSet) findSourceFile(sessionsDir, sessionID string) string {
+ 	return archived
+ }
+ 
++// isMatchingCodexContinuationFile reports whether filename matches threadID,
++// either by a segment suffix "_<threadID>.jsonl" (Pattern A) or by direct UUID match (Pattern B).
++func isMatchingCodexContinuationFile(filename, threadID string) bool {
++	if !isCodexSessionFilename(filename) {
++		return false
++	}
++	if strings.HasSuffix(filename, "_"+threadID+".jsonl") {
++		return true
++	}
++	return extractUUIDFromRollout(filename) == threadID
++}
++
++// findContinuationParentFile locates the predecessor rollout segment for a given
++// continuation thread ID (history_base.thread_id).
++func (s codexSourceSet) findContinuationParentFile(currentPath, threadID string) string {
++	if !IsValidSessionID(threadID) {
++		return ""
++	}
++
++	// 1. Check directory of current file first (fast path for same-day continuation).
++	dir := filepath.Dir(currentPath)
++	if entries, err := os.ReadDir(dir); err == nil {
++		for _, f := range entries {
++			if !f.IsDir() && isMatchingCodexContinuationFile(f.Name(), threadID) {
++				return filepath.Join(dir, f.Name())
++			}
++		}
++	}
++
++	// 2. Search across configured roots (handles cross-midnight rollouts or multi-root setups).
++	for _, root := range s.roots {
++		if strings.HasPrefix(root, "s3://") {
++			continue
++		}
++		var found string
++		walkCodexDayDirs(root, func(dayPath string) bool {
++			if found != "" {
++				return false
++			}
++			if dayPath == dir {
++				return true
++			}
++			dayEntries, err := os.ReadDir(dayPath)
++			if err != nil {
++				return true
++			}
++			for _, f := range dayEntries {
++				if !f.IsDir() && isMatchingCodexContinuationFile(f.Name(), threadID) {
++					found = filepath.Join(dayPath, f.Name())
++					return false
++				}
++			}
++			return true
++		})
++		if found != "" {
++			return found
++		}
++		entries, err := os.ReadDir(root)
++		if err == nil {
++			for _, f := range entries {
++				if !f.IsDir() && isMatchingCodexContinuationFile(f.Name(), threadID) {
++					return filepath.Join(root, f.Name())
++				}
++			}
++		}
++	}
++	return ""
++}
++
+ func (s codexSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
+ 	roots := make([]WatchRoot, 0, len(s.roots)*2)
+ 	seenShallow := make(map[string]struct{})
+@@ -1030,7 +1101,7 @@ func (s codexSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
+ 			roots = append(roots, WatchRoot{
+ 				Path:         shallow,
+ 				Recursive:    false,
+-				IncludeGlobs: []string{CodexSessionIndexFilename},
++				IncludeGlobs: []string{CodexSessionIndexFilename, "state_*.sqlite", "state_*.sqlite-*", "state_*.db", "state_*.db-*"},
+ 				DebounceKey:  string(s.agent) + ":index:" + shallow,
+ 			})
+ 		}
+@@ -1045,8 +1116,7 @@ func (s codexSourceSet) SourcesForChangedPath(
+ 	if err := ctx.Err(); err != nil {
+ 		return nil, err
+ 	}
+-	if s.ownsCodexSidecars() &&
+-		filepath.Base(req.Path) == CodexSessionIndexFilename {
++	if s.ownsCodexSidecars() && isCodexIndexPath(req.Path) {
+ 		return s.sourcesForIndexPath(ctx, req.Path)
+ 	}
+ 	for _, root := range s.roots {
+@@ -1179,6 +1249,19 @@ func (s codexSourceSet) pathFromSource(source SourceRef) (string, bool) {
+ 	return "", false
+ }
+ 
++func isCodexIndexPath(path string) bool {
++	base := filepath.Base(path)
++	if base == CodexSessionIndexFilename {
++		return true
++	}
++	base = strings.TrimSuffix(base, "-wal")
++	base = strings.TrimSuffix(base, "-shm")
++	if strings.HasPrefix(base, "state_") && (strings.HasSuffix(base, ".sqlite") || strings.HasSuffix(base, ".db")) {
++		return true
++	}
++	return false
++}
++
+ func (s codexSourceSet) sourcesForIndexPath(
+ 	ctx context.Context,
+ 	indexPath string,
+@@ -1298,7 +1381,7 @@ func preferCodexSource(candidate, current SourceRef) bool {
+ 	if cand.Layout != curr.Layout {
+ 		return cand.Layout == CodexLayoutDated
+ 	}
+-	return candidate.DisplayPath < current.DisplayPath
++	return candidate.DisplayPath > current.DisplayPath
+ }
+ 
+ func codexProviderUserMessageCount(messages []ParsedMessage) int {
+diff --git a/internal/parser/codex_provider_test.go b/internal/parser/codex_provider_test.go
+index c2082eca..0be9b8e3 100644
+--- a/internal/parser/codex_provider_test.go
++++ b/internal/parser/codex_provider_test.go
+@@ -42,7 +42,7 @@ func TestCodexProviderSourceMethods(t *testing.T) {
+ 	assert.Equal(t, []string{"*.jsonl"}, plan.Roots[0].IncludeGlobs)
+ 	assert.Equal(t, base, plan.Roots[1].Path)
+ 	assert.False(t, plan.Roots[1].Recursive)
+-	assert.Equal(t, []string{CodexSessionIndexFilename}, plan.Roots[1].IncludeGlobs)
++	assert.Equal(t, []string{CodexSessionIndexFilename, "state_*.sqlite", "state_*.sqlite-*", "state_*.db", "state_*.db-*"}, plan.Roots[1].IncludeGlobs)
+ 
+ 	discovered, err := provider.Discover(t.Context())
+ 	require.NoError(t, err)
+@@ -59,7 +59,7 @@ func TestCodexProviderSourceMethods(t *testing.T) {
+ 	require.True(t, ok)
+ 	assert.Equal(t, sourcePath, found.DisplayPath)
+ 
+-	for _, path := range []string{sourcePath, indexPath} {
++	for _, path := range []string{sourcePath, indexPath, filepath.Join(base, "state_5.sqlite")} {
+ 		changed, err := provider.SourcesForChangedPath(
+ 			t.Context(),
+ 			ChangedPathRequest{Path: path, EventKind: "write"},
+@@ -218,6 +218,114 @@ func TestCodexProviderChildOnlySubagentWithoutParentStaysCurrent(t *testing.T) {
+ 	assert.Equal(t, DataVersionCurrent, outcome.Results[0].DataVersion)
+ }
+ 
++func TestCodexProviderForkWithoutReplayedPrefixStaysCurrent(t *testing.T) {
++	root := t.TempDir()
++	const childID = "22222222-2222-4222-8222-222222222222"
++	const parentID = "11111111-1111-4111-8111-111111111111"
++	writeCodexProviderSessionContent(t, root, parentID, testjsonl.JoinJSONL(
++		testjsonl.CodexSessionMetaJSON(parentID, "/workspace/project", "codex_cli_rs", tsEarly),
++		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", "parent-turn", tsEarly),
++	))
++	writeCodexProviderSessionContent(t, root, childID, testjsonl.JoinJSONL(
++		testjsonl.CodexForkedSessionMetaJSON(
++			childID, parentID, "/workspace/project", "codex_cli_rs", tsEarly,
++		),
++		testjsonl.CodexTurnContextWithIDJSON("gpt-5.5", "child-turn", tsEarlyS1),
++		testjsonl.CodexMsgJSON("user", "child task", tsEarlyS1),
++		testjsonl.CodexMsgJSON("assistant", "child answer", tsEarlyS5),
++	))
++	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
++	require.True(t, ok)
++	source := requireCodexProviderSource(t, provider, childID)
++
++	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
++
++	require.NoError(t, err)
++	require.Len(t, outcome.Results, 1)
++	result := outcome.Results[0]
++	assert.Equal(t, DataVersionCurrent, result.DataVersion)
++	assert.Empty(t, result.RetryReason)
++	assert.Equal(t, RelFork, result.Result.Session.RelationshipType)
++	assert.Equal(t, "codex:"+parentID, result.Result.Session.ParentSessionID)
++	require.Len(t, result.Result.Messages, 2)
++	assert.Equal(t, "child task", result.Result.Messages[0].Content)
++	assert.Equal(t, "child answer", result.Result.Messages[1].Content)
++}
++
++func TestCodexProviderSubagentWithoutReplayedPrefixStaysCurrent(t *testing.T) {
++	root := t.TempDir()
++	const childID = "22222222-2222-4222-8222-222222222222"
++	const parentID = "11111111-1111-4111-8111-111111111111"
++	writeCodexProviderSessionContent(t, root, parentID, testjsonl.JoinJSONL(
++		testjsonl.CodexSessionMetaJSON(parentID, "/workspace/project", "codex_cli_rs", tsEarly),
++		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", "parent-turn", tsEarly),
++	))
++	writeCodexProviderSessionContent(t, root, childID, testjsonl.JoinJSONL(
++		testjsonl.CodexSubagentSessionMetaJSON(
++			childID, parentID, "/workspace/project", "codex_cli_rs", tsEarly,
++		),
++		testjsonl.CodexTurnContextWithIDJSON("gpt-5.5", "child-turn", tsEarlyS1),
++		testjsonl.CodexMsgJSON("user", "child task", tsEarlyS1),
++	))
++	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
++	require.True(t, ok)
++	source := requireCodexProviderSource(t, provider, childID)
++
++	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
++
++	require.NoError(t, err)
++	require.Len(t, outcome.Results, 1)
++	result := outcome.Results[0]
++	assert.Equal(t, DataVersionCurrent, result.DataVersion)
++	assert.Empty(t, result.RetryReason)
++	assert.Equal(t, RelSubagent, result.Result.Session.RelationshipType)
++	assert.Equal(t, "codex:"+parentID, result.Result.Session.ParentSessionID)
++	require.Len(t, result.Result.Messages, 1)
++	assert.Equal(t, "child task", result.Result.Messages[0].Content)
++}
++
++func TestCodexProviderSubagentReplayedPrefixMissingParentFailOpen(t *testing.T) {
++	root := t.TempDir()
++	const childID = "22222222-2222-4222-8222-222222222222"
++	const parentID = "11111111-1111-4111-8111-111111111111"
++	// Parent file is absent. The subagent still carries a replayed copy of
++	// the parent's transcript, so the gate cannot safely suppress it.
++	writeCodexProviderSessionContent(t, root, childID, testjsonl.JoinJSONL(
++		testjsonl.CodexSubagentSessionMetaJSON(
++			childID, parentID, "/workspace/project", "codex_cli_rs", tsEarly,
++		),
++		testjsonl.CodexSessionMetaJSON(parentID, "/workspace/project", "codex_cli_rs", tsEarly),
++		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", "parent-turn", tsEarly),
++		testjsonl.CodexMsgJSON("user", "replayed parent question", tsEarly),
++		testjsonl.CodexMsgJSON("assistant", "replayed parent answer", tsEarly),
++		testjsonl.CodexTokenCountJSON(tsEarly, 50_000, 9_000, 0),
++		testjsonl.CodexTurnContextWithIDJSON("gpt-5.5", "child-turn", tsEarlyS1),
++		testjsonl.CodexMsgJSON("user", "genuine child task", tsEarlyS1),
++	))
++	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
++	require.True(t, ok)
++	source := requireCodexProviderSource(t, provider, childID)
++
++	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
++
++	require.NoError(t, err)
++	require.Len(t, outcome.Results, 1)
++	result := outcome.Results[0]
++	// The explicit replay parent could not be resolved, so the child remains
++	// visible but is marked for a later retry when the parent is available.
++	assert.Equal(t, DataVersionNeedsRetry, result.DataVersion)
++	assert.Contains(t, result.RetryReason, "parent turns")
++	assert.Equal(t, RelSubagent, result.Result.Session.RelationshipType)
++	assert.Equal(t, "codex:"+parentID, result.Result.Session.ParentSessionID)
++	// All content is preserved; the only suppressed line is the copied
++	// parent session_meta, which must not overwrite the child's identity.
++	assert.Equal(t, "codex:"+childID, result.Result.Session.ID)
++	require.Len(t, result.Result.Messages, 3)
++	assert.Equal(t, "replayed parent question", result.Result.Messages[0].Content)
++	assert.Equal(t, "replayed parent answer", result.Result.Messages[1].Content)
++	assert.Equal(t, "genuine child task", result.Result.Messages[2].Content)
++}
++
+ func TestCodexActivityHintsUseConfiguredRootParent(t *testing.T) {
+ 	base := t.TempDir()
+ 	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{
+diff --git a/internal/parser/codex_seed_sink.go b/internal/parser/codex_seed_sink.go
+index 27f33ae6..12d4e0db 100644
+--- a/internal/parser/codex_seed_sink.go
++++ b/internal/parser/codex_seed_sink.go
+@@ -44,6 +44,11 @@ func (*codexSeedSink) InsertOrphanMessage(string, ParsedMessage) bool { return t
+ 
+ func (*codexSeedSink) Finalize() {}
+ 
++func (s *codexSeedSink) Reset() {
++	s.nextOrdinal = 0
++	s.hadReservation = false
++}
++
+ func (*codexSeedSink) Messages() []ParsedMessage { return nil }
+ 
+ func (*codexSeedSink) ToolCallUpdates() []ParsedToolCallUpdate { return nil }
+diff --git a/internal/parser/codex_sink.go b/internal/parser/codex_sink.go
+index 943e4475..c310d167 100644
+--- a/internal/parser/codex_sink.go
++++ b/internal/parser/codex_sink.go
+@@ -45,6 +45,7 @@ type CodexSessionSink interface {
+ 	ApplyTokenUsageToLastAssistant(raw string) bool
+ 	InsertOrphanMessage(key string, m ParsedMessage) bool
+ 	Finalize()
++	Reset()
+ 	Messages() []ParsedMessage
+ 	ToolCallUpdates() []ParsedToolCallUpdate
+ }
+diff --git a/internal/sync/codex_staging.go b/internal/sync/codex_staging.go
+index 4b271232..2ea32111 100644
+--- a/internal/sync/codex_staging.go
++++ b/internal/sync/codex_staging.go
+@@ -70,9 +70,9 @@ type codexStagingSink struct {
+ 	findingPos     []stagedFindingPos
+ 	eventByCallKey map[string]int64
+ 	eventSeq       int64
+-	// A sole event is also its call summary. Keep only its display length
++	// A sole event is also its call summary. Keep only its content
+ 	// and failure verdict so publishing need not load the payload again.
+-	singleSummaryLengths map[string]int
++	singleSummaries map[string]string
+ 	// contentFailures records per-call content-failure verdicts captured
+ 	// during ingestion for sole events or publication for multi-event
+ 	// summaries, so the engine can reuse them in the signal pass.
+@@ -593,14 +593,14 @@ func (s *codexStagingSink) AppendToolResultEvent(ctx context.Context,
+ 	s.eventByCallKey[stageKey]++
+ 	s.addEventFindings(stageKey, eventIndex, storedContent)
+ 	if blanked == 0 && eventIndex == 0 {
+-		if s.singleSummaryLengths == nil {
+-			s.singleSummaryLengths = make(map[string]int)
++		if s.singleSummaries == nil {
++			s.singleSummaries = make(map[string]string)
+ 		}
+ 		summary := storedContent
+ 		if !summaryParticipates {
+ 			summary = ""
+ 		}
+-		s.singleSummaryLengths[stageKey] = len(summary)
++		s.singleSummaries[stageKey] = summary
+ 		if !s.disableSignals {
+ 			if s.contentFailures == nil {
+ 				s.contentFailures = make(map[string]bool)
+@@ -610,7 +610,7 @@ func (s *codexStagingSink) AppendToolResultEvent(ctx context.Context,
+ 			})
+ 		}
+ 	} else {
+-		delete(s.singleSummaryLengths, stageKey)
++		delete(s.singleSummaries, stageKey)
+ 		delete(s.contentFailures, stageKey)
+ 	}
+ 
+@@ -683,13 +683,13 @@ func (s *codexStagingSink) PublishToolResultImages(ctx context.Context) error {
+ 		}
+ 	}
+ 
+-	s.singleSummaryLengths = make(map[string]int)
++	s.singleSummaries = make(map[string]string)
+ 	s.contentFailures = make(map[string]bool)
+ 	s.findings = nil
+ 	s.findingPos = nil
+ 	s.eventByCallKey = make(map[string]int64)
+ 	type singleSummaryCandidate struct {
+-		length  int
++		summary string
+ 		failure bool
+ 	}
+ 	candidates := make(map[string]singleSummaryCandidate)
+@@ -725,7 +725,7 @@ func (s *codexStagingSink) PublishToolResultImages(ctx context.Context) error {
+ 			if participates == 0 {
+ 				summary = ""
+ 			}
+-			candidate := singleSummaryCandidate{length: len(summary)}
++			candidate := singleSummaryCandidate{summary: summary}
+ 			if !s.disableSignals {
+ 				candidate.failure = signals.IsFailure(signals.ToolCallRow{
+ 					Category:      s.categoryByCallKey[callKey],
+@@ -747,7 +747,7 @@ func (s *codexStagingSink) PublishToolResultImages(ctx context.Context) error {
+ 		return s.stageErr
+ 	}
+ 	for callKey, candidate := range candidates {
+-		s.singleSummaryLengths[callKey] = candidate.length
++		s.singleSummaries[callKey] = candidate.summary
+ 		if !s.disableSignals {
+ 			s.contentFailures[callKey] = candidate.failure
+ 		}
+@@ -780,6 +780,37 @@ func (s *codexStagingSink) addEventFindings(
+ 	}
+ }
+ 
++func (s *codexStagingSink) isCollapsedSingleEvent(ctx context.Context, stageKey string) bool {
++	if s.scratch == nil {
++		return false
++	}
++	var eventCount int
++	var soleContent string
++	var hasMetadata int
++	var participates int
++	var blanked int
++	err := s.scratch.QueryRowContext(ctx, `
++		SELECT COUNT(*),
++		       COALESCE(MIN(content), ''),
++		       MAX(CASE WHEN COALESCE(agent_id, '') != '' OR COALESCE(subagent_session_id, '') != '' THEN 1 ELSE 0 END),
++		       MIN(summary_participates),
++		       MAX(blanked)
++		FROM stage_events
++		WHERE call_key = ?
++	`, stageKey).Scan(&eventCount, &soleContent, &hasMetadata, &participates, &blanked)
++	if err != nil || eventCount != 1 || hasMetadata != 0 || participates != 1 || blanked != 0 {
++		return false
++	}
++	if s.blocked[s.categoryByCallKey[stageKey]] {
++		return false
++	}
++	summary, _, err := s.ResolveSummary(ctx, stageKey)
++	if err != nil || summary == "" || summary != soleContent {
++		return false
++	}
++	return true
++}
++
+ // Findings returns the staged event findings with session, ordinal, and
+ // call coordinates stamped from the final message model.
+ func (s *codexStagingSink) Findings(
+@@ -787,15 +818,22 @@ func (s *codexStagingSink) Findings(
+ 	positions map[string]db.StagedToolCallPosition,
+ ) []db.SecretFinding {
+ 	out := make([]db.SecretFinding, len(s.findings))
++	ctx := context.Background()
+ 	for i, f := range s.findings {
+ 		f.SessionID = sessionID
+-		pos, ok := positions[s.findingPos[i].stageKey]
++		stageKey := s.findingPos[i].stageKey
++		pos, ok := positions[stageKey]
+ 		if ok {
+ 			f.MessageOrdinal = pos.Ordinal
+ 			callIdx := pos.CallIndex
+-			evIdx := s.findingPos[i].eventIndex
+ 			f.CallIndex = &callIdx
+-			f.EventIndex = &evIdx
++			if s.isCollapsedSingleEvent(ctx, stageKey) {
++				f.LocationKind = "tool_result"
++				f.EventIndex = nil
++			} else {
++				evIdx := s.findingPos[i].eventIndex
++				f.EventIndex = &evIdx
++			}
+ 		}
+ 		out[i] = f
+ 	}
+@@ -817,6 +855,25 @@ func (s *codexStagingSink) InsertEventsTx(
+ 		return s.stageErr
+ 	}
+ 	for stageKey, pos := range messageOrdinals {
++		var eventCount int
++		var soleStoredContent string
++		if err := s.scratch.QueryRowContext(ctx, `
++			SELECT COUNT(*),
++			       COALESCE(MIN(CASE WHEN blanked = 1 THEN '' ELSE content END), '')
++			FROM stage_events
++			WHERE call_key = ?
++		`, stageKey).Scan(&eventCount, &soleStoredContent); err != nil {
++			return fmt.Errorf(
++				"counting staged events for %s/%s: %w",
++				sessionID, pos.ToolUseID, err,
++			)
++		}
++		if eventCount == 0 {
++			continue
++		}
++		if s.isCollapsedSingleEvent(ctx, stageKey) {
++			continue
++		}
+ 		if _, err := tx.ExecContext(ctx, `
+ 			INSERT INTO tool_result_events (
+ 				session_id, tool_call_message_ordinal, call_index,
+@@ -862,9 +919,7 @@ func (s *codexStagingSink) InsertEventsTx(
+ // is one call's aggregate output (the summary string itself), not the
+ // whole transcript. While the summary is in hand it also records the
+ // call's content-failure verdict (see ContentFailures), so the engine's
+-// post-publish signal fold never resolves summaries a second time. Once that
+-// verdict is recorded, a summary identical to its sole event is omitted
+-// from storage while contentLength retains the displayed length.
++// post-publish signal fold never resolves summaries a second time.
+ func (s *codexStagingSink) ResolveSummary(
+ 	ctx context.Context, stageKey string,
+ ) (summary string, contentLength int, err error) {
+@@ -874,8 +929,8 @@ func (s *codexStagingSink) ResolveSummary(
+ 	if err := ctx.Err(); err != nil {
+ 		return "", 0, err
+ 	}
+-	if length, ok := s.singleSummaryLengths[stageKey]; ok {
+-		return "", length, nil
++	if summary, ok := s.singleSummaries[stageKey]; ok {
++		return summary, len(summary), nil
+ 	}
+ 	blocked := s.blocked[s.categoryByCallKey[stageKey]]
+ 	if blocked {
+diff --git a/internal/sync/codex_staging_summary_test.go b/internal/sync/codex_staging_summary_test.go
+index b235952a..6b8c98e8 100644
+--- a/internal/sync/codex_staging_summary_test.go
++++ b/internal/sync/codex_staging_summary_test.go
+@@ -13,12 +13,13 @@ import (
+ func TestStagedSingleEventSummaryThenAdditionalEvent(t *testing.T) {
+ 	for _, tc := range []struct {
+ 		name, content string
++		wantSummary   string
+ 		length        int
+ 		failure       bool
+ 	}{
+-		{"anonymous", "command not found", 17, true},
+-		{"whitespace", " \n", 0, false},
+-		{"sanitized", "ok\x00", 2, false},
++		{"anonymous", "command not found", "command not found", 17, true},
++		{"whitespace", " \n", "", 0, false},
++		{"sanitized", "ok\x00", "ok", 2, false},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			sink, err := newCodexStagingSink(t.Context(), t.TempDir(), nil)
+@@ -34,7 +35,7 @@ func TestStagedSingleEventSummaryThenAdditionalEvent(t *testing.T) {
+ 			key := db.StagedToolCallKey("call", 0)
+ 			summary, length, err := sink.ResolveSummary(t.Context(), key)
+ 			require.NoError(t, err)
+-			require.Empty(t, summary)
++			require.Equal(t, tc.wantSummary, summary)
+ 			require.Equal(t, tc.length, length)
+ 			require.Equal(t, tc.failure, sink.ContentFailures()[key])
+ 			sink.AppendToolResultEvent(t.Context(), "call", nil, parser.ParsedToolResultEvent{
+@@ -69,7 +70,7 @@ func BenchmarkStagedSingleEventSummary(b *testing.B) {
+ 			for b.Loop() {
+ 				summary, length, err := sink.ResolveSummary(b.Context(), key)
+ 				require.NoError(b, err)
+-				require.Empty(b, summary)
++				require.Equal(b, strings.Repeat("x", size), summary)
+ 				require.Equal(b, size, length)
+ 			}
+ 		})
+diff --git a/internal/sync/codex_staging_test.go b/internal/sync/codex_staging_test.go
+index afdf7419..23425071 100644
+--- a/internal/sync/codex_staging_test.go
++++ b/internal/sync/codex_staging_test.go
+@@ -231,15 +231,16 @@ func TestSyncSingleSessionStagedPublishesRealContent(t *testing.T) {
+ 	found := false
+ 	for _, m := range msgs {
+ 		for _, tc := range m.ToolCalls {
+-			if tc.ToolUseID != "call_a" || len(tc.ResultEvents) == 0 {
++			if tc.ToolUseID != "call_a" {
+ 				continue
+ 			}
+ 			found = true
+-			require.NotContains(t, tc.ResultEvents[0].Content, "staged:",
++			require.NotContains(t, tc.ResultContent, "staged:",
+ 				"the single-session path must publish real output, "+
+ 					"not staged placeholders")
+-			require.Contains(t, tc.ResultEvents[0].Content,
++			require.Contains(t, tc.ResultContent,
+ 				"build passed")
++			require.Empty(t, tc.ResultEvents)
+ 		}
+ 	}
+ 	require.True(t, found, "call_a output must be stored")
+@@ -474,10 +475,10 @@ func TestCodexStagedToolResultSummaryStorage(t *testing.T) {
+ 		wantDisplay string
+ 		wantEvents  int
+ 	}{
+-		{"single event", []string{"command finished"}, "", "command finished", 1},
+-		{"duplicate event", []string{"command finished", "command finished"}, "", "command finished", 1},
++		{"single event", []string{"command finished"}, "command finished", "command finished", 0},
++		{"duplicate event", []string{"command finished", "command finished"}, "command finished", "command finished", 0},
+ 		{"multiple events", []string{"working", "command finished"}, "command finished", "command finished", 2},
+-		{"sanitized single event", []string{"before\x00after"}, "", "beforeafter", 1},
++		{"sanitized single event", []string{"before\x00after"}, "beforeafter", "beforeafter", 0},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			const uuid = "019eb791-cf7d-75c1-8439-9ed74c122d01"

@@ -1,0 +1,962 @@
+diff --git a/docs/agents/storage.md b/docs/agents/storage.md
+index e055525e..2811c18a 100644
+--- a/docs/agents/storage.md
++++ b/docs/agents/storage.md
+@@ -326,8 +326,12 @@ snapshot. Do not widen or narrow this live/baked boundary implicitly.
+ The cache format version is also the extractor compatibility version. Bump
+ `usageCacheFormatVersion` whenever fact extraction, `priceUsageFact`, web-search
+ fees, deduplication, rollup semantics, or query-time model canonicalization
+-change. Catalog and user-pricing changes are covered separately by the pricing
+-content digest; do not add a write-only extractor-version metadata key.
++change. Catalog and user-pricing changes are covered per session instead: each
++rollup install records the distinct `(provider, reported model, canonical
++model)` lookups its daily rows used, and a read re-resolves only those against
++the current catalog. A price change therefore rebuilds just the sessions whose
++lookups resolve differently, while `updated_at`-only refreshes rebuild nothing.
++Do not add a write-only extractor-version metadata key.
+ 
+ Deduplication groups are classified per group at rollup build time. A group is
+ finalized into daily rows only when its resolution provably cannot vary with the
+@@ -367,8 +371,8 @@ file and warn that the cache will rebuild after restart.
+ 
+ Usage reads are exact. A cold aggregate request fills facts, builds the required
+ timezone rollups, then reads them in one pinned cache transaction. Verify every
+-candidate session's facts fingerprint, exact baked metadata, canonical pricing
+-digest, resolved rate hashes, and Cursor high-water mark. A result is no older
++candidate session's facts fingerprint, exact baked metadata, per-session pricing
++identity, resolved rate hashes, and Cursor high-water mark. A result is no older
+ than the archive snapshot captured when the read began, and may be newer for a
+ session whose facts were refilled meanwhile. A session confirmed deleted during
+ fill is dropped from the request. `cached_at` is diagnostic only.
+diff --git a/docs/changelog.md b/docs/changelog.md
+index c3680baa..4a850d78 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -1,5 +1,5 @@
+ ---
+-last_edited: 2026-10-01
++last_edited: 2026-10-07
+ title: Changelog
+ description: Release history for AgentsView
+ ---
+@@ -22,6 +22,10 @@ The latest published release is
+ - The web UI reports anonymous search, session-view, export, insight and
+   analytics-page events through the server, each with one value from a fixed
+   list. `AGENTSVIEW_TELEMETRY_ENABLED=0` turns them off.
++- Chat imports can replace sessions whose archived history is wrong. List them
++  with `agentsview import --replace <session-id>` or `replace=<session-id>` on
++  the import API. The old version moves to the trash with its messages, name,
++  and pins.
+ - Sessions show the title their agent keeps for them, and a name you chose with
+   `/rename` or the agent's equivalent wins over a generated title. Current
+   Claude Code `/rename` names now appear, and Qwen Code, Gemini CLI, Kimi CLI,
+@@ -109,6 +113,12 @@ The latest published release is
+ 
+ **Improvements**
+ 
++- The Usage page stays fast after a pricing update. A changed price now
++  rebuilds only the sessions that used that model, instead of every session in
++  the archive, and a refresh that changes no rates rebuilds nothing. The daemon
++  rebuilds affected sessions in the background after its daily price refresh,
++  so the next Usage load doesn't wait for them. The first
++  Usage load after upgrading rebuilds the usage cache once.
+ - The Usage page shows a **Total Input** card that adds uncached input, cache
+   writes, and cache reads, so heavy prompt caching no longer looks like missing
+   input. The input count that leaves out cached tokens is now labeled
+@@ -196,9 +206,56 @@ The latest published release is
+   used about 99% less memory in AgentsView. Local dates and hours now come
+   from the PostgreSQL server's time zone data, which matches AgentsView's for
+   current time zones.
++- Hosted raw sync stays fast on a device that has already uploaded many
++  sources. Each acknowledged upload used to reread every object the device had
++  ever uploaded. On a synthetic checkpoint with about 107,000 uploaded objects,
++  acknowledging 36 queued uploads went from about 19 minutes to 1.5 seconds.
++  The first start after upgrading adds an index to the raw sync checkpoint, and
++  earlier AgentsView versions can't open that checkpoint afterward.
+ 
+ **Bug fixes**
+ 
++- Hosted raw sync keeps a session listed and searchable after its source file
++  disappears from the device that uploaded it, matching the local archive.
++  Before, `raw-sync watch` reporting a missing file hid the session, emptied it
++  from the trash, and could swap in a shorter copy from another device. Deleting
++  a session yourself still removes it. Sessions already hidden this way stay
++  hidden until their file returns; see
++  [Hosted Raw Sync](/docs/hosted-raw-sync/#isolation-and-processing-limits).
++- `recall query` and `recall brief` in `--mode vector` or `--mode hybrid` no
++  longer turn unavailable every time recall extraction writes a new entry. The
++  Recall index may now trail the corpus by up to `recall_max_revision_lag`
++  revisions (a `[vector]` setting, default 256) and still answer; entries newer
++  than the index are found by the lexical half of hybrid search until the next
++  build. Set it to `0` for the previous exact-match behavior.
++- On macOS, `agentsview serve` no longer hangs at `Running initial sync...`
++  when a session's working directory is on an external or network drive under
++  `/Volumes`. Reading Git metadata there made macOS ask for access to the
++  volume, and a `launchd` service on a Mac with nobody at the screen waited on
++  that prompt forever. AgentsView now leaves those directories untouched, so
++  sessions recorded there keep path-only project identity with no Git remote,
++  worktree, or branch. Set `scan_protected_paths = true` to read Git detail
++  from them again; see
++  [macOS Protected Folders](/docs/configuration/#macos-protected-folders).
++- On macOS, a reboot no longer makes the next sync re-read every session from
++  scratch. macOS can give a volume a different device number each time it is
++  mounted, which happens after a system update, and AgentsView took the changed
++  number to mean every session file had been replaced. Until that re-read
++  finished, `agentsview serve` did not start and `pg push --watch` could not
++  run. Saved file identity now follows the volume's own UUID, querying only
++  volumes that contain source files. Capture checks keep using the live device
++  and inode. The first sync after upgrading re-reads each session once, raw
++  capture re-captures each source once, and the first push to a DuckDB or
++  ClickHouse mirror re-sends each session once.
++- On Windows, `duckdb push` can now rebuild the mirror while `duckdb serve` has
++  it open, and serve switches to the rebuilt file without a restart, as on
++  macOS and Linux. Before, the push failed with "Access is denied" and asked
++  you to stop the server first.
++- Messages one Claude Code session sends to another no longer count as user
++  prompts. They no longer raise user-message counts or become a session's first
++  message, and the transcript shows each one as a "Message from another
++  session" card with the sender's name and full text. The first sync after
++  upgrading re-reads each session once.
+ - Price Codex auto-review turns, recorded as `codex-auto-review`, at GPT-5.6
+   Luna catalog rates instead of $0. Usage reports still list
+   `codex-auto-review` as the reported model, and a custom pricing row for it
+diff --git a/docs/configuration.md b/docs/configuration.md
+index cc67a9a4..c9fa32cd 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -226,7 +226,7 @@ zoom_level = 120
+ | `disabled_agents`                   | Session providers to exclude from local filesystem scanning — see [Disabling Session Providers](#disabling-session-providers)                                                                                                                                                                                                                                                                                                                                                    |
+ | `[proxy]`                           | Managed proxy configuration table — see [Remote Access](/docs/remote-access/)                                                                                                                                                                                                                                                                                                                                                                                                    |
+ | `disable_update_check`              | Disable the automatic update check (see [Privacy](#privacy-and-telemetry))                                                                                                                                                                                                                                                                                                                                                                                                       |
+-| `scan_protected_paths`              | Allow Git discovery inside macOS privacy-protected folders, accepting one consent prompt per folder — see [macOS Protected Folders](#macos-protected-folders)                                                                                                                                                                                                                                                                                                                    |
++| `scan_protected_paths`              | Allow Git discovery inside macOS privacy-protected folders and volumes under `/Volumes`, accepting one consent prompt per location — see [macOS Protected Folders](#macos-protected-folders)                                                                                                                                                                                                                                                                                                                    |
+ | `[pg]`                              | PostgreSQL sync configuration — see [PostgreSQL Sync](/docs/pg-sync/)                                                                                                                                                                                                                                                                                                                                                                                                            |
+ | `[duckdb]`                          | DuckDB mirror configuration — see [DuckDB Mirror](/docs/duckdb/)                                                                                                                                                                                                                                                                                                                                                                                                                 |
+ | `[clickhouse]`                      | ClickHouse sync configuration — see [ClickHouse Sync](/docs/clickhouse-sync/)                                                                                                                                                                                                                                                                                                                                                                                                    |
+@@ -1657,6 +1657,13 @@ AgentsView no longer touches these locations during discovery:
+ - `~/Library/CloudStorage` (Dropbox, OneDrive, Google Drive, Box) and
+     `~/Dropbox`
+ - `~/Library/Mobile Documents` (iCloud Drive)
++- Removable and network volumes mounted under `/Volumes`, such as
++    `/Volumes/External`
++
++The `/Volumes` rule matters most when AgentsView runs as a background service.
++macOS shows the consent prompt on the console, so a `launchd` agent on a Mac
++with nobody logged in at the screen waits on it forever and startup sync never
++finishes.
+ 
+ Sessions whose working directory lives in one of these folders — including
+ directories that only reach one through a symlink — keep **path-only project
+@@ -1671,9 +1678,9 @@ If you keep code in one of these folders and want the Git detail, opt in:
+ scan_protected_paths = true
+ ```
+ 
+-macOS then prompts once per folder on the next sync; granting access restores
+-full identity for those sessions, and denying leaves them path-only. The option
+-has no effect on other platforms.
++macOS then prompts once per folder or volume on the next sync; granting access
++restores full identity for those sessions, and denying leaves them path-only.
++The option has no effect on other platforms.
+ 
+ Enabling the option applies to sessions parsed after the change. Sessions
+ already in the archive keep their path-only identity until their session files
+diff --git a/docs/internal/session-format-sources.md b/docs/internal/session-format-sources.md
+index 6ac810ad..c55aebde 100644
+--- a/docs/internal/session-format-sources.md
++++ b/docs/internal/session-format-sources.md
+@@ -201,6 +201,22 @@ fixtures retain this field; missing identities remain source-local.
+   title. Data version 118 reparses existing sessions once, so renames made
+   before the upgrade appear.
+ 
++- **Peer message evidence (2026-10-04):** Claude Code 2.1.280 persists a message
++  from another local session in the receiving transcript as
++  `{"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","isMeta":true,"prompt":"<cross-session-message from=... from-name=... from-mode=...>\nBODY\n</cross-session-message>","origin":{"kind":"peer","name":...,"body":...}}}`,
++  with `queue-operation` `enqueue` and `remove` records around it. The
++  harness may also write a `type:"user"` record with `isMeta:true` and
++  `promptSource:"system"` carrying a delivery notice. Native parsing
++  classifies a prompt that starts with `<cross-session-message` as a system
++  row with `source_subtype` `peer_message`, keeping the wrapper so the sender
++  stays visible; `isMeta` user records stay dropped. Task notifications in the
++  same release are `type:"user"` records with
++  `origin:{"kind":"task-notification"}` and a `<task-notification>` body,
++  which the existing `task_notification` rule already covers. Checked against
++  a local transcript corpus; the synthetic fixture
++  `internal/parser/testdata/claude/queued_peer_messages.jsonl` mirrors these
++  shapes. Data version 126 reparses existing sessions once.
++
+ - **Evidence:** `no-public-source`.
+ 
+ - **Upstream:** The public
+@@ -590,13 +606,13 @@ fixtures retain this field; missing identities remain source-local.
+   shows writes counted inside `input_tokens`. OpenAI's
+   [prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
+   bills GPT-5.6 and later cache writes at 1.25x the uncached input rate.
+-  Reverified 2026-10-02.
+-  Catalog pricing therefore covers only the normalized fields the parser
+-  emits. Codex Luna Reserve turns persist `turn_context.payload.model` as
+-  `gpt-reserve`. That reported name is stored unchanged; pricing resolves it
+-  to the `gpt-5.6-luna` catalog row (Luna list rates, not an OpenAI invoice).
+-  An exact `[custom_model_pricing."gpt-reserve"]` row still wins. Reverified
+-  2026-09-06 against OpenAI's Luna Reserve help article
++  Reverified 2026-10-02. Catalog pricing therefore covers only the normalized
++  fields the parser emits. Codex Luna Reserve turns persist
++  `turn_context.payload.model` as `gpt-reserve`. That reported name is stored
++  unchanged; pricing resolves it to the `gpt-5.6-luna` catalog row (Luna list
++  rates, not an OpenAI invoice). An exact `[custom_model_pricing."gpt-reserve"]`
++  row still wins. Reverified 2026-09-06 against OpenAI's Luna Reserve help
++  article
+     <https://help.openai.com/en/articles/20001499-luna-reserve-in-codex-and-chatgpt-work>
+     and Codex `turn_context` model seeding in `internal/parser/codex.go`. With
+     the `amazon-bedrock` provider, Codex reports `openai.gpt-5.4`,
+@@ -1383,14 +1399,13 @@ latter is verified against the upstream
+ [bash tool](https://github.com/anomalyco/opencode/blob/dff8fbc149fb7492e4f07b713ac31ea70d9a541c/packages/core/src/tool/bash.ts).
+ 
+ OpenCode timing uses the native dispatch fields. Legacy tool parts store
+-`state.time.start` and `state.time.end`; v2 tool items store
+-`time.ran` and `time.completed`. AgentsView measures dispatch through
+-completion, so time spent waiting for approval is included. `time.created` is
+-not a fallback. A missing, zero, or reversed dispatch boundary leaves the
+-duration unknown. An interrupted legacy record with
+-`state.metadata.interrupted=true` and equal positive bounds is synthetic and
+-also remains unknown; equal positive bounds without that flag are valid zero
+-duration. Standalone shell rows have no `ran` field and retain
++`state.time.start` and `state.time.end`; v2 tool items store `time.ran` and
++`time.completed`. AgentsView measures dispatch through completion, so time spent
++waiting for approval is included. `time.created` is not a fallback. A missing,
++zero, or reversed dispatch boundary leaves the duration unknown. An interrupted
++legacy record with `state.metadata.interrupted=true` and equal positive bounds
++is synthetic and also remains unknown; equal positive bounds without that flag
++are valid zero duration. Standalone shell rows have no `ran` field and retain
+ unknown timing. The legacy start is written before the producer's permission
+ request in the
+ [v1 processor](https://github.com/anomalyco/opencode/blob/67caf894e0843ee370e72839e8265e483233479b/packages/opencode/src/session/processor.ts#L331-L378).
+diff --git a/frontend/messages/az.json b/frontend/messages/az.json
+index c61cdb78..cfcea42d 100644
+--- a/frontend/messages/az.json
++++ b/frontend/messages/az.json
+@@ -2184,6 +2184,7 @@
+   "system_boundary_interrupted": "Sorğu dayandırıldı",
+   "system_boundary_task_notification": "Tapşırıq bildirişi",
+   "system_boundary_stop_hook": "Dayandırma hadisəsi emalçısının rəyi",
++  "system_boundary_peer_message": "Başqa sessiyadan mesaj",
+   "system_boundary_title": "Sistem sərhədi: {subtype}",
+   "system_boundary_show_content": "Məzmunu göstər",
+   "trash_loading": "Zibil qutusu yüklənir...",
+diff --git a/frontend/messages/en.json b/frontend/messages/en.json
+index 2b69da85..50af3490 100644
+--- a/frontend/messages/en.json
++++ b/frontend/messages/en.json
+@@ -2182,6 +2182,7 @@
+   "system_boundary_interrupted": "Request interrupted",
+   "system_boundary_task_notification": "Task notification",
+   "system_boundary_stop_hook": "Stop hook feedback",
++  "system_boundary_peer_message": "Message from another session",
+   "system_boundary_title": "System boundary: {subtype}",
+   "system_boundary_show_content": "Show content",
+   "trash_loading": "Loading trash...",
+diff --git a/frontend/messages/es.json b/frontend/messages/es.json
+index 63a900f6..9761afc0 100644
+--- a/frontend/messages/es.json
++++ b/frontend/messages/es.json
+@@ -2184,6 +2184,7 @@
+   "system_boundary_interrupted": "Solicitud interrumpida",
+   "system_boundary_task_notification": "Notificación de tarea",
+   "system_boundary_stop_hook": "Respuesta del hook de detención",
++  "system_boundary_peer_message": "Mensaje de otra sesión",
+   "system_boundary_title": "Límite del sistema: {subtype}",
+   "system_boundary_show_content": "Mostrar contenido",
+   "trash_loading": "Cargando papelera...",
+diff --git a/frontend/messages/fr.json b/frontend/messages/fr.json
+index ebbb8241..4c43fae2 100644
+--- a/frontend/messages/fr.json
++++ b/frontend/messages/fr.json
+@@ -2181,6 +2181,7 @@
+   "system_boundary_interrupted": "Requête interrompue",
+   "system_boundary_task_notification": "Notification de tâche",
+   "system_boundary_stop_hook": "Retour du hook d'arrêt",
++  "system_boundary_peer_message": "Message d'une autre session",
+   "system_boundary_title": "Limite système : {subtype}",
+   "system_boundary_show_content": "Afficher le contenu",
+   "trash_loading": "Chargement de la corbeille...",
+diff --git a/frontend/messages/ja.json b/frontend/messages/ja.json
+index 52ab45aa..a8a979d3 100644
+--- a/frontend/messages/ja.json
++++ b/frontend/messages/ja.json
+@@ -2170,6 +2170,7 @@
+   "system_boundary_interrupted": "リクエストが中断されました",
+   "system_boundary_task_notification": "タスク通知",
+   "system_boundary_stop_hook": "フックフィードバックを停止する",
++  "system_boundary_peer_message": "別のセッションからのメッセージ",
+   "system_boundary_title": "システム境界: {subtype}",
+   "system_boundary_show_content": "コンテンツを表示",
+   "trash_loading": "ゴミ箱を読み込み中...",
+diff --git a/frontend/messages/ko.json b/frontend/messages/ko.json
+index 0ab7a38f..c983456c 100644
+--- a/frontend/messages/ko.json
++++ b/frontend/messages/ko.json
+@@ -2100,6 +2100,7 @@
+   "system_boundary_interrupted": "요청 중단됨",
+   "system_boundary_task_notification": "작업 알림",
+   "system_boundary_stop_hook": "중지 훅 피드백",
++  "system_boundary_peer_message": "다른 세션의 메시지",
+   "system_boundary_title": "시스템 경계: {subtype}",
+   "system_boundary_show_content": "내용 표시",
+   "trash_loading": "휴지통을 불러오는 중...",
+diff --git a/frontend/messages/zh-CN.json b/frontend/messages/zh-CN.json
+index 5e2e7fe1..b55cac95 100644
+--- a/frontend/messages/zh-CN.json
++++ b/frontend/messages/zh-CN.json
+@@ -2098,6 +2098,7 @@
+   "system_boundary_interrupted": "请求中断",
+   "system_boundary_task_notification": "任务通知",
+   "system_boundary_stop_hook": "停止钩子反馈",
++  "system_boundary_peer_message": "来自其他会话的消息",
+   "system_boundary_title": "系统边界：{subtype}",
+   "system_boundary_show_content": "显示内容",
+   "trash_loading": "正在加载回收站...",
+diff --git a/frontend/messages/zh-TW.json b/frontend/messages/zh-TW.json
+index 9c745323..971566a8 100644
+--- a/frontend/messages/zh-TW.json
++++ b/frontend/messages/zh-TW.json
+@@ -2098,6 +2098,7 @@
+   "system_boundary_interrupted": "請求中斷",
+   "system_boundary_task_notification": "任務通知",
+   "system_boundary_stop_hook": "停止 Hook 回饋",
++  "system_boundary_peer_message": "來自其他工作階段的訊息",
+   "system_boundary_title": "系統邊界：{subtype}",
+   "system_boundary_show_content": "顯示內容",
+   "trash_loading": "正在載入垃圾桶...",
+diff --git a/frontend/src/lib/utils/messages.ts b/frontend/src/lib/utils/messages.ts
+index fd14fc27..2bdc39db 100644
+--- a/frontend/src/lib/utils/messages.ts
++++ b/frontend/src/lib/utils/messages.ts
+@@ -31,6 +31,7 @@ const VISIBLE_SYSTEM_SUBTYPES = new Set([
+   "interrupted",
+   "task_notification",
+   "stop_hook",
++  "peer_message",
+ ]);
+ 
+ /**
+@@ -51,7 +52,8 @@ export function isSystemBoundaryMessage(m: Message): m is Message & { source_sub
+  * then falls back to prefix detection for parsers that don't set it.
+  *
+  * Compact boundary messages and promoted system-subtype messages
+- * (continuation, resume, interrupted, task_notification, stop_hook)
++ * (continuation, resume, interrupted, task_notification, stop_hook,
++ * peer_message)
+  * are system-flagged but rendered as dividers/cards, so they are
+  * kept visible here.
+  */
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 68042470..6529568d 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -32,6 +32,7 @@ import (
+ 	"go.kenn.io/agentsview/internal/jsonutil"
+ 	"go.kenn.io/agentsview/internal/parser"
+ 	"go.kenn.io/agentsview/internal/pathutil"
++	"go.kenn.io/kit/atomicfile"
+ 	"go.kenn.io/kit/embedconfig"
+ )
+ 
+@@ -205,9 +206,18 @@ type VectorConfig struct {
+ 	// archive's index with content that search already hides by default.
+ 	// `embeddings build --include-automated` can override this for a
+ 	// one-off build; see that flag's help for the scheduled-build caveat.
+-	IncludeAutomated bool                   `toml:"include_automated" json:"include_automated"`
+-	Embeddings       VectorEmbeddingsConfig `toml:"embeddings" json:"embeddings"`
+-	Embed            VectorEmbedConfig      `toml:"embed" json:"embed"`
++	IncludeAutomated bool `toml:"include_automated" json:"include_automated"`
++	// RecallMaxRevisionLag is how many Recall corpus revisions the Recall
++	// vector index may trail the corpus and still answer vector and hybrid
++	// queries. Every insert, delete, or text edit of an accepted Recall entry
++	// is one revision, so while extraction runs the index trails by a few
++	// until the next build. Entries newer than the index are missing only
++	// from the vector ranking; hybrid still finds them by keyword. 0 requires
++	// an exact match, which was the only behavior before this setting.
++	// Default 256.
++	RecallMaxRevisionLag int                    `toml:"recall_max_revision_lag" json:"recall_max_revision_lag"`
++	Embeddings           VectorEmbeddingsConfig `toml:"embeddings" json:"embeddings"`
++	Embed                VectorEmbedConfig      `toml:"embed" json:"embed"`
+ }
+ 
+ // VectorEmbeddingsConfig describes the embedding space — the model identity
+@@ -416,12 +426,22 @@ type VectorEmbedConfig struct {
+ 	BackstopInterval string `toml:"backstop_interval" json:"backstop_interval"`
+ }
+ 
++// DefaultRecallMaxRevisionLag is the default [vector]
++// recall_max_revision_lag: room for about 50 minutes of steady extraction
++// between Recall index builds.
++const DefaultRecallMaxRevisionLag = 256
++
+ // Validate checks the vector config for internal consistency. It is a
+ // no-op when the section is disabled.
+ func (c VectorConfig) Validate() error {
+ 	if !c.Enabled {
+ 		return nil
+ 	}
++	if c.RecallMaxRevisionLag < 0 {
++		return fmt.Errorf(
++			"[vector] recall_max_revision_lag must be 0 or greater, got %d",
++			c.RecallMaxRevisionLag)
++	}
+ 	if c.Embeddings.Model == "" {
+ 		return errors.New("[vector.embeddings] model is required when [vector] is enabled")
+ 	}
+@@ -936,8 +956,9 @@ type Config struct {
+ 
+ 	// ScanProtectedPaths allows local Git discovery to read working
+ 	// directories inside macOS locations guarded by a TCC consent prompt
+-	// (Documents, Downloads, Desktop, iCloud Drive, and cloud-provider
+-	// folders such as Dropbox). It defaults to false so a first sync never
++	// (Documents, Downloads, Desktop, iCloud Drive, cloud-provider folders
++	// such as Dropbox, and removable or network volumes under /Volumes). It
++	// defaults to false so a first sync never
+ 	// asks for access to folders the user did not point us at; sessions
+ 	// there keep path-only project identity instead of Git remote,
+ 	// worktree, and branch detail. Setting it accepts one macOS prompt per
+@@ -1233,6 +1254,7 @@ func Default() (Config, error) {
+ 		DaemonIdleTimeout:              20 * time.Minute,
+ 		Agent:                          map[string]AgentConfig{},
+ 		Vector: VectorConfig{
++			RecallMaxRevisionLag: DefaultRecallMaxRevisionLag,
+ 			Embeddings: VectorEmbeddingsConfig{
+ 				MaxInputChars: 8192,
+ 			},
+@@ -1479,7 +1501,7 @@ func (c *Config) migrateJSONToTOML() error {
+ 		if err := os.WriteFile(tomlPath, buf.Bytes(), 0o600); err != nil {
+ 			return fmt.Errorf("writing config.toml: %w", err)
+ 		}
+-		if err := os.Rename(jsonPath, jsonPath+".bak"); err != nil {
++		if err := atomicfile.Replace(jsonPath, jsonPath+".bak"); err != nil {
+ 			return fmt.Errorf("renaming config.json to .bak: %w", err)
+ 		}
+ 		return nil
+@@ -1865,6 +1887,9 @@ func (c *Config) applyConfigTOML(data string) error {
+ 	if meta.IsDefined("vector", "include_automated") {
+ 		c.Vector.IncludeAutomated = file.Vector.IncludeAutomated
+ 	}
++	if meta.IsDefined("vector", "recall_max_revision_lag") {
++		c.Vector.RecallMaxRevisionLag = file.Vector.RecallMaxRevisionLag
++	}
+ 	if file.Vector.Embeddings.Model != "" {
+ 		c.Vector.Embeddings.Model = file.Vector.Embeddings.Model
+ 	}
+diff --git a/internal/db/db.go b/internal/db/db.go
+index 3794f119..ce0213e1 100644
+--- a/internal/db/db.go
++++ b/internal/db/db.go
+@@ -560,7 +560,12 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
+ // (125: Gemini and Cursor files that share a session ID remain separate
+ // conversations. Re-parse unchanged sources, including cached remote mirrors,
+ // to recover conversations previously collapsed into one archived session.)
+-const dataVersion = 125
++// (126: Claude messages from another Claude Code session, persisted as
++// queued_command prompts wrapped in <cross-session-message>, are now system
++// rows with source_subtype peer_message instead of user prompts. Re-parse
++// unchanged Claude sources so user-message counts and first messages drop
++// them.)
++const dataVersion = 126
+ 
+ const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
+ 
+@@ -778,6 +783,7 @@ type DB struct {
+ 	usageBackfillDone    chan struct{}
+ 	usageBackfillErr     error
+ 	usageBackfillStarted func()
++	usageBackfillRerun   bool // queues one more pass after the active one
+ 	// usageBackfillEnabled records that this process explicitly started
+ 	// background backfill (the daemon lifecycle). Reopen restarts a pass
+ 	// only then, so CLI resyncs never trigger an unrequested archive scan.
+@@ -4554,14 +4560,11 @@ func (db *DB) startWALCheckpointLoop() {
+ 		defer close(done)
+ 		ticker := time.NewTicker(walCheckpointInterval)
+ 		defer ticker.Stop()
++		var diag walDiagnostics
+ 		for {
+ 			select {
+ 			case <-ticker.C:
+-				attempted, err := db.MaybeCheckpointLargeWAL(context.Background())
+-				if attempted && err != nil &&
+-					!errors.Is(err, ErrWALCheckpointBusy) {
+-					log.Printf("sqlite wal checkpoint: %v", err)
+-				}
++				db.walMaintenanceTick(context.Background(), &diag)
+ 			case <-stop:
+ 				return
+ 			}
+diff --git a/internal/db/db_test.go b/internal/db/db_test.go
+index 643695af..f7c913c1 100644
+--- a/internal/db/db_test.go
++++ b/internal/db/db_test.go
+@@ -1116,6 +1116,11 @@ func TestCurrentDataVersionCodexCacheWriteTokens(t *testing.T) {
+ 		"version 123 is the data-version boundary for Codex cache-write token normalization")
+ }
+ 
++func TestCurrentDataVersionClaudePeerMessages(t *testing.T) {
++	assert.GreaterOrEqual(t, CurrentDataVersion(), 126,
++		"version 126 is the data-version boundary for Claude peer-message classification")
++}
++
+ func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {
+ 	d := testDB(t)
+ 	insertSession(t, d, "s-events", "proj")
+@@ -5141,7 +5146,7 @@ func TestReopenDoesNotBlockNewReadsWhileClosingRetiredPool(t *testing.T) {
+ 	select {
+ 	case err := <-readDone:
+ 		require.NoError(t, err, "new read while closing retired pool")
+-	case <-time.After(200 * time.Millisecond):
++	case <-time.After(2 * time.Second):
+ 		require.Fail(t, "new read blocked while Reopen closed a retired pool")
+ 	}
+ 
+@@ -5176,44 +5181,6 @@ func TestRepeatedReopenBoundsRetiredPools(t *testing.T) {
+ 	assert.NotNil(t, s, "session s1 missing after repeated Reopen")
+ }
+ 
+-func TestCloseConnectionsWaitsForInFlightReads(t *testing.T) {
+-	d := testDB(t)
+-	insertSession(t, d, "s1", "proj")
+-
+-	rows, err := d.Reader().Query(t.Context(), "SELECT id FROM sessions")
+-	require.NoError(t, err, "Query")
+-	defer rows.Close()
+-
+-	closeDone := make(chan error, 1)
+-	go func() { closeDone <- d.CloseConnections(t.Context()) }()
+-
+-	// The open rows hold a reader connection with a live file
+-	// handle. CloseConnections promises the database file can be
+-	// renamed afterwards, which fails on Windows while any handle
+-	// survives, so it must not return before the rows are released.
+-	select {
+-	case err := <-closeDone:
+-		require.Failf(t, "CloseConnections returned early",
+-			"returned while rows were still open: %v", err)
+-	case <-time.After(150 * time.Millisecond):
+-	}
+-
+-	require.NoError(t, rows.Err(), "rows.Err")
+-	require.NoError(t, rows.Close(), "rows.Close")
+-
+-	select {
+-	case err := <-closeDone:
+-		require.NoError(t, err, "CloseConnections")
+-	case <-time.After(2 * time.Second):
+-		require.Fail(t, "CloseConnections did not return after rows were released")
+-	}
+-
+-	require.NoError(t, d.Reopen(), "Reopen")
+-	s, err := d.GetSession(t.Context(), "s1")
+-	require.NoError(t, err, "GetSession after Reopen")
+-	assert.NotNil(t, s, "session s1 missing after Reopen")
+-}
+-
+ func TestCloseConnectionsBlocksConcurrentReopen(t *testing.T) {
+ 	d := testDB(t)
+ 	insertSession(t, d, "s1", "proj")
+@@ -5239,14 +5206,20 @@ func TestCloseConnectionsBlocksConcurrentReopen(t *testing.T) {
+ 	reopenDone := make(chan error, 1)
+ 	go func() { reopenDone <- d.Reopen() }()
+ 
+-	// Reopen must serialize behind the drain: fresh handles opened
+-	// mid-drain would let CloseConnections return while the database
+-	// file is still unrenameable on Windows.
++	// The open rows hold a reader connection with a live file handle.
++	// CloseConnections promises the database file can be renamed
++	// afterwards, which fails on Windows while any handle survives, so it
++	// must not return before the rows are released. Reopen must serialize
++	// behind the drain, since fresh handles opened mid-drain would break
++	// the same promise.
+ 	select {
++	case err := <-closeDone:
++		require.Failf(t, "CloseConnections returned early",
++			"returned while rows were still open: %v", err)
+ 	case err := <-reopenDone:
+ 		require.Failf(t, "Reopen returned early",
+ 			"returned while CloseConnections was draining: %v", err)
+-	case <-time.After(150 * time.Millisecond):
++	case <-time.After(150 * time.Millisecond): //nolint:kennlint // absence check; the open rows keep the drain, and so Reopen, waiting
+ 	}
+ 
+ 	require.NoError(t, rows.Err(), "rows.Err")
+@@ -5288,7 +5261,7 @@ func TestCloseWriterWaitsForInFlightWriterQuery(t *testing.T) {
+ 	case err := <-closeDone:
+ 		require.Failf(t, "CloseWriter returned early",
+ 			"returned while writer rows were still open: %v", err)
+-	case <-time.After(150 * time.Millisecond):
++	case <-time.After(150 * time.Millisecond): //nolint:kennlint // absence check; the open writer rows keep CloseWriter waiting
+ 	}
+ 
+ 	require.NoError(t, rows.Err(), "rows.Err")
+diff --git a/internal/db/messages.go b/internal/db/messages.go
+index 1464c054..9eb06a82 100644
+--- a/internal/db/messages.go
++++ b/internal/db/messages.go
+@@ -1453,16 +1453,19 @@ func (db *DB) insertMessages(ctx context.Context,
+ 		return nil
+ 	}
+ 	t := time.Now()
++	var lockWait time.Duration
+ 	defer func() {
+ 		if d := time.Since(t); d > slowOpThreshold {
+ 			log.Printf(
+-				"db: InsertMessages (%d msgs): %s",
++				"db: InsertMessages (%d msgs): %s (lock wait %s)",
+ 				len(msgs), d.Round(time.Millisecond),
++				lockWait.Round(time.Millisecond),
+ 			)
+ 		}
+ 	}()
+ 
+ 	db.mu.Lock()
++	lockWait = time.Since(t)
+ 	defer db.mu.Unlock()
+ 
+ 	tx, err := db.getWriter().Begin(ctx)
+@@ -1692,16 +1695,19 @@ func (db *DB) writeSessionIncremental(ctx context.Context,
+ 	}
+ 
+ 	t := time.Now()
++	var lockWait time.Duration
+ 	defer func() {
+ 		if d := time.Since(t); d > slowOpThreshold {
+ 			log.Printf(
+-				"db: WriteSessionIncremental (%d msgs): %s",
++				"db: WriteSessionIncremental (%d msgs): %s (lock wait %s)",
+ 				len(msgs), d.Round(time.Millisecond),
++				lockWait.Round(time.Millisecond),
+ 			)
+ 		}
+ 	}()
+ 
+ 	db.mu.Lock()
++	lockWait = time.Since(t)
+ 	defer db.mu.Unlock()
+ 
+ 	tx, err := db.getWriter().Begin(ctx)
+@@ -1981,17 +1987,20 @@ func (db *DB) replaceSessionMessages(ctx context.Context,
+ 	msgs = db.messagesForStorage(msgs)
+ 
+ 	t := time.Now()
++	var lockWait time.Duration
+ 	defer func() {
+ 		if d := time.Since(t); d > slowOpThreshold {
+ 			log.Printf(
+-				"db: ReplaceSessionMessages %s (%d msgs): %s",
++				"db: ReplaceSessionMessages %s (%d msgs): %s (lock wait %s)",
+ 				sessionID, len(msgs),
+ 				d.Round(time.Millisecond),
++				lockWait.Round(time.Millisecond),
+ 			)
+ 		}
+ 	}()
+ 
+ 	db.mu.Lock()
++	lockWait = time.Since(t)
+ 	defer db.mu.Unlock()
+ 
+ 	// Prefer an in-place diff (append/merge shapes from streaming
+diff --git a/internal/parser/claude.go b/internal/parser/claude.go
+index e12fae6f..1e82aaa4 100644
+--- a/internal/parser/claude.go
++++ b/internal/parser/claude.go
+@@ -55,7 +55,9 @@ type dagEntry struct {
+ // claudeQueuedCommand is a user message Claude Code persisted as
+ // type=attachment with attachment.type=queued_command — i.e. a
+ // prompt the user typed while a tool call was still running.
+-// These records have no uuid/parentUuid, so we collect them out
++// Claude Code also uses this shape for task notifications and for
++// messages another session sent, which queuedCommandMessage
++// classifies as system rows. These records have no uuid/parentUuid, so we collect them out
+ // of band and splice them into the message stream by timestamp
+ // after DAG processing completes.
+ type claudeQueuedCommand struct {
+@@ -3160,6 +3162,11 @@ func classifyClaudeSystemMessage(content string) string {
+ 		return "interrupted"
+ 	case strings.HasPrefix(trimmed, "<task-notification>"):
+ 		return "task_notification"
++	case strings.HasPrefix(trimmed, "<cross-session-message"):
++		// Another Claude Code session sent this message. Claude Code
++		// persists it as a queued_command whose prompt keeps the
++		// sender attributes in this wrapper.
++		return "peer_message"
+ 	case strings.HasPrefix(trimmed, "Stop hook feedback:"):
+ 		return "stop_hook"
+ 	case strings.HasPrefix(trimmed, "<system-reminder>"):
+diff --git a/internal/sync/engine.go b/internal/sync/engine.go
+index cbb3512f..28513d54 100644
+--- a/internal/sync/engine.go
++++ b/internal/sync/engine.go
+@@ -34,6 +34,7 @@ import (
+ 	"go.kenn.io/agentsview/internal/secrets"
+ 	"go.kenn.io/agentsview/internal/sync/failurecache"
+ 	"go.kenn.io/agentsview/internal/timeutil"
++	"go.kenn.io/kit/atomicfile"
+ )
+ 
+ const (
+@@ -471,8 +472,9 @@ type EngineConfig struct {
+ 	IncludeCwdPrefixes []string
+ 	// ScanProtectedPaths lets local Git discovery read working directories
+ 	// inside macOS TCC-protected locations (Documents, Downloads, Desktop,
+-	// iCloud Drive, and cloud-provider folders). It defaults to false so a
+-	// first sync cannot raise consent prompts the user cannot explain;
++	// iCloud Drive, cloud-provider folders, and volumes under /Volumes). It
++	// defaults to false so a first sync cannot raise consent prompts the
++	// user cannot explain;
+ 	// sessions there keep path-only project identity. Populated from the
+ 	// scan_protected_paths config option. The safe default belongs to the
+ 	// zero value so an engine built without the option never prompts.
+@@ -4017,7 +4019,7 @@ func (e *Engine) swapResyncDatabaseLocked(
+ 	// complete original.
+ 	removeWAL(origPath)
+ 
+-	if err := os.Rename(tempPath, origPath); err != nil {
++	if err := atomicfile.Replace(tempPath, origPath); err != nil {
+ 		log.Printf("resync: rename temp db: %v", err)
+ 		stats.Aborted = true
+ 		stats.Warnings = append(stats.Warnings,
+diff --git a/internal/sync/engine_integration_test.go b/internal/sync/engine_integration_test.go
+index 7ab7881a..c5f054fa 100644
+--- a/internal/sync/engine_integration_test.go
++++ b/internal/sync/engine_integration_test.go
+@@ -4307,7 +4307,7 @@ func TestRunExclusiveSerializesWorktreeReclassification(t *testing.T) {
+ 	select {
+ 	case applyErr := <-applyDone:
+ 		require.Failf(t, "apply overlapped exclusive work", "error: %v", applyErr)
+-	case <-time.After(25 * time.Millisecond):
++	case <-time.After(25 * time.Millisecond): //nolint:kennlint // absence check; the held exclusive work keeps the apply waiting
+ 	}
+ 	close(release)
+ 	require.NoError(t, <-firstDone)
+@@ -10845,7 +10845,7 @@ func TestSyncEngineConcurrentSerialization(t *testing.T) {
+ 		require.FailNow(t,
+ 			"ResyncAll entered while SyncAll held mutex",
+ 		)
+-	case <-time.After(50 * time.Millisecond):
++	case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check; the held SyncAll mutex keeps ResyncAll out
+ 		// Expected: ResyncAll is blocked.
+ 	}
+ 
+diff --git a/internal/sync/engine_test.go b/internal/sync/engine_test.go
+index de5ecb42..385c4d89 100644
+--- a/internal/sync/engine_test.go
++++ b/internal/sync/engine_test.go
+@@ -4317,13 +4317,16 @@ func TestStartupSyncFallbackRechecksAfterInFlightForegroundSync(t *testing.T) {
+ 		err error
+ 	}
+ 	fallbackDone := make(chan fallbackResult, 1)
++	fallbackFinished := make(chan struct{})
+ 	go func() {
+ 		_, ran, err := engine.RunStartupSyncFallback(t.Context(), nil)
+ 		fallbackDone <- fallbackResult{ran: ran, err: err}
++		close(fallbackFinished)
+ 	}()
++	// Never can leave a poll running after it returns; keep the result for the assertion below.
+ 	assert.Never(t, func() bool {
+ 		select {
+-		case <-fallbackDone:
++		case <-fallbackFinished:
+ 			return true
+ 		default:
+ 			return false
+diff --git a/internal/sync/watcher_test.go b/internal/sync/watcher_test.go
+index 06a646fc..ca22efd7 100644
+--- a/internal/sync/watcher_test.go
++++ b/internal/sync/watcher_test.go
+@@ -79,7 +79,7 @@ func TestWatcherAcknowledgesLifecycleOnlyAfterSuccessfulReconciliation(t *testin
+ 	select {
+ 	case generation := <-gate.acknowledged:
+ 		require.Fail(t, "failed reconciliation acknowledged lifecycle", generation)
+-	case <-time.After(50 * time.Millisecond):
++	case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check; the failed reconciliation must not acknowledge the lifecycle
+ 	}
+ 	second := requireReceiveWithin(t, calls, time.Second)
+ 	assert.Equal(t, []string{"/sync"}, second.ReconcileRoots)
+@@ -206,7 +206,7 @@ func TestWatcherLifecycleStoppedRejectsCollectionAndDispatch(t *testing.T) {
+ 	select {
+ 	case batch := <-calls:
+ 		require.Fail(t, "stopped watcher dispatched a batch", "%+v", batch)
+-	case <-time.After(50 * time.Millisecond):
++	case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check; a stopped watcher must never dispatch
+ 	}
+ }
+ 
+@@ -895,7 +895,7 @@ func TestWatcherSustainedWritesProgress(t *testing.T) {
+ 		case err := <-writeErr:
+ 			require.NoError(t, err)
+ 			return watcherCall{}
+-		case <-time.After(minInterval + dispatchTolerance):
++		case <-time.After(watcherTestTimeout):
+ 			require.FailNow(t, "continuous writes starved the watcher callback")
+ 			return watcherCall{}
+ 		}
+@@ -2024,7 +2024,7 @@ func TestWatcherStopCancelsPendingCallback(t *testing.T) {
+ 	select {
+ 	case batch := <-calls:
+ 		require.FailNowf(t, "test failed", "callback ran after Stop with batch %+v", batch)
+-	case <-time.After(350 * time.Millisecond):
++	case <-time.After(350 * time.Millisecond): //nolint:kennlint // absence check; a stopped watcher must never run the callback
+ 	}
+ }
+ 
+@@ -2067,7 +2067,7 @@ func TestWatcherStopWaitsForRunningCallbackAndDiscardsPending(t *testing.T) {
+ 	select {
+ 	case <-stopped:
+ 		require.FailNow(t, "Stop returned before the running callback completed")
+-	case <-time.After(50 * time.Millisecond):
++	case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check; the running callback keeps Stop waiting
+ 	}
+ 
+ 	releaseCallback()
+@@ -2122,38 +2122,6 @@ func TestWatcherCallsOnChange(t *testing.T) {
+ 	}
+ }
+ 
+-func TestWatcherAutoWatchesNewDirs(t *testing.T) {
+-	pathsCh := make(chan []string, 10)
+-
+-	_, dir := startTestWatcher(t, func(paths []string) {
+-		pathsCh <- paths
+-	})
+-
+-	subdir := filepath.Join(dir, "newdir")
+-	require.NoError(t, os.Mkdir(subdir, 0o755))
+-
+-	// Delivery of the directory create means the backend has completed its
+-	// auto-watch decision before handing the event to the scheduler.
+-	waitForPath(t, pathsCh, subdir)
+-
+-	nestedPath := filepath.Join(subdir, "nested.jsonl")
+-	require.NoError(t, os.WriteFile(nestedPath, []byte("nested"), 0o644))
+-
+-	deadline := time.Now().Add(5 * time.Second)
+-	found := false
+-	for time.Now().Before(deadline) && !found {
+-		select {
+-		case paths := <-pathsCh:
+-			if slices.Contains(paths, nestedPath) {
+-				found = true
+-			}
+-		case <-time.After(50 * time.Millisecond):
+-		}
+-	}
+-
+-	require.True(t, found, "timed out waiting for nested file change")
+-}
+-
+ func TestWatcherStopIsClean(t *testing.T) {
+ 	w, _ := startTestWatcherNoCleanup(t, func(_ []string) {}, 50*time.Millisecond)
+ 
+@@ -2185,7 +2153,7 @@ func TestWatcherLifecycleStopBeforeStartReturns(t *testing.T) {
+ 
+ 	select {
+ 	case <-stopped:
+-	case <-time.After(100 * time.Millisecond):
++	case <-time.After(watcherTestTimeout):
+ 		require.FailNow(t, "Stop blocked before Start")
+ 	}
+ 	w.Start()
+@@ -2220,7 +2188,7 @@ func TestWatcherLifecycleStartFailureReturnsErrorAndDegradesRegisteredScopes(t *
+ 		requireReceiveWithin(t, degraded, time.Second))
+ 	select {
+ 	case <-backend.stopped:
+-	case <-time.After(100 * time.Millisecond):
++	case <-time.After(watcherTestTimeout):
+ 		require.FailNow(t, "failed Start did not stop its backend")
+ 	}
+ 	w.Stop()
+@@ -2353,7 +2321,7 @@ func TestWatcherIgnoresNonWriteCreate(t *testing.T) {
+ 	select {
+ 	case <-pathsCh:
+ 		require.FailNow(t, "onChange called for chmod event, expected it to be ignored")
+-	case <-time.After(100 * time.Millisecond):
++	case <-time.After(100 * time.Millisecond): //nolint:kennlint // absence check; a chmod must never schedule a callback
+ 		// Success
+ 	}
+ }
+@@ -2450,7 +2418,18 @@ func TestWatcherAutoWatchesNewDirs_RespectsExcludes(t *testing.T) {
+ 	require.NoError(t, os.Mkdir(gitDir, 0o755), "Mkdir(.git)")
+ 	barrier := filepath.Join(root, "included-barrier")
+ 	require.NoError(t, os.Mkdir(barrier, 0o755), "Mkdir(barrier)")
+-	waitForPath(t, pathsCh, barrier)
++	deadline := time.NewTimer(watcherTestTimeout)
++	defer deadline.Stop()
++	for reached := false; !reached; {
++		select {
++		case paths := <-pathsCh:
++			assert.NotContains(t, paths, gitDir,
++				"excluded directory create should not trigger onChange")
++			reached = slices.Contains(paths, barrier)
++		case <-deadline.C:
++			require.FailNow(t, "timed out waiting for the included barrier")
++		}
++	}
+ 
+ 	fileInGit := filepath.Join(gitDir, "config")
+ 	require.NoError(t, os.WriteFile(fileInGit, []byte("x"), 0o644))
+@@ -2477,7 +2456,7 @@ func TestWatcherShallowRootDoesNotAutoWatchNewDirs(t *testing.T) {
+ 	case paths := <-pathsCh:
+ 		assert.Contains(t, paths, localDir,
+ 			"root-level create should still trigger onChange")
+-	case <-time.After(250 * time.Millisecond):
++	case <-time.After(watcherTestTimeout):
+ 		require.FailNow(t, "timed out waiting for shallow root create event")
+ 	}
+ 
+@@ -2521,19 +2500,7 @@ func TestWatcherShallowParentDoesNotShadowRecursiveChild(t *testing.T) {
+ 	sessionFile := filepath.Join(dateDir, "rollout.jsonl")
+ 	require.NoError(t, os.WriteFile(sessionFile, []byte("x"), 0o644))
+ 
+-	deadline := time.Now().Add(5 * time.Second)
+-	found := false
+-	for time.Now().Before(deadline) && !found {
+-		select {
+-		case paths := <-pathsCh:
+-			if slices.Contains(paths, sessionFile) {
+-				found = true
+-			}
+-		case <-time.After(50 * time.Millisecond):
+-		}
+-	}
+-	require.True(t, found,
+-		"file in a new date dir under the recursive child must trigger onChange")
++	waitForPath(t, pathsCh, sessionFile)
+ }
+ 
+ func TestWatchRecursive_RootUnderExcludedAncestorStillWatchesDescendants(t *testing.T) {
+@@ -2590,31 +2557,6 @@ func TestWatchRecursive_OverlappingRoots_UsesMostSpecificRoot(t *testing.T) {
+ 	assert.Zero(t, nestedUnwatched)
+ }
+ 
+-func TestWatcherExcludedCreateDir_DoesNotTriggerOnChange(t *testing.T) {
+-	pathsCh := make(chan []string, 10)
+-	w, err := NewWatcher(20*time.Millisecond, func(batch WatchBatch) {
+-		pathsCh <- batch.Paths
+-	}, []string{".git"})
+-	require.NoError(t, err, "NewWatcher")
+-	t.Cleanup(func() { w.Stop() })
+-
+-	root := t.TempDir()
+-	_, _, err = w.WatchRecursive(root)
+-	require.NoError(t, err, "WatchRecursive")
+-	w.Start()
+-
+-	gitDir := filepath.Join(root, ".git")
+-	require.NoError(t, os.Mkdir(gitDir, 0o755), "Mkdir(.git)")
+-
+-	select {
+-	case paths := <-pathsCh:
+-		assert.NotContains(t, paths, gitDir,
+-			"excluded directory create should not trigger onChange")
+-	case <-time.After(250 * time.Millisecond):
+-		// Expected: no callback for excluded dir creation.
+-	}
+-}
+-
+ func TestNewWatcher_NilOnChange(t *testing.T) {
+ 	_, err := NewWatcher(time.Second, nil, nil)
+ 	require.Error(t, err, "NewWatcher(nil) should return error")

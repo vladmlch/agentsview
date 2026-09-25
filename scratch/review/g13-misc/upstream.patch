@@ -1,0 +1,232 @@
+diff --git a/docs/agents/storage.md b/docs/agents/storage.md
+index e055525e..2811c18a 100644
+--- a/docs/agents/storage.md
++++ b/docs/agents/storage.md
+@@ -326,8 +326,12 @@ snapshot. Do not widen or narrow this live/baked boundary implicitly.
+ The cache format version is also the extractor compatibility version. Bump
+ `usageCacheFormatVersion` whenever fact extraction, `priceUsageFact`, web-search
+ fees, deduplication, rollup semantics, or query-time model canonicalization
+-change. Catalog and user-pricing changes are covered separately by the pricing
+-content digest; do not add a write-only extractor-version metadata key.
++change. Catalog and user-pricing changes are covered per session instead: each
++rollup install records the distinct `(provider, reported model, canonical
++model)` lookups its daily rows used, and a read re-resolves only those against
++the current catalog. A price change therefore rebuilds just the sessions whose
++lookups resolve differently, while `updated_at`-only refreshes rebuild nothing.
++Do not add a write-only extractor-version metadata key.
+ 
+ Deduplication groups are classified per group at rollup build time. A group is
+ finalized into daily rows only when its resolution provably cannot vary with the
+@@ -367,8 +371,8 @@ file and warn that the cache will rebuild after restart.
+ 
+ Usage reads are exact. A cold aggregate request fills facts, builds the required
+ timezone rollups, then reads them in one pinned cache transaction. Verify every
+-candidate session's facts fingerprint, exact baked metadata, canonical pricing
+-digest, resolved rate hashes, and Cursor high-water mark. A result is no older
++candidate session's facts fingerprint, exact baked metadata, per-session pricing
++identity, resolved rate hashes, and Cursor high-water mark. A result is no older
+ than the archive snapshot captured when the read began, and may be newer for a
+ session whose facts were refilled meanwhile. A session confirmed deleted during
+ fill is dropped from the request. `cached_at` is diagnostic only.
+diff --git a/docs/changelog.md b/docs/changelog.md
+index c3680baa..4a850d78 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -1,5 +1,5 @@
+ ---
+-last_edited: 2026-10-01
++last_edited: 2026-10-07
+ title: Changelog
+ description: Release history for AgentsView
+ ---
+@@ -22,6 +22,10 @@ The latest published release is
+ - The web UI reports anonymous search, session-view, export, insight and
+   analytics-page events through the server, each with one value from a fixed
+   list. `AGENTSVIEW_TELEMETRY_ENABLED=0` turns them off.
++- Chat imports can replace sessions whose archived history is wrong. List them
++  with `agentsview import --replace <session-id>` or `replace=<session-id>` on
++  the import API. The old version moves to the trash with its messages, name,
++  and pins.
+ - Sessions show the title their agent keeps for them, and a name you chose with
+   `/rename` or the agent's equivalent wins over a generated title. Current
+   Claude Code `/rename` names now appear, and Qwen Code, Gemini CLI, Kimi CLI,
+@@ -109,6 +113,12 @@ The latest published release is
+ 
+ **Improvements**
+ 
++- The Usage page stays fast after a pricing update. A changed price now
++  rebuilds only the sessions that used that model, instead of every session in
++  the archive, and a refresh that changes no rates rebuilds nothing. The daemon
++  rebuilds affected sessions in the background after its daily price refresh,
++  so the next Usage load doesn't wait for them. The first
++  Usage load after upgrading rebuilds the usage cache once.
+ - The Usage page shows a **Total Input** card that adds uncached input, cache
+   writes, and cache reads, so heavy prompt caching no longer looks like missing
+   input. The input count that leaves out cached tokens is now labeled
+@@ -196,9 +206,56 @@ The latest published release is
+   used about 99% less memory in AgentsView. Local dates and hours now come
+   from the PostgreSQL server's time zone data, which matches AgentsView's for
+   current time zones.
++- Hosted raw sync stays fast on a device that has already uploaded many
++  sources. Each acknowledged upload used to reread every object the device had
++  ever uploaded. On a synthetic checkpoint with about 107,000 uploaded objects,
++  acknowledging 36 queued uploads went from about 19 minutes to 1.5 seconds.
++  The first start after upgrading adds an index to the raw sync checkpoint, and
++  earlier AgentsView versions can't open that checkpoint afterward.
+ 
+ **Bug fixes**
+ 
++- Hosted raw sync keeps a session listed and searchable after its source file
++  disappears from the device that uploaded it, matching the local archive.
++  Before, `raw-sync watch` reporting a missing file hid the session, emptied it
++  from the trash, and could swap in a shorter copy from another device. Deleting
++  a session yourself still removes it. Sessions already hidden this way stay
++  hidden until their file returns; see
++  [Hosted Raw Sync](/docs/hosted-raw-sync/#isolation-and-processing-limits).
++- `recall query` and `recall brief` in `--mode vector` or `--mode hybrid` no
++  longer turn unavailable every time recall extraction writes a new entry. The
++  Recall index may now trail the corpus by up to `recall_max_revision_lag`
++  revisions (a `[vector]` setting, default 256) and still answer; entries newer
++  than the index are found by the lexical half of hybrid search until the next
++  build. Set it to `0` for the previous exact-match behavior.
++- On macOS, `agentsview serve` no longer hangs at `Running initial sync...`
++  when a session's working directory is on an external or network drive under
++  `/Volumes`. Reading Git metadata there made macOS ask for access to the
++  volume, and a `launchd` service on a Mac with nobody at the screen waited on
++  that prompt forever. AgentsView now leaves those directories untouched, so
++  sessions recorded there keep path-only project identity with no Git remote,
++  worktree, or branch. Set `scan_protected_paths = true` to read Git detail
++  from them again; see
++  [macOS Protected Folders](/docs/configuration/#macos-protected-folders).
++- On macOS, a reboot no longer makes the next sync re-read every session from
++  scratch. macOS can give a volume a different device number each time it is
++  mounted, which happens after a system update, and AgentsView took the changed
++  number to mean every session file had been replaced. Until that re-read
++  finished, `agentsview serve` did not start and `pg push --watch` could not
++  run. Saved file identity now follows the volume's own UUID, querying only
++  volumes that contain source files. Capture checks keep using the live device
++  and inode. The first sync after upgrading re-reads each session once, raw
++  capture re-captures each source once, and the first push to a DuckDB or
++  ClickHouse mirror re-sends each session once.
++- On Windows, `duckdb push` can now rebuild the mirror while `duckdb serve` has
++  it open, and serve switches to the rebuilt file without a restart, as on
++  macOS and Linux. Before, the push failed with "Access is denied" and asked
++  you to stop the server first.
++- Messages one Claude Code session sends to another no longer count as user
++  prompts. They no longer raise user-message counts or become a session's first
++  message, and the transcript shows each one as a "Message from another
++  session" card with the sender's name and full text. The first sync after
++  upgrading re-reads each session once.
+ - Price Codex auto-review turns, recorded as `codex-auto-review`, at GPT-5.6
+   Luna catalog rates instead of $0. Usage reports still list
+   `codex-auto-review` as the reported model, and a custom pricing row for it
+diff --git a/docs/configuration.md b/docs/configuration.md
+index cc67a9a4..c9fa32cd 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -226,7 +226,7 @@ zoom_level = 120
+ | `disabled_agents`                   | Session providers to exclude from local filesystem scanning — see [Disabling Session Providers](#disabling-session-providers)                                                                                                                                                                                                                                                                                                                                                    |
+ | `[proxy]`                           | Managed proxy configuration table — see [Remote Access](/docs/remote-access/)                                                                                                                                                                                                                                                                                                                                                                                                    |
+ | `disable_update_check`              | Disable the automatic update check (see [Privacy](#privacy-and-telemetry))                                                                                                                                                                                                                                                                                                                                                                                                       |
+-| `scan_protected_paths`              | Allow Git discovery inside macOS privacy-protected folders, accepting one consent prompt per folder — see [macOS Protected Folders](#macos-protected-folders)                                                                                                                                                                                                                                                                                                                    |
++| `scan_protected_paths`              | Allow Git discovery inside macOS privacy-protected folders and volumes under `/Volumes`, accepting one consent prompt per location — see [macOS Protected Folders](#macos-protected-folders)                                                                                                                                                                                                                                                                                                                    |
+ | `[pg]`                              | PostgreSQL sync configuration — see [PostgreSQL Sync](/docs/pg-sync/)                                                                                                                                                                                                                                                                                                                                                                                                            |
+ | `[duckdb]`                          | DuckDB mirror configuration — see [DuckDB Mirror](/docs/duckdb/)                                                                                                                                                                                                                                                                                                                                                                                                                 |
+ | `[clickhouse]`                      | ClickHouse sync configuration — see [ClickHouse Sync](/docs/clickhouse-sync/)                                                                                                                                                                                                                                                                                                                                                                                                    |
+@@ -1657,6 +1657,13 @@ AgentsView no longer touches these locations during discovery:
+ - `~/Library/CloudStorage` (Dropbox, OneDrive, Google Drive, Box) and
+     `~/Dropbox`
+ - `~/Library/Mobile Documents` (iCloud Drive)
++- Removable and network volumes mounted under `/Volumes`, such as
++    `/Volumes/External`
++
++The `/Volumes` rule matters most when AgentsView runs as a background service.
++macOS shows the consent prompt on the console, so a `launchd` agent on a Mac
++with nobody logged in at the screen waits on it forever and startup sync never
++finishes.
+ 
+ Sessions whose working directory lives in one of these folders — including
+ directories that only reach one through a symlink — keep **path-only project
+@@ -1671,9 +1678,9 @@ If you keep code in one of these folders and want the Git detail, opt in:
+ scan_protected_paths = true
+ ```
+ 
+-macOS then prompts once per folder on the next sync; granting access restores
+-full identity for those sessions, and denying leaves them path-only. The option
+-has no effect on other platforms.
++macOS then prompts once per folder or volume on the next sync; granting access
++restores full identity for those sessions, and denying leaves them path-only.
++The option has no effect on other platforms.
+ 
+ Enabling the option applies to sessions parsed after the change. Sessions
+ already in the archive keep their path-only identity until their session files
+diff --git a/docs/internal/session-format-sources.md b/docs/internal/session-format-sources.md
+index 6ac810ad..c55aebde 100644
+--- a/docs/internal/session-format-sources.md
++++ b/docs/internal/session-format-sources.md
+@@ -201,6 +201,22 @@ fixtures retain this field; missing identities remain source-local.
+   title. Data version 118 reparses existing sessions once, so renames made
+   before the upgrade appear.
+ 
++- **Peer message evidence (2026-10-04):** Claude Code 2.1.280 persists a message
++  from another local session in the receiving transcript as
++  `{"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","isMeta":true,"prompt":"<cross-session-message from=... from-name=... from-mode=...>\nBODY\n</cross-session-message>","origin":{"kind":"peer","name":...,"body":...}}}`,
++  with `queue-operation` `enqueue` and `remove` records around it. The
++  harness may also write a `type:"user"` record with `isMeta:true` and
++  `promptSource:"system"` carrying a delivery notice. Native parsing
++  classifies a prompt that starts with `<cross-session-message` as a system
++  row with `source_subtype` `peer_message`, keeping the wrapper so the sender
++  stays visible; `isMeta` user records stay dropped. Task notifications in the
++  same release are `type:"user"` records with
++  `origin:{"kind":"task-notification"}` and a `<task-notification>` body,
++  which the existing `task_notification` rule already covers. Checked against
++  a local transcript corpus; the synthetic fixture
++  `internal/parser/testdata/claude/queued_peer_messages.jsonl` mirrors these
++  shapes. Data version 126 reparses existing sessions once.
++
+ - **Evidence:** `no-public-source`.
+ 
+ - **Upstream:** The public
+@@ -590,13 +606,13 @@ fixtures retain this field; missing identities remain source-local.
+   shows writes counted inside `input_tokens`. OpenAI's
+   [prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
+   bills GPT-5.6 and later cache writes at 1.25x the uncached input rate.
+-  Reverified 2026-10-02.
+-  Catalog pricing therefore covers only the normalized fields the parser
+-  emits. Codex Luna Reserve turns persist `turn_context.payload.model` as
+-  `gpt-reserve`. That reported name is stored unchanged; pricing resolves it
+-  to the `gpt-5.6-luna` catalog row (Luna list rates, not an OpenAI invoice).
+-  An exact `[custom_model_pricing."gpt-reserve"]` row still wins. Reverified
+-  2026-09-06 against OpenAI's Luna Reserve help article
++  Reverified 2026-10-02. Catalog pricing therefore covers only the normalized
++  fields the parser emits. Codex Luna Reserve turns persist
++  `turn_context.payload.model` as `gpt-reserve`. That reported name is stored
++  unchanged; pricing resolves it to the `gpt-5.6-luna` catalog row (Luna list
++  rates, not an OpenAI invoice). An exact `[custom_model_pricing."gpt-reserve"]`
++  row still wins. Reverified 2026-09-06 against OpenAI's Luna Reserve help
++  article
+     <https://help.openai.com/en/articles/20001499-luna-reserve-in-codex-and-chatgpt-work>
+     and Codex `turn_context` model seeding in `internal/parser/codex.go`. With
+     the `amazon-bedrock` provider, Codex reports `openai.gpt-5.4`,
+@@ -1383,14 +1399,13 @@ latter is verified against the upstream
+ [bash tool](https://github.com/anomalyco/opencode/blob/dff8fbc149fb7492e4f07b713ac31ea70d9a541c/packages/core/src/tool/bash.ts).
+ 
+ OpenCode timing uses the native dispatch fields. Legacy tool parts store
+-`state.time.start` and `state.time.end`; v2 tool items store
+-`time.ran` and `time.completed`. AgentsView measures dispatch through
+-completion, so time spent waiting for approval is included. `time.created` is
+-not a fallback. A missing, zero, or reversed dispatch boundary leaves the
+-duration unknown. An interrupted legacy record with
+-`state.metadata.interrupted=true` and equal positive bounds is synthetic and
+-also remains unknown; equal positive bounds without that flag are valid zero
+-duration. Standalone shell rows have no `ran` field and retain
++`state.time.start` and `state.time.end`; v2 tool items store `time.ran` and
++`time.completed`. AgentsView measures dispatch through completion, so time spent
++waiting for approval is included. `time.created` is not a fallback. A missing,
++zero, or reversed dispatch boundary leaves the duration unknown. An interrupted
++legacy record with `state.metadata.interrupted=true` and equal positive bounds
++is synthetic and also remains unknown; equal positive bounds without that flag
++are valid zero duration. Standalone shell rows have no `ran` field and retain
+ unknown timing. The legacy start is written before the producer's permission
+ request in the
+ [v1 processor](https://github.com/anomalyco/opencode/blob/67caf894e0843ee370e72839e8265e483233479b/packages/opencode/src/session/processor.ts#L331-L378).

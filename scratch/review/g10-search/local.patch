@@ -1,0 +1,1363 @@
+diff --git a/frontend/e2e/session-find-regressions.spec.ts b/frontend/e2e/session-find-regressions.spec.ts
+index b41ed853..d2484a5c 100644
+--- a/frontend/e2e/session-find-regressions.spec.ts
++++ b/frontend/e2e/session-find-regressions.spec.ts
+@@ -1,5 +1,5 @@
+ import { expect, test, type Page } from "@playwright/test";
+-import type { Message } from "../src/lib/api/types.js";
++import type { DbMessage as Message } from "../src/lib/api/generated/index.js";
+ 
+ const SESSION_ID = "test-session-xlarge-5500";
+ function message(ordinal: number, content: string, extra: Partial<Message> = {}): Message {
+@@ -17,6 +17,8 @@ function message(ordinal: number, content: string, extra: Partial<Message> = {})
+     model: "",
+     context_tokens: 0,
+     output_tokens: 0,
++    has_context_tokens: false,
++    has_output_tokens: false,
+     is_system: false,
+     ...extra,
+   };
+@@ -112,15 +114,17 @@ test.describe("session find audit regressions", () => {
+       await expect(current).toHaveAttribute("data-search-block", "0:thinking:0");
+       await expect(current).toBeVisible();
+       await page.keyboard.press("Escape");
+-      // Thinking stays rendered by its filter; only the search expansion ends.
++      // Thinking stays rendered by its filter; only the search expansion
++      // ends. The thinking block is a sibling turn event next to the tool
++      // rollup — both self-disclose ephemerally rather than through turn
++      // state.
+       await expect(page.locator(".thinking-header")).toHaveCount(1);
+       await expect(page.locator(".thinking-content")).toHaveCount(0);
++      await expect(page.locator("[data-search-current]")).toHaveCount(0);
+     });
+   }
+ 
+-  test("excludes tool output hidden at start and follows a live filter change", async ({
+-    page,
+-  }) => {
++  test("keeps hidden tool output indexed and follows a live filter change", async ({ page }) => {
+     await installMessages(
+       page,
+       [
+@@ -133,21 +137,36 @@ test.describe("session find audit regressions", () => {
+       { hidden: ["tool", "code", "system"] },
+     );
+     await find(page);
+-    await expect(page.locator(".search-announcement")).toHaveText("Match 1 of 1");
++    // The hidden tool match stays indexed and is temporarily revealed.
++    await expect(page.locator(".search-announcement")).toHaveText("Match 1 of 2");
+     await expect(page.locator('[data-search-current="true"]')).toHaveAttribute(
+       "data-search-block",
+-      "1:text:0",
++      "0:tool-output:0",
+     );
++    await expect(page.locator('[data-search-current="true"]')).toBeVisible();
++    await expect(page.locator(".tool-block")).toHaveCount(1);
++
++    // Manually hiding the revealed type suppresses it; the index is
++    // unchanged while its block unmounts.
++    await toggleBlockFilter(page, "Tool calls");
++    await expect(page.locator(".search-announcement")).toHaveText("Match 1 of 2");
+     await expect(page.locator(".tool-block")).toHaveCount(0);
++    await expect(page.locator("[data-search-current]")).toHaveCount(0);
+ 
++    // Re-enabling restores the saved filter and the same current match.
+     await toggleBlockFilter(page, "Tool calls");
+-    await expect(page.locator(".search-announcement")).toHaveText(/^Match \d+ of 2$/);
+-    await page.keyboard.press("F3");
++    await expect(page.locator(".tool-block")).toHaveCount(1);
+     await expect(page.locator('[data-search-current="true"]')).toHaveAttribute(
+       "data-search-block",
+       "0:tool-output:0",
+     );
+     await expect(page.locator('[data-search-current="true"]')).toBeVisible();
++    await page.keyboard.press("F3");
++    await expect(page.locator(".search-announcement")).toHaveText("Match 2 of 2");
++    await expect(page.locator('[data-search-current="true"]')).toHaveAttribute(
++      "data-search-block",
++      "1:text:0",
++    );
+   });
+ 
+   for (const earlyHit of [true, false]) {
+@@ -217,7 +236,7 @@ test("searches the displayed image placeholder rather than serialized result met
+   await installMessages(page, [
+     message(0, "", {
+       has_tool_use: true,
+-      tool_calls: [{ tool_name: "view_image", result_content: result }],
++      tool_calls: [{ tool_name: "view_image", category: "view_image", result_content: result }],
+     }),
+   ]);
+   const input = await find(page);
+diff --git a/frontend/e2e/session-find.spec.ts b/frontend/e2e/session-find.spec.ts
+index 31400f87..8eb6b867 100644
+--- a/frontend/e2e/session-find.spec.ts
++++ b/frontend/e2e/session-find.spec.ts
+@@ -1,5 +1,5 @@
+ import { expect, test, type Page } from "@playwright/test";
+-import type { Message } from "../src/lib/api/types.js";
++import type { DbMessage as Message } from "../src/lib/api/generated/index.js";
+ 
+ const SESSION_ID = "test-session-xlarge-5500";
+ const QUERY = "needle";
+@@ -34,6 +34,8 @@ function fixtureMessages(): Message[] {
+       model: "",
+       context_tokens: 0,
+       output_tokens: 0,
++      has_context_tokens: false,
++      has_output_tokens: false,
+       is_system: false,
+     };
+   });
+@@ -222,27 +224,33 @@ async function stepOccurrences(page: Page, total: number, direction: "F3" | "Shi
+     await expect(counter).not.toHaveText(before);
+     let current: Awaited<ReturnType<typeof currentGeometry>> = null;
+     await expect
+-      .poll(async () => {
+-        const first = await currentGeometry(page);
+-        if (first?.visible && !first.native) {
+-          current = first;
+-          return true;
+-        }
+-        await page.evaluate(
+-          () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
+-        );
+-        const second = await currentGeometry(page);
+-        if (
+-          first?.visible &&
+-          second?.visible &&
+-          first.key === second.key &&
+-          first.offset === second.offset
+-        ) {
+-          current = second;
+-          return true;
+-        }
+-        return false;
+-      })
++      .poll(
++        async () => {
++          const first = await currentGeometry(page);
++          if (first?.visible && !first.native) {
++            current = first;
++            return true;
++          }
++          await page.evaluate(
++            () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
++          );
++          const second = await currentGeometry(page);
++          if (
++            first?.visible &&
++            second?.visible &&
++            first.key === second.key &&
++            first.offset === second.offset
++          ) {
++            current = second;
++            return true;
++          }
++          return false;
++        },
++        // Reveal on a 5500-row virtual transcript involves mount,
++        // scroll, and re-measure; allow more than the 5s default
++        // under parallel load.
++        { timeout: 15_000 },
++      )
+       .toBe(true);
+     expect(current).not.toBeNull();
+     steps.push(current!);
+@@ -335,30 +343,28 @@ test.describe("In-session find", () => {
+     });
+   });
+ 
+-  test("excludes tool calls hidden at start and restores them when the filter returns", async ({
+-    page,
+-  }) => {
++  test("keeps hidden tool calls indexed and honors a manual hide", async ({ page }) => {
+     const fixture = await installFixture(page, { hidden: ["tool"] });
+     fixture.releaseHistory();
+     const transcript = await openSession(page);
+     await openFind(page);
+-    await expectCompleteIndex(page, PROSE_MATCHES);
++    // Normal-mode block filters do not shrink the search index: the tool
++    // matches stay indexed and their blocks are temporarily revealed.
++    await expectCompleteIndex(page, ALL_MATCHES);
+     await openResults(page);
+-    const hiddenSteps = await stepOccurrences(page, PROSE_MATCHES, "F3");
++    const hiddenSteps = await stepOccurrences(page, ALL_MATCHES, "F3");
+     const hiddenKeys = new Set(hiddenSteps.map((step) => step.key!));
+-    expect(hiddenKeys.has("12:tool-output:0")).toBe(false);
+-    expect(hiddenKeys.has("12:tool-history:0.0")).toBe(false);
+-    await expect(transcript.locator(".tool-block")).toHaveCount(0);
++    expect(hiddenKeys.has("12:tool-output:0")).toBe(true);
++    expect(hiddenKeys.has("12:tool-history:0.0")).toBe(true);
++    expect(await page.evaluate(() => localStorage.getItem("agentsview-block-filters"))).toBe(
++      JSON.stringify({ hidden: ["tool"] }),
++    );
+ 
++    // Hiding the revealed type manually suppresses the temporary reveal;
++    // the index and the current match are unchanged.
+     await toggleBlockFilter(page, "Tool calls");
+     await expectCompleteIndex(page, ALL_MATCHES);
+-    const shownSteps = await stepOccurrences(page, ALL_MATCHES, "F3");
+-    const shownKeys = new Set(shownSteps.map((step) => step.key!));
+-    expect(shownKeys.has("12:tool-output:0")).toBe(true);
+-    expect(shownKeys.has("12:tool-history:0.0")).toBe(true);
+-
+-    await toggleBlockFilter(page, "Tool calls");
+-    await expectCompleteIndex(page, PROSE_MATCHES);
++    await expect(transcript.locator(".tool-block")).toHaveCount(0);
+     await expect
+       .poll(async () => {
+         const current = await currentGeometry(page);
+@@ -366,6 +372,55 @@ test.describe("In-session find", () => {
+       })
+       .toBe(true);
+     await expect(transcript.locator("mark")).toHaveCount(0);
++
++    // Re-enabling clears the suppression and reveals the blocks again.
++    await toggleBlockFilter(page, "Tool calls");
++    await expectCompleteIndex(page, ALL_MATCHES);
++    const shownSteps = await stepOccurrences(page, 4, "F3");
++    expect(shownSteps.at(-1)?.key).toBe("12:tool-output:0");
++    await expect(transcript.locator(".tool-block").first()).toBeVisible();
++  });
++
++  test("hidden-type search reveals matches without persisting filters", async ({ page }) => {
++    const fixture = await installFixture(page, { hidden: ["thinking", "tool"] });
++    fixture.releaseHistory();
++    const transcript = await openSession(page);
++    const input = await openFind(page);
++
++    // Hidden block types stay indexed: all seven needle matches resolve
++    // and their folded rows mount while the search view navigates to them.
++    await expectCompleteIndex(page, ALL_MATCHES);
++    await openResults(page);
++    const steps = await stepOccurrences(page, ALL_MATCHES, "F3");
++    const keys = new Set(steps.map((step) => step.key!));
++    expect(keys.has("7:thinking:0")).toBe(true);
++    expect(keys.has("12:tool-output:0")).toBe(true);
++    expect(keys.has("12:tool-history:0.0")).toBe(true);
++    // The reveal is ephemeral — the persisted filter is untouched.
++    expect(await page.evaluate(() => localStorage.getItem("agentsview-block-filters"))).toBe(
++      JSON.stringify({ hidden: ["thinking", "tool"] }),
++    );
++
++    // Land on the hidden thinking match so its revealed block mounts.
++    const thinkingSteps = await stepOccurrences(page, 2, "F3");
++    expect(thinkingSteps.at(-1)?.key).toBe("7:thinking:0");
++    await expect(transcript.locator(".thinking-block").first()).toBeVisible();
++
++    // Manually hiding a revealed type wins over the temporary reveal
++    // while the saved filter still records the same hidden types.
++    await toggleBlockFilter(page, "Thinking blocks");
++    await expect(transcript.locator(".thinking-block")).toHaveCount(0);
++    expect(await page.evaluate(() => localStorage.getItem("agentsview-block-filters"))).toBe(
++      JSON.stringify({ hidden: ["thinking", "tool"] }),
++    );
++
++    // Clearing the query drops every temporary reveal, but the turn the
++    // search expanded keeps its disclosure.
++    await input.fill("");
++    await expect(transcript.locator(".thinking-block")).toHaveCount(0);
++    await expect(transcript.locator(".tool-block")).toHaveCount(0);
++    await expect(transcript.locator("[data-search-current]")).toHaveCount(0);
++    await expect(transcript.locator('.turn-header[aria-expanded="true"]').first()).toBeVisible();
+   });
+ 
+   test("keeps the current occurrence valid when a filter hides it mid-search", async ({ page }) => {
+@@ -387,20 +442,20 @@ test.describe("In-session find", () => {
+     await expect.poll(async () => (await currentGeometry(page))?.visible).toBe(true);
+ 
+     await toggleBlockFilter(page, "Tool calls");
+-    await expectCompleteIndex(page, PROSE_MATCHES);
++    // The match stays indexed while its hidden block unmounts.
++    await expectCompleteIndex(page, ALL_MATCHES);
++    await expect(transcript.locator(".tool-block")).toHaveCount(0);
++    await expect(transcript.locator("[data-search-current]")).toHaveCount(0);
++
++    await toggleBlockFilter(page, "Tool calls");
++    await expectCompleteIndex(page, ALL_MATCHES);
++    await expect(input).toHaveValue(QUERY);
+     await expect
+       .poll(async () => {
+         const current = await currentGeometry(page);
+-        return current !== null && current.visible && !TOOL_KEYS.includes(current.key ?? "");
++        return current !== null && current.visible && current.key === "12:tool-output:0";
+       })
+       .toBe(true);
+-    await expect(transcript.locator('[data-search-current="true"]')).not.toHaveCount(0);
+-    await expect(transcript.locator("[data-search-current]")).toHaveCount(1);
+-
+-    await toggleBlockFilter(page, "Tool calls");
+-    await expectCompleteIndex(page, ALL_MATCHES);
+-    await expect(input).toHaveValue(QUERY);
+-    await expect.poll(async () => (await currentGeometry(page))?.visible).toBe(true);
+   });
+ 
+   test("keeps counts and block navigation without the Highlight API", async ({ page }) => {
+@@ -413,11 +468,12 @@ test.describe("In-session find", () => {
+     fixture.releaseHistory();
+     const transcript = await openSession(page);
+     await openFind(page);
+-    await expectCompleteIndex(page, PROSE_MATCHES);
+-    const hiddenSteps = await stepOccurrences(page, PROSE_MATCHES, "F3");
++    // Tool calls stay indexed while hidden and are temporarily revealed.
++    await expectCompleteIndex(page, ALL_MATCHES);
++    const hiddenSteps = await stepOccurrences(page, ALL_MATCHES, "F3");
+     expect(hiddenSteps.every((step) => step.native === false)).toBe(true);
+     expect(hiddenSteps.every((step) => step.visible === true)).toBe(true);
+-    expect(hiddenSteps.some((step) => TOOL_KEYS.includes(step.key ?? ""))).toBe(false);
++    expect(hiddenSteps.some((step) => TOOL_KEYS.includes(step.key ?? ""))).toBe(true);
+     await expect(transcript.locator('[data-search-current="true"]')).toHaveCount(1);
+     await expect(transcript.locator("mark")).toHaveCount(0);
+     expect(
+@@ -427,7 +483,11 @@ test.describe("In-session find", () => {
+       }),
+     ).not.toContain(true);
+ 
+-    // The tool filter still owns its blocks when it returns.
++    // A manual hide suppresses the temporary reveal; re-enabling hands
++    // the blocks back to the saved filter.
++    await toggleBlockFilter(page, "Tool calls");
++    await expectCompleteIndex(page, ALL_MATCHES);
++    await expect(transcript.locator(".tool-block")).toHaveCount(0);
+     await toggleBlockFilter(page, "Tool calls");
+     await expectCompleteIndex(page, ALL_MATCHES);
+     const shownSteps = await stepOccurrences(page, ALL_MATCHES, "F3");
+diff --git a/frontend/src/lib/components/content/FindOverviewRail.svelte b/frontend/src/lib/components/content/FindOverviewRail.svelte
+index e5fd2930..c2b92a7d 100644
+--- a/frontend/src/lib/components/content/FindOverviewRail.svelte
++++ b/frontend/src/lib/components/content/FindOverviewRail.svelte
+@@ -1,38 +1,85 @@
+ <script lang="ts">
+   import { untrack } from "svelte";
+-  import type { DisplayItem } from "../../utils/display-items.js";
++  import type { DbMessage as Message } from "../../api/generated/index.js";
++  import type { TranscriptRow } from "../../utils/transcript-rows.js";
+   import { collectSearchBlocks } from "../../search/block-text.js";
++  import { blockTypeForKind } from "../../search/session-scope.js";
+   import { nearestOverviewMatch, overviewLocations, overviewTicks, overviewY } from "../../search/overview.js";
+   import { ui } from "../../stores/ui.svelte.js";
+   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+   import { m } from "../../i18n/index.js";
+ 
+   interface Props {
+-    items: DisplayItem[];
++    /** Virtual transcript rows in display order — the same sequence the
++     *  virtualizer positions via `rowOffset`. */
++    rows: TranscriptRow[];
+     totalSize: number;
+-    newestFirst: boolean;
+     rowOffset: (index: number) => number;
+   }
+-  let { items, totalSize, newestFirst, rowOffset }: Props = $props();
++  let { rows, totalSize, rowOffset }: Props = $props();
+   let rail: SVGSVGElement | undefined = $state(undefined);
+   let width = $state(0);
+   let height = $state(0);
+ 
++  /** Messages a match can land on for one row. The first rendered row of
++   *  a source message claims it (`taken`), so a message behind several
++   *  events emits its blocks exactly once; a turn header adopts the
++   *  members no child or final-output row renders, so matches inside a
++   *  collapsed or filtered turn still pin to its visible header band. */
++  function rowMessages(
++    row: TranscriptRow,
++    claimed: ReadonlySet<number>,
++    taken: Set<number>,
++  ): Message[] {
++    let mine: Message[];
++    switch (row.kind) {
++      case "display":
++        mine = row.item.kind === "message"
++          ? [row.item.message]
++          : row.item.messages;
++        break;
++      case "turn-header":
++        mine = row.turn.messages.filter(
++          (message) => !claimed.has(message.ordinal),
++        );
++        break;
++      default: {
++        // The header's empty-tuple progressOrdinals widens here; every
++        // other row kind carries a plain number list.
++        const rendered: readonly number[] = row.progressOrdinals;
++        mine = row.turn.messages.filter((message) =>
++          rendered.includes(message.ordinal),
++        );
++      }
++    }
++    const fresh = mine.filter((message) => !taken.has(message.ordinal));
++    for (const message of fresh) taken.add(message.ordinal);
++    return fresh;
++  }
++
+   let locations = $derived.by(() => {
+-    const ordered = newestFirst ? [...items].reverse() : items;
++    const ordered = rows;
+     const matches = inSessionSearch.matches;
+     const scope = inSessionSearch.scope;
++    const revealed = inSessionSearch.revealedBlockTypes;
+     const total = totalSize;
+     const renderUnknownXmlBlocksAsPreformatted = ui.renderUnknownXmlBlocksAsPreformatted;
+-    return untrack(() => overviewLocations(ordered.map((item, index) => {
+-      const offset = rowOffset(index);
+-      const end = index + 1 < ordered.length ? rowOffset(index + 1) : total;
+-      const messages = item.kind === "message" ? [item.message]
+-        : newestFirst ? [...item.messages].reverse() : item.messages;
+-      return { offset, size: Math.max(1, end - offset), blocks: messages.flatMap((message) =>
+-        collectSearchBlocks(message, { renderUnknownXmlBlocksAsPreformatted })
+-          .filter((block) => scope?.allowsBlock(message, block.kind))) };
+-    }), matches));
++    return untrack(() => {
++      const claimed = new Set<number>();
++      for (const row of ordered) {
++        for (const ordinal of row.progressOrdinals) claimed.add(ordinal);
++      }
++      const taken = new Set<number>();
++      return overviewLocations(ordered.map((row, index) => {
++        const offset = rowOffset(index);
++        const end = index + 1 < ordered.length ? rowOffset(index + 1) : total;
++        const messages = rowMessages(row, claimed, taken);
++        return { offset, size: Math.max(1, end - offset), blocks: messages.flatMap((message) =>
++          collectSearchBlocks(message, { renderUnknownXmlBlocksAsPreformatted })
++            .filter((block) => (scope?.allowsBlock(message, block.kind) ?? false)
++              || revealed.has(blockTypeForKind(block.kind, message.role)))) };
++      }), matches);
++    });
+   });
+ 
+   let ticks = $derived(overviewTicks(locations, totalSize, height));
+diff --git a/frontend/src/lib/components/content/FindOverviewRail.test.ts b/frontend/src/lib/components/content/FindOverviewRail.test.ts
+index 243e33e3..1865b863 100644
+--- a/frontend/src/lib/components/content/FindOverviewRail.test.ts
++++ b/frontend/src/lib/components/content/FindOverviewRail.test.ts
+@@ -5,6 +5,7 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
+ import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+ import { messages } from "../../stores/messages.svelte.js";
+ import { ui } from "../../stores/ui.svelte.js";
++import { displayTranscriptRow } from "../../utils/transcript-rows.js";
+ import FindOverviewRail from "./FindOverviewRail.svelte";
+ 
+ let component: ReturnType<typeof mount> | undefined;
+@@ -67,9 +68,8 @@ it("positions visible matches without hidden thinking, including live filter cha
+   component = mount(FindOverviewRail, {
+     target: document.body,
+     props: {
+-      items: inSessionSearch.scope!.items,
++      rows: inSessionSearch.scope!.displayItems.map(displayTranscriptRow),
+       totalSize: 100,
+-      newestFirst: false,
+       rowOffset: () => 0,
+     },
+   });
+diff --git a/frontend/src/lib/components/content/SessionFindView.svelte b/frontend/src/lib/components/content/SessionFindView.svelte
+index 2f19ba0b..a470f80f 100644
+--- a/frontend/src/lib/components/content/SessionFindView.svelte
++++ b/frontend/src/lib/components/content/SessionFindView.svelte
+@@ -1,6 +1,6 @@
+ <script lang="ts">
+   import type { Snippet } from "svelte";
+-  import type { DisplayItem } from "../../utils/display-items.js";
++  import type { TranscriptRow } from "../../utils/transcript-rows.js";
+   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+   import FindResultsList from "./FindResultsList.svelte";
+   import FindOverviewRail from "./FindOverviewRail.svelte";
+@@ -8,12 +8,13 @@
+ 
+   interface Props {
+     children: Snippet;
+-    items: DisplayItem[];
++    /** Virtual transcript rows in display order — the same sequence the
++     *  virtualizer positions. */
++    rows: TranscriptRow[];
+     totalSize: number;
+-    newestFirst: boolean;
+     rowOffset: (index: number) => number;
+   }
+-  let { children, items, totalSize, newestFirst, rowOffset }: Props = $props();
++  let { children, rows, totalSize, rowOffset }: Props = $props();
+ </script>
+ 
+ <SessionFindBar />
+@@ -23,7 +24,7 @@
+ <div class="find-viewport" class:has-find={inSessionSearch.isActive}>
+   {@render children()}
+   {#if inSessionSearch.isActive}
+-    <FindOverviewRail {items} {totalSize} {newestFirst} {rowOffset} />
++    <FindOverviewRail {rows} {totalSize} {rowOffset} />
+   {/if}
+ </div>
+ 
+diff --git a/frontend/src/lib/search/README.md b/frontend/src/lib/search/README.md
+index 48d6b103..80684cf5 100644
+--- a/frontend/src/lib/search/README.md
++++ b/frontend/src/lib/search/README.md
+@@ -32,13 +32,16 @@ candidates without invoking navigation or closing find.
+ ## Presentation and recovery
+ 
+ Search respects block-type filters and Focused mode. The transcript and index
+-share `projectSessionScope`, so hidden categories do not contribute matches.
+-Changing a filter updates counts, results, and navigation without retyping.
+-Collapsed content within that scope remains searchable; only the current
+-matching disclosure is opened automatically. Skim layout temporarily lifts while
+-searching without changing the saved layout preference. Native CSS highlights do
+-not rewrite transcript text. Precise reveal handles nested scrolling and the
+-application's text-size/zoom settings.
++share `projectSessionScope`: index membership is filter-independent, so hidden
++categories still contribute matches, and a block type owning a match is
++temporarily revealed while the find view is open without touching the saved
++filter. Manually hiding a revealed type suppresses the reveal until it is
++re-enabled or find closes. Focused mode still narrows which messages are
++eligible at all. Collapsed content within that scope remains searchable; only
++the current matching disclosure is opened automatically. Skim layout
++temporarily lifts while searching without changing the saved layout
++preference. Native CSS highlights do not rewrite transcript text. Precise
++reveal handles nested scrolling and the application's text-size/zoom settings.
+ 
+ Native Markdown details elements also open for the current match. Search
+ restores only its own temporary changes on navigation or close, preserving
+diff --git a/frontend/src/lib/search/navigation.test.ts b/frontend/src/lib/search/navigation.test.ts
+index 09c6f07a..f4c54710 100644
+--- a/frontend/src/lib/search/navigation.test.ts
++++ b/frontend/src/lib/search/navigation.test.ts
+@@ -1,4 +1,5 @@
+ import { describe, expect, it } from "vite-plus/test";
++import type { SearchBlockKind } from "./block-text.js";
+ import type { Match } from "./session-index.js";
+ import {
+   cursorFor,
+@@ -15,6 +16,8 @@ function match(ordinal: number, block = "text:0", occurrence = 0): Match {
+     occurrence,
+     start: occurrence * 7,
+     end: occurrence * 7 + 6,
++    kind: block.split(":")[0] as SearchBlockKind,
++    role: "assistant",
+   };
+ }
+ 
+diff --git a/frontend/src/lib/search/overview.test.ts b/frontend/src/lib/search/overview.test.ts
+index 4e936b5c..e4b89866 100644
+--- a/frontend/src/lib/search/overview.test.ts
++++ b/frontend/src/lib/search/overview.test.ts
+@@ -3,7 +3,15 @@ import type { Match } from "./session-index.js";
+ import type { SearchBlock } from "./block-text.js";
+ import { overviewLocations, overviewTicks, overviewY, nearestOverviewMatch } from "./overview.js";
+ function match(ordinal: number, start = 0, occurrence = 0): Match {
+-  return { ordinal, blockKey: `${ordinal}:text:0`, start, end: start + 1, occurrence };
++  return {
++    ordinal,
++    blockKey: `${ordinal}:text:0`,
++    start,
++    end: start + 1,
++    occurrence,
++    kind: "text",
++    role: "assistant",
++  };
+ }
+ function block(ordinal: number, text: string): SearchBlock {
+   return { key: `${ordinal}:text:0`, ordinal, kind: "text", text };
+diff --git a/frontend/src/lib/search/results.test.ts b/frontend/src/lib/search/results.test.ts
+index 1a0f7c26..048c07ff 100644
+--- a/frontend/src/lib/search/results.test.ts
++++ b/frontend/src/lib/search/results.test.ts
+@@ -33,6 +33,8 @@ function match(ordinal: number, occurrence = 0): Match {
+     occurrence,
+     start: occurrence * 7,
+     end: occurrence * 7 + 6,
++    kind: "text",
++    role: "assistant",
+   };
+ }
+ describe("find result snippets", () => {
+diff --git a/frontend/src/lib/search/session-index.test.ts b/frontend/src/lib/search/session-index.test.ts
+index 86afaed2..ba68b777 100644
+--- a/frontend/src/lib/search/session-index.test.ts
++++ b/frontend/src/lib/search/session-index.test.ts
+@@ -39,8 +39,24 @@ describe("buildSessionIndex", () => {
+   it("counts occurrences rather than messages", () => {
+     const index = buildSessionIndex([message(3, "needle needle")], "needle");
+     expect(index.matches).toEqual([
+-      { ordinal: 3, blockKey: "3:text:0", occurrence: 0, start: 0, end: 6 },
+-      { ordinal: 3, blockKey: "3:text:0", occurrence: 1, start: 7, end: 13 },
++      {
++        ordinal: 3,
++        blockKey: "3:text:0",
++        occurrence: 0,
++        start: 0,
++        end: 6,
++        kind: "text",
++        role: "assistant",
++      },
++      {
++        ordinal: 3,
++        blockKey: "3:text:0",
++        occurrence: 1,
++        start: 7,
++        end: 13,
++        kind: "text",
++        role: "assistant",
++      },
+     ]);
+     expect(index.total).toBe(2);
+     expect(index.byBlock.get("3:text:0")).toBe(2);
+@@ -130,6 +146,30 @@ describe("buildSessionIndex", () => {
+     ]);
+     expect(index.byOrdinal.get(4)).toBe(7);
+     expect(index.matches.map((match) => match.occurrence)).toEqual([0, 1, 0, 1, 2, 0, 0]);
++    expect(index.matches.map((match) => match.kind)).toEqual([
++      "tool-input",
++      "tool-input",
++      "tool-output",
++      "tool-output",
++      "tool-output",
++      "tool-history",
++      "tool-history",
++    ]);
++    expect(index.matches.every((match) => match.role === "assistant")).toBe(true);
++  });
++
++  it("records each match's block kind and source message role", () => {
++    const source = [
++      message(0, "needle", { role: "user" }),
++      message(1, "[Thinking]\nneedle\n[/Thinking]", { has_thinking: true }),
++      message(2, "needle"),
++    ];
++    const index = buildSessionIndex(source, "needle");
++    expect(index.matches.map((match) => [match.kind, match.role, match.blockKey])).toEqual([
++      ["text", "user", "0:text:0"],
++      ["thinking", "assistant", "1:thinking:0"],
++      ["text", "assistant", "2:text:0"],
++    ]);
+   });
+ 
+   it("excludes system and boundary cards", () => {
+@@ -158,7 +198,7 @@ describe("buildSessionIndex", () => {
+     expect(nextIndex.total).toBe(3);
+   });
+ 
+-  it("skips blocks the caller's scope excludes while keeping the others intact", () => {
++  it("indexes every searchable block so filters stay out of membership", () => {
+     const source = [
+       message(4, "", {
+         has_tool_use: true,
+@@ -173,15 +213,11 @@ describe("buildSessionIndex", () => {
+       }),
+       message(5, "needle prose"),
+     ];
+-    const textOnly = buildSessionIndex(
+-      source,
+-      "needle",
+-      (_message, block) => block.kind === "text",
+-    );
+-    expect(textOnly.matches.map((match) => match.blockKey)).toEqual(["5:text:0"]);
+-    expect(textOnly.byBlock.has("4:tool-output:0")).toBe(false);
+-    const everything = buildSessionIndex(source, "needle", () => true);
+-    expect(everything.total).toBe(4);
++    const index = buildSessionIndex(source, "needle");
++    expect(index.total).toBe(4);
++    expect(index.byBlock.has("4:tool-output:0")).toBe(true);
++    expect(index.byBlock.has("4:tool-input:0")).toBe(true);
++    expect(index.byBlock.get("5:text:0")).toBe(1);
+   });
+ 
+   it("refreshes replaced same-length output data", () => {
+diff --git a/frontend/src/lib/search/session-index.ts b/frontend/src/lib/search/session-index.ts
+index e0392a23..eb724e8f 100644
+--- a/frontend/src/lib/search/session-index.ts
++++ b/frontend/src/lib/search/session-index.ts
+@@ -1,7 +1,7 @@
+ /** Occurrence-level search over message data, independent of mounted DOM. */
+ import type { MarkdownRenderOptions } from "../utils/markdown.js";
+ import type { DbMessage as Message } from "../api/generated/index.js";
+-import { collectSearchBlocks, type SearchBlock } from "./block-text.js";
++import { collectSearchBlocks, type SearchBlock, type SearchBlockKind } from "./block-text.js";
+ import { createOccurrenceMatcher, prepareSearchText, type PreparedSearchText } from "./dom-text.js";
+ 
+ // Weak ownership releases folded text when a message version is discarded.
+@@ -22,6 +22,10 @@ export interface Match {
+   occurrence: number;
+   start: number;
+   end: number;
++  /** The searchable block kind that produced the match. */
++  kind: SearchBlockKind;
++  /** The role of the source message the match came from. */
++  role: Message["role"];
+ }
+ 
+ export interface SessionIndex {
+@@ -34,14 +38,14 @@ export interface SessionIndex {
+ /**
+  * Return chronological, non-overlapping matches using the shared text matcher.
+  * Offsets are UTF-16 offsets in the block's rendered text. The input array and
+- * its messages are never mutated; transcript visibility enters only through the
+- * optional predicate, so callers pass the messages and blocks the current
+- * filters actually render.
++ * its messages are never mutated. Every searchable block in `messages` is
++ * indexed — block-visibility filtering belongs to the caller's scope, which
++ * selects which source messages are eligible, so hidden filter types still
++ * produce matches that an active search can temporarily reveal.
+  */
+ export function buildSessionIndex(
+   messages: readonly Message[],
+   query: string,
+-  allowsBlock?: (message: Message, block: SearchBlock) => boolean,
+   renderOptions: MarkdownRenderOptions = {},
+   wholeWord = false,
+ ): SessionIndex {
+@@ -63,7 +67,6 @@ export function buildSessionIndex(
+ 
+   for (const message of ordered) {
+     for (const block of collectSearchBlocks(message, renderOptions)) {
+-      if (allowsBlock && !allowsBlock(message, block)) continue;
+       const occurrences = matchText(preparedText(block));
+       if (!occurrences.length) continue;
+       index.byBlock.set(block.key, occurrences.length);
+@@ -78,6 +81,8 @@ export function buildSessionIndex(
+           occurrence,
+           start,
+           end,
++          kind: block.kind,
++          role: message.role,
+         });
+       });
+     }
+diff --git a/frontend/src/lib/search/session-scope.test.ts b/frontend/src/lib/search/session-scope.test.ts
+index 4db62f9a..bff0801c 100644
+--- a/frontend/src/lib/search/session-scope.test.ts
++++ b/frontend/src/lib/search/session-scope.test.ts
+@@ -2,6 +2,7 @@
+ import { describe, expect, it } from "vite-plus/test";
+ import type { DbMessage as Message } from "../api/generated/index.js";
+ import type { BlockType } from "../stores/ui.svelte.js";
++import { buildSessionIndex } from "./session-index.js";
+ import { keepsAnswerBeforeTrailingTools, projectSessionScope } from "./session-scope.js";
+ 
+ const ALL: ReadonlySet<BlockType> = new Set([
+@@ -83,7 +84,9 @@ describe("session search scope", () => {
+     expect(result.messages).toContain(thinkingPlusTool);
+     expect(result.allowsBlock(thinkingPlusTool, "thinking")).toBe(true);
+     expect(result.allowsBlock(thinkingPlusTool, "tool-output")).toBe(false);
+-    expect(result.messages).not.toContain(legacyTool);
++    // Hidden tool-only rows leave the rendered list but stay searchable.
++    expect(result.messages).toContain(legacyTool);
++    expect(result.displayItems.flatMap((item) => item.ordinals)).toEqual([2]);
+     expect(result.allowsBlock(legacyTool, "tool-input")).toBe(false);
+   });
+ 
+@@ -91,7 +94,9 @@ describe("session search scope", () => {
+     const user = message(4, "hello", { role: "user" });
+     const assistant = message(5, "hello");
+     const result = scope([user, assistant], filtered(["assistant"]));
+-    expect(result.messages).not.toContain(user);
++    // Filter-hidden source messages remain eligible for the search index.
++    expect(result.messages).toContain(user);
++    expect(result.displayItems.flatMap((item) => item.ordinals)).toEqual([5]);
+     expect(result.allowsBlock(user, "text")).toBe(false);
+     expect(result.allowsBlock(user, "skill")).toBe(false);
+     expect(result.messages).toContain(assistant);
+@@ -99,6 +104,46 @@ describe("session search scope", () => {
+     expect(result.allowsBlock(assistant, "skill")).toBe(true);
+   });
+ 
++  it("keeps filter-hidden blocks searchable while rendering only visible content", () => {
++    const prompt = message(0, "find the needle", { role: "user" });
++    const thinking = message(1, "[Thinking]\nneedle\n[/Thinking]", {
++      has_thinking: true,
++    });
++    const result = scope([prompt, thinking], filtered(["user", "assistant"]));
++    // Transcript nodes keep full group membership before block filtering.
++    expect(result.items.map((node) => node.kind)).toEqual(["prompt", "assistant-turn"]);
++    expect(result.items[1]!.ordinals).toEqual([1]);
++    expect(result.messages).toContain(thinking);
++    // The rendered list and the per-kind gate still respect the filter.
++    expect(result.displayItems.flatMap((item) => item.ordinals)).toEqual([0]);
++    expect(result.allowsBlock(thinking, "thinking")).toBe(false);
++    const index = buildSessionIndex(result.messages, "needle");
++    expect(index.matches).toContainEqual(
++      expect.objectContaining({
++        kind: "thinking",
++        role: "assistant",
++        blockKey: "1:thinking:0",
++      }),
++    );
++  });
++
++  it("lets a temporarily revealed type render without joining the saved filter", () => {
++    const prompt = message(0, "find the needle", { role: "user" });
++    const thinking = message(1, "[Thinking]\nneedle\n[/Thinking]", {
++      has_thinking: true,
++    });
++    const result = scope([prompt, thinking], {
++      ...filtered(["user", "assistant"]),
++      revealedBlocks: new Set<BlockType>(["thinking"]),
++    });
++    // The reveal overlay renders the hidden row but never enters the saved
++    // filter gate that non-search consumers consult.
++    expect(result.displayItems.flatMap((item) => item.ordinals)).toEqual([0, 1]);
++    expect(result.normalItems.flatMap((item) => item.ordinals)).toEqual([0, 1]);
++    expect(result.allowsBlock(thinking, "thinking")).toBe(false);
++    expect(result.allowsBlock(thinking, "code")).toBe(false);
++  });
++
+   it("maps thinking and code to their own filters", () => {
+     const both = message(6, "[Thinking]\nthink\n[/Thinking]\n\n```ts\nconst x = 1;\n```");
+     const result = scope([both], filtered(["user", "assistant", "thinking"]));
+@@ -115,12 +160,34 @@ describe("session search scope", () => {
+       message(3, "next", { role: "user" }),
+     ];
+     const result = scope(messages, { transcriptMode: "focused" });
+-    expect(result.items.flatMap((item) => item.ordinals)).toEqual([0, 2, 3]);
++    expect(result.displayItems.flatMap((item) => item.ordinals)).toEqual([0, 2, 3]);
++    expect(result.items.map((node) => node.kind)).toEqual(["prompt", "assistant-turn", "prompt"]);
+     expect(result.messages.map((item) => item.ordinal)).toEqual([0, 2, 3]);
+     expect(result.allowsBlock(messages[1]!, "text")).toBe(false);
+     expect(result.normalItems.flatMap((item) => item.ordinals)).toEqual([0, 1, 2, 3]);
+   });
+ 
++  it("keeps intermediate focused-mode messages out of search under block filters", () => {
++    const messages = [
++      message(0, "prompt", { role: "user" }),
++      message(1, "intermediate needle"),
++      message(2, "final needle"),
++      message(3, "next", { role: "user" }),
++    ];
++    const result = scope(messages, {
++      transcriptMode: "focused",
++      ...filtered(["user"]),
++    });
++    // The filtered focused projection hides the assistant answer, but the
++    // mode-selected source messages stay eligible for the search index. Only
++    // the non-selected intermediate assistant message stays out.
++    expect(result.displayItems.flatMap((item) => item.ordinals)).toEqual([0, 3]);
++    expect(result.messages.map((item) => item.ordinal)).toEqual([0, 2, 3]);
++    expect(result.messages).not.toContain(messages[1]!);
++    const index = buildSessionIndex(result.messages, "needle");
++    expect(index.total).toBe(1);
++  });
++
+   it("keeps the answer before trailing tools only when the provider asks", () => {
+     const messages = [
+       message(0, "prompt", { role: "user" }),
+@@ -161,7 +228,7 @@ it.each(["normal", "focused"] as const)(
+     const prompt = message(0, "Show the example", { role: "user" });
+     const code = message(1, "```ts\nconst needle = 1;\n```");
+     const result = scope([prompt, code], { ...filtered(["user", "assistant"]), transcriptMode });
+-    expect(result.items.flatMap((item) => item.ordinals)).toEqual([0, 1]);
++    expect(result.displayItems.flatMap((item) => item.ordinals)).toEqual([0, 1]);
+     expect(result.allowsBlock(code, "code")).toBe(false);
+   },
+ );
+diff --git a/frontend/src/lib/search/session-scope.ts b/frontend/src/lib/search/session-scope.ts
+index 118e199c..ec4c9988 100644
+--- a/frontend/src/lib/search/session-scope.ts
++++ b/frontend/src/lib/search/session-scope.ts
+@@ -6,9 +6,25 @@
+  * DOM while search still counts or reveals it. The module stays free of store
+  * imports: callers pass the current filters in and receive display items plus
+  * the block kinds those items actually render.
++ *
++ * The scope separates three layers:
++ *
++ * - `items` — the assistant-turn tree with full group membership, built
++ *   before child block-type visibility is applied.
++ * - `displayItems`/`normalItems` — the flat lists the current mode and normal
++ *   mode render. An ephemeral `revealedBlocks` overlay may unhide types
++ *   while search is active without touching the saved filter.
++ * - `messages` — every source message eligible for the selected mode,
++ *   independent of block filters, so the search index sees all of them.
+  */
+ import type { DbMessage as Message } from "../api/generated/index.js";
+ import type { BlockType } from "../stores/ui.svelte.js";
++import {
++  buildTranscriptNodes,
++  leadingTurnAnchor,
++  type LeadingTurnAnchor,
++  type TranscriptNode,
++} from "../utils/assistant-turns.js";
+ import { hasVisibleSegments } from "../utils/content-parser.js";
+ import { buildDisplayItems, type DisplayItem } from "../utils/display-items.js";
+ import { isSystemMessage } from "../utils/messages.js";
+@@ -23,18 +39,33 @@ export interface SessionScopeInput {
+   visibleBlocks?: ReadonlySet<BlockType>;
+   /** Whether any block type is hidden; absent means no filters. */
+   hasBlockFilters?: boolean;
++  /** Types an open search temporarily reveals; ephemeral overlay only. */
++  revealedBlocks?: ReadonlySet<BlockType>;
+   /** Provider rule that keeps an answer before its trailing tool calls. */
+   keepAnswerBeforeTrailingTools?: boolean;
++  /** Session id used for stable transcript-node keys; derived otherwise. */
++  sessionId?: string;
+ }
+ 
+ export interface SessionScope {
++  /**
++   * Transcript nodes for the selected mode with full group membership.
++   * `MessageList` flattens these into virtual transcript rows.
++   */
++  items: TranscriptNode[];
+   /** Display items the current transcript mode and filters render. */
+-  items: DisplayItem[];
++  displayItems: DisplayItem[];
+   /** Display items normal mode renders under the same block filters. */
+   normalItems: DisplayItem[];
+-  /** Messages reachable through `items`, in transcript order and deduplicated. */
++  /** Messages eligible for the current mode regardless of block filters. */
+   messages: Message[];
+-  /** Whether an included message can contribute this block kind to search. */
++  /**
++   * The assistant turn normal mode opens on — key, anchor id, and member
++   * ids — always projected from the unfiltered `baseItems` so pagination
++   * re-anchor detection works whatever mode is currently rendered.
++   */
++  leadingTurn: LeadingTurnAnchor | null;
++  /** Whether an included message's block kind survives the saved filter. */
+   allowsBlock(message: Message, kind: SearchBlockKind): boolean;
+ }
+ 
+@@ -49,55 +80,75 @@ export function keepsAnswerBeforeTrailingTools(
+   );
+ }
+ 
+-/** Map a searchable block kind to the filter that owns it. */
+-function kindVisible(
+-  isVisible: (type: BlockType) => boolean,
+-  role: Message["role"],
+-  kind: SearchBlockKind,
+-): boolean {
++/** Map a searchable block kind to the filter type that owns it. */
++export function blockTypeForKind(kind: SearchBlockKind, role: Message["role"]): BlockType {
+   switch (kind) {
+     case "thinking":
+-      return isVisible("thinking");
++      return "thinking";
+     case "code":
+-      return isVisible("code");
++      return "code";
+     case "tool-input":
+     case "tool-output":
+     case "tool-history":
+-      return isVisible("tool");
++      return "tool";
+     case "text":
+     case "skill":
+-      return isVisible(role === "user" ? "user" : "assistant");
++      return role === "user" ? "user" : "assistant";
+   }
+ }
+ 
+ export function projectSessionScope(input: SessionScopeInput): SessionScope {
+   const visibleBlocks = input.visibleBlocks;
++  const revealedBlocks = input.revealedBlocks;
+   const isVisible = (type: BlockType): boolean =>
+     visibleBlocks === undefined || visibleBlocks.has(type);
+-  // A filtered code fence still renders its manually expandable placeholder.
+-  // Keep the row in the transcript without adding its code to the search index.
+-  const isTranscriptBlockVisible = (type: BlockType): boolean => type === "code" || isVisible(type);
+-  const hasBlockFilters = input.hasBlockFilters ?? false;
++  // The search reveal layers over the saved filter for rendered output only;
++  // it is never persisted to the user's block-visibility preference.
++  // Must agree with InSessionSearchStore.isBlockEffectivelyVisible, which
++  // applies the same saved-or-revealed rule inside message components.
++  const isEffectivelyVisible = (type: BlockType): boolean =>
++    isVisible(type) || (revealedBlocks?.has(type) ?? false);
++  // A filtered code fence still renders its manually expandable placeholder,
++  // so `itemVisible`/`hasVisibleSegments` count code as transcript-visible
++  // even while the effective filter hides it. Its content stays in the
++  // search index and can be temporarily revealed.
++  const isTranscriptBlockVisible = (type: BlockType): boolean =>
++    type === "code" || isEffectivelyVisible(type);
++  const hasBlockFilters = (input.hasBlockFilters ?? false) || (revealedBlocks?.size ?? 0) > 0;
+   const transcriptMode = input.transcriptMode ?? "normal";
++  const sessionId = input.sessionId ?? input.messages[0]?.session_id ?? "";
+ 
+   const baseMessages = input.messages.filter((message) => !isSystemMessage(message));
+   const baseItems = buildDisplayItems(baseMessages);
+   const filteredItems = buildDisplayItems(baseMessages, {
+-    skipToolGrouping: !isVisible("tool"),
++    skipToolGrouping: !isEffectivelyVisible("tool"),
+   });
+   const itemVisible = (item: DisplayItem): boolean =>
+     item.kind === "tool-group" || hasVisibleSegments(item.message, isTranscriptBlockVisible);
+ 
++  // Full mode-aware membership before child block-type filtering. This feeds
++  // both the transcript tree and the search index's message set, so hidden
++  // block types keep their membership and stay searchable.
++  const scopedItems =
++    transcriptMode === "normal"
++      ? baseItems
++      : filterDisplayItemsByTranscriptMode(baseItems, "focused", {
++          keepAnswerBeforeTrailingTools: input.keepAnswerBeforeTrailingTools,
++        });
++  const items = buildTranscriptNodes(scopedItems, sessionId);
++  // The leading normal-mode turn comes from unfiltered baseItems: it is
++  // the same anchor `items` carries in normal mode, and it stays stable
++  // when focused mode or block filters reshape the rendered projection.
++  const leadingTurn = leadingTurnAnchor(baseItems, sessionId);
++
+   const normalItems = hasBlockFilters ? filteredItems.filter(itemVisible) : baseItems;
+-  let items: DisplayItem[];
++  let displayItems: DisplayItem[];
+   if (transcriptMode === "normal") {
+-    items = normalItems;
++    displayItems = normalItems;
+   } else if (!hasBlockFilters) {
+-    items = filterDisplayItemsByTranscriptMode(baseItems, "focused", {
+-      keepAnswerBeforeTrailingTools: input.keepAnswerBeforeTrailingTools,
+-    });
++    displayItems = scopedItems;
+   } else {
+-    items = filterDisplayItemsByTranscriptMode(filteredItems, "focused", {
++    displayItems = filterDisplayItemsByTranscriptMode(filteredItems, "focused", {
+       keepAnswerBeforeTrailingTools: input.keepAnswerBeforeTrailingTools,
+       isMessageVisible: (message) => hasVisibleSegments(message, isTranscriptBlockVisible),
+     }).filter(itemVisible);
+@@ -105,7 +156,7 @@ export function projectSessionScope(input: SessionScopeInput): SessionScope {
+ 
+   const messages: Message[] = [];
+   const included = new Set<Message>();
+-  for (const item of items) {
++  for (const item of scopedItems) {
+     const group = item.kind === "tool-group" ? item.messages : [item.message];
+     for (const message of group) {
+       if (included.has(message)) continue;
+@@ -116,9 +167,11 @@ export function projectSessionScope(input: SessionScopeInput): SessionScope {
+ 
+   return {
+     items,
++    displayItems,
+     normalItems,
+     messages,
++    leadingTurn,
+     allowsBlock: (message, kind) =>
+-      included.has(message) && kindVisible(isVisible, message.role, kind),
++      included.has(message) && isVisible(blockTypeForKind(kind, message.role)),
+   };
+ }
+diff --git a/frontend/src/lib/stores/inSessionSearch.svelte.ts b/frontend/src/lib/stores/inSessionSearch.svelte.ts
+index a47e5e18..5355870c 100644
+--- a/frontend/src/lib/stores/inSessionSearch.svelte.ts
++++ b/frontend/src/lib/stores/inSessionSearch.svelte.ts
+@@ -11,6 +11,7 @@ import {
+   type SearchCursor,
+ } from "../search/navigation.js";
+ import {
++  blockTypeForKind,
+   keepsAnswerBeforeTrailingTools,
+   projectSessionScope,
+   type SessionScope,
+@@ -41,12 +42,20 @@ export interface SearchView {
+   setFollowLatest(follow: boolean): void;
+   /** Display projection inputs; absent means unfiltered normal mode. */
+   transcriptMode?: "normal" | "focused";
++  /**
++   * Saved block-visibility set. Writers MUST reassign the Set rather than
++   * mutate it in place: the filter-diff effect below snapshots the previous
++   * reference, so in-place mutation is not observable as a change.
++   */
+   visibleBlocks?: ReadonlySet<BlockType>;
+   hasBlockFilters?: boolean;
+   renderUnknownXmlBlocksAsPreformatted?: boolean;
++  /** Saved block-visibility predicate; preferred over `visibleBlocks` when defined. */
++  isBlockVisible?(type: BlockType): boolean;
+ }
+ 
+ const EMPTY_MATCHES: Match[] = [];
++const EMPTY_BLOCK_TYPES: ReadonlySet<BlockType> = new Set();
+ 
+ export class InSessionSearchStore {
+   isOpen = $state(false);
+@@ -60,23 +69,32 @@ export class InSessionSearchStore {
+   focusRequest = $state(0);
+   resultsOpen = $state(false);
+   private historyFailed = $state(false);
++  /** Types the user manually hid while the find view is open. */
++  private suppressedTypes = $state(new Set<BlockType>());
+ 
+   private source: SearchMessageSource = messages;
+   private view: SearchView = ui;
+   private disposeEffects: () => void;
+   private previousSessionId: string | null;
+   private historyRequest: { sessionId: string; promise: Promise<void> } | null = null;
++  /** Snapshot the `visibleBlocks` diff effect compares against each run. */
++  private previousVisibleBlocks: ReadonlySet<BlockType> | undefined;
+ 
+   private historyIncomplete = $derived(
+     this.source.hasOlder || this.source.historyComplete === false,
+   );
+   historyError = $derived(this.isOpen && this.historyIncomplete && this.historyFailed);
+   isActive = $derived(this.isOpen && this.debouncedQuery.trim() !== "");
+-  /** What the transcript renders right now: filters and focused mode included. */
++  /**
++   * The mode's saved-filter projection, shared by navigation and search.
++   * `displayItems`/`normalItems` follow the saved filter; `messages` is the
++   * filter-independent membership the index searches.
++   */
+   scope: SessionScope | null = $derived.by(() => {
+     if (!this.source.sessionId) return null;
+     return projectSessionScope({
+       messages: this.source.messages,
++      sessionId: this.source.sessionId,
+       transcriptMode: this.view.transcriptMode,
+       visibleBlocks: this.view.visibleBlocks,
+       hasBlockFilters: this.view.hasBlockFilters,
+@@ -92,10 +110,11 @@ export class InSessionSearchStore {
+     if (!this.source.sessionId || !this.isActive) return null;
+     const scope = this.scope;
+     if (!scope) return null;
++    // Every searchable block of every eligible message is indexed; block
++    // filters shape what renders, not what the search can find.
+     return buildSessionIndex(
+       scope.messages,
+       this.debouncedQuery,
+-      (message, block) => scope.allowsBlock(message, block.kind),
+       { renderUnknownXmlBlocksAsPreformatted: this.view.renderUnknownXmlBlocksAsPreformatted },
+       this.wholeWord,
+     );
+@@ -104,6 +123,23 @@ export class InSessionSearchStore {
+   orderedMatches: readonly Match[] = $derived(
+     matchesInDisplayOrder(this.matches, this.view.sortNewestFirst),
+   );
++  /**
++   * Saved-hidden block types that own at least one active match, temporarily
++   * revealed for the open find view. Suppressed types stay hidden; closing
++   * search clears both reveals and suppression. Never persisted.
++   */
++  revealedBlockTypes: ReadonlySet<BlockType> = $derived.by(() => {
++    if (!this.isOpen) return EMPTY_BLOCK_TYPES;
++    const saved = this.view.visibleBlocks;
++    if (saved === undefined) return EMPTY_BLOCK_TYPES;
++    let revealed: Set<BlockType> | null = null;
++    for (const match of this.matches) {
++      const type = blockTypeForKind(match.kind, match.role);
++      if (saved.has(type) || this.suppressedTypes.has(type)) continue;
++      (revealed ??= new Set<BlockType>()).add(type);
++    }
++    return revealed ?? EMPTY_BLOCK_TYPES;
++  });
+   total = $derived(this.index?.total ?? 0);
+   loadingHistory = $derived(
+     this.isOpen &&
+@@ -139,6 +175,7 @@ export class InSessionSearchStore {
+           this.composing = false;
+           this.historyRequest = null;
+           this.historyFailed = false;
++          this.suppressedTypes = new Set();
+           this.navigationRevision++;
+           if (!sessionId) this.close();
+         });
+@@ -172,6 +209,24 @@ export class InSessionSearchStore {
+         return () => clearTimeout(timer);
+       });
+ 
++      $effect(() => {
++        const saved = this.view.visibleBlocks;
++        const open = this.isOpen;
++        untrack(() => {
++          const previous = this.previousVisibleBlocks;
++          this.previousVisibleBlocks = saved ? new Set(saved) : saved;
++          if (!open || !previous || !saved) return;
++          // A manual hide while the find view is open suppresses the
++          // temporary reveal; re-enabling clears that suppression.
++          for (const type of previous) {
++            if (!saved.has(type)) this.noteManualBlockFilterChange(type, false);
++          }
++          for (const type of saved) {
++            if (!previous.has(type)) this.noteManualBlockFilterChange(type, true);
++          }
++        });
++      });
++
+       $effect(() => {
+         const open = this.isOpen;
+         const sessionId = this.source.sessionId;
+@@ -288,9 +343,43 @@ export class InSessionSearchStore {
+     this.debouncedQuery = "";
+     this.current = null;
+     this.resultsOpen = false;
++    this.suppressedTypes = new Set();
+     this.navigationRevision++;
+   }
+ 
++  /**
++   * Records a saved-filter change while the find view is open. Hiding a type
++   * suppresses its temporary reveal until it is re-enabled or the view
++   * closes; re-enabling clears the suppression. Ignored while closed.
++   */
++  noteManualBlockFilterChange(type: BlockType, visible: boolean): void {
++    if (!this.isOpen) return;
++    if (visible === !this.suppressedTypes.has(type)) return;
++    // Reassign rather than mutate: the visibleBlocks diff effect works on
++    // reference snapshots, so reassignment is the explicit invalidation
++    // signal consumers of this set rely on.
++    const next = new Set(this.suppressedTypes);
++    if (visible) {
++      next.delete(type);
++    } else {
++      next.add(type);
++    }
++    this.suppressedTypes = next;
++  }
++
++  /**
++   * Saved block visibility plus the open search's temporary reveals. Must
++   * agree with `isTranscriptBlockVisible` in session-scope.ts, which applies
++   * the same saved-or-revealed rule inside the scope projection.
++   */
++  isBlockEffectivelyVisible(type: BlockType): boolean {
++    const saved = this.view.visibleBlocks;
++    const savedVisible = this.view.isBlockVisible
++      ? this.view.isBlockVisible(type)
++      : saved === undefined || saved.has(type);
++    return savedVisible || this.revealedBlockTypes.has(type);
++  }
++
+   toggleWholeWord(): void {
+     this.wholeWord = !this.wholeWord;
+     this.current = null;
+@@ -354,3 +443,14 @@ export class InSessionSearchStore {
+ }
+ 
+ export const inSessionSearch = new InSessionSearchStore();
++
++/** The shared manual block-filter protocol used by every filter control:
++ *  read the next state from effective visibility, record the manual choice
++ *  while the find view is open so a temporary reveal is suppressed, then
++ *  persist it. The note must run before the saved visibility flips or the
++ *  suppression cannot be told apart from a persisted preference. */
++export function toggleBlockFilter(type: BlockType): void {
++  const next = !inSessionSearch.isBlockEffectivelyVisible(type);
++  inSessionSearch.noteManualBlockFilterChange(type, next);
++  ui.setBlockVisible(type, next);
++}
+diff --git a/frontend/src/lib/stores/inSessionSearch.test.ts b/frontend/src/lib/stores/inSessionSearch.test.ts
+index cd37dea1..c4efc5ca 100644
+--- a/frontend/src/lib/stores/inSessionSearch.test.ts
++++ b/frontend/src/lib/stores/inSessionSearch.test.ts
+@@ -2,7 +2,8 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+ import { tick } from "svelte";
+ import type { DbMessage as Message } from "../api/generated/index.js";
+-import { InSessionSearchStore } from "./inSessionSearch.svelte.js";
++import { InSessionSearchStore, type SearchView } from "./inSessionSearch.svelte.js";
++import type { BlockType } from "./ui.svelte.js";
+ import { reactiveSource, reactiveView } from "./__fixtures__/search-state.svelte.js";
+ 
+ vi.mock("./messages.svelte.js", () => ({
+@@ -48,7 +49,10 @@ function message(ordinal: number, content: string, overrides: Partial<Message> =
+ }
+ 
+ const stores: InSessionSearchStore[] = [];
+-function setup(items = [message(0, "needle needle"), message(2, "needle")]) {
++function setup(
++  items = [message(0, "needle needle"), message(2, "needle")],
++  viewInit: Partial<SearchView> = {},
++) {
+   const ensureOrdinalLoaded = vi.fn().mockResolvedValue(undefined);
+   const source = reactiveSource({
+     sessionId: "session-a",
+@@ -67,6 +71,7 @@ function setup(items = [message(0, "needle needle"), message(2, "needle")]) {
+     sortNewestFirst: false,
+     selectOrdinal,
+     setFollowLatest,
++    ...viewInit,
+   });
+   const store = new InSessionSearchStore(source, view);
+   stores.push(store);
+@@ -322,6 +327,96 @@ describe("local in-session search", () => {
+     expect(store.total).toBe(2);
+     expect(store.currentOrdinal).toBe(1);
+   });
++
++  it("reveals the types owning hidden-kind matches without saving filters", async () => {
++    const items = [
++      message(0, "needle", { role: "user" }),
++      message(1, "[Thinking]\nneedle\n[/Thinking]", { has_thinking: true }),
++      message(2, "", {
++        tool_calls: [
++          {
++            category: "",
++            tool_name: "Read",
++            result_content: "needle",
++          },
++        ],
++      }),
++      message(3, "needle"),
++    ];
++    const { store, view } = setup(items, {
++      visibleBlocks: new Set<BlockType>(["assistant"]),
++      hasBlockFilters: true,
++    });
++    await search(store);
++    // user text + thinking + tool output + assistant text all match.
++    expect(store.total).toBe(4);
++    expect([...store.revealedBlockTypes].sort()).toEqual(["thinking", "tool", "user"]);
++    // The saved filter is untouched by the temporary reveal.
++    expect([...view.visibleBlocks!].sort()).toEqual(["assistant"]);
++    expect(store.isBlockEffectivelyVisible("thinking")).toBe(true);
++    // Clearing the query ends the temporary reveal.
++    store.clearQuery();
++    expect([...store.revealedBlockTypes]).toEqual([]);
++    expect(store.isBlockEffectivelyVisible("thinking")).toBe(false);
++  });
++
++  it("suppresses a type hidden while the find view stays open", async () => {
++    const items = [
++      message(0, "prompt", { role: "user" }),
++      message(1, "[Thinking]\nneedle\n[/Thinking]", { has_thinking: true }),
++    ];
++    const { store, view } = setup(items, {
++      visibleBlocks: new Set<BlockType>(["user", "assistant", "thinking"]),
++      hasBlockFilters: true,
++    });
++    await search(store);
++    // Thinking was already visible, so nothing is revealed yet.
++    expect(store.revealedBlockTypes.has("thinking")).toBe(false);
++    // Manually hiding the type suppresses the reveal its match would cause.
++    view.visibleBlocks = new Set<BlockType>(["user", "assistant"]);
++    await tick();
++    expect(store.revealedBlockTypes.has("thinking")).toBe(false);
++    expect(store.isBlockEffectivelyVisible("thinking")).toBe(false);
++    // The match stays indexed even while suppressed.
++    expect(store.countForBlock("1:thinking:0")).toBe(1);
++    // The suppression survives query changes while the view stays open.
++    store.clearQuery();
++    await tick();
++    store.query = "needle";
++    await tick();
++    await vi.advanceTimersByTimeAsync(200);
++    await tick();
++    expect(store.revealedBlockTypes.has("thinking")).toBe(false);
++    // Closing and reopening the find view clears the suppression.
++    store.close();
++    await search(store);
++    expect(store.revealedBlockTypes.has("thinking")).toBe(true);
++  });
++
++  it("clears suppression when a manually hidden type is re-enabled", async () => {
++    const items = [
++      message(0, "prompt", { role: "user" }),
++      message(1, "[Thinking]\nneedle\n[/Thinking]", { has_thinking: true }),
++    ];
++    const { store, view } = setup(items, {
++      visibleBlocks: new Set<BlockType>(["user", "assistant"]),
++      hasBlockFilters: true,
++    });
++    await search(store);
++    expect(store.revealedBlockTypes.has("thinking")).toBe(true);
++    store.noteManualBlockFilterChange("thinking", false);
++    await tick();
++    expect(store.revealedBlockTypes.has("thinking")).toBe(false);
++    store.noteManualBlockFilterChange("thinking", true);
++    await tick();
++    expect(store.revealedBlockTypes.has("thinking")).toBe(true);
++    // Saving the type visible makes it ordinary, not a reveal.
++    view.visibleBlocks = new Set<BlockType>(["user", "assistant", "thinking"]);
++    await tick();
++    expect(store.revealedBlockTypes.has("thinking")).toBe(false);
++    expect(store.isBlockEffectivelyVisible("thinking")).toBe(true);
++    expect(store.countForBlock("1:thinking:0")).toBe(1);
++  });
+ });
+ 
+ it("reindexes and navigates whole words without changing the query", async () => {

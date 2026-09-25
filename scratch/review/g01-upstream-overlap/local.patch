@@ -1,0 +1,2200 @@
+diff --git a/docs/agents/storage.md b/docs/agents/storage.md
+index e055525e..8357efa9 100644
+--- a/docs/agents/storage.md
++++ b/docs/agents/storage.md
+@@ -446,20 +446,24 @@ content clears them for a fresh scan.
+ 
+ ### Tool result summaries
+ 
+-`tool_calls.result_content` is a display summary derived from the call's
+-`tool_result_events` rows at sync time. When exactly one of a call's events has
+-content and the summary equals that content, the summary is not stored: the
+-column is empty while `result_content_length` still records the summary's size.
+-Empty events, such as timing-only `tool_execution` marks, don't count. That
+-pair, an empty column with a non-zero length, tells a reader to take the text
+-from the one event with content. Summaries over several content-bearing events,
+-summaries that differ from their event, calls with no content-bearing event, and
+-blocked categories store exactly what the parser produced. Load tool calls through the message loaders, which
+-refill the summary once events are attached; a query that selects the column
+-directly must apply the same fallback, and PostgreSQL and DuckDB apply the same
+-write rule so their tool-call fingerprints match SQLite. Anyone reading the
+-archive or a mirror by hand sees the empty column and must join the events table
+-to recover the text.
++`tool_calls.result_content` stores the tool call result summary. When a tool call
++has only 1 result event and its content matches the tool call's result summary /
++output, single-event results are stored directly in `tool_calls.result_content`
++with 0 rows in `tool_result_events`. Only genuine multi-event tool calls (e.g.
++streaming or multiple subagents where events > 1 or event content differs from
++summary) have rows in `tool_result_events`. This eliminates duplicate Output and
++History sections in the UI across all providers while preserving full event
++history for streaming and multi-event agent executions.
++
++For backward compatibility with pre-v123 archives where `result_content` was
++cleared for single-event calls, `RestoreToolCallResultContent` and
++`ToolCallResultContentSQL` continue to refill `result_content` from
++`tool_result_events` when loading older records.
++
++Replicas (PostgreSQL, DuckDB, ClickHouse): the SQLite storage model change is
++implemented first. Replicas are not altered yet and will continue to replicate
++tool call result summaries without breaking. Future replication migrations can
++align mirror tables to drop redundant single-event rows accordingly.
+ 
+ ## DuckDB Mirror
+ 
+diff --git a/docs/changelog.md b/docs/changelog.md
+index c3680baa..3446bf13 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -33,6 +33,12 @@ The latest published release is
+   them from `~/.omo/agent/sessions` with the Pi parser. Sessions you indexed
+   earlier by pointing `PI_DIR` at `~/.omo` stay labeled Pi; remove that
+   override so new OMO sessions are not indexed twice.
++- Index JetBrains Junie sessions from `~/.junie/sessions/` with full
++  transcripts: prompts, thinking, replies, tool, terminal, file, and MCP
++  activity, sidecar metadata from `summary.json` and `state.json`, subagent
++  runs as linked sessions, and per-call token usage with Junie's recorded
++  USD costs. `JUNIE_HOME` re-roots the Junie home directory and `JUNIE_DIR`
++  or `agents.junie.dirs` point at custom sessions directories.
+ - Verify conversation memory through an opt-in live release gate that records a
+   synthetic decision, starts a fresh Claude Code or Codex session, and requires
+   the client to search, read, answer accurately, and cite the source. Raw
+diff --git a/docs/configuration.md b/docs/configuration.md
+index cc67a9a4..d871f632 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -426,7 +426,7 @@ keeps its default directories.
+ | Hermes Agent          | `~/.hermes/sessions/` (macOS and Linux), `~/AppData/Local/hermes/sessions/` (Windows)                                                                            | SQLite `state.db`; JSONL / JSON transcripts remain supported                                                                                                 |
+ | iFlow                 | `~/.iflow/projects/`                                                                                                                                             | JSONL per session                                                                                                                                             |
+ | IcodeMate             | `~/.local/share/icodemate/` and `~/.icodemate/cli/projects/`                                                                                                     | OpenCode-family storage, including per-session usage events                                                                                                   |
+-| Junie                 | `~/.junie/sessions/` (or `$JUNIE_HOME/sessions/`)                                                                                                             | Per-session `events.jsonl` plus sibling `index.jsonl` metadata; CLI `SessionStore` only                                                                     |
++| Junie                 | `~/.junie/sessions/` (or `$JUNIE_HOME/sessions/`)                                                                                                                | Per-task `events.jsonl` event streams with `index.jsonl` catalog and `state.json`/`summary.json` sidecars; CLI `SessionStore` only                             |
+ | Kilo                  | `~/.local/share/kilo/`                                                                                                                                           | SQLite DB or `storage/` JSON files                                                                                                                            |
+ | Kimi                  | `~/.kimi/sessions/` and `~/.kimi-code/sessions/`                                                                                                                 | JSONL per session                                                                                                                                             |
+ | Kimi Work             | (platform-specific, see below)                                                                                                                                   | JSONL per session (kimi-code kernel wire logs)                                                                                                                |
+diff --git a/docs/internal/session-format-sources.md b/docs/internal/session-format-sources.md
+index 6ac810ad..ea778989 100644
+--- a/docs/internal/session-format-sources.md
++++ b/docs/internal/session-format-sources.md
+@@ -523,17 +523,21 @@ fixtures retain this field; missing identities remain source-local.
+   [session_index.rs](https://github.com/openai/codex/blob/92bc601ad60542c92bf0bb1e7a2eb70b84ac49d2/codex-rs/rollout/src/session_index.rs)
+   and its caller in
+   [update_thread_metadata.rs](https://github.com/openai/codex/blob/92bc601ad60542c92bf0bb1e7a2eb70b84ac49d2/codex-rs/thread-store/src/local/update_thread_metadata.rs).
+-  A Codex home where no thread was ever renamed has no index, so an absent
+-  index is the normal state, not a rename signal. Reverified 2026-09-30: a
+-  local `~/.codex` used by codex-cli 0.159.2 had both a
+-  `thread_history_1.sqlite` and a `session_index.jsonl` written that day. The
+-  TUI also maintains an append-oriented `history.jsonl` whose records contain
+-  `session_id`, Unix-seconds `ts`, and submitted prompt `text`; configured
+-  size enforcement can rewrite a retained tail in place. Agentsview consumes
+-  only the first two fields as a live-activity hint. Subagent rollouts carry a
+-  structural `source.subagent` marker and a top-level `parent_thread_id`; that
+-  pair defines the parent edge. `thread_source` is a legacy fallback, and
+-  `session_id` identifies the root or tree rather than the parent.
++  Thread titles live in `state_*.sqlite` (or `state_*.db`) databases
++  (`threads` table); Agentsview reads and watches both sources. A Codex home
++  where no thread was ever renamed has no index, so an absent index is the
++  normal state, not a rename signal. Reverified 2026-09-30: a local
++  `~/.codex` used by codex-cli 0.159.2 had both a `thread_history_1.sqlite`
++  and a `session_index.jsonl` written that day. Streaming rollouts are
++  parsed line-by-line with a multiline JSON decoder fallback for
++  pretty-printed array rollouts. The TUI also maintains an append-oriented
++  `history.jsonl` whose records contain `session_id`, Unix-seconds `ts`, and
++  submitted prompt `text`; configured size enforcement can rewrite a
++  retained tail in place. Agentsview consumes only the first two fields as a
++  live-activity hint. Subagent rollouts carry a structural `source.subagent`
++  marker and a top-level `parent_thread_id`; that pair defines the parent
++  edge. `thread_source` is a legacy fallback, and `session_id` identifies
++  the root or tree rather than the parent.
+ 
+ - **Automation (reverified 2026-09-19):** `session_meta.payload.originator` of
+   `codex_exec` is durable producer evidence of a non-interactive `codex exec`
+@@ -557,6 +561,20 @@ fixtures retain this field; missing identities remain source-local.
+   call per file. `custom_tool_call` items carry the same patch text under
+   `input` instead of a JSON `patch` argument.
+ 
++- **Paginated rollout continuation stitching (2026-09-26):** Codex sessions
++  interrupted or resumed across multiple rollout files record
++  `history_mode: "paginated"` with a `history_base` object in `session_meta`.
++  `history_base.thread_id` identifies the predecessor segment, either by
++  direct rollout UUID or by segment suffix (`_<segment_id>.jsonl`), and
++  `history_base.end_ordinal_exclusive` defines the slice boundary that excludes
++  interrupted or aborted turns (`turn_aborted`). Agentsview stitches ancestor
++  segments up through the root segment into a unified session with continuous
++  message ordinals `0..N`, preserving the root `FirstMessage` and `StartedAt`
++  while taking `EndedAt` from the leaf segment. Rollout filename matching in
++  discovery and source resolution recognizes both unsegmented
++  `rollout-*-{uuid}.jsonl` and segmented `rollout-*-{uuid}_{segment_uuid}.jsonl`
++  patterns, and provider source preference resolves to the newest leaf rollout.
++
+ - **Evidence:** `source`.
+ 
+ - **Upstream:** Clone `https://github.com/openai/codex.git` at
+@@ -1955,13 +1973,18 @@ schemas keep their existing ordering behavior.
+   days. It preceded the earliest bubble in 25 of the day-plus cases and
+   followed it in 5; 6 composers had `createdAt` after their last bubble.
+   Header order also differed from chronological order in 38 composers.
+-  Agentsview therefore starts a session at its earliest timestamped message
+-  and uses `createdAt` only when no bubble carries a timestamp. The session
+-  ends at the later of `lastUpdatedAt` and the latest message timestamp.
+-- **Usage and cost:** No per-message or per-session token, cache, reasoning,
+-  credit, or monetary-cost fields were observed in `composerData` or bubble
+-  documents. Agentsview emits no usage events for this agent; cost is
+-  unpriced.
++  Agentsview therefore starts a session at its earliest timestamped message and
++  uses `createdAt` only when no bubble carries a timestamp. The session ends at
++  the later of `lastUpdatedAt` and the latest message timestamp.
++- **Usage and cost:** Some `composerData` documents expose a session-level
++  `contextTokensUsed` field. Agentsview distributes that total across the
++  parsed message sequence using the largest-remainder (Hamilton) method,
++  proportional to each message's content length, and records the result in
++  per-message `ContextTokens`. Because these per-message values are inferred
++  rather than supplied by the wire format, the Cursor IDE registry entry sets
++  `NoPerMessageTokenData: true`. The session's `PeakContextTokens` is set to
++  the composer-level total. No output-token, cache, reasoning, credit, or
++  monetary-cost fields have been observed; cost remains unpriced.
+ - **Agentsview:** `internal/parser/cursor_ide.go` and
+   `internal/parser/cursor_ide_provider.go`, built on the shared
+   `multiSessionContainerSourceSet` framework (see Zed, below). Fingerprinting
+@@ -2904,20 +2927,75 @@ schemas keep their existing ordering behavior.
+   [Devin parser](https://github.com/getagentseal/codeburn/blob/3472885629c41725b40c19c0780ecce148b067bf/src/providers/devin.ts)
+   makes the observed aliases reproducible. Neither project is Cognition's
+   producer source.
++- **Subagent message trees:** observed CLI databases store child transcripts
++  as separate roots in the `message_nodes` forest. A root system message
++  containing `You are a subagent of Devin` identifies a candidate child; its
++  messages are the descendants reached through `parent_node_id`. Roots
++  containing `You are a Summarizer` are auxiliary summaries, not child
++  transcripts. The forest can contain multiple disconnected roots for the
++  same task. Copies retain the `message_id` of the first user prompt even
++  when their root `node_id` differs. Group copies by that prompt ID and keep
++  the tree with the most descendant rows; use the higher root `node_id` to
++  break ties. A unique prompt-only tree can still represent an unfinished
++  child. The emitted application ID is scoped to the parent session and the
++  selected representative root node:
++  `devin:<parent-session-id>:agent-<root-node-id>`. This is AgentsView's
++  derived key, not a producer-supplied session ID. The CLI schema remains
++  unpublished.
++  Child trees are emitted separately and are not interleaved with a parent's
++  transcript export.
++  `run_subagent` and `read_subagent` calls remain events in the parent
++  transcript; an event or its `agent_id` alone does not establish a child
++  transcript. Duplicate prompt IDs and their progressively populated tree
++  copies were verified against the local CLI database on 2026-09-26.
+ - **Usage and cost:** Message or aggregate metrics can persist prompt,
+   completion, and cached tokens. The parser handles multiple observed field
+   names; no authoritative provider-reported USD value is consumed, so pricing
+   is catalog-derived when model attribution is possible. Transcript JSON is
+-  written only by an explicit session export, so most sessions have none; for
+-  those the parser reads per-assistant-message counters from the
+-  `message_nodes` fallback at `chat_message -> metadata.metrics`
+-  (`input_tokens`, `output_tokens`, `cache_read_tokens`,
+-  `cache_creation_tokens`, any of which may be JSON null). `message_nodes` is
+-  a forest, so totals are summed only along the main chain
+-  (`sessions.main_chain_id` walked up via `parent_node_id`); summing every row
+-  double-counts retries and edits. Older databases that predate
++  written only by an explicit session export, so most sessions have none.
++  Per-assistant-message counters are read from `message_nodes` at
++  `chat_message -> metadata.metrics` (`input_tokens`, `output_tokens`,
++  `cache_read_tokens`, `cache_creation_tokens`, any of which may be JSON
++  null). `message_nodes` is a forest, so totals are summed only along the main
++  chain (`sessions.main_chain_id` walked up via `parent_node_id`); summing
++  every row double-counts retries and edits. Older databases that predate
+   `sessions.main_chain_id` keep that field invalid and fall back to all
+-  message nodes in creation order. Verified against a live Devin CLI database.
++  message nodes in creation order. When Devin continues a compacted session,
++  it re-roots the context: the new chain starts at a fresh snapshot whose
++  system node opens with "You are continuing work from a previous
++  conversation thread", and earlier threads remain on disconnected root trees
++  linked via `metadata.summarized_from` on each continuation summary node, or
++  on sibling subtrees branching off a shared prefix. The parser recovers those
++  pre-continuation eras: across multi-generation compactions,
++  `metadata.summarized_from` recursively unwinds each prior era from its leaf
++  node back to its root; for structures lacking `summarized_from`, sibling
++  subtrees headed by a system node that hang off chain nodes preceding an
++  on-chain summary are linearized into messages (sibling nodes sharing one
++  `message_id` are pending/committed duplicates resolved to the higher
++  `node_id`; forks with distinct message_ids resolve toward the deepest subtree,
++  the era's surviving line), while user- or assistant-headed siblings are edits
++  and abandoned retries and stay excluded. Continuation-summary nodes are
++  surfaced as `compact_boundary` markers, matching the Claude compact-boundary
++  convention. Exported transcripts open with the same summary step and likewise
++  drop pre-continuation steps; when an export is the fallback source,
++  earlier eras can still be recovered from the node forest unless the export
++  carries real content before the boundary. Verified against a live Devin CLI
++  database 2026-09-26.
++  A valid `message_nodes` representation is preferred over an export because
++  the explicit export can lag the live session. Export JSON is used when the
++  node table cannot provide an ordered chain, the session has no nodes, or a
++  node message is invalid JSON; the representations are not merged. Native
++  `chat_message` `tool_calls[]` use `id`, `name`, and `arguments`; tool-result
++  nodes use `role=tool` with `tool_call_id` and `content`. Exported `steps[]`
++  can also include `tool_calls[]`, using `tool_call_id`, `function_name`, and
++  `arguments`. Their `observation.results[]` entries link to calls through
++  `source_call_id` and carry result text in `content`. Verified against Devin
++  CLI session artifacts 2026-09-25.
++  Assistant `chat_message.thinking` is an object
++  (`{"thinking": string, "signature": ..., "signature_type": ...}`), never a
++  bare string: across a live database every populated node used the object
++  form, so the parser reads `thinking.thinking` and still accepts a string for
++  compatibility. Verified against a live Devin CLI database 2026-09-25.
+   Each message-node request is attributed to the concrete model at
+   `metadata.generation_model` (falling back to the session-level
+   `sessions.model` alias), because the session column is often empty or a
+@@ -2933,9 +3011,9 @@ schemas keep their existing ordering behavior.
+   identities are prefixed with the session id to stay unique under
+   cross-session usage deduplication. Verified against a live Devin CLI
+   database 2026-09-17.
+-- **Agentsview:** `internal/parser/devin.go` and
+-  `internal/parser/devin_provider.go`; metric aliases are implementation
+-  evidence because the upstream schema is unavailable.
++- **Agentsview:** `internal/parser/devin.go`, `internal/parser/devin_subagent.go`,
++	and `internal/parser/devin_provider.go`; metric aliases and subagent markers
++	are implementation evidence because the upstream schema is unavailable.
+ 
+ ## Piebald (`piebald`)
+ 
+@@ -3185,10 +3263,11 @@ schemas keep their existing ordering behavior.
+ 
+ ## Antigravity IDE (`antigravity`)
+ 
+-- **Format:** Per-session SQLite databases, optionally supplemented by
+-  trajectory JSON sidecars, plus the agent brain's plaintext
+-  `brain/<uuid>/.system_generated/logs/transcript.jsonl`, which is the session
+-  itself for a conversation with no database.
++- **Format:** Per-session SQLite databases (`conversations/<id>.db`),
++  supplemented by global workspace directory `conversation_summaries.db`
++  (extracting workspace URIs, thread titles, and cwd), native execution logs
++  (`brain/<id>/.system_generated/logs/transcript.jsonl` for full-fidelity thinking
++  traces and tool result interleaving), and trajectory JSON sidecars.
+ - **Evidence:** `no-public-source`.
+ - **Upstream:** Google's first-party Antigravity product and documentation
+   surfaces and public repositories were searched 2026-07-19; no application
+@@ -3200,14 +3279,28 @@ schemas keep their existing ordering behavior.
+   [Antigravity format notes](https://github.com/getagentseal/codeburn/blob/3472885629c41725b40c19c0780ecce148b067bf/docs/providers/antigravity.md)
+   and
+   [parser](https://github.com/getagentseal/codeburn/blob/3472885629c41725b40c19c0780ecce148b067bf/src/providers/antigravity.ts).
++  Spawned subagents are linked by
++  `brain/<parent>/.system_generated/subagents/<child>.json` descriptors
++  (fields: `conversationId` equal to the filename's child UUID,
++  `subagentDescriptor.role`/`typeName`, `state`, `spawnStepIndex`), which
++  are authoritative regardless of `state` (killed children still link).
++  The descriptor's `spawnStepIndex` names the result step carrying the
++  `Created the following subagents` marker whose payload echoes each
++  spawned `conversationId`; one `invoke_subagent` call can spawn a batch
++  of children sharing that step, while `manage_subagents` and
++  `define_subagent` results also quote `conversationId` without the
++  marker and are not spawn edges. Without a descriptor, the
++  `.trajectory.json` sidecar's `agyReader.parentCascadeId` supplies the
++  parent.
+ - **Usage and cost:** Heuristically decoded generation metadata or sidecars
+   provide uncached input, output (including thinking), cache-read, and model
+   data. There is no separate reliable reasoning counter or reported USD cost;
+   Agentsview catalog-prices tokens. Decode failures are surfaced explicitly.
+ - **Agentsview:** `internal/parser/antigravity.go`,
+   `internal/parser/antigravity_proto.go`,
+-  `internal/parser/antigravity_brain_transcript.go`, and
+-  `internal/parser/antigravity_provider.go`; field decoding is deliberately
++  `internal/parser/antigravity_brain_transcript.go`,
++  `internal/parser/antigravity_provider.go`, and
++  `internal/parser/antigravity_subagents.go`; field decoding is deliberately
+   marked as reverse engineering. The brain transcript needs no such decoding:
+   it is line-delimited JSON with named fields, verified 2026-09-26 against
+   transcripts two Antigravity builds wrote, and it is read as untrusted
+@@ -3217,6 +3310,12 @@ schemas keep their existing ordering behavior.
+   surviving source. Copies with the same conversation UUID across configured
+   roots share that ID. An unreadable database still reports an error instead
+   of replacing archived content with a potentially incomplete transcript.
++  Because `tool_calls` stores one subagent id per call, Agentsview keeps only
++  the first `conversationId` echoed per `invoke_subagent` call for the inline
++  subagent link; the descriptor edge still links every spawned child to its
++  parent session. User prompt envelopes (`<USER_REQUEST>`) are unwrapped and
++  runtime prompt metadata (`<ADDITIONAL_METADATA>`, `<USER_SETTINGS_CHANGE>`)
++  is stripped from stored user messages and previews.
+ 
+ ## Antigravity CLI (`antigravity-cli`)
+ 
+@@ -3860,109 +3959,71 @@ schemas keep their existing ordering behavior.
+   deletes them in AgentsView. A malformed `parts` value fails that session's
+   parse rather than degrading silently, matching the goose parser's policy.
+ 
+-## JetBrains Junie (`junie`)
+-
+-- **Format:** Junie CLI stores one append-only `events.jsonl` stream per session
+-  below `${JUNIE_HOME:-~/.junie}/sessions/<session-id>/`. The sibling
+-  `sessions/index.jsonl` contains `sessionId`, `createdAt`, `updatedAt`,
+-  `projectDir`, `taskName`, and `status` summary records. Event records use a
+-  polymorphic `kind` discriminator and a producer-added `timestampMs` Unix
+-  millisecond field.
+-
++## Junie (`junie`)
++
++- **Format:** `~/.junie/sessions/<id>/events.jsonl`, an append-only JSONL
++  event stream per task. Event envelopes carry `kind`, `taskId`,
++  `timestampMs` (epoch milliseconds), and a nested `agentEvent` or `agent`
++  object; a few kinds such as `TaskState` and `SystemMessageEvent` appear at
++  the envelope's top level. Observed kinds include `UserPromptEvent`,
++  `UserResponseEvent`, `UserAsyncResponseEvent`,
++  `AgentThoughtBlockUpdatedEvent`, `ResultBlockUpdatedEvent`,
++  `ToolBlockUpdatedEvent`, `TerminalBlockUpdatedEvent`,
++  `ViewFilesBlockUpdatedEvent`, `McpBlockUpdatedEvent`,
++  `CustomAgentBlockUpdatedEvent`, `SubagentSpawnedEvent`,
++  `AgentPatchCreatedEvent`, `LlmResponseMetadataEvent`,
++  `CancelAgentEvent`, `AgentTaskFailedEvent`,
++  `SessionCostTrajectorySnapshotEvent`, `TaskState`, and
++  `AgentTaskNameUpdatedEvent`. `*UpdatedEvent` records are
++  incremental snapshots keyed by `stepId` whose `status` progresses from
++  `IN_PROGRESS` to `COMPLETED`, `CANCELLED`, or `FAILED`; the last update
++  wins. Nested agents appear inline with `agent.id` (`agent-1`, ...) and
++  `agent.name`, with rendered Markdown copies under `subagents/*.md`.
++  Per-session sidecars include `state.json`, `summary.json` (lifecycle plus
++  aggregate `modelUsage`), `transcript.md`, `checkpoints/`, and
++  `task-*/terminal-output/*.txt`. An optional `<root>/index.jsonl` catalog
++  carries `sessionId`, `taskName`, `projectDir`, `status`, `createdAt`, and
++  `updatedAt` (epoch ms); the catalog is incomplete — observed session
++  directories exist without index rows.
+ - **Evidence:** `no-public-source`.
+-
+-- **Upstream:** The first-party
+-  [Junie CLI Quickstart](https://junie.jetbrains.com/docs/junie-cli.html),
+-  [slash-command reference](https://junie.jetbrains.com/docs/slash-commands.html),
+-  and
+-  [JetBrains Marketplace listing](https://plugins.jetbrains.com/plugin/26104-junie-the-ai-coding-agent-by-jetbrains)
+-  were searched 2026-09-24; no public persistence source or authoritative
+-  event schema was found. Use the public
+-  [Linux amd64 archive for release 2285.4](https://github.com/JetBrains/junie/releases/download/2285.4/junie-release-2285.4-linux-amd64.zip)
+-  to reproduce this entry. Its `junie-app/lib/app/junie-release-2285.4.jar`
+-  has SHA-256
+-  `e7f7fdccb50ca32981c58f671ed60622f29790f4fa9f65d5b9644f8624b7b75a`. Storage
+-  paths, index replacement, model usage, and shared step IDs were reverified
+-  from this artifact on 2026-09-28. Extract the jar with `jar xf`, read
+-  `agent-skills/junie-cli-docs/junie-cli-user-disk-storage.md`, and inspect
+-  `com.intellij.ml.llm.matterhorn.ej.app.cli.standalone.tui.app.state.SessionStore`,
+-  `SessionSummary`, `SessionEvent`,
+-  `org.jetbrains.a2ux.api.LlmResponseMetadataEvent`, and
+-  `org.jetbrains.a2ux.api.ModelUsage` with CFR 0.152 or `javap -p -c`. The
+-  bundled storage document defines `JUNIE_HOME`; `SessionStore` bytecode
+-  defines `sessions/index.jsonl`, `sessions/<sessionId>/events.jsonl`, and the
+-  timestamp append. `SessionStore` atomically replaces the complete index
+-  rather than appending changed rows, so the filesystem event does not
+-  identify which summary row changed.
+-
+-    The initial investigation used an installed CLI 26.7.13 jar with the same
+-    filename and SHA-256
+-    `51548cbe893b5e69e53ff49d5deaa1aa0ac6ebff8017b4ffc228a41681811323`. Its
+-    distribution archive was not recorded, so the reason for the different bytes
+-    is unknown. That hash is historical evidence; use the public Linux artifact
+-    above for reproduction. The initial producer serializers generated
+-    representative `UserPromptEvent`, `UserResponseEvent`,
+-    `UserAsyncResponseEvent`, `SessionTitleSetEvent`, and nested
+-    `SessionA2uxEvent` records.
+-
+-    Decompile `com.intellij.ml.llm.matterhorn.a2ux.server.steps.StepEventData`
+-    with CFR 0.152: `post` emits `MarkdownBlockUpdatedEvent` for `details`, but
+-    emits `ResultBlockUpdatedEvent` instead when `result` is set. Both use the
+-    same `stepId`. `JunieSessionSteps.post` also keys active blocks by `stepId`,
+-    rather than event kind.
+-
+-- **Conversation mapping:** `UserPromptEvent` prefers `presentablePrompt` over
+-  its internal prompt. Synchronous and asynchronous user-response events
+-  become user messages. History committed, dropped, and failed records
+-  reconcile queued prompts by `requestId`. Nested A2UX
+-  `MarkdownBlockUpdatedEvent` and `ResultBlockUpdatedEvent` records become
+-  assistant messages; repeated block updates replace the prior content with
+-  the same `stepId`, so active streaming text remains visible without
+-  duplicating the final answer. A result replaces earlier markdown for that
+-  step, matching the producer's block model; markdown with a different step ID
+-  remains a separate message. The index supplies session creation and update
+-  times; events supply message times. Tool calls, tool results, and file edits
+-  are not imported. Malformed event lines are counted and skipped, including a
+-  truncated final line, so complete earlier messages remain available.
+-  Agentsview rejects event streams and index snapshots containing a record
+-  over 64 MiB, preserving the archived session and cached index. This is an
+-  Agentsview limit, not a producer limit. When the index is absent, both full
+-  and direct session syncs remove cached index metadata and use event data.
+-
+-- **IDE boundary:** The JetBrains ACP registry and local `junie-chronicles.csv`
+-  files were inspected on 2026-09-24. Chronicles contain project edit
+-  activity, not conversations, and no separate IDE transcript source was
+-  found. This provider therefore ingests the shared Junie CLI `SessionStore`
+-  only. It does not claim support for IDE-only conversations until JetBrains
+-  exposes a reproducible conversation artifact.
+-
+-- **Usage and cost:** Nested A2UX `LlmResponseMetadataEvent.modelUsage` records
+-  persist the model, producer-reported USD cost, uncached input, cache-read,
+-  cache-creation, and output tokens for each model response. Agentsview emits
+-  one aggregate usage row per record and uses the producer-reported cost
+-  rather than catalog pricing. `SessionCostTrajectorySnapshotEvent` totals and
+-  `completion.taskCostUsd` overlap those response records, so they are not
+-  emitted separately. An invalid reported cost rejects the session parse,
+-  matching the Goose policy; it is not silently replaced with zero or an
+-  estimate.
+-
++- **Upstream:** JetBrains publishes Junie product pages and IDE help
++  documentation, but no event-stream schema, field reference, or serializer
++  source. JetBrains documentation was checked 2026-09-28; repository and
++  code searches for `junie session format`, `junie persistence`,
++  `junie token usage cost`, `events.jsonl`, and `SessionA2uxEvent` were
++  searched 2026-09-28 and found no public producer. Format details verified
++  against locally observed session directories under `~/.junie/sessions/`.
++- **Usage and cost:** `LlmResponseMetadataEvent.modelUsage[]` carries one
++  entry per LLM call with `model`, `inputTokens`, `outputTokens`,
++  `cacheInputTokens`, `cacheCreateTokens`, and a provider-reported `cost` in
++  USD. Agentsview maps `cacheInputTokens` to cache-read input and
++  `cacheCreateTokens` to cache-creation input and preserves the recorded USD
++  cost rather than catalog-pricing. Usage dedup is position-scoped per stream
++  (`junie:<id>:llm-response:<line>:<index>`).
++  `SessionCostTrajectorySnapshotEvent`
++  holds cumulative session totals (including `reasoningTokens`, which is not
++  persisted per call) and is used only as a test cross-check, not emitted as
++  a usage record.
+ - **Agentsview:** `internal/parser/junie.go` and
+-  `internal/parser/junie_provider.go` discover only direct
+-  `sessions/<session-id>/events.jsonl` members, use content hashing for
+-  freshness, normalize final messages and model usage, and treat discovery as
+-  authoritative for provider membership. Missing roots do not block discovery
+-  in other configured roots. A corrupt index keeps its last complete cached
+-  snapshot and does not block healthy roots. Without a cached snapshot, that
+-  root's sessions wait for a valid index; their archived data remains intact.
+-  Direct session lookups and index watcher updates still report invalid
+-  indexes. With an in-memory baseline, index watcher events select only
+-  changed sessions. A fresh engine selects every session listed in the index.
+-  Remote delta imports create a fresh planning engine each time, so an index
+-  change re-hashes all listed transcripts even if only one summary changed.
+-  The local daemon's startup sync establishes its baseline first. Failed
+-  metadata-only updates recover on the next full sync (normally within 15
+-  minutes) or transcript write. Direct session lookups refresh metadata
+-  without consuming the watcher baseline.
++  `internal/parser/junie_provider.go`. Discovery scans `*/events.jsonl`
++  without requiring an index row and excludes startup-stub directories
++  (streams containing only system notices or non-conversational events without
++  user prompts, assistant turns, usage, a task title, or an index row),
++  purging any previously ingested stubs; `index.jsonl` supplies title, project,
++  status (mapped to lifecycle), and timestamps when present, with
++  `AgentTaskNameUpdatedEvent`, `summary.json`, and `state.json` as fallbacks.
++  `summary.json` and `state.json` are read as sidecars and folded into source
++  freshness. When timestamps are missing, start times fall back to directory ID
++  timestamp parsing (`session-YYMMDD-HHMMSS-...`) and file mtime. Repeated
++  `stepId` updates deduplicate last-wins; assistant blocks group into one
++  message per `taskId`. Subagent sessions synthesize as `<parent>--agent-N`
++  children from the parent stream's nested `agent.id` blocks, linked to parent
++  `SubagentSpawnedEvent` calls via stepId prefix disambiguation;
++  `CancelAgentEvent` and `AgentTaskFailedEvent` mark sessions and failed
++  children with truncated termination. On-disk artifacts like `subagents/*.md`,
++  `task-*/terminal-output/*.txt`, `checkpoints/`, and `transcript.md` are not
++  parsed as transcripts. `JUNIE_HOME` reroots `~/.junie`;
++  `JUNIE_DIR`/`agents.junie.dirs` override the sessions root.
+ 
+ [evener-source-1]: https://github.com/prime-radiant-inc/evener/blob/da7c06396c9848abfae362dcffce3861a6a0c95a/agent/transcript/transcript.go
+ [evener-source-2]: https://github.com/prime-radiant-inc/evener/blob/da7c06396c9848abfae362dcffce3861a6a0c95a/agent/schema/turn.go
+diff --git a/frontend/messages/az.json b/frontend/messages/az.json
+index c61cdb78..75b29cb0 100644
+--- a/frontend/messages/az.json
++++ b/frontend/messages/az.json
+@@ -66,6 +66,8 @@
+   "header_transcript_filter_label": "Blok növlərini süz",
+   "header_transcript_visibility": "Blokların görünməsi",
+   "header_transcript_show_all": "Hamısını göstər",
++  "transcript_expand_all": "Hamısını aç",
++  "transcript_collapse_all": "Hamısını yığ",
+   "header_transcript_blocks_user": "İstifadəçi mesajları",
+   "header_transcript_blocks_assistant": "Köməkçi mətni",
+   "header_transcript_blocks_thinking": "Düşünmə blokları",
+@@ -374,6 +376,8 @@
+   "tool_block_status_label": "Vəziyyət:",
+   "tool_block_source_label": "Mənbə:",
+   "tool_block_agent_label": "Agent:",
++  "tool_block_subagent_label": "Alt agent:",
++  "tool_block_subagent_result_label": "Alt agentin nəticəsi:",
+   "tool_block_show_less": "Daha az göstər",
+   "tool_block_show_all_lines": [
+     {
+@@ -400,6 +404,7 @@
+     }
+   ],
+   "sidebar_loading": "Yüklənir",
++  "sidebar_load_more": "Daha çox yüklə",
+   "sidebar_multi_select": "Çoxlu seçim",
+   "sidebar_exit_multi_select": "Çoxlu seçimdən çıx",
+   "sidebar_select_all_visible": "Bütün görünənləri seç",
+@@ -2381,6 +2386,30 @@
+   ],
+   "settings_image_cleanup_compact_note": "Məlumat yüklərinin silinməsi saxlanılmış sətirləri yenidən yazır. Arxiv faylının ölçüsü agentsview db compact əmrini icra edənədək dəyişmir.",
+   "appearance_render_unknown_xml_blocks": "Naməlum XML bloklarını əvvəlcədən formatlanmış mətn kimi göstər",
++  "appearance_auto_collapse_assistant_turns": "Köməkçi növbələrini susmaya görə yığ",
++  "message_content_show_full_prompt": "Tam sorğunu göstər",
++  "message_content_show_less": "Daha az göstər",
++  "assistant_turn_event_message": "Mesaj",
++  "assistant_turn_message_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} mesaj",
++        "countPlural=other": "{countLabel} mesaj"
++      }
++    }
++  ],
++  "assistant_turn_tool_call_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} alət çağırışı",
++        "countPlural=other": "{countLabel} alət çağırışı"
++      }
++    }
++  ],
+   "go_to_session_title": "Sessiyaya keç",
+   "go_to_session_input_label": "Sessiya ID-si və ya UUID",
+   "go_to_session_placeholder": "Sessiya ID-sini və ya UUID-ni yapışdır",
+diff --git a/frontend/messages/en.json b/frontend/messages/en.json
+index 2b69da85..2b83d1c0 100644
+--- a/frontend/messages/en.json
++++ b/frontend/messages/en.json
+@@ -64,6 +64,8 @@
+   "header_transcript_filter_label": "Filter block types",
+   "header_transcript_visibility": "Block Visibility",
+   "header_transcript_show_all": "Show all",
++  "transcript_expand_all": "Expand all",
++  "transcript_collapse_all": "Collapse all",
+   "header_transcript_blocks_user": "User messages",
+   "header_transcript_blocks_assistant": "Assistant text",
+   "header_transcript_blocks_thinking": "Thinking blocks",
+@@ -372,6 +374,8 @@
+   "tool_block_status_label": "status:",
+   "tool_block_source_label": "source:",
+   "tool_block_agent_label": "agent:",
++  "tool_block_subagent_label": "Subagent:",
++  "tool_block_subagent_result_label": "Subagent result:",
+   "tool_block_show_less": "show less",
+   "tool_block_show_all_lines": [
+     {
+@@ -398,6 +402,7 @@
+     }
+   ],
+   "sidebar_loading": "loading",
++  "sidebar_load_more": "Load more",
+   "sidebar_multi_select": "Multi-select",
+   "sidebar_exit_multi_select": "Exit multi-select",
+   "sidebar_select_all_visible": "Select all visible",
+@@ -2379,6 +2384,30 @@
+   ],
+   "settings_image_cleanup_compact_note": "Removing payloads rewrites the stored rows. The archive file keeps its size until you run agentsview db compact.",
+   "appearance_render_unknown_xml_blocks": "Render unknown XML blocks as preformatted text",
++  "appearance_auto_collapse_assistant_turns": "Collapse assistant turns by default",
++  "message_content_show_full_prompt": "Show full prompt",
++  "message_content_show_less": "Show less",
++  "assistant_turn_event_message": "Message",
++  "assistant_turn_message_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} message",
++        "countPlural=other": "{countLabel} messages"
++      }
++    }
++  ],
++  "assistant_turn_tool_call_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} tool call",
++        "countPlural=other": "{countLabel} tool calls"
++      }
++    }
++  ],
+   "go_to_session_title": "Go to session",
+   "go_to_session_input_label": "Session ID or UUID",
+   "go_to_session_placeholder": "Paste a session ID or UUID",
+diff --git a/frontend/messages/es.json b/frontend/messages/es.json
+index 63a900f6..df67a920 100644
+--- a/frontend/messages/es.json
++++ b/frontend/messages/es.json
+@@ -66,6 +66,8 @@
+   "header_transcript_filter_label": "Filtrar tipos de bloque",
+   "header_transcript_visibility": "Visibilidad de bloques",
+   "header_transcript_show_all": "Mostrar todo",
++  "transcript_expand_all": "Expandir todo",
++  "transcript_collapse_all": "Contraer todo",
+   "header_transcript_blocks_user": "Mensajes del usuario",
+   "header_transcript_blocks_assistant": "Texto del asistente",
+   "header_transcript_blocks_thinking": "Bloques de razonamiento",
+@@ -374,6 +376,8 @@
+   "tool_block_status_label": "estado:",
+   "tool_block_source_label": "origen:",
+   "tool_block_agent_label": "agente:",
++  "tool_block_subagent_label": "Subagente:",
++  "tool_block_subagent_result_label": "Resultado del subagente:",
+   "tool_block_show_less": "mostrar menos",
+   "tool_block_show_all_lines": [
+     {
+@@ -400,6 +404,7 @@
+     }
+   ],
+   "sidebar_loading": "cargando",
++  "sidebar_load_more": "Cargar más",
+   "sidebar_multi_select": "Selección múltiple",
+   "sidebar_exit_multi_select": "Salir de la selección múltiple",
+   "sidebar_select_all_visible": "Seleccionar todas las visibles",
+@@ -2381,6 +2386,30 @@
+   ],
+   "settings_image_cleanup_compact_note": "Quitar las cargas útiles reescribe las filas almacenadas. El archivo de almacenamiento conserva su tamaño hasta que ejecutes agentsview db compact.",
+   "appearance_render_unknown_xml_blocks": "Mostrar los bloques XML desconocidos como texto preformateado",
++  "appearance_auto_collapse_assistant_turns": "Contraer los turnos del asistente de forma predeterminada",
++  "message_content_show_full_prompt": "Mostrar el prompt completo",
++  "message_content_show_less": "Mostrar menos",
++  "assistant_turn_event_message": "Mensaje",
++  "assistant_turn_message_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} mensaje",
++        "countPlural=other": "{countLabel} mensajes"
++      }
++    }
++  ],
++  "assistant_turn_tool_call_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} llamada a herramienta",
++        "countPlural=other": "{countLabel} llamadas a herramienta"
++      }
++    }
++  ],
+   "go_to_session_title": "Ir a sesión",
+   "go_to_session_input_label": "ID o UUID de sesión",
+   "go_to_session_placeholder": "Pega un ID o UUID de sesión",
+diff --git a/frontend/messages/fr.json b/frontend/messages/fr.json
+index ebbb8241..f4a43d3f 100644
+--- a/frontend/messages/fr.json
++++ b/frontend/messages/fr.json
+@@ -64,6 +64,8 @@
+   "header_transcript_filter_label": "Filtrer les types de blocs",
+   "header_transcript_visibility": "Visibilité des blocs",
+   "header_transcript_show_all": "Tout afficher",
++  "transcript_expand_all": "Tout développer",
++  "transcript_collapse_all": "Tout réduire",
+   "header_transcript_blocks_user": "Messages utilisateur",
+   "header_transcript_blocks_assistant": "Texte de l'assistant",
+   "header_transcript_blocks_thinking": "Blocs de réflexion",
+@@ -372,6 +374,8 @@
+   "tool_block_status_label": "état :",
+   "tool_block_source_label": "source :",
+   "tool_block_agent_label": "agent :",
++  "tool_block_subagent_label": "Sous-agent :",
++  "tool_block_subagent_result_label": "Résultat du sous-agent :",
+   "tool_block_show_less": "afficher moins",
+   "tool_block_show_all_lines": [
+     {
+@@ -398,6 +402,7 @@
+     }
+   ],
+   "sidebar_loading": "chargement",
++  "sidebar_load_more": "Charger plus",
+   "sidebar_multi_select": "Sélection multiple",
+   "sidebar_exit_multi_select": "Quitter la sélection multiple",
+   "sidebar_select_all_visible": "Sélectionner les sessions visibles",
+@@ -2378,6 +2383,30 @@
+   ],
+   "settings_image_cleanup_compact_note": "La suppression des charges réécrit les lignes stockées. La taille du fichier d'archive reste inchangée jusqu'à ce que vous exécutiez agentsview db compact.",
+   "appearance_render_unknown_xml_blocks": "Afficher les blocs XML inconnus en texte préformaté",
++  "appearance_auto_collapse_assistant_turns": "Réduire les tours de l'assistant par défaut",
++  "message_content_show_full_prompt": "Afficher le prompt complet",
++  "message_content_show_less": "Afficher moins",
++  "assistant_turn_event_message": "Message",
++  "assistant_turn_message_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} message",
++        "countPlural=other": "{countLabel} messages"
++      }
++    }
++  ],
++  "assistant_turn_tool_call_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} appel d'outil",
++        "countPlural=other": "{countLabel} appels d'outil"
++      }
++    }
++  ],
+   "go_to_session_title": "Accéder à une session",
+   "go_to_session_input_label": "ID ou UUID de session",
+   "go_to_session_placeholder": "Collez un ID ou UUID de session",
+diff --git a/frontend/messages/ja.json b/frontend/messages/ja.json
+index 52ab45aa..e6217117 100644
+--- a/frontend/messages/ja.json
++++ b/frontend/messages/ja.json
+@@ -64,6 +64,8 @@
+   "header_transcript_filter_label": "フィルターブロックタイプ",
+   "header_transcript_visibility": "ブロックの可視性",
+   "header_transcript_show_all": "すべて表示",
++  "transcript_expand_all": "すべて展開",
++  "transcript_collapse_all": "すべて折りたたむ",
+   "header_transcript_blocks_user": "ユーザーメッセージ",
+   "header_transcript_blocks_assistant": "アシスタントテキスト",
+   "header_transcript_blocks_thinking": "思考ブロック",
+@@ -372,6 +374,8 @@
+   "tool_block_status_label": "状態：",
+   "tool_block_source_label": "ソース：",
+   "tool_block_agent_label": "エージェント：",
++  "tool_block_subagent_label": "サブエージェント：",
++  "tool_block_subagent_result_label": "サブエージェントの結果：",
+   "tool_block_show_less": "あまり見せない",
+   "tool_block_show_all_lines": [
+     {
+@@ -398,6 +402,7 @@
+     }
+   ],
+   "sidebar_loading": "読み込み中",
++  "sidebar_load_more": "さらに読み込む",
+   "sidebar_multi_select": "複数選択",
+   "sidebar_exit_multi_select": "複数選択を終了する",
+   "sidebar_select_all_visible": "表示されているものをすべて選択します",
+@@ -2367,6 +2372,30 @@
+   ],
+   "settings_image_cleanup_compact_note": "ペイロードの削除は保存済み行を書き換えます。agentsview db compact を実行するまでアーカイブファイルのサイズは変わりません。",
+   "appearance_render_unknown_xml_blocks": "不明なXMLブロックを整形済みテキストとして表示",
++  "appearance_auto_collapse_assistant_turns": "アシスタントのターンを既定で折りたたむ",
++  "message_content_show_full_prompt": "プロンプト全体を表示",
++  "message_content_show_less": "折りたたむ",
++  "assistant_turn_event_message": "メッセージ",
++  "assistant_turn_message_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} 件のメッセージ",
++        "countPlural=other": "{countLabel} 件のメッセージ"
++      }
++    }
++  ],
++  "assistant_turn_tool_call_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} 個のツール呼び出し",
++        "countPlural=other": "{countLabel} 個のツール呼び出し"
++      }
++    }
++  ],
+   "go_to_session_title": "セッションへ移動",
+   "go_to_session_input_label": "セッションIDまたはUUID",
+   "go_to_session_placeholder": "セッションIDまたはUUIDを貼り付け",
+diff --git a/frontend/messages/ko.json b/frontend/messages/ko.json
+index 0ab7a38f..a94ec7ed 100644
+--- a/frontend/messages/ko.json
++++ b/frontend/messages/ko.json
+@@ -64,6 +64,8 @@
+   "header_transcript_filter_label": "블록 유형 필터",
+   "header_transcript_visibility": "블록 표시 여부",
+   "header_transcript_show_all": "모두 표시",
++  "transcript_expand_all": "모두 펼치기",
++  "transcript_collapse_all": "모두 접기",
+   "header_transcript_blocks_user": "사용자 메시지",
+   "header_transcript_blocks_assistant": "어시스턴트 텍스트",
+   "header_transcript_blocks_thinking": "사고 블록",
+@@ -361,6 +363,8 @@
+   "tool_block_status_label": "상태:",
+   "tool_block_source_label": "출처:",
+   "tool_block_agent_label": "에이전트:",
++  "tool_block_subagent_label": "서브에이전트:",
++  "tool_block_subagent_result_label": "서브에이전트 결과:",
+   "tool_block_show_less": "간략히 보기",
+   "tool_block_show_all_lines": [
+     {
+@@ -385,6 +389,7 @@
+     }
+   ],
+   "sidebar_loading": "불러오는 중",
++  "sidebar_load_more": "더 보기",
+   "sidebar_multi_select": "다중 선택",
+   "sidebar_exit_multi_select": "다중 선택 종료",
+   "sidebar_select_all_visible": "표시된 항목 모두 선택",
+@@ -2296,6 +2301,28 @@
+   ],
+   "settings_image_cleanup_compact_note": "페이로드를 제거하면 저장된 행이 다시 작성됩니다. agentsview db compact를 실행할 때까지 아카이브 파일 크기는 유지됩니다.",
+   "appearance_render_unknown_xml_blocks": "알 수 없는 XML 블록을 미리 서식이 지정된 텍스트로 표시",
++  "appearance_auto_collapse_assistant_turns": "어시스턴트 턴을 기본으로 접기",
++  "message_content_show_full_prompt": "전체 프롬프트 보기",
++  "message_content_show_less": "간략히 보기",
++  "assistant_turn_event_message": "메시지",
++  "assistant_turn_message_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=other": "메시지 {countLabel}개"
++      }
++    }
++  ],
++  "assistant_turn_tool_call_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=other": "도구 호출 {countLabel}회"
++      }
++    }
++  ],
+   "go_to_session_title": "세션으로 이동",
+   "go_to_session_input_label": "세션 ID 또는 UUID",
+   "go_to_session_placeholder": "세션 ID 또는 UUID 붙여넣기",
+diff --git a/frontend/messages/zh-CN.json b/frontend/messages/zh-CN.json
+index 5e2e7fe1..d060bb85 100644
+--- a/frontend/messages/zh-CN.json
++++ b/frontend/messages/zh-CN.json
+@@ -64,6 +64,8 @@
+   "header_transcript_filter_label": "筛选 block 类型",
+   "header_transcript_visibility": "Block 可见性",
+   "header_transcript_show_all": "全部显示",
++  "transcript_expand_all": "全部展开",
++  "transcript_collapse_all": "全部折叠",
+   "header_transcript_blocks_user": "用户消息",
+   "header_transcript_blocks_assistant": "助手文本",
+   "header_transcript_blocks_thinking": "思考块",
+@@ -361,6 +363,8 @@
+   "tool_block_status_label": "状态：",
+   "tool_block_source_label": "来源：",
+   "tool_block_agent_label": "agent：",
++  "tool_block_subagent_label": "子代理：",
++  "tool_block_subagent_result_label": "子代理结果：",
+   "tool_block_show_less": "收起",
+   "tool_block_show_all_lines": [
+     {
+@@ -385,6 +389,7 @@
+     }
+   ],
+   "sidebar_loading": "加载中",
++  "sidebar_load_more": "加载更多",
+   "sidebar_multi_select": "多选",
+   "sidebar_exit_multi_select": "退出多选",
+   "sidebar_select_all_visible": "选择所有可见会话",
+@@ -2296,6 +2301,28 @@
+   ],
+   "settings_image_cleanup_compact_note": "删除载荷会重写存储的行。在运行 agentsview db compact 之前，存档文件大小保持不变。",
+   "appearance_render_unknown_xml_blocks": "将未知 XML 块渲染为预格式化文本",
++  "appearance_auto_collapse_assistant_turns": "默认折叠助手回合",
++  "message_content_show_full_prompt": "显示完整提示",
++  "message_content_show_less": "收起",
++  "assistant_turn_event_message": "消息",
++  "assistant_turn_message_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=other": "{countLabel} 条消息"
++      }
++    }
++  ],
++  "assistant_turn_tool_call_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=other": "{countLabel} 次 tool call"
++      }
++    }
++  ],
+   "go_to_session_title": "跳转到会话",
+   "go_to_session_input_label": "会话 ID 或 UUID",
+   "go_to_session_placeholder": "粘贴会话 ID 或 UUID",
+diff --git a/frontend/messages/zh-TW.json b/frontend/messages/zh-TW.json
+index 9c745323..f2b2d285 100644
+--- a/frontend/messages/zh-TW.json
++++ b/frontend/messages/zh-TW.json
+@@ -64,6 +64,8 @@
+   "header_transcript_filter_label": "篩選 block 類型",
+   "header_transcript_visibility": "Block 可見性",
+   "header_transcript_show_all": "全部顯示",
++  "transcript_expand_all": "全部展開",
++  "transcript_collapse_all": "全部摺疊",
+   "header_transcript_blocks_user": "使用者訊息",
+   "header_transcript_blocks_assistant": "助手文本",
+   "header_transcript_blocks_thinking": "思考區塊",
+@@ -361,6 +363,8 @@
+   "tool_block_status_label": "狀態：",
+   "tool_block_source_label": "來源：",
+   "tool_block_agent_label": "agent：",
++  "tool_block_subagent_label": "子代理：",
++  "tool_block_subagent_result_label": "子代理結果：",
+   "tool_block_show_less": "收起",
+   "tool_block_show_all_lines": [
+     {
+@@ -385,6 +389,7 @@
+     }
+   ],
+   "sidebar_loading": "載入中",
++  "sidebar_load_more": "載入更多",
+   "sidebar_multi_select": "多選",
+   "sidebar_exit_multi_select": "退出多選",
+   "sidebar_select_all_visible": "選擇所有可見對話",
+@@ -2296,6 +2301,28 @@
+   ],
+   "settings_image_cleanup_compact_note": "刪除有效載荷會改寫儲存的資料列。在執行 agentsview db compact 之前，封存檔大小保持不變。",
+   "appearance_render_unknown_xml_blocks": "將未知 XML 區塊以預格式化文字呈現",
++  "appearance_auto_collapse_assistant_turns": "預設摺疊助手回合",
++  "message_content_show_full_prompt": "顯示完整提示",
++  "message_content_show_less": "收起",
++  "assistant_turn_event_message": "訊息",
++  "assistant_turn_message_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=other": "{countLabel} 則訊息"
++      }
++    }
++  ],
++  "assistant_turn_tool_call_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=other": "{countLabel} 次 tool call"
++      }
++    }
++  ],
+   "go_to_session_title": "跳轉至對話",
+   "go_to_session_input_label": "對話 ID 或 UUID",
+   "go_to_session_placeholder": "貼上對話 ID 或 UUID",
+diff --git a/frontend/src/lib/utils/messages.ts b/frontend/src/lib/utils/messages.ts
+index fd14fc27..749c6a5a 100644
+--- a/frontend/src/lib/utils/messages.ts
++++ b/frontend/src/lib/utils/messages.ts
+@@ -45,6 +45,24 @@ export function isSystemBoundaryMessage(m: Message): m is Message & { source_sub
+   return !!m.source_subtype && m.source_subtype !== "compact_boundary";
+ }
+ 
++// System rows that arrive while the assistant is still working on the
++// current prompt. The Claude parser keeps them on role "user" so analytics
++// do not count them as replies, but they are not prompts: a task
++// notification reports a background agent finishing, and stop hook feedback
++// is injected by tooling. Treating them as turn boundaries split one
++// exchange into many and promoted every "still waiting" status line before
++// them to a final answer.
++const MID_TURN_SYSTEM_SUBTYPES = new Set(["task_notification", "stop_hook"]);
++
++/**
++ * Reports whether the message is a mid-turn system row — a task
++ * notification or stop-hook feedback card that belongs inside the
++ * current assistant turn instead of acting as a turn boundary.
++ */
++export function isMidTurnSystemMessage(m: Message): boolean {
++  return isSystemBoundaryMessage(m) && MID_TURN_SYSTEM_SUBTYPES.has(m.source_subtype);
++}
++
+ /**
+  * Returns true if the message is system-injected and should be
+  * hidden from the UI. Checks the backend is_system flag first,
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 68042470..28a7bb2b 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -1227,7 +1227,7 @@ func Default() (Config, error) {
+ 		AgentDirs:                      agentDirs,
+ 		agentDirSource:                 agentDirSource,
+ 		SourceMachines:                 make(map[parser.AgentType]map[string]string),
+-		WatchExcludePatterns:           []string{".git", "node_modules", "__pycache__", ".venv", "venv", "vendor", ".next", "*.lock*"},
++		WatchExcludePatterns:           []string{".git", "node_modules", "__pycache__", ".venv", "venv", "vendor", ".next", "*.lock*", "*-shm"},
+ 		ResultContentBlockedCategories: []string{"Read", "Glob"},
+ 		EventsCoalesceInterval:         10 * time.Second,
+ 		DaemonIdleTimeout:              20 * time.Minute,
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 5ed3b58f..48237200 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -1097,6 +1097,7 @@ func TestDefaultWatchExcludesTransientLockFiles(t *testing.T) {
+ 	require.NoError(t, err)
+ 
+ 	assert.Contains(t, cfg.WatchExcludePatterns, "*.lock*")
++	assert.Contains(t, cfg.WatchExcludePatterns, "*-shm")
+ }
+ 
+ func TestAgentDirsEnvBeatsExplicitEmptyArray(t *testing.T) {
+diff --git a/internal/db/db.go b/internal/db/db.go
+index 3794f119..27e94ba5 100644
+--- a/internal/db/db.go
++++ b/internal/db/db.go
+@@ -560,7 +560,49 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
+ // (125: Gemini and Cursor files that share a session ID remain separate
+ // conversations. Re-parse unchanged sources, including cached remote mirrors,
+ // to recover conversations previously collapsed into one archived session.)
+-const dataVersion = 125
++// (126: Devin message_nodes thinking is read from the observed
++// {thinking, signature, signature_type} object instead of a plain string
++// that Devin never writes. Re-parse Devin sessions to restore dropped
++// thinking text on assistant messages.)
++// (127: Devin continued sessions recover the pre-compaction history from
++// message_nodes sibling branches, and continuation-summary nodes are marked
++// as compact boundaries. Re-parse Devin sessions to restore messages the
++// main chain does not reach.)
++// (128: Devin message_nodes are preferred over possibly stale transcript
++// exports, and Devin subagent calls/results are normalized from both formats.
++// Re-parse Devin sessions to restore current messages and tool details.)
++// (129: Devin message_nodes subagent trees are stored as parent-linked child
++// sessions. Re-parse Devin sessions to materialize their transcript-backed
++// subagents from the source database.)
++// (130: duplicate Devin subagent roots sharing a prompt message_id are
++// coalesced onto the most complete transcript tree.)
++// (131: the Antigravity IDE parser now reads
++// brain/<parent>/.system_generated/subagents/<child>.json descriptors and
++// invoke_subagent result steps to link spawned subagent sessions to their
++// parent. Re-parse Antigravity sessions so stored rows gain
++// parent_session_id, relationship_type, subagent session names, and
++// tool-call spawn edges.)
++// (132: the Devin CLI parser now recursively unwinds prior compaction eras
++// via metadata.summarized_from across disconnected message_nodes root trees,
++// restoring pre-compaction history in multi-generation compacted sessions.)
++// (133: Codex rollout continuation segments with history_mode: "paginated"
++// are now stitched across history_base ancestor chains into a single session,
++// restoring the initial prompt and complete conversation history.)
++// (134: inverted tool result storage: single-event results are stored directly
++// in tool_calls.result_content with 0 rows in tool_result_events, eliminating
++// duplicate output/history drawers across all providers.)
++// (135: JetBrains Junie CLI session indexing. Re-parse Junie sessions to store
++// events.jsonl block-update streams and synthesize subagent child sessions.)
++// (136: the Antigravity IDE and CLI providers now catalog-price reasoning
++// tokens from gemini-2.5-pro / gemini-2.5-flash / gemini-3-flash thinking
++// blocks when cost is not recorded by the provider.)
++// (137: the Cursor IDE parser now distributes composerData.contextTokensUsed
++// across the session's parsed messages proportional to content length,
++// setting per-message ContextTokens and session PeakContextTokens.)
++// (138: the Antigravity parser unwraps <USER_REQUEST> envelopes and strips
++// runtime prompt-injection metadata (<ADDITIONAL_METADATA>,
++// <USER_SETTINGS_CHANGE>) from user messages.)
++const dataVersion = 138
+ 
+ const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
+ 
+@@ -616,34 +658,12 @@ const ClassifierHashKey = "is_automated_classifier_hash"
+ //go:embed schema.sql
+ var schemaSQL string
+ 
+-// messagesADTriggerDDL is the AFTER DELETE trigger that mirrors row
+-// removals into the FTS5 shadow tables. ReplaceSessionMessages drops
+-// this trigger inside its transaction (replacing N per-row FTS deletes
+-// with a single bulk INSERT...SELECT) and then re-runs this DDL to
+-// restore it before commit. Keeping the statement in one place keeps
+-// the two installation sites byte-identical.
+-const messagesADTriggerDDL = `
+-CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+-    INSERT INTO messages_fts(messages_fts, rowid, content)
+-        VALUES('delete', old.id, old.content);
+-END;
+-`
+-
+ const cjkFTSRuntimeMatchesSQL = `EXISTS (
+     SELECT 1 FROM main.stats
+     WHERE key = '` + cjkFTSFingerprintStatsKey + `'
+       AND CAST(value AS TEXT) = agentsview_cjk_fts_fingerprint()
+ )`
+ 
+-const messagesCJKADTriggerDDL = `
+-CREATE TEMP TRIGGER IF NOT EXISTS messages_cjk_ad
+-AFTER DELETE ON main.messages
+-WHEN ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
+-    INSERT INTO messages_cjk_fts(messages_cjk_fts, rowid, content)
+-        VALUES('delete', old.id, old.content);
+-END;
+-`
+-
+ const schemaFTS = `
+ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+     content,
+@@ -651,15 +671,121 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+     content_rowid='id',
+     tokenize='porter unicode61'
+ );
+-
+-CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+-    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
++CREATE VIRTUAL TABLE IF NOT EXISTS tool_content_fts USING fts5(
++    content,
++    content='tool_content',
++    content_rowid='id',
++    tokenize='porter unicode61'
++);
++CREATE TRIGGER IF NOT EXISTS tool_content_fts_ai AFTER INSERT ON tool_content BEGIN
++    INSERT INTO tool_content_fts(rowid, content) VALUES(new.id, new.content);
++END;
++CREATE TRIGGER IF NOT EXISTS tool_content_fts_ad AFTER DELETE ON tool_content BEGIN
++    INSERT INTO tool_content_fts(tool_content_fts, rowid, content)
++        VALUES('delete', old.id, old.content);
+ END;
+-` + messagesADTriggerDDL + `
+-CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+-    INSERT INTO messages_fts(messages_fts, rowid, content)
++CREATE TRIGGER IF NOT EXISTS tool_content_fts_au AFTER UPDATE ON tool_content BEGIN
++    INSERT INTO tool_content_fts(tool_content_fts, rowid, content)
+         VALUES('delete', old.id, old.content);
+-    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
++    INSERT INTO tool_content_fts(rowid, content) VALUES(new.id, new.content);
++END;
++`
++
++const toolContentTriggersDropsSQL = `
++DROP TRIGGER IF EXISTS tool_calls_fts_ai;
++DROP TRIGGER IF EXISTS tool_calls_fts_ad;
++DROP TRIGGER IF EXISTS tool_calls_fts_au;
++DROP TRIGGER IF EXISTS tool_result_events_fts_ai;
++DROP TRIGGER IF EXISTS tool_result_events_fts_ad;
++DROP TRIGGER IF EXISTS tool_result_events_fts_au;
++`
++
++const toolContentTriggersCreatesSQL = `
++CREATE TRIGGER IF NOT EXISTS tool_calls_fts_ai AFTER INSERT ON tool_calls BEGIN
++    INSERT INTO tool_content(source_kind, source_id, session_id, message_id,
++        ordinal, location, tool_name, tool_use_id, content, file_path,
++        exit_code, is_error)
++    SELECT 'call', new.id, new.session_id, new.message_id, m.ordinal,
++        'tool_input', new.tool_name, COALESCE(new.tool_use_id,''),
++        COALESCE(new.input_json,''), COALESCE(new.file_path,''), NULL, 0
++    FROM messages m WHERE m.id = new.message_id AND COALESCE(new.input_json,'') <> '';
++    INSERT INTO tool_content(source_kind, source_id, session_id, message_id,
++        ordinal, location, tool_name, tool_use_id, content, file_path,
++        exit_code, is_error)
++    SELECT 'call', new.id, new.session_id, new.message_id, m.ordinal,
++        'tool_result', new.tool_name, COALESCE(new.tool_use_id,''),
++        COALESCE(new.result_content,''), COALESCE(new.file_path,''),
++        CASE WHEN json_valid(new.result_content) THEN CAST(COALESCE(
++            json_extract(new.result_content,'$.exit_code'),
++            json_extract(new.result_content,'$.exitCode')) AS INTEGER) END,
++        CASE WHEN json_valid(new.result_content) AND
++                       COALESCE(json_extract(new.result_content,'$.is_error'),0)
++             THEN 1 ELSE 0 END
++    FROM messages m WHERE m.id = new.message_id AND COALESCE(new.result_content,'') <> '';
++END;
++CREATE TRIGGER IF NOT EXISTS tool_calls_fts_ad AFTER DELETE ON tool_calls BEGIN
++    DELETE FROM tool_content WHERE source_kind='call' AND source_id=old.id;
++END;
++CREATE TRIGGER IF NOT EXISTS tool_calls_fts_au AFTER UPDATE ON tool_calls BEGIN
++    DELETE FROM tool_content WHERE source_kind='call' AND source_id=old.id;
++    INSERT INTO tool_content(source_kind, source_id, session_id, message_id,
++        ordinal, location, tool_name, tool_use_id, content, file_path,
++        exit_code, is_error)
++    SELECT 'call', new.id, new.session_id, new.message_id, m.ordinal,
++        'tool_input', new.tool_name, COALESCE(new.tool_use_id,''),
++        COALESCE(new.input_json,''), COALESCE(new.file_path,''), NULL, 0
++    FROM messages m WHERE m.id = new.message_id AND COALESCE(new.input_json,'') <> '';
++    INSERT INTO tool_content(source_kind, source_id, session_id, message_id,
++        ordinal, location, tool_name, tool_use_id, content, file_path,
++        exit_code, is_error)
++    SELECT 'call', new.id, new.session_id, new.message_id, m.ordinal,
++        'tool_result', new.tool_name, COALESCE(new.tool_use_id,''),
++        COALESCE(new.result_content,''), COALESCE(new.file_path,''),
++        CASE WHEN json_valid(new.result_content) THEN CAST(COALESCE(
++            json_extract(new.result_content,'$.exit_code'),
++            json_extract(new.result_content,'$.exitCode')) AS INTEGER) END,
++        CASE WHEN json_valid(new.result_content) AND
++                       COALESCE(json_extract(new.result_content,'$.is_error'),0)
++             THEN 1 ELSE 0 END
++    FROM messages m WHERE m.id = new.message_id AND COALESCE(new.result_content,'') <> '';
++END;
++CREATE TRIGGER IF NOT EXISTS tool_result_events_fts_ai AFTER INSERT ON tool_result_events BEGIN
++    INSERT INTO tool_content(source_kind, source_id, session_id, ordinal,
++        location, tool_name, tool_use_id, content, file_path, exit_code, is_error)
++    VALUES ('event', new.id, new.session_id, new.tool_call_message_ordinal,
++        'tool_result', COALESCE((SELECT tool_name FROM tool_calls
++          WHERE session_id=new.session_id AND
++            ((new.tool_use_id <> '' AND tool_use_id=new.tool_use_id) OR
++             (COALESCE(new.tool_use_id,'')='' AND call_index=new.call_index))
++          ORDER BY id LIMIT 1),''), COALESCE(new.tool_use_id,''), new.content,
++        '', CASE WHEN json_valid(new.content) THEN CAST(COALESCE(
++            json_extract(new.content,'$.exit_code'),
++            json_extract(new.content,'$.exitCode')) AS INTEGER) END,
++        CASE WHEN lower(new.status) IN ('error','failed','failure') OR
++                       (json_valid(new.content) AND COALESCE(
++                           json_extract(new.content,'$.is_error'),0))
++             THEN 1 ELSE 0 END);
++END;
++CREATE TRIGGER IF NOT EXISTS tool_result_events_fts_ad AFTER DELETE ON tool_result_events BEGIN
++    DELETE FROM tool_content WHERE source_kind='event' AND source_id=old.id;
++END;
++CREATE TRIGGER IF NOT EXISTS tool_result_events_fts_au AFTER UPDATE ON tool_result_events BEGIN
++    DELETE FROM tool_content WHERE source_kind='event' AND source_id=old.id;
++    INSERT INTO tool_content(source_kind, source_id, session_id, ordinal,
++        location, tool_name, tool_use_id, content, file_path, exit_code, is_error)
++    VALUES ('event', new.id, new.session_id, new.tool_call_message_ordinal,
++        'tool_result', COALESCE((SELECT tool_name FROM tool_calls
++          WHERE session_id=new.session_id AND
++            ((new.tool_use_id <> '' AND tool_use_id=new.tool_use_id) OR
++             (COALESCE(new.tool_use_id,'')='' AND call_index=new.call_index))
++          ORDER BY id LIMIT 1),''), COALESCE(new.tool_use_id,''), new.content,
++        '', CASE WHEN json_valid(new.content) THEN CAST(COALESCE(
++            json_extract(new.content,'$.exit_code'),
++            json_extract(new.content,'$.exitCode')) AS INTEGER) END,
++        CASE WHEN lower(new.status) IN ('error','failed','failure') OR
++                       (json_valid(new.content) AND COALESCE(
++                           json_extract(new.content,'$.is_error'),0))
++             THEN 1 ELSE 0 END);
+ END;
+ `
+ 
+@@ -673,19 +799,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_cjk_fts USING fts5(
+ `
+ 
+ const schemaCJKFTSTriggers = `
+-CREATE TEMP TRIGGER IF NOT EXISTS messages_cjk_ai
+-AFTER INSERT ON main.messages
+-WHEN ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
+-    INSERT INTO messages_cjk_fts(rowid, content) VALUES (new.id, new.content);
+-END;
+-` + messagesCJKADTriggerDDL + `
+-CREATE TEMP TRIGGER IF NOT EXISTS messages_cjk_au
+-AFTER UPDATE ON main.messages
+-WHEN ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
+-    INSERT INTO messages_cjk_fts(messages_cjk_fts, rowid, content)
+-        VALUES('delete', old.id, old.content);
+-    INSERT INTO messages_cjk_fts(rowid, content) VALUES (new.id, new.content);
+-END;
+ 
+ -- The persistent BEFORE triggers mark a session pending without consulting
+ -- the extension, because a build without the sidecar cannot evaluate the
+@@ -2936,6 +3049,9 @@ func (db *DB) migrateColumns(ctx context.Context, progress OpenProgressFunc) err
+ 	if _, err := w.ExecContext(ctx, artifactSessionQueueTriggerDropsSQL); err != nil {
+ 		return fmt.Errorf("dropping artifact session queue triggers: %w", err)
+ 	}
++	if _, err := w.ExecContext(ctx, toolContentTriggersDropsSQL); err != nil {
++		return fmt.Errorf("dropping tool content triggers: %w", err)
++	}
+ 	if err := ctx.Err(); err != nil {
+ 		return err
+ 	}
+@@ -2945,6 +3061,9 @@ func (db *DB) migrateColumns(ctx context.Context, progress OpenProgressFunc) err
+ 	if _, err := w.ExecContext(ctx, artifactSessionQueueTriggerCreatesSQL); err != nil {
+ 		return fmt.Errorf("installing artifact session queue triggers: %w", err)
+ 	}
++	if _, err := w.ExecContext(ctx, toolContentTriggersCreatesSQL); err != nil {
++		return fmt.Errorf("installing tool content triggers: %w", err)
++	}
+ 	if err := ctx.Err(); err != nil {
+ 		return err
+ 	}
+@@ -2974,6 +3093,12 @@ func (db *DB) migrateColumns(ctx context.Context, progress OpenProgressFunc) err
+ 	if err := ctx.Err(); err != nil {
+ 		return err
+ 	}
++	if err := db.backfillToolContentFTSLocked(ctx, w); err != nil {
++		return err
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
+ 	if err := scopeLegacyDevinSourceUUIDsLocked(ctx, w); err != nil {
+ 		return err
+ 	}
+@@ -3675,6 +3800,14 @@ func (db *DB) createPartialIndexesLocked(ctx context.Context, w *writerHandle) e
+ 		WHERE file_path IS NOT NULL AND deleted_at IS NULL`); err != nil {
+ 		return fmt.Errorf("creating active session source index: %w", err)
+ 	}
++	// The UNIQUE(session_id, ordinal) constraint on messages already
++	// maintains an identical implicit index, so the explicit named index
++	// is redundant and wastes space and write cost.
++	if _, err := w.Exec(ctx,
++		`DROP INDEX IF EXISTS idx_messages_session_ordinal`,
++	); err != nil {
++		return fmt.Errorf("dropping redundant messages session ordinal index: %w", err)
++	}
+ 	if _, err := w.Exec(ctx,
+ 		`DROP INDEX IF EXISTS idx_artifact_checkpoint_stage_pending`,
+ 	); err != nil {
+@@ -3942,6 +4075,56 @@ func (db *DB) markToolCallFieldBackfillDoneLocked(ctx context.Context,
+ 	return nil
+ }
+ 
++func (db *DB) backfillToolContentFTSLocked(ctx context.Context, w *writerHandle) error {
++	var fts5Available bool
++	if err := w.QueryRowContext(ctx,
++		`SELECT EXISTS(SELECT 1 FROM pragma_module_list WHERE name = 'fts5')`,
++	).Scan(&fts5Available); err != nil || !fts5Available {
++		return nil
++	}
++	var count int
++	if err := w.QueryRowContext(ctx,
++		"SELECT count(*) FROM sqlite_master WHERE type='table' AND name='tool_content'",
++	).Scan(&count); err != nil || count == 0 {
++		return nil
++	}
++	var tcCount int
++	if err := w.QueryRowContext(ctx, "SELECT count(*) FROM tool_content").Scan(&tcCount); err != nil {
++		return nil
++	}
++	if tcCount > 0 {
++		return nil
++	}
++	if _, err := w.ExecContext(ctx, `
++		INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
++			message_id, ordinal, location, tool_name, tool_use_id, content, file_path)
++		SELECT 'call', tc.id, tc.session_id, tc.message_id, m.ordinal,
++			'tool_input', tc.tool_name, COALESCE(tc.tool_use_id,''),
++			COALESCE(tc.input_json,''), COALESCE(tc.file_path,'')
++		FROM tool_calls tc JOIN messages m ON m.id=tc.message_id
++		WHERE COALESCE(tc.input_json,'') <> '';
++		INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
++			message_id, ordinal, location, tool_name, tool_use_id, content, file_path)
++		SELECT 'call', tc.id, tc.session_id, tc.message_id, m.ordinal,
++			'tool_result', tc.tool_name, COALESCE(tc.tool_use_id,''),
++			COALESCE(tc.result_content,''), COALESCE(tc.file_path,'')
++		FROM tool_calls tc JOIN messages m ON m.id=tc.message_id
++		WHERE COALESCE(tc.result_content,'') <> '';
++		INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
++			ordinal, location, tool_name, tool_use_id, content, is_error)
++		SELECT 'event', tre.id, tre.session_id, tre.tool_call_message_ordinal,
++			'tool_result', COALESCE((SELECT tc.tool_name FROM tool_calls tc
++			 WHERE tc.session_id=tre.session_id AND tc.tool_use_id=tre.tool_use_id
++			 AND COALESCE(tre.tool_use_id,'')<>'' ORDER BY tc.id LIMIT 1),''),
++			COALESCE(tre.tool_use_id,''), tre.content,
++			CASE WHEN lower(tre.status) IN ('error','failed','failure') THEN 1 ELSE 0 END
++		FROM tool_result_events tre;
++		INSERT INTO tool_content_fts(tool_content_fts) VALUES('rebuild')`); err != nil {
++		return fmt.Errorf("backfilling tool content FTS: %w", err)
++	}
++	return nil
++}
++
+ // ForceBackfillIsAutomated reclassifies is_automated across
+ // every session, ignoring any cached classifier hash. ResyncAll
+ // calls this after CopyOrphanedDataFrom because orphan-copied
+@@ -4706,7 +4889,7 @@ func (db *DB) RebuildBulkImportIndexes(ctx context.Context) error {
+ 
+ // checkFTSModuleLoads fails when messages_fts is in the schema but this
+ // executable's SQLite cannot load its virtual table module. Writes to
+-// messages fire triggers into messages_fts, so such an archive is
++// messages synchronize messages_fts, so such an archive is
+ // read-only for this build no matter how the open succeeds.
+ func (db *DB) checkFTSModuleLoads(
+ 	ctx context.Context, w *writerHandle,
+@@ -4873,6 +5056,14 @@ func (db *DB) init(ctx context.Context, progress OpenProgressFunc) error {
+ 		}
+ 	}
+ 
++	// Drop legacy row-level FTS triggers if present from earlier schema versions
++	// to avoid per-row trigger overhead during message writes.
++	for _, tr := range []string{"messages_ai", "messages_au", "messages_ad"} {
++		if _, err := w.ExecContext(ctx, "DROP TRIGGER IF EXISTS "+tr); err != nil {
++			return fmt.Errorf("dropping legacy trigger %s: %w", tr, err)
++		}
++	}
++
+ 	if err := ensureCJKFTS(ctx, w, false); err != nil {
+ 		return fmt.Errorf("initializing CJK FTS: %w", err)
+ 	}
+diff --git a/internal/db/db_test.go b/internal/db/db_test.go
+index 643695af..0f9da463 100644
+--- a/internal/db/db_test.go
++++ b/internal/db/db_test.go
+@@ -816,6 +816,12 @@ func TestMigration_ResultContentColumn(t *testing.T) {
+ 	conn, err := sql.Open("sqlite3", path)
+ 	requireNoError(t, err, "raw open")
+ 	_, err = conn.ExecContext(t.Context(), `
++		DROP TRIGGER IF EXISTS tool_result_events_fts_ai;
++		DROP TRIGGER IF EXISTS tool_result_events_fts_ad;
++		DROP TRIGGER IF EXISTS tool_result_events_fts_au;
++		DROP TRIGGER IF EXISTS tool_calls_fts_ai;
++		DROP TRIGGER IF EXISTS tool_calls_fts_ad;
++		DROP TRIGGER IF EXISTS tool_calls_fts_au;
+ 		CREATE TABLE tool_calls_old AS
+ 			SELECT id, message_id, session_id, tool_name,
+ 			       category, tool_use_id, input_json,
+@@ -1041,6 +1047,36 @@ func TestCurrentDataVersionDevinMessageNodeTokenUsage(t *testing.T) {
+ 		"Devin message_nodes token usage requires re-parsing fallback sessions")
+ }
+ 
++func TestCurrentDataVersionDevinMessageNodeThinking(t *testing.T) {
++	assert.GreaterOrEqual(t, CurrentDataVersion(), 123,
++		"Devin message_nodes thinking objects require re-parsing to restore dropped thinking text")
++}
++
++func TestCurrentDataVersionDevinMultiGenerationCompaction(t *testing.T) {
++	assert.GreaterOrEqual(t, CurrentDataVersion(), 129,
++		"Devin multi-generation compaction context recovery requires re-parsing sessions to unwind disconnected root trees")
++}
++
++func TestCurrentDataVersionCodexContinuationHistory(t *testing.T) {
++	assert.GreaterOrEqual(t, CurrentDataVersion(), 130,
++		"Codex continuation history stitching requires re-parsing paginated rollouts to recover full history")
++}
++
++func TestCurrentDataVersionJunieSessionIndexing(t *testing.T) {
++	assert.GreaterOrEqual(t, CurrentDataVersion(), 132,
++		"Junie session indexing requires re-parsing to ingest events.jsonl block-update streams")
++}
++
++func TestCurrentDataVersionAntigravityThinkingPricing(t *testing.T) {
++	assert.GreaterOrEqual(t, CurrentDataVersion(), 133,
++		"Antigravity thinking pricing requires re-pricing sessions with reasoning tokens")
++}
++
++func TestCurrentDataVersionCursorContextTokens(t *testing.T) {
++	assert.GreaterOrEqual(t, CurrentDataVersion(), 134,
++		"Cursor context tokens distribution requires re-parsing sessions to populate per-message context tokens")
++}
++
+ func TestCurrentDataVersionPositAssistantProviderIdentity(t *testing.T) {
+ 	assert.GreaterOrEqual(t, CurrentDataVersion(), 95,
+ 		"Posit Assistant provider identity requires re-parsing usage rows")
+@@ -4208,7 +4244,7 @@ func TestWriteSessionIncrementalToolCallResultUpdate(t *testing.T) {
+ 		WHERE session_id = ? AND tool_use_id = ?`,
+ 		"s1", "call_cmd",
+ 	).Scan(&result, &resultLen))
+-	assert.Empty(t, result, "the sole event already stores the summary")
++	assert.Equal(t, "command finished", result, "single event summary stored directly in tool_calls")
+ 	loaded, err := d.GetAllMessages(t.Context(), "s1")
+ 	require.NoError(t, err)
+ 	require.Len(t, loaded, 1)
+@@ -4216,18 +4252,14 @@ func TestWriteSessionIncrementalToolCallResultUpdate(t *testing.T) {
+ 	assert.Equal(t, "command finished", loaded[0].ToolCalls[0].ResultContent)
+ 	assert.Equal(t, len("command finished"), resultLen)
+ 
+-	var source, content, timestamp string
+-	var eventIndex, eventCount int
++	var eventCount int
+ 	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+-		SELECT source, content, COALESCE(timestamp, ''), event_index
++		SELECT COUNT(*)
+ 		FROM tool_result_events
+ 		WHERE session_id = ? AND tool_use_id = ?`,
+ 		"s1", "call_cmd",
+-	).Scan(&source, &content, &timestamp, &eventIndex))
+-	assert.Equal(t, "function_call_output", source)
+-	assert.Equal(t, "command finished", content)
+-	assert.Equal(t, "2026-08-02T09:00:00Z", timestamp)
+-	assert.Zero(t, eventIndex)
++	).Scan(&eventCount))
++	assert.Zero(t, eventCount, "single event matching summary has 0 tool_result_events rows")
+ 
+ 	_, werr = d.WriteSessionIncremental(t.Context(), "s1", nil, update)
+ 	require.NoError(t, werr,
+@@ -4237,7 +4269,7 @@ func TestWriteSessionIncrementalToolCallResultUpdate(t *testing.T) {
+ 		WHERE session_id = ? AND tool_use_id = ?`,
+ 		"s1", "call_cmd",
+ 	).Scan(&eventCount))
+-	assert.Equal(t, 1, eventCount)
++	assert.Zero(t, eventCount, "replayed single event still has 0 tool_result_events rows")
+ 
+ 	sess, err := d.GetSession(t.Context(), "s1")
+ 	require.NoError(t, err)
+@@ -4300,7 +4332,7 @@ func TestWriteSessionIncrementalTargetsDuplicateCallIDOccurrence(t *testing.T) {
+ 		SELECT COUNT(*) FROM tool_result_events
+ 		WHERE session_id = ? AND tool_call_message_ordinal = ?
+ 		  AND call_index = ?`, "s1", 1, 0).Scan(&eventCount))
+-	assert.Equal(t, 1, eventCount)
++	assert.Zero(t, eventCount)
+ 
+ 	write(ToolCallPosition{MessageOrdinal: 0, CallIndex: 0}, "first")
+ 	var stateOccurrences int
+@@ -6371,6 +6403,9 @@ func TestCopyOrphanedDataFrom_LegacyNoIsSystem(t *testing.T) {
+ 	// SQLite doesn't support DROP COLUMN before 3.35;
+ 	// recreate the table without is_system.
+ 	_, err = raw.ExecContext(t.Context(), `
++		DROP TRIGGER IF EXISTS tool_calls_fts_ai;
++		DROP TRIGGER IF EXISTS tool_calls_fts_ad;
++		DROP TRIGGER IF EXISTS tool_calls_fts_au;
+ 		CREATE TABLE messages_new (
+ 			id INTEGER PRIMARY KEY AUTOINCREMENT,
+ 			session_id TEXT NOT NULL,
+diff --git a/internal/db/messages.go b/internal/db/messages.go
+index 1464c054..506b89d1 100644
+--- a/internal/db/messages.go
++++ b/internal/db/messages.go
+@@ -1,6 +1,7 @@
+ package db
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"crypto/sha256"
+ 	"database/sql"
+@@ -1135,8 +1136,8 @@ func embeddableUnitsQuery(since, sessionID string, includeAutomated bool) string
+ // predicate on the joined sessions row so SQLite can drive the scan from
+ // sessions, which is orders of magnitude smaller than messages. With the
+ // predicate on the join, the planner had no indexed way to apply it and
+-// scanned every message row (content included) through
+-// idx_messages_session_ordinal before discarding almost all of them; an
++// scanned every message row (content included) through the unique
++// (session_id, ordinal) index before discarding almost all of them; an
+ // incremental refresh touching eight sessions still read the whole corpus.
+ // The IN form makes the candidate session list the outer loop and looks its
+ // messages up with SEARCH ... (session_id=?) on that same index, which also
+@@ -1241,6 +1242,23 @@ func insertMessagesTx(
+ 			)
+ 		}
+ 	}
++	if len(ids) > 0 {
++		active, err := activeFTSTablesTx(tx)
++		if err != nil {
++			return nil, err
++		}
++		minID := ids[0]
++		maxID := ids[len(ids)-1]
++		for _, table := range active {
++			if _, err := tx.Exec(
++				`INSERT INTO `+table+`(rowid, content)
++				 SELECT id, content FROM messages WHERE id BETWEEN ? AND ?`,
++				minID, maxID,
++			); err != nil {
++				return nil, fmt.Errorf("bulk-indexing %s entries id=%d..%d: %w", table, minID, maxID, err)
++			}
++		}
++	}
+ 	return ids, nil
+ }
+ 
+@@ -2266,48 +2284,44 @@ func sessionHasCurrentCJKFTSTx(
+ 	return storedFingerprint == simpleFTSRuntimeConfig.fingerprint, nil
+ }
+ 
++// activeFTSTablesTx returns the names of active FTS tables (standard and CJK)
++// that need to be synchronized when messages are modified.
++func activeFTSTablesTx(tx transactionQueries) ([]string, error) {
++	var active []string
++	hasFTS, err := sessionHasFTSTableTx(tx, "messages_fts")
++	if err != nil {
++		return nil, err
++	}
++	if hasFTS {
++		active = append(active, "messages_fts")
++	}
++	hasCJK, err := sessionHasCurrentCJKFTSTx(tx)
++	if err != nil {
++		return nil, err
++	}
++	if hasCJK {
++		active = append(active, "messages_cjk_fts")
++	}
++	return active, nil
++}
++
+ func deleteSessionMessageRowsTx(
+ 	tx transactionQueries, sessionID string,
+ ) error {
+-	tables := []struct {
+-		name       string
+-		deleteName string
+-		deleteDDL  string
+-	}{
+-		{"messages_fts", "messages_ad", messagesADTriggerDDL},
+-		{"messages_cjk_fts", "messages_cjk_ad", messagesCJKADTriggerDDL},
+-	}
+-	active := tables[:0]
+-	for _, table := range tables {
+-		var exists bool
+-		var err error
+-		if table.name == "messages_cjk_fts" {
+-			exists, err = sessionHasCurrentCJKFTSTx(tx)
+-		} else {
+-			exists, err = sessionHasFTSTableTx(tx, table.name)
+-		}
+-		if err != nil {
+-			return err
+-		}
+-		if exists {
+-			active = append(active, table)
+-		}
++	active, err := activeFTSTablesTx(tx)
++	if err != nil {
++		return err
+ 	}
+ 
+ 	for _, table := range active {
+-		// Bulk-delete the FTS entries first so the later row delete
+-		// does not re-tokenize large message blobs through delete triggers.
++		// Bulk-delete the FTS entries first so the FTS index is kept
++		// synchronized without per-row delete triggers.
+ 		if _, err := tx.Exec(
+-			`INSERT INTO `+table.name+`(`+table.name+`, rowid, content)
++			`INSERT INTO `+table+`(`+table+`, rowid, content)
+ 			 SELECT 'delete', id, content FROM messages WHERE session_id = ?`,
+ 			sessionID,
+ 		); err != nil {
+-			return fmt.Errorf("bulk-deleting %s entries: %w", table.name, err)
+-		}
+-		if _, err := tx.Exec(
+-			"DROP TRIGGER IF EXISTS " + table.deleteName,
+-		); err != nil {
+-			return fmt.Errorf("dropping %s trigger: %w", table.deleteName, err)
++			return fmt.Errorf("bulk-deleting %s entries: %w", table, err)
+ 		}
+ 	}
+ 	if _, err := tx.Exec(
+@@ -2315,11 +2329,6 @@ func deleteSessionMessageRowsTx(
+ 	); err != nil {
+ 		return fmt.Errorf("deleting old messages: %w", err)
+ 	}
+-	for _, table := range active {
+-		if _, err := tx.Exec(table.deleteDDL); err != nil {
+-			return fmt.Errorf("restoring %s trigger: %w", table.deleteName, err)
+-		}
+-	}
+ 	return nil
+ }
+ 
+@@ -3602,6 +3611,8 @@ func soleToolResultEventTx(ctx context.Context,
+ 	imagePolicy config.ToolResultImages,
+ ) ([]ToolResultEvent, error) {
+ 	var count int
++	var subagent, agentID, status, timestamp string
++	var digest []byte
+ 	var content sql.NullString
+ 	if err := tx.QueryRowContext(ctx,
+ 		`SELECT COUNT(*) FROM (
+@@ -3622,11 +3633,17 @@ func soleToolResultEventTx(ctx context.Context,
+ 		return nil, nil
+ 	}
+ 	if err := tx.QueryRowContext(ctx,
+-		`SELECT content FROM tool_result_events
++		`SELECT COALESCE(subagent_session_id, ''),
++		        COALESCE(agent_id, ''),
++		        COALESCE(status, ''),
++		        COALESCE(timestamp, ''),
++		        raw_content_digest,
++		        content
++		 FROM tool_result_events
+ 		 WHERE session_id = ? AND tool_call_message_ordinal = ?
+ 		   AND call_index = ? AND COALESCE(content, '') <> ''`,
+ 		sessionID, messageOrdinal, callIndex,
+-	).Scan(&content); err != nil {
++	).Scan(&subagent, &agentID, &status, &timestamp, &digest, &content); err != nil {
+ 		return nil, fmt.Errorf(
+ 			"reading sole tool result event for %s/%d/%d: %w",
+ 			sessionID, messageOrdinal, callIndex, err,
+@@ -3637,7 +3654,14 @@ func soleToolResultEventTx(ctx context.Context,
+ 		stored, _ = StripToolResultImages(stored)
+ 	}
+ 	// Offload dedup must compare stored bytes because readers hydrate the original event.
+-	return []ToolResultEvent{{Content: stored}}, nil
++	return []ToolResultEvent{{
++		Content:           stored,
++		SubagentSessionID: subagent,
++		AgentID:           agentID,
++		Status:            status,
++		Timestamp:         timestamp,
++		RawContentDigest:  digest,
++	}}, nil
+ }
+ 
+ func applyToolCallSubagentLinkTx(ctx context.Context,
+@@ -3721,15 +3745,25 @@ func applyToolCallSubagentLinkTx(ctx context.Context,
+ 			resultContent, resultContentLen,
+ 		)
+ 		// A linked result carries no events of its own, but the call it
+-		// targets may already have one stored. Re-storing a summary the
+-		// event repeats would undo the dedup on every incremental pass.
++		// targets may already have one stored. If the linked result repeats
++		// that single stored event, delete the redundant event row so the
++		// call conforms to the single-event storage model.
+ 		sole, err := soleToolResultEventTx(ctx,
+ 			tx, sessionID, messageOrdinal, callIndex, imagePolicy,
+ 		)
+ 		if err != nil {
+ 			return false, err
+ 		}
+-		resultContent = DedupToolCallResultSummary(resultContent, sole)
++		if ResultContentDuplicatesSingleEvent(resultContent, sole) {
++			if _, err := tx.ExecContext(ctx,
++				`DELETE FROM tool_result_events
++				 WHERE session_id = ? AND tool_call_message_ordinal = ?
++				   AND call_index = ?`,
++				sessionID, messageOrdinal, callIndex,
++			); err != nil {
++				return false, fmt.Errorf("deleting redundant single event: %w", err)
++			}
++		}
+ 	}
+ 	if currentSubagent == storedSubagent &&
+ 		currentResultContentLen == resultContentLen &&
+@@ -3758,9 +3792,12 @@ func applyToolCallResultUpdateTx(ctx context.Context,
+ 
+ 	position := update.Position
+ 	var toolCallID int64
+-	var category string
++	var category, currentResultContent string
++	var currentResultContentLen int
+ 	if err := tx.QueryRowContext(ctx,
+-		`SELECT tc.id, tc.category
++		`SELECT tc.id, tc.category,
++		        COALESCE(tc.result_content, ''),
++		        COALESCE(tc.result_content_length, 0)
+ 		 FROM tool_calls tc
+ 		 JOIN messages m ON m.id = tc.message_id
+ 		 WHERE tc.session_id = ? AND m.session_id = tc.session_id AND m.ordinal = ?
+@@ -3768,7 +3805,7 @@ func applyToolCallResultUpdateTx(ctx context.Context,
+ 		   AND COALESCE(tc.tool_use_id, '') = ?`,
+ 		sessionID, position.MessageOrdinal, position.CallIndex,
+ 		update.ToolUseID,
+-	).Scan(&toolCallID, &category); err != nil {
++	).Scan(&toolCallID, &category, &currentResultContent, &currentResultContentLen); err != nil {
+ 		if errors.Is(err, sql.ErrNoRows) {
+ 			return false, nil, nil
+ 		}
+@@ -3802,16 +3839,16 @@ func applyToolCallResultUpdateTx(ctx context.Context,
+ 			return false, nil, err
+ 		}
+ 	}
+-	var nextEventIndex int
++
++	var eventCount int
+ 	if err := tx.QueryRowContext(ctx,
+-		`SELECT COALESCE(MAX(event_index), -1) + 1
+-		 FROM tool_result_events
++		`SELECT COUNT(*) FROM tool_result_events
+ 		 WHERE session_id = ? AND tool_call_message_ordinal = ?
+ 		   AND call_index = ?`,
+ 		sessionID, position.MessageOrdinal, position.CallIndex,
+-	).Scan(&nextEventIndex); err != nil {
++	).Scan(&eventCount); err != nil {
+ 		return false, nil, fmt.Errorf(
+-			"reading next event index for %s/%s: %w",
++			"counting tool result events for %s/%s: %w",
+ 			sessionID, update.ToolUseID, err,
+ 		)
+ 	}
+@@ -3848,6 +3885,67 @@ func applyToolCallResultUpdateTx(ctx context.Context,
+ 		incoming = toolCall.ResultEvents
+ 	}
+ 
++	if eventCount == 0 && (currentResultContent != "" || currentResultContentLen > 0) {
++		if !blocked && len(incoming) == 1 {
++			candidate := incoming[0]
++			if candidate.ContentLength == currentResultContentLen &&
++				candidate.Content == currentResultContent &&
++				candidate.AgentID == "" && candidate.SubagentSessionID == "" {
++				storedDigest := sha256.Sum256([]byte(currentResultContent))
++				if bytes.Equal(candidate.RawContentDigest, storedDigest[:]) ||
++					strings.Contains(currentResultContent, "asset://") {
++					return false, nil, nil
++				}
++			}
++		}
++		var agentID string
++		_ = tx.QueryRowContext(ctx,
++			`SELECT agent_id FROM tool_call_occurrence_agent_state
++			 WHERE session_id = ? AND message_ordinal = ? AND call_index = ?
++			 LIMIT 1`,
++			sessionID, position.MessageOrdinal, position.CallIndex,
++		).Scan(&agentID)
++		ev0Event := ToolResultEvent{
++			ToolUseID:     update.ToolUseID,
++			AgentID:       agentID,
++			Source:        "function_call_output",
++			Status:        "completed",
++			Content:       currentResultContent,
++			ContentLength: currentResultContentLen,
++			EventIndex:    0,
++		}
++		if blocked {
++			ev0Event.Content = ""
++		}
++		PrepareToolResultEvent(&ev0Event)
++		ev0Row := toolResultEventRow{
++			SessionID:      sessionID,
++			MessageOrdinal: position.MessageOrdinal,
++			CallIndex:      position.CallIndex,
++			Event:          ev0Event,
++		}
++		if err := insertToolResultEventsTx(tx, []toolResultEventRow{ev0Row}); err != nil {
++			return false, nil, err
++		}
++		if err := upsertToolCallAgentStateRows(tx, []toolResultEventRow{ev0Row}); err != nil {
++			return false, nil, err
++		}
++	}
++
++	var nextEventIndex int
++	if err := tx.QueryRowContext(ctx,
++		`SELECT COALESCE(MAX(event_index), -1) + 1
++		 FROM tool_result_events
++		 WHERE session_id = ? AND tool_call_message_ordinal = ?
++		   AND call_index = ?`,
++		sessionID, position.MessageOrdinal, position.CallIndex,
++	).Scan(&nextEventIndex); err != nil {
++		return false, nil, fmt.Errorf(
++			"reading next event index for %s/%s: %w",
++			sessionID, update.ToolUseID, err,
++		)
++	}
++
+ 	insertRows := make([]toolResultEventRow, 0, len(incoming))
+ 	var inserted []ToolResultEvent
+ 	var metadataChanged bool
+@@ -3908,6 +4006,16 @@ func applyToolCallResultUpdateTx(ctx context.Context,
+ 		})
+ 	}
+ 	if len(insertRows) == 0 {
++		if eventCount == 0 {
++			if _, err := tx.ExecContext(ctx,
++				`DELETE FROM tool_result_events
++				 WHERE session_id = ? AND tool_call_message_ordinal = ?
++				   AND call_index = ?`,
++				sessionID, position.MessageOrdinal, position.CallIndex,
++			); err != nil {
++				return false, nil, err
++			}
++		}
+ 		return metadataChanged, nil, nil
+ 	}
+ 	if err := insertToolResultEventsTx(tx, insertRows); err != nil {
+@@ -3941,15 +4049,26 @@ func applyToolCallResultUpdateTx(ctx context.Context,
+ 				resultLength = len(summary)
+ 			}
+ 		}
++		storedSummary = summary
++	}
+ 
+-		sole, err := soleToolResultEventTx(ctx,
+-			tx, sessionID, position.MessageOrdinal, position.CallIndex,
+-			imagePolicy,
+-		)
+-		if err != nil {
+-			return false, nil, err
++	sole, err := soleToolResultEventTx(ctx,
++		tx, sessionID, position.MessageOrdinal, position.CallIndex,
++		imagePolicy,
++	)
++	if err != nil {
++		return false, nil, err
++	}
++	if ResultContentDuplicatesSingleEvent(storedSummary, sole) {
++		if _, err := tx.ExecContext(ctx,
++			`DELETE FROM tool_result_events
++			 WHERE session_id = ? AND tool_call_message_ordinal = ?
++			   AND call_index = ?`,
++			sessionID, position.MessageOrdinal, position.CallIndex,
++		); err != nil {
++			return false, nil, fmt.Errorf("deleting redundant single event: %w", err)
+ 		}
+-		storedSummary = DedupToolCallResultSummary(summary, sole)
++		inserted = nil
+ 	}
+ 	if _, err := tx.ExecContext(ctx,
+ 		`UPDATE tool_calls
+@@ -4184,6 +4303,9 @@ func resolveToolResultEvents(msgs []Message) []toolResultEventRow {
+ 	var rows []toolResultEventRow
+ 	for _, m := range msgs {
+ 		for callIndex, tc := range m.ToolCalls {
++			if !ShouldPersistToolResultEvents(tc.ResultContent, tc.ResultEvents) {
++				continue
++			}
+ 			for eventIndex, ev := range tc.ResultEvents {
+ 				ev.EventIndex = eventIndex
+ 				ev.ContentLength = ResolveResultContentLength(
+diff --git a/internal/parser/claude.go b/internal/parser/claude.go
+index e12fae6f..5eaa1ca1 100644
+--- a/internal/parser/claude.go
++++ b/internal/parser/claude.go
+@@ -155,7 +155,8 @@ func claudeParseFile(
+ 		parentSessionID = lineage.parentSessionID
+ 	}
+ 
+-	lr := newLineReaderContext(ctx, f, maxLineSize)
++	tee := newCodexHashAnchorTee(io.LimitReader(f, info.Size()))
++	lr := newLineReaderContext(ctx, tee, maxLineSize)
+ 	defer releaseLineReader(lr)
+ 	lastLineFailed := false
+ 	for {
+@@ -403,6 +404,19 @@ func claudeParseFile(
+ 		}
+ 	}
+ 
++	if err := lr.Err(); err != nil {
++		return nil, nil, fmt.Errorf("reading claude %s: %w", path, err)
++	}
++	if tee.total < info.Size() {
++		if _, err := io.Copy(io.Discard, tee); err != nil {
++			return nil, nil, fmt.Errorf("reading remainder of %s: %w", path, err)
++		}
++	}
++	fullHash, err := tee.HashDigest()
++	if err != nil {
++		return nil, nil, err
++	}
++
+ 	// Detect truncation: last line is non-empty, invalid JSON,
+ 	// AND the file did not end with a newline. A newline-
+ 	// terminated invalid line is just a complete malformed
+@@ -421,10 +435,16 @@ func claudeParseFile(
+ 		return nil, nil, err
+ 	}
+ 
++	inode, device := sourceFileIdentityForFile(f, info)
++	changeTime, _ := codexIndexChangeTimeForFile(f, info)
+ 	fileInfo := FileInfo{
+-		Path:  path,
+-		Size:  info.Size(),
+-		Mtime: info.ModTime().UnixNano(),
++		Path:       path,
++		Size:       info.Size(),
++		Mtime:      info.ModTime().UnixNano(),
++		Inode:      int64(inode),
++		Device:     int64(device),
++		ChangeTime: changeTime,
++		Hash:       fullHash,
+ 	}
+ 	if opts.compatibleTitleEvents {
+ 		displayName = firstNonEmptyJSONLString(
+@@ -532,6 +552,21 @@ func claudeParseFile(
+ 	if err := ctx.Err(); err != nil {
+ 		return nil, nil, err
+ 	}
++	var lastEntryUUID string
++	for i := len(entries) - 1; i >= 0; i-- {
++		if entries[i].uuid != "" {
++			lastEntryUUID = entries[i].uuid
++			break
++		}
++	}
++	if !opts.uploadIdentity && lineage == nil && !lastLineFailed && len(kept) == 1 && lastEntryUUID != "" {
++		hashState, stateErr := tee.HashState()
++		if stateErr == nil {
++			kept[0].Checkpoint = []byte(lastEntryUUID)
++			kept[0].CheckpointHashState = hashState
++			kept[0].CheckpointAnchorDigest = tee.AnchorDigest()
++		}
++	}
+ 	return kept, excluded, nil
+ }
+ 
+diff --git a/internal/sync/engine.go b/internal/sync/engine.go
+index cbb3512f..07e8bb14 100644
+--- a/internal/sync/engine.go
++++ b/internal/sync/engine.go
+@@ -1942,7 +1942,29 @@ func (e *Engine) classifyPaths(
+ 	seen := make(map[string]int, len(paths))
+ 	files := make([]parser.DiscoveredFile, 0, len(paths))
+ 	var classificationErr error
++	pathSet := make(map[string]struct{}, len(paths))
+ 	for _, p := range paths {
++		if strings.HasSuffix(p, "-shm") {
++			continue
++		}
++		pathSet[p] = struct{}{}
++	}
++	seenPaths := make(map[string]struct{}, len(paths))
++	for _, p := range paths {
++		if strings.HasSuffix(p, "-shm") {
++			continue
++		}
++		if strings.HasSuffix(p, "-wal") {
++			mainDB := strings.TrimSuffix(p, "-wal")
++			if _, hasMain := pathSet[mainDB]; hasMain {
++				continue
++			}
++		}
++		if _, already := seenPaths[p]; already {
++			continue
++		}
++		seenPaths[p] = struct{}{}
++
+ 		// Codex resolved-index events map to potentially several session
+ 		// sources and must classify even when the event path was deleted, so
+ 		// they are handled by classifyCodexIndexPath. All other changed paths,
+@@ -6490,6 +6512,13 @@ func isCodexFormatAgent(agent parser.AgentType) bool {
+ 	return ingest.IsCodexFormatAgent(agent)
+ }
+ 
++// isCheckpointEligibleAgent reports whether an agent format supports
++// resumable parser checkpoints and incremental tail-appends (Codex formats
++// and Claude Code).
++func isCheckpointEligibleAgent(agent parser.AgentType) bool {
++	return isCodexFormatAgent(agent) || agent == parser.AgentClaude
++}
++
+ func reconciliationWatchRoot(
+ 	path string, watchRoots []parser.WatchRoot, configuredRoots []string,
+ ) string {
+@@ -10748,6 +10777,9 @@ func (e *Engine) collectAndBatchWithOptions(
+ 				r.releaseAll()
+ 				continue
+ 			}
++			if r.cacheSkip && r.incremental.fileMtime != 0 && !r.noCacheSkip {
++				e.cacheSkip(r.skipCacheKey(), r.incremental.fileMtime, r.sourceFingerprint)
++			}
+ 			stats.RecordSynced(1)
+ 			if !sourceProofWithheld {
+ 				baselineJob := r
+@@ -11915,7 +11947,7 @@ func (e *Engine) processProviderFile(
+ 	codexForceFullParse := false
+ 	codexProvenUnchanged := false
+ 	codexAuditDeepVerify := e.checkpointAudit.Load() &&
+-		isCodexFormatAgent(file.Agent)
++		isCheckpointEligibleAgent(file.Agent)
+ 	var codexUnchangedMtime int64
+ 	verifiedCapture, verifiedMtime, verifiedFresh, verifiedStateOK := e.verifiedProviderSourceState(provider, source, file)
+ 	if !forceSourceCwdParse && !codexForceFullParse &&
+@@ -12005,7 +12037,7 @@ func (e *Engine) processProviderFile(
+ 	// warm-sweep behavior while still proving appends before any full content
+ 	// fingerprint read. Audit mode deliberately bypasses this optimization and
+ 	// takes the authoritative full-parse path below.
+-	if isCodexFormatAgent(file.Agent) && !codexAuditDeepVerify {
++	if isCheckpointEligibleAgent(file.Agent) && !codexAuditDeepVerify {
+ 		cpResult, cpErr := e.codexCheckpointFingerprint(ctx, source, file)
+ 		if cpErr != nil {
+ 			log.Printf("codex checkpoint %s: %v", file.Path, cpErr)
+@@ -12687,8 +12719,10 @@ func (e *Engine) processProviderFile(
+ 	// so ownership reconciliation is needed only by real sync engines.
+ 	if (file.Agent == parser.AgentKiro ||
+ 		file.Agent == parser.AgentCline ||
++		(file.Agent == parser.AgentDevin && outcome.ForceReplace) ||
+ 		(file.Agent == parser.AgentOmnigent && outcome.ForceReplace) ||
+ 		(file.Agent == parser.AgentCursorIDE && outcome.ForceReplace) ||
++		(file.Agent == parser.AgentJunie && outcome.ForceReplace) ||
+ 		(file.Agent == parser.AgentTrae && !e.forceParse)) &&
+ 		outcome.ResultSetComplete && len(outcome.SourceErrors) == 0 {
+ 		missingMembers, err = e.providerSourceMissingSessionOwnershipsForCompleteResultWithPreserved(
+@@ -18018,7 +18052,7 @@ func (e *Engine) writeBatchWithOutcomeContext(
+ 			if ctx.Err() != nil {
+ 				return outcome
+ 			}
+-			if isCodexFormatAgent(pw.sess.Agent) {
++			if isCheckpointEligibleAgent(pw.sess.Agent) {
+ 				cp, blobs, cpErr := e.buildCodexFullParseCheckpoint(
+ 					pw.sess.File.Path, pw,
+ 				)
+@@ -18666,7 +18700,7 @@ func (e *Engine) writeBatchBulkWithOutcomeContext(
+ 		snapshotProject := pw.sess.Project
+ 		var checkpoint *db.ParserCheckpoint
+ 		var checkpointBlobs *db.ParserCheckpointBlobs
+-		if isCodexFormatAgent(pw.sess.Agent) {
++		if isCheckpointEligibleAgent(pw.sess.Agent) {
+ 			var checkpointErr error
+ 			checkpoint, checkpointBlobs, checkpointErr = e.buildCodexFullParseCheckpoint(pw.sess.File.Path, pw)
+ 			if checkpointErr != nil {
+@@ -19236,7 +19270,7 @@ func shouldReplaceFullParseMessages(
+ ) bool {
+ 	return forceReplace || pw.forceReplace || pw.needsRetry || stale ||
+ 		revivingSourceMissing ||
+-		isCodexFormatAgent(pw.sess.Agent) ||
++		isCheckpointEligibleAgent(pw.sess.Agent) ||
+ 		// Kiro full parses rebuild the complete accepted message projection;
+ 		// append semantics would retain rows removed or rewritten by the source.
+ 		pw.sess.Agent == parser.AgentKiro ||
+@@ -19433,7 +19467,8 @@ func (e *Engine) writeIncremental(ctx context.Context,
+ 
+ 	var replaceFromOrdinal *int
+ 	if inc.suffixReplace {
+-		replaceFromOrdinal = new(inc.replaceFromOrdinal)
++		ord := inc.replaceFromOrdinal
++		replaceFromOrdinal = &ord
+ 	}
+ 	var signalsMaintained bool
+ 	var maintainer db.SignalMaintainer
+@@ -19686,7 +19721,7 @@ func (e *Engine) writeSessionFullWithResolver(
+ 		}
+ 		var checkpoint *db.ParserCheckpoint
+ 		var checkpointBlobs *db.ParserCheckpointBlobs
+-		if isCodexFormatAgent(pw.sess.Agent) {
++		if isCheckpointEligibleAgent(pw.sess.Agent) {
+ 			var checkpointErr error
+ 			checkpoint, checkpointBlobs, checkpointErr = e.buildCodexFullParseCheckpoint(pw.sess.File.Path, pw)
+ 			if checkpointErr != nil {
+diff --git a/internal/sync/engine_integration_test.go b/internal/sync/engine_integration_test.go
+index 7ab7881a..e574d022 100644
+--- a/internal/sync/engine_integration_test.go
++++ b/internal/sync/engine_integration_test.go
+@@ -15858,9 +15858,7 @@ func TestIncrementalSync_CodexExecAppendRetainsEvents(t *testing.T) {
+ 	call := msgs[1].ToolCalls[0]
+ 	assert.Equal(t, "exec_command", call.ToolName, "tool name")
+ 	assert.Equal(t, "done", call.ResultContent, "result_content")
+-	require.Len(t, call.ResultEvents, 1)
+-	assert.Equal(t, "function_call_output", call.ResultEvents[0].Source)
+-	assert.Equal(t, "done", call.ResultEvents[0].Content)
++	require.Empty(t, call.ResultEvents)
+ 	afterIncremental, err := env.db.GetSessionFull(
+ 		t.Context(), "codex:inc-cx-exec",
+ 	)
+diff --git a/internal/sync/engine_test.go b/internal/sync/engine_test.go
+index de5ecb42..b1a9ec67 100644
+--- a/internal/sync/engine_test.go
++++ b/internal/sync/engine_test.go
+@@ -96,7 +96,7 @@ func TestIncrementalClaudeLateResultLinkScansDefiniteSecret(t *testing.T) {
+ 	require.NoError(t, err)
+ 	found := false
+ 	for _, finding := range findings {
+-		if finding.LocationKind == "tool_result_event" &&
++		if (finding.LocationKind == "tool_result" || finding.LocationKind == "tool_result_event") &&
+ 			strings.Contains(finding.RedactedMatch, "AKIA") {
+ 			found = true
+ 			break
+@@ -10473,6 +10473,31 @@ func TestEngine_ClassifyPathsOpenCodeSQLiteWALFile(
+ 	assert.Equal(t, parser.AgentOpenCode, files[0].Agent)
+ }
+ 
++func TestClassifyPaths_FiltersShmAndFoldsWal(t *testing.T) {
++	database := openTestDB(t)
++	opencodeDir := t.TempDir()
++	engine := NewEngine(t.Context(), database, EngineConfig{
++		AgentDirs: map[parser.AgentType][]string{
++			parser.AgentOpenCode: {opencodeDir},
++		},
++		Machine: "local",
++	})
++
++	dbPath := filepath.Join(opencodeDir, "opencode.db")
++	seedOpenCodeSQLiteWALSession(t, dbPath, "ses_wal")
++	walPath := filepath.Join(opencodeDir, "opencode.db-wal")
++	shmPath := filepath.Join(opencodeDir, "opencode.db-shm")
++
++	// Classifying only shmPath should produce zero discovered files.
++	shmFiles := requireClassifyPaths(t, engine, []string{shmPath})
++	assert.Empty(t, shmFiles)
++
++	// Classifying dbPath, walPath, and shmPath together should deduplicate into exactly one discovered file.
++	combinedFiles := requireClassifyPaths(t, engine, []string{dbPath, walPath, shmPath})
++	require.Len(t, combinedFiles, 1)
++	assert.Equal(t, parser.OpenCodeSQLiteVirtualPath(dbPath, "ses_wal"), combinedFiles[0].Path)
++}
++
+ // seedOpenCodeSQLiteWALSession creates a minimal OpenCode-shaped SQLite
+ // database and keeps its writer open with the session commit held in the WAL.
+ // This exercises the same uncheckpointed state produced by a live OpenCode
+@@ -11546,8 +11571,7 @@ func TestSyncAllReparsesCursorLegacyToolResultsFromVersion101(t *testing.T) {
+ 	require.Len(t, messages, 1)
+ 	require.Len(t, messages[0].ToolCalls, 1)
+ 	call := messages[0].ToolCalls[0]
+-	require.Len(t, call.ResultEvents, 1)
+-	assert.Equal(t, "file1.go", call.ResultEvents[0].Content)
++	require.Empty(t, call.ResultEvents)
+ 	assert.Equal(t, "file1.go", call.ResultContent)
+ }
+ 
+diff --git a/internal/sync/watcher_test.go b/internal/sync/watcher_test.go
+index 06a646fc..f1c88707 100644
+--- a/internal/sync/watcher_test.go
++++ b/internal/sync/watcher_test.go
+@@ -498,6 +498,25 @@ func TestPendingWatchBatchOverflowsByEntryCount(t *testing.T) {
+ 	assert.Empty(t, batch.Paths)
+ }
+ 
++func TestPendingWatchBatch_FiltersShmAndFoldsWal(t *testing.T) {
++	pending := newPendingWatchBatch(10, 1_000)
++
++	// -shm should be ignored completely
++	pending.Add("/data/opencode.db-shm")
++	assert.True(t, pending.Empty())
++
++	// -wal should fold into .db
++	pending.Add("/data/opencode.db-wal")
++	assert.False(t, pending.Empty())
++
++	// adding both .db and .wal should produce only a single entry for .db
++	pending.Add("/data/opencode.db")
++
++	batch, ok := pending.Take()
++	require.True(t, ok)
++	assert.Equal(t, []string{"/data/opencode.db"}, batch.Paths)
++}
++
+ func TestWatchBatchAccumulatorMergesAndSortsPublicWork(t *testing.T) {
+ 	accumulator := NewWatchBatchAccumulator(nil)
+ 	rename := WatchRename{

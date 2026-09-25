@@ -1,0 +1,9845 @@
+package db
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"encoding/base64"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
+)
+
+func reflectedFieldValue(v any, name string) reflect.Value {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return reflect.Value{}
+		}
+		rv = rv.Elem()
+	}
+	if !rv.IsValid() || rv.Kind() != reflect.Struct {
+		return reflect.Value{}
+	}
+	return rv.FieldByName(name)
+}
+
+func reflectedIntField(v any, name string) int {
+	f := reflectedFieldValue(v, name)
+	if !f.IsValid() || f.Kind() != reflect.Int {
+		return 0
+	}
+	return int(f.Int())
+}
+
+func reflectedStringField(v any, name string) string {
+	f := reflectedFieldValue(v, name)
+	if !f.IsValid() {
+		return ""
+	}
+	switch f.Kind() {
+	case reflect.String:
+		return f.String()
+	case reflect.Pointer:
+		if !f.IsNil() && f.Elem().Kind() == reflect.String {
+			return f.Elem().String()
+		}
+	default:
+		return ""
+	}
+	return ""
+}
+
+func callUpdateSessionIncrementalCompat(
+	t *testing.T,
+	d *DB,
+	id string,
+	endedAt *string,
+	msgCount, userMsgCount int,
+	fileSize, fileMtime int64,
+	nextOrdinal int,
+	lastEntryUUID string,
+	totalOutputTokens, peakContextTokens int,
+	hasTotalOutputTokens, hasPeakContextTokens bool,
+) error {
+	t.Helper()
+	return d.UpdateSessionIncremental(t.Context(), id, IncrementalSessionUpdate{
+		EndedAt:              endedAt,
+		MsgCount:             msgCount,
+		UserMsgCount:         userMsgCount,
+		FileSize:             fileSize,
+		FileMtime:            fileMtime,
+		NextOrdinal:          nextOrdinal,
+		LastEntryUUID:        lastEntryUUID,
+		TotalOutputTokens:    totalOutputTokens,
+		PeakContextTokens:    peakContextTokens,
+		HasTotalOutputTokens: hasTotalOutputTokens,
+		HasPeakContextTokens: hasPeakContextTokens,
+	})
+}
+
+const blockingCloseDriverName = "agentsview-blocking-close"
+
+var (
+	registerBlockingCloseDriverOnce sync.Once
+	blockingCloseDriverStates       sync.Map
+)
+
+type blockingCloseState struct {
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+}
+
+type blockingCloseDriver struct{}
+
+func (blockingCloseDriver) Open(name string) (driver.Conn, error) {
+	state, ok := blockingCloseDriverStates.Load(name)
+	if !ok {
+		return nil, fmt.Errorf("missing blocking close state for %q", name)
+	}
+	return &blockingCloseConn{
+		state: state.(*blockingCloseState),
+	}, nil
+}
+
+type blockingCloseConn struct {
+	state *blockingCloseState
+}
+
+func (c *blockingCloseConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("prepare not implemented")
+}
+
+func (c *blockingCloseConn) Close() error {
+	c.state.startedOnce.Do(func() {
+		close(c.state.started)
+	})
+	<-c.state.release
+	return nil
+}
+
+func (c *blockingCloseConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("begin not implemented")
+}
+
+func openBlockingCloseDB(
+	t *testing.T,
+) (*sql.DB, <-chan struct{}, func()) {
+	t.Helper()
+
+	registerBlockingCloseDriverOnce.Do(func() {
+		sql.Register(blockingCloseDriverName, blockingCloseDriver{})
+	})
+
+	dsn := fmt.Sprintf("%s/%p", t.Name(), t)
+	state := &blockingCloseState{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	blockingCloseDriverStates.Store(dsn, state)
+
+	pool, err := sql.Open(blockingCloseDriverName, dsn)
+	require.NoError(t, err, "opening blocking close pool")
+	pool.SetMaxOpenConns(1)
+	require.NoError(t, pool.PingContext(t.Context()),
+		"priming blocking close pool")
+
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(state.release)
+			blockingCloseDriverStates.Delete(dsn)
+		})
+	}
+	t.Cleanup(release)
+
+	return pool, state.started, release
+}
+
+// filterWith returns a SessionFilter with Limit defaulted to 100.
+func filterWith(fn func(*SessionFilter)) SessionFilter {
+	f := SessionFilter{Limit: 100}
+	fn(&f)
+	return f
+}
+
+// sessionSet inserts 3 sessions with sequential dates and
+// increasing message counts (5, 15, 25).
+func sessionSet(t *testing.T, d *DB) {
+	t.Helper()
+	for i, mc := range []int{5, 15, 25} {
+		day := fmt.Sprintf("2024-06-0%dT10:00:00Z", i+1)
+		end := fmt.Sprintf("2024-06-0%dT11:00:00Z", i+1)
+		insertSession(t, d, fmt.Sprintf("s%d", i+1),
+			"proj", func(s *Session) {
+				s.StartedAt = new(day)
+				s.EndedAt = new(end)
+				s.MessageCount = mc
+			})
+	}
+}
+
+// requireCount lists sessions with filter and asserts the count.
+func requireCount(
+	t *testing.T, d *DB, f SessionFilter, want int,
+) {
+	t.Helper()
+	page, err := d.ListSessions(
+		t.Context(), f,
+	)
+	require.NoError(t, err, "ListSessions")
+	assert.Len(t, page.Sessions, want, "session count")
+}
+
+// requireSessions lists sessions with filter and asserts the exact IDs returned.
+func requireSessions(
+	t *testing.T, d *DB, f SessionFilter, wantIDs []string,
+) {
+	t.Helper()
+	page, err := d.ListSessions(
+		t.Context(), f,
+	)
+	require.NoError(t, err, "ListSessions")
+
+	gotIDs := collectIDs(page.Sessions)
+	wantSorted := make([]string, len(wantIDs))
+	copy(wantSorted, wantIDs)
+	slices.Sort(wantSorted)
+
+	gotSorted := make([]string, len(gotIDs))
+	copy(gotSorted, gotIDs)
+	slices.Sort(gotSorted)
+
+	if diff := cmp.Diff(wantSorted, gotSorted); diff != "" {
+		assert.Failf(t, "sessions mismatch", "(-want +got):\n%s", diff)
+	}
+}
+
+// requireNoError fails the test if err is not nil. Wraps testify's
+// require.NoError to preserve the legacy helper signature used throughout
+// the package.
+func requireNoError(t *testing.T, err error, msg string) {
+	t.Helper()
+	require.NoError(t, err, msg)
+}
+
+// requireErrContains fails if err is nil or doesn't contain
+// substr.
+func requireErrContains(
+	t *testing.T, err error, substr string,
+) {
+	t.Helper()
+	require.Error(t, err, "expected error, got nil")
+	assert.Contains(t, err.Error(), substr,
+		"error %q does not contain %q", err.Error(), substr)
+}
+
+const (
+	defaultMachine = "local"
+	defaultAgent   = "claude"
+
+	// Timestamp constants for test data.
+	tsZero    = "2024-01-01T00:00:00Z"
+	tsZeroS1  = "2024-01-01T00:00:01Z"
+	tsZeroS2  = "2024-01-01T00:00:02Z"
+	tsHour1   = "2024-01-01T01:00:00Z"
+	tsMidYear = "2024-06-01T10:00:00Z"
+)
+
+func testDB(tb testing.TB) *DB {
+	tb.Helper()
+	routeBenchmarkLogs(tb)
+	dir := tb.TempDir()
+	path := filepath.Join(dir, "test.db")
+	d, err := openCopiedTestDB(tb, path)
+	require.NoError(tb, err, "opening test db")
+	tb.Cleanup(func() { require.NoError(tb, d.Close()) })
+	return d
+}
+
+// routeBenchmarkLogs sends the package's global log output through the
+// benchmark's own output for its duration. go test prints a benchmark's
+// name before the timed loop and its numbers after, so a log line
+// written straight to stderr in between (the slow InsertMessages
+// warning during fixture seeding on a busy runner) splits the result
+// line and the bench gate rejects the capture. Output written through
+// b.Output is printed after the result line instead. Tests are left
+// alone: parallel tests share the one global logger, so a per-test swap
+// could point it at a test that has already finished.
+func routeBenchmarkLogs(tb testing.TB) {
+	tb.Helper()
+	b, ok := tb.(*testing.B)
+	if !ok {
+		return
+	}
+	prev := log.Writer()
+	log.SetOutput(b.Output())
+	b.Cleanup(func() { log.SetOutput(prev) })
+}
+
+func testDBAtPath(t *testing.T, path, label string) *DB {
+	t.Helper()
+	d, err := openCopiedTestDB(t, path)
+	require.NoError(t, err, "opening %s", label)
+	return d
+}
+
+var (
+	testDBTemplateOnce sync.Once
+	testDBTemplatePath string
+	testDBTemplateDir  string
+	errTestDBTemplate  error
+)
+
+func TestMain(m *testing.M) {
+	var err error
+	testDBFixtureTempDir, err = os.MkdirTemp("", "agentsview-db-fixtures-*")
+	if err != nil {
+		panic(err)
+	}
+	code := m.Run()
+	_ = os.RemoveAll(testDBFixtureTempDir)
+	if testDBTemplateDir != "" {
+		_ = os.RemoveAll(testDBTemplateDir)
+	}
+	if largeSessionOnlyDir != "" {
+		_ = os.RemoveAll(largeSessionOnlyDir)
+	}
+	if largeSessionPoisonDir != "" {
+		_ = os.RemoveAll(largeSessionPoisonDir)
+	}
+	if chunkedAnalyticsDir != "" {
+		_ = os.RemoveAll(chunkedAnalyticsDir)
+	}
+	if dailyUsageFixtureDir != "" {
+		_ = os.RemoveAll(dailyUsageFixtureDir)
+	}
+	if storeContractSQLiteTemplateDir != "" {
+		_ = os.RemoveAll(storeContractSQLiteTemplateDir)
+	}
+	if statsOutcomeRepoDir != "" {
+		_ = os.RemoveAll(statsOutcomeRepoDir)
+	}
+	os.Exit(code)
+}
+
+var testDBFixtureTempDir string
+
+func openCopiedTestDB(tb testing.TB, path string) (*DB, error) {
+	tb.Helper()
+	return openTestDBWithTemplate(tb, path, func(dst string) error {
+		return copyTestDBTemplate(tb, dst)
+	})
+}
+
+func openTestDBWithTemplate(
+	tb testing.TB, path string, copyTemplate func(string) error,
+) (*DB, error) {
+	tb.Helper()
+	if err := copyTemplate(path); err != nil {
+		// The shared template is only a setup-cost optimization.
+		// Never let a template failure poison every test in the
+		// binary; build this database from scratch instead.
+		tb.Logf("db test: template unavailable, creating %s from scratch: %v",
+			path, err)
+		for _, suffix := range []string{"", "-wal", "-shm"} {
+			_ = os.Remove(path + suffix)
+		}
+		return Open(tb.Context(), path)
+	}
+	return OpenPreparedTestDB(path)
+}
+
+func copyTestDBTemplate(tb testing.TB, dst string) error {
+	tb.Helper()
+	testDBTemplateOnce.Do(func() {
+		testDBTemplateDir = filepath.Join(testDBFixtureTempDir, "db-template")
+		errTestDBTemplate = os.MkdirAll(testDBTemplateDir, 0o700)
+		if errTestDBTemplate != nil {
+			errTestDBTemplate = fmt.Errorf(
+				"creating db template dir: %w",
+				errTestDBTemplate,
+			)
+			return
+		}
+
+		testDBTemplatePath = filepath.Join(testDBTemplateDir, "test.db")
+		var template *DB
+		template, errTestDBTemplate = Open(tb.Context(), testDBTemplatePath)
+		if errTestDBTemplate != nil {
+			errTestDBTemplate = fmt.Errorf(
+				"opening db template: %w",
+				errTestDBTemplate,
+			)
+			return
+		}
+		// Checkpointing keeps the copied template compact, but it
+		// is best-effort: the copy below carries the -wal/-shm
+		// files along, so a checkpoint that cannot finish in time
+		// (slow Windows CI runners) must not fail the build. The
+		// timeout is generous because this runs once per binary.
+		ctx, cancel := context.WithTimeout(
+			tb.Context(), 30*time.Second,
+		)
+		defer cancel()
+		if err := template.CheckpointWALTruncate(ctx); err != nil {
+			tb.Logf("db test: template wal checkpoint failed, copying wal as-is: %v",
+				err)
+		}
+		if err := template.Close(); err != nil && errTestDBTemplate == nil {
+			errTestDBTemplate = fmt.Errorf(
+				"closing db template: %w",
+				err,
+			)
+		}
+	})
+	if errTestDBTemplate != nil {
+		return errTestDBTemplate
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("creating test db dir: %w", err)
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if err := copyTemplateDBFile(
+			testDBTemplatePath+suffix,
+			dst+suffix,
+			suffix == "",
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyTemplateDBFile(src, dst string, required bool) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		if !required && errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("reading test db template %s: %w", src, err)
+	}
+	if err := os.WriteFile(dst, data, 0o600); err != nil {
+		return fmt.Errorf("writing test db copy %s: %w", dst, err)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to v.
+func Ptr[T any](v T) *T { return new(v) }
+
+// insertSession creates and upserts a session with sensible
+// defaults. Override any field via the opts functions.
+// seedOneSession inserts a single session so reader queries have a row to
+// return across a writer handoff.
+func seedOneSession(t *testing.T, d *DB) {
+	t.Helper()
+	insertSession(t, d, "writer-handoff-seed", "handoff")
+}
+
+// writeOneSession attempts a single write through the writer pool. It returns
+// the write error unchanged so callers can assert on ErrWriterClosed.
+func writeOneSession(ctx context.Context, d *DB) error {
+	return d.UpsertSession(ctx, Session{
+		ID:      "writer-handoff-write",
+		Project: "handoff",
+		Machine: defaultMachine,
+		Agent:   defaultAgent,
+	})
+}
+
+func TestCloseWriterKeepsReadersServing(t *testing.T) {
+	database := testDB(t)
+	seedOneSession(t, database)
+
+	require.NoError(t, database.CloseWriter())
+
+	rows, err := database.ListSessionsModifiedBetween(
+		t.Context(), "", "", nil, nil,
+	)
+	require.NoError(t, err, "readers must survive a writer handoff")
+	assert.NotEmpty(t, rows, "seeded session must still be readable")
+
+	err = writeOneSession(t.Context(), database)
+	require.Error(t, err, "writes must fail cleanly while the writer is closed")
+	require.ErrorIs(t, err, ErrWriterClosed)
+
+	require.NoError(t, database.ReopenWriter())
+	assert.NoError(t, writeOneSession(t.Context(), database),
+		"writer must accept writes again after ReopenWriter")
+}
+
+// TestCloseWriterFailsEveryWritePathCleanly proves the write barrier covers
+// every writer access, not just the writerHandle facade: the Update transaction
+// path and the real star/delete session mutations must all return
+// ErrWriterClosed without panicking while the writer is closed.
+func TestCloseWriterFailsEveryWritePathCleanly(t *testing.T) {
+	database := testDB(t)
+	insertSession(t, database, "barrier-session", "handoff")
+
+	require.NoError(t, database.CloseWriter())
+	t.Cleanup(func() { require.NoError(t, database.ReopenWriter()) })
+
+	t.Run("Update", func(t *testing.T) {
+		err := database.Update(t.Context(), func(tx *sql.Tx) error {
+			_, execErr := tx.ExecContext(t.Context(),
+				"UPDATE sessions SET first_message = ? WHERE id = ?",
+				"x", "barrier-session",
+			)
+			return execErr
+		})
+		require.ErrorIs(t, err, ErrWriterClosed)
+	})
+
+	t.Run("StarSession", func(t *testing.T) {
+		_, err := database.StarSession(t.Context(), "barrier-session")
+		require.ErrorIs(t, err, ErrWriterClosed)
+	})
+
+	t.Run("DeleteSession", func(t *testing.T) {
+		err := database.DeleteSession(t.Context(), "barrier-session")
+		require.ErrorIs(t, err, ErrWriterClosed)
+	})
+
+	t.Run("RestoreSession", func(t *testing.T) {
+		_, err := database.RestoreSession(t.Context(), "barrier-session")
+		require.ErrorIs(t, err, ErrWriterClosed)
+	})
+}
+
+func insertSession(
+	t *testing.T, d *DB, id, project string,
+	opts ...func(*Session),
+) {
+	t.Helper()
+	s := Session{
+		ID:           id,
+		Project:      project,
+		Machine:      defaultMachine,
+		Agent:        defaultAgent,
+		MessageCount: 1,
+	}
+	for _, opt := range opts {
+		opt(&s)
+	}
+	require.NoError(t, d.UpsertSession(t.Context(), s), "insertSession %s", id)
+}
+
+// updateSignals is a helper that updates session signal columns
+// and fails the test on error.
+func updateSignals(
+	t *testing.T, d *DB, id string, u SessionSignalUpdate,
+) {
+	t.Helper()
+	require.NoError(t, d.UpdateSessionSignals(t.Context(), id, u),
+		"updateSignals %s", id)
+}
+
+// insertMessages is a helper that inserts messages and fails
+// the test on error.
+func insertMessages(t *testing.T, d *DB, msgs ...Message) {
+	t.Helper()
+	require.NoError(t, d.InsertMessages(t.Context(), msgs), "insertMessages")
+}
+
+// userMsg creates a user message with the given content.
+func userMsg(sid string, ordinal int, content string) Message {
+	return Message{
+		SessionID:     sid,
+		Ordinal:       ordinal,
+		Role:          "user",
+		Content:       content,
+		ContentLength: len(content),
+		Timestamp:     tsZero,
+	}
+}
+
+// asstMsg creates an assistant message with the given content.
+func asstMsg(sid string, ordinal int, content string) Message {
+	return Message{
+		SessionID:     sid,
+		Ordinal:       ordinal,
+		Role:          "assistant",
+		Content:       content,
+		ContentLength: len(content),
+		Timestamp:     tsZero,
+	}
+}
+
+// userMsgAt creates a user message with the given content and
+// timestamp.
+func userMsgAt(
+	sid string, ordinal int, content, ts string,
+) Message {
+	m := userMsg(sid, ordinal, content)
+	m.Timestamp = ts
+	return m
+}
+
+// asstMsgAt creates an assistant message with the given content
+// and timestamp.
+func asstMsgAt(
+	sid string, ordinal int, content, ts string,
+) Message {
+	m := asstMsg(sid, ordinal, content)
+	m.Timestamp = ts
+	return m
+}
+
+type msgBuilder struct {
+	id   string
+	ord  int
+	msgs []Message
+}
+
+func (b *msgBuilder) user(content string) {
+	b.msgs = append(b.msgs, userMsg(b.id, b.ord, content))
+	b.ord++
+}
+
+func (b *msgBuilder) asst(content string) {
+	b.msgs = append(b.msgs, asstMsg(b.id, b.ord, content))
+	b.ord++
+}
+
+// canceledCtx returns an already-canceled context.
+func canceledCtx() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}
+
+// requireCanceledErr asserts that err is context.Canceled.
+func requireCanceledErr(t *testing.T, err error) {
+	t.Helper()
+	require.ErrorIs(t, err, context.Canceled,
+		"expected context.Canceled")
+}
+
+// requireFTS skips the test if FTS is not available.
+func requireFTS(t *testing.T, d *DB) {
+	t.Helper()
+	if !d.HasFTS(t.Context()) {
+		t.Skip("no FTS support")
+	}
+}
+
+// requireSessionExists asserts that a session exists and returns it.
+func requireSessionExists(t *testing.T, d *DB, id string) *Session {
+	t.Helper()
+	s, err := d.GetSession(t.Context(), id)
+	require.NoError(t, err, "GetSession %q", id)
+	require.NotNil(t, s, "session %q should exist", id)
+	return s
+}
+
+// requireSessionGone asserts that a session does not exist.
+func requireSessionGone(t *testing.T, d *DB, id string) {
+	t.Helper()
+	s, err := d.GetSession(t.Context(), id)
+	require.NoError(t, err, "GetSession %q", id)
+	require.Nil(t, s, "session %q should be gone", id)
+}
+
+func TestOpenCreatesFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "subdir", "test.db")
+	d, err := Open(t.Context(), path)
+	requireNoError(t, err, "Open")
+	defer d.Close()
+
+	_, err = os.Stat(path)
+	require.NoError(t, err, "db file not created")
+}
+
+func TestOpenIsolatedStartsNoWALCheckpointLoop(t *testing.T) {
+	d, err := OpenIsolated(t.Context(), filepath.Join(t.TempDir(), "capture.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, d.Close()) })
+
+	d.checkpointMu.Lock()
+	stop := d.checkpointStop
+	d.checkpointMu.Unlock()
+	assert.Nil(t, stop)
+}
+
+func TestOpenDataVersionBump_PreservesData(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	// Create a valid DB (sets user_version = dataVersion).
+	d, err := Open(t.Context(), path)
+	requireNoError(t, err, "initial open")
+
+	err = d.UpsertSession(t.Context(), Session{
+		ID:           "s1",
+		Project:      "proj",
+		Machine:      "local",
+		Agent:        "codex",
+		MessageCount: 1,
+		FileMtime:    new(int64(12345)),
+	})
+	requireNoError(t, err, "insert session")
+	insertMessages(t, d,
+		userMsg("s1", 0, "hello"),
+		asstMsg("s1", 1, "world"),
+	)
+
+	// Add a skipped file entry.
+	err = d.ReplaceSkippedFiles(t.Context(), map[string]int64{
+		"/tmp/skip.jsonl": 99999,
+	})
+	requireNoError(t, err, "add skipped file")
+	d.Close()
+
+	// Set user_version to 0 to simulate stale data version.
+	conn, err := sql.Open("sqlite3", path)
+	requireNoError(t, err, "raw open")
+	_, err = conn.ExecContext(t.Context(), "PRAGMA user_version = 0")
+	requireNoError(t, err, "reset version")
+	conn.Close()
+
+	// Re-open: should detect stale version but preserve data.
+	d2, err := Open(t.Context(), path)
+	requireNoError(t, err, "reopen")
+	defer d2.Close()
+
+	// NeedsResync should be true.
+	require.True(t, d2.NeedsResync(),
+		"expected NeedsResync()=true after version bump")
+
+	// Session and messages must still exist.
+	page, err := d2.ListSessions(
+		t.Context(),
+		SessionFilter{Limit: 100},
+	)
+	requireNoError(t, err, "list sessions")
+	require.Len(t, page.Sessions, 1, "expected 1 session preserved, got")
+
+	msgs, err := d2.GetMessages(
+		t.Context(), "s1", 0, 100, true,
+	)
+	requireNoError(t, err, "get messages")
+	require.Len(t, msgs, 2, "expected 2 messages preserved, got")
+
+	// user_version must stay stale — it is only bumped
+	// after a successful ResyncAll, not at Open() time.
+	var ver int
+	err = d2.getReader().QueryRow(t.Context(),
+		"PRAGMA user_version",
+	).Scan(&ver)
+	requireNoError(t, err, "read version")
+	require.Equal(t, 0, ver, "expected user_version=0 (stale)")
+}
+
+func TestOpenDataVersionBump_SurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	// Create a DB and downgrade its version.
+	d, err := Open(t.Context(), path)
+	requireNoError(t, err, "initial open")
+	insertSession(t, d, "s1", "proj")
+	d.Close()
+
+	conn, err := sql.Open("sqlite3", path)
+	requireNoError(t, err, "raw open")
+	_, err = conn.ExecContext(t.Context(), "PRAGMA user_version = 0")
+	requireNoError(t, err, "reset version")
+	conn.Close()
+
+	// First reopen: detects stale, does NOT bump version.
+	d2, err := Open(t.Context(), path)
+	requireNoError(t, err, "reopen 1")
+	require.True(t, d2.NeedsResync(),
+		"first reopen: expected NeedsResync=true")
+	d2.Close() // simulate process exit without resync
+
+	// Second reopen: must still detect stale because the
+	// version was not bumped.
+	d3, err := Open(t.Context(), path)
+	requireNoError(t, err, "reopen 2")
+	defer d3.Close()
+	require.True(t, d3.NeedsResync(),
+		"second reopen: expected NeedsResync=true")
+}
+
+func TestMigration_ResultContentColumn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	// Create a DB with the current schema then drop the
+	// result_content column to simulate a pre-migration DB.
+	d := testDBAtPath(t, path, "initial migration db")
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d,
+		userMsg("s1", 0, "hello"),
+		Message{
+			SessionID:  "s1",
+			Ordinal:    1,
+			Role:       "assistant",
+			Content:    "Let me read that.",
+			HasToolUse: true,
+			ToolCalls: []ToolCall{{
+				SessionID:           "s1",
+				ToolName:            "Read",
+				Category:            "Read",
+				ToolUseID:           "tu1",
+				ResultContentLength: 42,
+			}},
+		},
+	)
+	d.Close()
+
+	// Remove result_content via raw SQL: recreate tool_calls
+	// without the column to simulate a legacy schema.
+	conn, err := sql.Open("sqlite3", path)
+	requireNoError(t, err, "raw open")
+	_, err = conn.ExecContext(t.Context(), `
+		CREATE TABLE tool_calls_old AS
+			SELECT id, message_id, session_id, tool_name,
+			       category, tool_use_id, input_json,
+			       skill_name, result_content_length,
+			       subagent_session_id
+			FROM tool_calls;
+		DROP TABLE tool_calls;
+		ALTER TABLE tool_calls_old RENAME TO tool_calls;
+	`)
+	requireNoError(t, err, "drop result_content column")
+
+	// Verify column is gone and tool_calls row exists.
+	var count int
+	err = conn.QueryRowContext(t.Context(),
+		`SELECT count(*) FROM pragma_table_info('tool_calls')`+
+			` WHERE name = 'result_content'`,
+	).Scan(&count)
+	requireNoError(t, err, "verify column removed")
+	require.Equal(t, 0, count,
+		"expected result_content column to be absent")
+	var tcCount int
+	err = conn.QueryRowContext(t.Context(),
+		`SELECT count(*) FROM tool_calls`,
+	).Scan(&tcCount)
+	requireNoError(t, err, "count tool_calls pre-migration")
+	require.Equal(t, 1, tcCount, "expected 1 tool_call row, got")
+	conn.Close()
+
+	// Reopen with Open() — migration should add the column.
+	d2, err := Open(t.Context(), path)
+	requireNoError(t, err, "reopen after migration")
+	defer d2.Close()
+
+	// Verify column exists.
+	err = d2.getReader().QueryRow(t.Context(),
+		`SELECT count(*) FROM pragma_table_info('tool_calls')`+
+			` WHERE name = 'result_content'`,
+	).Scan(&count)
+	requireNoError(t, err, "verify column added")
+	require.Equal(t, 1, count,
+		"expected result_content column after migration")
+
+	// Verify tool_calls row preserved with fields intact.
+	msgs, err := d2.GetMessages(
+		t.Context(), "s1", 0, 100, true,
+	)
+	requireNoError(t, err, "get messages")
+	require.Len(t, msgs, 2, "expected 2 messages")
+	require.Len(t, msgs[1].ToolCalls, 1, "expected 1 tool call, got")
+	tc := msgs[1].ToolCalls[0]
+	assert.Equal(t, "Read", tc.ToolName, "ToolName")
+	assert.Equal(t, "tu1", tc.ToolUseID, "ToolUseID")
+	assert.Equal(t, 42, tc.ResultContentLength, "ResultContentLength")
+	assert.Empty(t, tc.ResultContent, "ResultContent")
+}
+
+func TestUpgradeExportSchemaInPlaceOnlyAddsExportIdentitySchema(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	d := testDBAtPath(t, path, "schema-only upgrade db")
+	insertSession(t, d, "schema-only", "project")
+	requireNoError(t, d.Close(), "close schema-only upgrade db")
+
+	conn, err := sql.Open("sqlite3", path)
+	requireNoError(t, err, "open schema-only upgrade fixture")
+	_, err = conn.ExecContext(t.Context(), `
+		UPDATE sessions
+		SET first_message = 'ordinary interactive request',
+			user_message_count = 1,
+			is_automated = 1
+		WHERE id = 'schema-only';
+		DELETE FROM archive_metadata;
+		ALTER TABLE project_identity_observations DROP COLUMN checkout_state;
+		DROP TABLE remote_skipped_files;
+		DROP TABLE session_project_identity_snapshots;
+	`)
+	requireNoError(t, err, "prepare schema-only upgrade fixture")
+	requireNoError(t, conn.Close(), "close schema-only upgrade fixture")
+
+	requireNoError(t, UpgradeExportSchemaInPlace(t.Context(), path,
+		&SchemaUpgradeRequiredError{
+			Table:  "session_project_identity_snapshots",
+			Column: "session_id",
+		}), "upgrade export schema in place")
+
+	conn, err = sql.Open("sqlite3", path)
+	requireNoError(t, err, "reopen schema-only upgrade fixture")
+	defer conn.Close()
+	var isAutomated int
+	requireNoError(t, conn.QueryRowContext(t.Context(),
+		`SELECT is_automated FROM sessions WHERE id = 'schema-only'`,
+	).Scan(&isAutomated), "read preserved session classification")
+	assert.Equal(t, 1, isAutomated,
+		"schema-only upgrade must not reclassify existing sessions")
+	var tableCount int
+	requireNoError(t, conn.QueryRowContext(t.Context(), `
+		SELECT count(*) FROM sqlite_master
+		WHERE type = 'table' AND name = 'session_project_identity_snapshots'
+	`).Scan(&tableCount), "read upgraded schema")
+	assert.Equal(t, 1, tableCount)
+	requireNoError(t, conn.QueryRowContext(t.Context(), `
+		SELECT count(*) FROM sqlite_master
+		WHERE type = 'table' AND name = 'remote_skipped_files'
+	`).Scan(&tableCount), "read unrelated schema")
+	assert.Zero(t, tableCount,
+		"export upgrade must not initialize unrelated schema")
+	var columnCount int
+	requireNoError(t, conn.QueryRowContext(t.Context(), `
+		SELECT count(*) FROM pragma_table_info('project_identity_observations')
+		WHERE name = 'checkout_state'
+	`).Scan(&columnCount), "read upgraded observation schema")
+	assert.Equal(t, 1, columnCount)
+	var metadataCount int
+	requireNoError(t, conn.QueryRowContext(t.Context(), `
+		SELECT count(*) FROM archive_metadata
+		WHERE key IN ('database_id', 'archive_id', 'archive_salt')
+		  AND trim(value) != ''
+	`).Scan(&metadataCount), "read initialized export metadata")
+	assert.Equal(t, 3, metadataCount)
+}
+
+func TestUpgradeExportSchemaInPlaceRejectsUnrelatedSchemaGap(t *testing.T) {
+	d := testDB(t)
+	err := UpgradeExportSchemaInPlace(t.Context(), d.Path(), &SchemaUpgradeRequiredError{
+		Table:  "tool_calls",
+		Column: "file_path",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not eligible")
+}
+
+func TestUpgradeExportSchemaInPlaceRejectsUnsupportedExistingTableGap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	d := testDBAtPath(t, path, "incomplete export table db")
+	requireNoError(t, d.Close(), "close incomplete export table db")
+
+	conn, err := sql.Open("sqlite3", path)
+	requireNoError(t, err, "open incomplete export table fixture")
+	_, err = conn.ExecContext(t.Context(), `DROP TRIGGER conversation_project_update`)
+	requireNoError(t, err, "remove dependent conversation trigger from incomplete fixture")
+	_, err = conn.ExecContext(t.Context(),
+		`ALTER TABLE session_project_identity_snapshots DROP COLUMN git_branch`)
+	requireNoError(t, err, "remove unsupported snapshot column")
+	requireNoError(t, conn.Close(), "close incomplete export table fixture")
+
+	err = UpgradeExportSchemaInPlace(t.Context(), path, &SchemaUpgradeRequiredError{
+		Table:  "session_project_identity_snapshots",
+		Column: "git_branch",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not eligible")
+}
+
+func TestMigration_ToolResultEventsTable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	d := testDBAtPath(t, path, "initial migration db")
+	insertSession(t, d, "s1", "proj")
+	d.Close()
+
+	conn, err := sql.Open("sqlite3", path)
+	requireNoError(t, err, "raw open")
+	legacyVersion := dataVersion - 1
+	_, err = conn.ExecContext(t.Context(), fmt.Sprintf(`
+		DROP TABLE tool_result_events;
+		PRAGMA user_version = %d;
+	`, legacyVersion))
+	requireNoError(t, err, "drop tool_result_events")
+
+	var count int
+	err = conn.QueryRowContext(t.Context(),
+		`SELECT count(*) FROM sqlite_master
+		 WHERE type = 'table' AND name = 'tool_result_events'`,
+	).Scan(&count)
+	requireNoError(t, err, "verify table removed")
+	require.Equal(t, 0, count,
+		"expected tool_result_events table to be absent")
+	requireNoError(t, conn.Close(), "close legacy db")
+
+	d2, err := Open(t.Context(), path)
+	requireNoError(t, err, "reopen after migration")
+	defer d2.Close()
+
+	requireSessionExists(t, d2, "s1")
+	require.True(t, d2.NeedsResync(),
+		"expected NeedsResync()=true after data version bump")
+
+	err = d2.getReader().QueryRow(t.Context(),
+		`SELECT count(*) FROM sqlite_master
+		 WHERE type = 'table' AND name = 'tool_result_events'`,
+	).Scan(&count)
+	requireNoError(t, err, "verify table exists")
+	require.Equal(t, 1, count,
+		"expected tool_result_events table after reopen")
+}
+
+func TestCurrentDataVersionIncludesOpenCodeProjectMetadataChange(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 89,
+		"version 89 is the data-version boundary for file-backed OpenCode metadata changes")
+	t.Logf("CurrentDataVersion=%d", CurrentDataVersion())
+}
+
+func TestCurrentDataVersionGrokMessageTimestamps(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 90,
+		"version 90 is the data-version boundary for Grok message timestamps")
+}
+
+func TestCurrentDataVersionPositAssistantCacheAccounting(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 91,
+		"version 91 is the data-version boundary for Posit Assistant cache accounting")
+}
+
+func TestCurrentDataVersionPositAssistantUsageEventsSidecar(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 93,
+		"version 93 is the data-version boundary for Posit Assistant usage-events")
+}
+
+func TestCurrentDataVersionDevinMessageNodeTokenUsage(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 94,
+		"Devin message_nodes token usage requires re-parsing fallback sessions")
+}
+
+func TestCurrentDataVersionPositAssistantProviderIdentity(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 95,
+		"Posit Assistant provider identity requires re-parsing usage rows")
+}
+
+func TestCurrentDataVersionClaudeRepoLocalWorktrees(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 109,
+		"Claude repository-local worktrees must reparse archives from v0.43.0 at data version 108")
+}
+
+func TestCurrentDataVersionAntigravityCLICwdAndWorktreeProject(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 96,
+		"version 96 is the data-version boundary for Antigravity CLI cwd and worktree project recovery")
+}
+
+func TestCurrentDataVersionOpenCodeMessageIdentity(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 105,
+		"OpenCode rows need re-parsing to record their storage message ID")
+}
+
+func TestCurrentDataVersionToolResultSummaryDedup(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 97,
+		"version 97 is the data-version boundary for tool-result summary deduplication")
+}
+
+func TestCurrentDataVersionPiSkillAttribution(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 98,
+		"version 98 is the data-version boundary for Pi skill attribution")
+}
+
+func TestCurrentDataVersionAntigravityCLIExperimentalServingVariant(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 99,
+		"version 99 is the data-version boundary for Antigravity CLI experimental serving variant normalization")
+}
+
+func TestCurrentDataVersionCodexGuardianLineage(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 100,
+		"version 100 is the data-version boundary for Codex guardian lineage")
+}
+
+func TestCurrentDataVersionCodexExecSessionKind(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 112,
+		"version 112 is the data-version boundary for Codex exec and roborev session kinds")
+}
+
+func TestCurrentDataVersionCodexApplyPatchFilePath(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 114,
+		"Codex apply_patch file paths require re-parsing existing sessions")
+}
+
+func TestCurrentDataVersionCursorTurnTimestamps(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 101,
+		"Cursor turn timestamps require re-parsing existing sessions")
+}
+
+func TestCurrentDataVersionCursorIDESessionStart(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 115,
+		"Cursor IDE session starts from bubble timestamps require re-parsing unchanged containers")
+}
+
+func TestCurrentDataVersionReasoningEffort(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 106,
+		"reasoning effort persistence requires re-parsing unchanged transcripts")
+}
+
+func TestCurrentDataVersionCursorSubagentCategory(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 107,
+		"version 107 is the data-version boundary for the Cursor Subagent tool category")
+}
+
+func TestCurrentDataVersionCodexCacheWriteTokens(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 123,
+		"version 123 is the data-version boundary for Codex cache-write token normalization")
+}
+
+func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s-events", "proj")
+
+	err := d.InsertMessages(t.Context(), []Message{
+		{
+			SessionID:  "s-events",
+			Ordinal:    0,
+			Role:       "assistant",
+			Content:    "tool use response",
+			HasToolUse: true,
+			ToolCalls: []ToolCall{
+				{
+					SessionID:           "s-events",
+					ToolName:            "wait",
+					Category:            "Task",
+					ToolUseID:           "call_wait",
+					ResultContentLength: 9,
+					ResultContent:       "latest one",
+					ResultEvents: []ToolResultEvent{
+						{
+							ToolUseID:         "call_wait",
+							AgentID:           "agent-1",
+							SubagentSessionID: "codex:agent-1",
+							Source:            "wait_output",
+							Status:            "completed",
+							Content:           "first result",
+							ContentLength:     len("first result"),
+							Timestamp:         "2026-03-27T10:00:00Z",
+							EventIndex:        0,
+						},
+						{
+							ToolUseID:         "call_wait",
+							AgentID:           "agent-2",
+							SubagentSessionID: "codex:agent-2",
+							Source:            "subagent_notification",
+							Status:            "errored",
+							Content:           "second result",
+							ContentLength:     len("second result"),
+							Timestamp:         "2026-03-27T10:01:00Z",
+							EventIndex:        1,
+						},
+					},
+				},
+			},
+		},
+	})
+	requireNoError(t, err, "InsertMessages")
+
+	msgs, err := d.GetMessages(t.Context(), "s-events", 0, 100, true)
+	requireNoError(t, err, "GetMessages")
+	require.Len(t, msgs, 1, "len")
+	require.Len(t, msgs[0].ToolCalls, 1, "len")
+	tc := msgs[0].ToolCalls[0]
+	require.Len(t, tc.ResultEvents, 2, "len")
+	assert.Equal(t, "agent-1", tc.ResultEvents[0].AgentID, "result event 0 agent_id")
+	assert.Equal(t, "subagent_notification", tc.ResultEvents[1].Source, "result event 1 source")
+}
+
+func TestOpenPreservesDataAtCurrentVersion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	d, err := Open(t.Context(), path)
+	requireNoError(t, err, "initial open")
+	err = d.UpsertSession(t.Context(), Session{
+		ID:           "s1",
+		Project:      "proj",
+		Machine:      "local",
+		Agent:        "codex",
+		MessageCount: 1,
+	})
+	requireNoError(t, err, "insert session")
+	d.Close()
+
+	// Re-open without changing user_version: data survives.
+	d2, err := Open(t.Context(), path)
+	requireNoError(t, err, "reopen")
+	defer d2.Close()
+
+	require.False(t, d2.NeedsResync(),
+		"expected NeedsResync()=false at current version")
+
+	page, err := d2.ListSessions(
+		t.Context(),
+		SessionFilter{Limit: 100},
+	)
+	requireNoError(t, err, "list sessions")
+	require.Len(t, page.Sessions, 1, "expected 1 session preserved, got")
+}
+
+func TestOpenRejectsNewerDataVersion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	d, err := Open(t.Context(), path)
+	requireNoError(t, err, "initial open")
+
+	// Simulate a newer build by setting user_version higher
+	// than our dataVersion.
+	futureVersion := dataVersion + 10
+	_, err = d.getWriter().Exec(t.Context(),
+		fmt.Sprintf("PRAGMA user_version = %d", futureVersion),
+	)
+	requireNoError(t, err, "set future version")
+	d.Close()
+
+	// Reopen with current (lower) dataVersion.
+	d2, openErr := Open(t.Context(), path)
+	require.Nil(t, d2, "newer database must not open")
+	require.Error(t, openErr, "newer database must be rejected")
+
+	var version int
+	conn, err := sql.Open("sqlite3", path)
+	requireNoError(t, err, "raw sqlite open")
+	defer conn.Close()
+	err = conn.QueryRowContext(t.Context(),
+		"PRAGMA user_version",
+	).Scan(&version)
+	requireNoError(t, err, "read version")
+
+	assert.Equal(t, futureVersion, version,
+		"user_version should not be mutated")
+	assert.True(t, IsDataVersionTooNew(openErr),
+		"expected too-new data version error")
+}
+
+func TestOpenAcceptsArchiveUserVersion111(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	d, err := Open(t.Context(), path)
+	requireNoError(t, err, "initial open")
+	err = d.UpsertSession(t.Context(), Session{
+		ID:           "s1",
+		Project:      "proj",
+		Machine:      "local",
+		Agent:        "codex",
+		MessageCount: 1,
+		FileMtime:    new(int64(12345)),
+	})
+	requireNoError(t, err, "insert session")
+	require.NoError(t, d.Close())
+
+	conn, err := sql.Open("sqlite3", path)
+	requireNoError(t, err, "raw sqlite open")
+	_, err = conn.ExecContext(t.Context(), "PRAGMA user_version = 111")
+	requireNoError(t, err, "set archive version 111")
+	require.NoError(t, conn.Close())
+
+	d2, err := Open(t.Context(), path)
+	requireNoError(t, err, "open version-111 archive")
+	t.Cleanup(func() { require.NoError(t, d2.Close()) })
+	page, err := d2.ListSessions(t.Context(), SessionFilter{Limit: 100})
+	requireNoError(t, err, "list sessions")
+	require.Len(t, page.Sessions, 1)
+}
+
+func TestOpenProbeErrorPropagates(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping: chmod semantics differ on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("skipping: running as root")
+	}
+
+	t.Run("StatPermissionError", func(t *testing.T) {
+		dir := t.TempDir()
+		sub := filepath.Join(dir, "sub")
+		require.NoError(t, os.Mkdir(sub, 0o755))
+		path := filepath.Join(sub, "test.db")
+
+		d, err := Open(t.Context(), path)
+		requireNoError(t, err, "setup")
+		d.Close()
+
+		// Remove execute on parent dir so os.Stat fails
+		// with EACCES, not ENOENT.
+		if err := os.Chmod(sub, 0o000); err != nil {
+			t.Skipf("cannot remove permissions: %v", err)
+		}
+		t.Cleanup(func() { os.Chmod(sub, 0o755) })
+
+		_, err = Open(t.Context(), path)
+		require.Error(t, err, "expected error")
+		require.ErrorIs(t, err, fs.ErrPermission,
+			"expected permission error")
+		assert.Contains(t, err.Error(), "checking database",
+			"expected database compatibility wrapper")
+	})
+
+	t.Run("ProbeReadError", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "test.db")
+
+		d, err := Open(t.Context(), path)
+		requireNoError(t, err, "setup")
+		d.Close()
+
+		// Remove read on the file so os.Stat succeeds
+		// but the SQLite probe fails.
+		if err := os.Chmod(path, 0o000); err != nil {
+			t.Skipf("cannot remove permissions: %v", err)
+		}
+		t.Cleanup(func() { os.Chmod(path, 0o644) })
+
+		_, err = Open(t.Context(), path)
+		require.Error(t, err, "expected error")
+		assert.True(t,
+			strings.Contains(err.Error(), "checking database") ||
+				strings.Contains(err.Error(), "probing data version"),
+			"unexpected error: %v", err)
+	})
+}
+
+func TestSessionCRUD(t *testing.T) {
+	d := testDB(t)
+
+	s := Session{
+		ID:           "test-session-1",
+		Project:      "my_project",
+		Machine:      defaultMachine,
+		Agent:        defaultAgent,
+		FirstMessage: new("Hello world"),
+		StartedAt:    new(tsZero),
+		EndedAt:      new(tsHour1),
+		MessageCount: 5,
+	}
+
+	err := d.UpsertSession(t.Context(), s)
+	require.NoError(t, err, "UpsertSession")
+
+	got := requireSessionExists(t, d, "test-session-1")
+	assert.Equal(t, "my_project", got.Project, "project")
+	assert.Equal(t, 5, got.MessageCount, "message_count")
+
+	// Update
+	s.MessageCount = 10
+	err = d.UpsertSession(t.Context(), s)
+	require.NoError(t, err, "UpsertSession update")
+	got = requireSessionExists(t, d, "test-session-1")
+	assert.Equal(t, 10, got.MessageCount, "after update: message_count")
+
+	// Get nonexistent
+	requireSessionGone(t, d, "nonexistent")
+}
+
+func TestSessionParentSessionID(t *testing.T) {
+	d := testDB(t)
+
+	t.Run("UpsertWithParent", func(t *testing.T) {
+		insertSession(t, d, "child-1", "proj", func(s *Session) {
+			s.ParentSessionID = new("parent-uuid")
+		})
+
+		got := requireSessionExists(t, d, "child-1")
+		require.NotNil(t, got.ParentSessionID, "parent_session_id")
+		assert.Equal(t, "parent-uuid", *got.ParentSessionID,
+			"parent_session_id")
+	})
+
+	t.Run("WithoutParent", func(t *testing.T) {
+		insertSession(t, d, "child-2", "proj")
+
+		got := requireSessionExists(t, d, "child-2")
+		assert.Nil(t, got.ParentSessionID, "parent_session_id")
+	})
+
+	t.Run("ParentInListSessions", func(t *testing.T) {
+		page, err := d.ListSessions(
+			t.Context(),
+			filterWith(func(f *SessionFilter) {
+				f.Project = "proj"
+			}),
+		)
+		requireNoError(t, err, "ListSessions")
+		found := false
+		for _, s := range page.Sessions {
+			if s.ID == "child-1" {
+				found = true
+				if assert.NotNil(t, s.ParentSessionID,
+					"parent_session_id want %q", "parent-uuid") {
+					assert.Equal(t, "parent-uuid",
+						*s.ParentSessionID, "parent_session_id")
+				}
+			}
+		}
+		assert.True(t, found, "child-1 not found in list")
+	})
+
+	t.Run("ParentInGetSessionFull", func(t *testing.T) {
+		got, err := d.GetSessionFull(
+			t.Context(), "child-1",
+		)
+		requireNoError(t, err, "GetSessionFull")
+		require.NotNil(t, got, "session not found")
+		require.NotNil(t, got.ParentSessionID,
+			"parent_session_id want %q", "parent-uuid")
+		assert.Equal(t, "parent-uuid", *got.ParentSessionID,
+			"parent_session_id")
+	})
+}
+
+func TestUpsertSessionRefreshesParserParentSessionID(t *testing.T) {
+	d := testDB(t)
+	s := Session{
+		ID:              "kid",
+		Project:         "proj",
+		Machine:         defaultMachine,
+		Agent:           defaultAgent,
+		ParentSessionID: Ptr("first-parent"),
+	}
+	require.NoError(t, d.UpsertSession(t.Context(), s), "insert session")
+
+	assertParserParent := func(want string) {
+		t.Helper()
+		var got sql.NullString
+		err := d.getReader().QueryRow(t.Context(),
+			`SELECT parser_parent_session_id FROM sessions WHERE id = ?`,
+			"kid",
+		).Scan(&got)
+		require.NoError(t, err, "query parser parent")
+		require.True(t, got.Valid, "parser parent must be set")
+		assert.Equal(t, want, got.String, "parser parent")
+	}
+
+	assertParserParent("first-parent")
+	s.ParentSessionID = Ptr("second-parent")
+	require.NoError(t, d.UpsertSession(t.Context(), s), "update session")
+	assertParserParent("second-parent")
+}
+
+func TestGetChildSessions(t *testing.T) {
+	d := testDB(t)
+
+	// Insert a parent session.
+	insertSession(t, d, "parent-1", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T10:00:00Z")
+		s.EndedAt = new("2024-06-01T11:00:00Z")
+		s.MessageCount = 5
+	})
+
+	// Insert child sessions with different relationship types.
+	insertSession(t, d, "child-sub", "proj", func(s *Session) {
+		s.ParentSessionID = new("parent-1")
+		s.RelationshipType = "subagent"
+		s.StartedAt = new("2024-06-01T10:05:00Z")
+		s.EndedAt = new("2024-06-01T10:10:00Z")
+		s.MessageCount = 3
+	})
+	insertSession(t, d, "child-fork", "proj", func(s *Session) {
+		s.ParentSessionID = new("parent-1")
+		s.RelationshipType = "fork"
+		s.StartedAt = new("2024-06-01T10:20:00Z")
+		s.EndedAt = new("2024-06-01T10:30:00Z")
+		s.MessageCount = 2
+	})
+	insertSession(t, d, "child-cont", "proj", func(s *Session) {
+		s.ParentSessionID = new("parent-1")
+		s.RelationshipType = "continuation"
+		s.StartedAt = new("2024-06-01T10:10:00Z")
+		s.EndedAt = new("2024-06-01T10:15:00Z")
+		s.MessageCount = 4
+	})
+	insertSession(t, d, "child-deleted", "proj", func(s *Session) {
+		s.ParentSessionID = new("parent-1")
+		s.RelationshipType = "subagent"
+		s.StartedAt = new("2024-06-01T10:07:00Z")
+		s.EndedAt = new("2024-06-01T10:08:00Z")
+		s.MessageCount = 1
+	})
+	requireNoError(t, d.SoftDeleteSession(t.Context(), "child-deleted"), "SoftDeleteSession")
+
+	// Insert an unrelated session (no parent).
+	insertSession(t, d, "unrelated", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T10:00:00Z")
+		s.MessageCount = 1
+	})
+
+	t.Run("ReturnsChildrenOrderedByStartedAt", func(t *testing.T) {
+		children, err := d.GetChildSessions(
+			t.Context(), "parent-1",
+		)
+		requireNoError(t, err, "GetChildSessions")
+		require.Len(t, children, 3, "expected 3 visible children")
+		// Ordered by started_at ascending.
+		wantIDs := []string{"child-sub", "child-cont", "child-fork"}
+		for i, want := range wantIDs {
+			assert.Equal(t, want, children[i].ID,
+				"children[%d].ID", i)
+		}
+	})
+
+	t.Run("NoChildren", func(t *testing.T) {
+		children, err := d.GetChildSessions(
+			t.Context(), "unrelated",
+		)
+		requireNoError(t, err, "GetChildSessions")
+		require.Empty(t, children, "expected 0 children")
+	})
+
+	t.Run("NonexistentParent", func(t *testing.T) {
+		children, err := d.GetChildSessions(
+			t.Context(), "no-such-parent",
+		)
+		requireNoError(t, err, "GetChildSessions")
+		require.Empty(t, children, "expected 0 children")
+	})
+
+	t.Run("CanceledContext", func(t *testing.T) {
+		_, err := d.GetChildSessions(
+			canceledCtx(), "parent-1",
+		)
+		requireCanceledErr(t, err)
+	})
+}
+
+func TestListSessions(t *testing.T) {
+	d := testDB(t)
+
+	for i := range 5 {
+		ea := fmt.Sprintf("2024-01-01T0%d:00:00Z", i)
+		insertSession(t, d,
+			fmt.Sprintf("session-%c", 'a'+i), "proj",
+			func(s *Session) {
+				s.EndedAt = new(ea)
+				s.MessageCount = i + 1
+			},
+		)
+	}
+
+	requireCount(t, d, SessionFilter{Limit: 10}, 5)
+
+	page, err := d.ListSessions(
+		t.Context(), SessionFilter{Limit: 2},
+	)
+	requireNoError(t, err, "ListSessions limit")
+	assert.Len(t, page.Sessions, 2, "len")
+	assert.NotEmpty(t, page.NextCursor, "expected next cursor")
+
+	requireCount(t, d, SessionFilter{
+		Limit:  10,
+		Cursor: page.NextCursor,
+	}, 3)
+}
+
+func TestListSessionsPaginationNoDuplicates(t *testing.T) {
+	d := testDB(t)
+
+	// 5 sessions: 2 share the same ended_at to test
+	// tie-breaking at page boundaries.
+	times := []string{
+		"2024-01-01T01:00:00Z",
+		"2024-01-01T02:00:00Z",
+		"2024-01-01T02:00:00Z", // same as previous
+		"2024-01-01T03:00:00Z",
+		"2024-01-01T04:00:00Z",
+	}
+	for i, ea := range times {
+		insertSession(t, d,
+			fmt.Sprintf("page-%c", 'a'+i), "proj",
+			func(s *Session) { s.EndedAt = new(ea) },
+		)
+	}
+
+	// Paginate through all sessions 2 at a time.
+	seen := make(map[string]bool)
+	cursor := ""
+	pages := 0
+	for {
+		page, err := d.ListSessions(
+			t.Context(),
+			SessionFilter{Limit: 2, Cursor: cursor},
+		)
+		require.NoError(t, err, "ListSessions page %d", pages)
+		for _, s := range page.Sessions {
+			assert.False(t, seen[s.ID],
+				"duplicate session %s on page %d",
+				s.ID, pages)
+			seen[s.ID] = true
+		}
+		pages++
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	assert.Len(t, seen, 5, "saw")
+}
+
+func TestListSessionsPaginationEmptyTimestamps(t *testing.T) {
+	d := testDB(t)
+
+	// Mix of normal, NULL, and empty-string timestamps.
+	// Empty-string ended_at/started_at should sort by
+	// created_at, same as NULL.
+	insertSession(t, d, "s-normal", "proj", func(s *Session) {
+		s.EndedAt = new("2024-06-01T12:00:00Z")
+		s.StartedAt = new("2024-06-01T10:00:00Z")
+	})
+	insertSession(t, d, "s-empty-ended", "proj", func(s *Session) {
+		s.EndedAt = new("")
+		s.StartedAt = new("2024-05-01T10:00:00Z")
+	})
+	insertSession(t, d, "s-both-empty", "proj", func(s *Session) {
+		s.EndedAt = new("")
+		s.StartedAt = new("")
+	})
+	insertSession(t, d, "s-null-ts", "proj")
+
+	// Paginate 1 at a time to exercise cursor encoding.
+	seen := make(map[string]bool)
+	cursor := ""
+	for {
+		page, err := d.ListSessions(
+			t.Context(),
+			SessionFilter{Limit: 1, Cursor: cursor},
+		)
+		require.NoError(t, err, "ListSessions")
+		for _, s := range page.Sessions {
+			assert.False(t, seen[s.ID], "duplicate session %s", s.ID)
+			seen[s.ID] = true
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	assert.Len(t, seen, 4, "saw")
+}
+
+func TestListSessionsProjectFilter(t *testing.T) {
+	d := testDB(t)
+
+	for i, proj := range []string{"proj_a", "proj_a", "proj_b"} {
+		ea := fmt.Sprintf("2024-01-01T00:00:0%dZ", i)
+		insertSession(t, d,
+			fmt.Sprintf("%s-%d", proj, i), proj,
+			func(s *Session) { s.EndedAt = new(ea) },
+		)
+	}
+
+	requireCount(t, d, filterWith(func(f *SessionFilter) {
+		f.Project = "proj_a"
+	}), 2)
+}
+
+func TestListSessionsMachineMultiSelect(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s-local", "proj", func(s *Session) {
+		s.Machine = "local"
+		s.EndedAt = new("2024-01-01T00:00:00Z")
+	})
+	insertSession(t, d, "s-remote", "proj", func(s *Session) {
+		s.Machine = "remote"
+		s.EndedAt = new("2024-01-01T00:00:01Z")
+	})
+	insertSession(t, d, "s-other", "proj", func(s *Session) {
+		s.Machine = "other"
+		s.EndedAt = new("2024-01-01T00:00:02Z")
+	})
+
+	page, err := d.ListSessions(
+		t.Context(),
+		SessionFilter{
+			Machine: "local,other",
+			Limit:   10,
+		},
+	)
+	requireNoError(t, err, "ListSessions")
+	require.Equal(t, 2, page.Total, "total")
+
+	got := map[string]bool{}
+	for _, session := range page.Sessions {
+		got[session.Machine] = true
+	}
+	require.True(t, got["local"],
+		"machines = %v, want local included", got)
+	require.True(t, got["other"],
+		"machines = %v, want other included", got)
+	require.False(t, got["remote"],
+		"machines = %v, want remote excluded", got)
+}
+
+func TestMessageCRUD(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s1", "p", func(s *Session) {
+		s.MessageCount = 4
+	})
+
+	m1 := userMsg("s1", 0, "Hello")
+	m2 := asstMsgAt("s1", 1, "Hi there", tsZeroS1)
+	m3 := userMsgAt("s1", 2, "Thanks", tsZeroS2)
+	m4 := userMsgAt("s1", 3, "Empty TS", "")
+
+	insertMessages(t, d, m1, m2, m3, m4)
+
+	got, err := d.GetAllMessages(t.Context(), "s1")
+	requireNoError(t, err, "GetAllMessages")
+	require.Len(t, got, 4, "len")
+	assert.Equal(t, "Hello", got[0].Content, "first message")
+	assert.Empty(t, got[3].Timestamp, "expected empty timestamp")
+
+	// Paginated
+	got, err = d.GetMessages(t.Context(), "s1", 1, 2, true)
+	requireNoError(t, err, "GetMessages")
+	require.Len(t, got, 2, "len")
+	assert.Equal(t, 1, got[0].Ordinal, "first ordinal")
+
+	// Descending
+	got, err = d.GetMessages(t.Context(), "s1", 2, 10, false)
+	requireNoError(t, err, "GetMessages desc")
+	require.Len(t, got, 3, "len")
+	assert.Equal(t, 2, got[0].Ordinal, "desc first ordinal")
+}
+
+func TestReplaceSessionMessages(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s1", "p")
+
+	insertMessages(t, d, userMsg("s1", 0, "old"))
+
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "s1", []Message{
+		userMsg("s1", 0, "new1"),
+		asstMsg("s1", 1, "new2"),
+	}), "ReplaceSessionMessages")
+
+	got, _ := d.GetAllMessages(t.Context(), "s1")
+	require.Len(t, got, 2, "len")
+	assert.Equal(t, "new1", got[0].Content, "content")
+}
+
+func TestInsertMessagesClassifiesAutomationFromUserTranscript(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	title := "Generated review title"
+	insertSession(t, d, "insert-review-title", "p", func(s *Session) {
+		s.FirstMessage = &title
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+	})
+
+	require.NoError(t, d.InsertMessages(ctx, []Message{
+		userMsg("insert-review-title", 0,
+			"You are a code reviewer. Review the code changes shown below."),
+		asstMsg("insert-review-title", 1, "Review complete."),
+	}), "InsertMessages")
+
+	got, err := d.GetSession(ctx, "insert-review-title")
+	require.NoError(t, err, "GetSession")
+	require.NotNil(t, got, "insert-review-title session")
+	assert.True(t, got.IsAutomated,
+		"automation should be classified from the first inserted user message")
+}
+
+func TestUpsertSessionPreservesTranscriptAutomation(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	title := "Generated review title"
+	insertSession(t, d, "upsert-review-title", "p", func(s *Session) {
+		s.FirstMessage = &title
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+	})
+
+	require.NoError(t, d.InsertMessages(ctx, []Message{
+		userMsg("upsert-review-title", 0,
+			"You are a code reviewer. Review the code changes shown below."),
+		asstMsg("upsert-review-title", 1, "Review complete."),
+	}), "InsertMessages")
+
+	require.NoError(t, d.UpsertSession(ctx, Session{
+		ID:               "upsert-review-title",
+		Project:          "p",
+		Machine:          defaultMachine,
+		Agent:            defaultAgent,
+		FirstMessage:     &title,
+		MessageCount:     2,
+		UserMessageCount: 1,
+		IsAutomated:      true,
+	}), "UpsertSession")
+
+	got, err := d.GetSession(ctx, "upsert-review-title")
+	require.NoError(t, err, "GetSession")
+	require.NotNil(t, got, "upsert-review-title session")
+	assert.True(t, got.IsAutomated,
+		"upsert should persist the transcript-derived automation flag")
+}
+
+func TestReplaceSessionMessagesClassifiesAutomationFromUserTranscript(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	title := "Generated review title"
+	insertSession(t, d, "review-title", "p", func(s *Session) {
+		s.FirstMessage = &title
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+	})
+
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "review-title", []Message{
+		userMsg("review-title", 0,
+			"You are a code reviewer. Review the code changes shown below."),
+		asstMsg("review-title", 1, "Review complete."),
+	}), "ReplaceSessionMessages")
+
+	got, err := d.GetSession(ctx, "review-title")
+	require.NoError(t, err, "GetSession")
+	require.NotNil(t, got, "review-title session")
+	assert.True(t, got.IsAutomated,
+		"automation should be classified from the first stored user message")
+
+	page, err := d.ListSessions(ctx, SessionFilter{
+		ExcludeAutomated: true,
+		Limit:            10,
+	})
+	require.NoError(t, err, "ListSessions")
+	assert.Empty(t, page.Sessions,
+		"automated transcript should be excluded even when first_message is a title")
+}
+
+// TestReplaceSessionMessagesPreservesPins verifies that pinned
+// messages survive a full message replacement (regression test for
+// the ON DELETE CASCADE bug: deleting messages used to cascade-delete
+// pinned_messages rows).
+func TestReplaceSessionMessagesPreservesPins(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "s1", "p")
+	oldMessages := []Message{
+		userMsg("s1", 0, "msg0"),
+		asstMsg("s1", 1, "msg1"),
+		userMsg("s1", 2, "msg2"),
+	}
+	for i := range oldMessages {
+		oldMessages[i].SourceUUID = fmt.Sprintf("uuid-%d", i)
+	}
+	insertMessages(t, d, oldMessages...)
+
+	msgs, err := d.GetAllMessages(ctx, "s1")
+	require.NoError(t, err, "GetAllMessages")
+
+	// Pin ordinal-0 with a note and ordinal-2 with no note.
+	note := "important"
+	_, err = d.PinMessage(ctx, "s1", msgs[0].ID, &note)
+	require.NoError(t, err, "PinMessage ord=0")
+	_, err = d.PinMessage(ctx, "s1", msgs[2].ID, nil)
+	require.NoError(t, err, "PinMessage ord=2")
+
+	// Record created_at before replace so we can verify it is preserved.
+	prePins, err := d.ListPinnedMessages(ctx, "s1", "")
+	require.NoError(t, err, "ListPinnedMessages before replace")
+	pinCreatedAt := make(map[int]string) // ordinal → created_at
+	for _, p := range prePins {
+		pinCreatedAt[p.Ordinal] = p.CreatedAt
+	}
+
+	// Full replace (simulates a resync of an OpenCode or
+	// explicitly re-synced session).
+	newMessages := []Message{
+		userMsg("s1", 0, "msg0-updated"),
+		asstMsg("s1", 1, "msg1-updated"),
+		userMsg("s1", 2, "msg2-updated"),
+	}
+	for i := range newMessages {
+		newMessages[i].SourceUUID = fmt.Sprintf("uuid-%d", i)
+	}
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "s1", newMessages),
+		"ReplaceSessionMessages")
+
+	newMsgs, err := d.GetAllMessages(ctx, "s1")
+	require.NoError(t, err, "GetAllMessages after replace")
+	require.Len(t, newMsgs, 3, "want 3 messages after replace")
+
+	pins, err := d.ListPinnedMessages(ctx, "s1", "")
+	require.NoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 2, "want 2 pins after replace")
+
+	byOrdinal := make(map[int]PinnedMessage)
+	for _, p := range pins {
+		byOrdinal[p.Ordinal] = p
+	}
+
+	// Ordinal-0: note preserved, message_id updated, created_at preserved.
+	p0, ok := byOrdinal[0]
+	require.True(t, ok, "pin for ordinal 0 missing after replace")
+	assert.Equal(t, newMsgs[0].ID, p0.MessageID, "ord=0 pin message_id")
+	if assert.NotNil(t, p0.Note, "ord=0 pin note want %q", note) {
+		assert.Equal(t, note, *p0.Note, "ord=0 pin note")
+	}
+	assert.Equal(t, pinCreatedAt[0], p0.CreatedAt, "ord=0 pin created_at")
+
+	// Ordinal-2: nil note preserved, message_id updated.
+	p2, ok := byOrdinal[2]
+	require.True(t, ok, "pin for ordinal 2 missing after replace")
+	assert.Equal(t, newMsgs[2].ID, p2.MessageID, "ord=2 pin message_id")
+	assert.Nil(t, p2.Note, "ord=2 pin note")
+	assert.Equal(t, pinCreatedAt[2], p2.CreatedAt, "ord=2 pin created_at")
+}
+
+// TestReplaceSessionMessagesDropsPinsForRemovedOrdinals verifies that
+// pins whose ordinal no longer exists after a replace are silently
+// dropped (the underlying message was removed from the session).
+func TestReplaceSessionMessagesDropsPinsForRemovedOrdinals(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "s1", "p")
+	oldMessages := []Message{
+		userMsg("s1", 0, "msg0"),
+		asstMsg("s1", 1, "msg1"),
+	}
+	oldMessages[0].SourceUUID = "uuid-0"
+	oldMessages[1].SourceUUID = "uuid-1"
+	insertMessages(t, d, oldMessages...)
+
+	msgs, err := d.GetAllMessages(ctx, "s1")
+	require.NoError(t, err, "GetAllMessages")
+	// Pin both messages.
+	for _, m := range msgs {
+		_, err := d.PinMessage(ctx, "s1", m.ID, nil)
+		require.NoError(t, err, "PinMessage")
+	}
+
+	// Replace with only ordinal-0 (ordinal-1 is gone).
+	replacement := userMsg("s1", 0, "msg0-updated")
+	replacement.SourceUUID = "uuid-0"
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "s1", []Message{replacement}),
+		"ReplaceSessionMessages")
+
+	pins, err := d.ListPinnedMessages(ctx, "s1", "")
+	require.NoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 1, "want 1 pin (ordinal-1 dropped)")
+	assert.Equal(t, 0, pins[0].Ordinal, "surviving pin ordinal")
+	assert.Nil(t, pins[0].Note, "surviving pin note")
+}
+
+// TestReplaceSessionMessagesPinSourceUUIDFollowsRow verifies that a
+// pin tracks its message by source_uuid even when the message's
+// ordinal shifts on rewrite (e.g. when a new compact-boundary row
+// is inserted earlier in the stream). The pin must follow the
+// content, not the position.
+func TestReplaceSessionMessagesPinSourceUUIDFollowsRow(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "s1", "p")
+	insertMessages(t, d,
+		Message{
+			SessionID: "s1", Ordinal: 0, Role: "user",
+			Content: "first", Timestamp: tsZero,
+			SourceUUID: "uuid-first",
+		},
+		Message{
+			SessionID: "s1", Ordinal: 1, Role: "assistant",
+			Content: "answer", Timestamp: tsZero,
+			SourceUUID: "uuid-answer",
+		},
+	)
+
+	msgs, err := d.GetAllMessages(ctx, "s1")
+	require.NoError(t, err, "GetAllMessages")
+	note := "important"
+	_, err = d.PinMessage(ctx, "s1", msgs[1].ID, &note)
+	require.NoError(t, err, "PinMessage")
+
+	// Rewrite: a compact-boundary row is now ordinal 1, pushing
+	// "answer" to ordinal 2. The pin should follow uuid-answer
+	// to its new ordinal, not stay on ordinal 1 (the boundary).
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "s1", []Message{
+		{
+			SessionID: "s1", Ordinal: 0, Role: "user",
+			Content: "first", Timestamp: tsZero,
+			SourceUUID: "uuid-first",
+		},
+		{
+			SessionID: "s1", Ordinal: 1, Role: "user",
+			Content: "[compact]", Timestamp: tsZero,
+			SourceUUID:        "uuid-boundary",
+			IsCompactBoundary: true,
+		},
+		{
+			SessionID: "s1", Ordinal: 2, Role: "assistant",
+			Content: "answer", Timestamp: tsZero,
+			SourceUUID: "uuid-answer",
+		},
+	}), "ReplaceSessionMessages")
+
+	pins, err := d.ListPinnedMessages(ctx, "s1", "")
+	require.NoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 1, "want 1 pin")
+	assert.Equal(t, 2, pins[0].Ordinal,
+		"pin ordinal want 2 (followed source_uuid)")
+	if assert.NotNil(t, pins[0].Note, "pin note want %q", note) {
+		assert.Equal(t, note, *pins[0].Note, "pin note")
+	}
+}
+
+// TestReplaceSessionMessagesPinFallsBackToOrdinal verifies that
+// when a pin's source_uuid is empty (legacy row from before the
+// column existed) the restore falls back to ordinal matching.
+func TestReplaceSessionMessagesPinFallsBackToOrdinal(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "s1", "p")
+	// Messages without source_uuid (legacy).
+	insertMessages(t, d,
+		userMsg("s1", 0, "msg0"),
+		asstMsg("s1", 1, "msg1"),
+		userMsg("s1", 2, "removed"),
+	)
+
+	msgs, err := d.GetAllMessages(ctx, "s1")
+	require.NoError(t, err, "GetAllMessages")
+	_, err = d.PinMessage(ctx, "s1", msgs[1].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	// Truncation forces a full replacement. The pinned legacy row remains
+	// unchanged at its old ordinal, so the guarded fallback can restore it.
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "s1", []Message{
+		userMsg("s1", 0, "msg0"),
+		asstMsg("s1", 1, "msg1"),
+	}), "ReplaceSessionMessages")
+
+	pins, err := d.ListPinnedMessages(ctx, "s1", "")
+	require.NoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 1, "want 1 pin")
+	assert.Equal(t, 1, pins[0].Ordinal, "pin ordinal")
+}
+
+func TestReplaceSessionMessagesPinFallbackAllowsSourceUUIDEnrichment(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "s1", "p")
+	insertMessages(t, d,
+		userMsg("s1", 0, "msg0"),
+		asstMsg("s1", 1, "msg1"),
+	)
+	msgs, err := d.GetAllMessages(ctx, "s1")
+	require.NoError(t, err, "GetAllMessages")
+	_, err = d.PinMessage(ctx, "s1", msgs[1].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	enriched := asstMsg("s1", 1, "msg1")
+	enriched.SourceUUID = "new-provider-uuid"
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "s1", []Message{
+		userMsg("s1", 0, "msg0"),
+		enriched,
+	}), "ReplaceSessionMessages")
+
+	pins, err := d.ListPinnedMessages(ctx, "s1", "")
+	require.NoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 1, "UUID enrichment must preserve the pin")
+	assert.Equal(t, 1, pins[0].Ordinal, "pin ordinal")
+}
+
+func TestReplaceSessionContentDuplicateSourceUUIDRestoresOnePin(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "s1", "p")
+	insertMessages(t, d,
+		Message{
+			SessionID: "s1", Ordinal: 0, Role: "user",
+			Content: "pinned", SourceUUID: "duplicate",
+		},
+		Message{
+			SessionID: "s1", Ordinal: 1, Role: "assistant",
+			Content: "not pinned", SourceUUID: "duplicate",
+		},
+		Message{
+			SessionID: "s1", Ordinal: 2, Role: "user",
+			Content: "removed", SourceUUID: "tail",
+		},
+	)
+	msgs, err := d.GetAllMessages(ctx, "s1")
+	require.NoError(t, err, "GetAllMessages")
+	_, err = d.PinMessage(ctx, "s1", msgs[0].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	require.NoError(t, d.ReplaceSessionContent(ctx, "s1", []Message{
+		{
+			SessionID: "s1", Ordinal: 0, Role: "user",
+			Content: "pinned", SourceUUID: "duplicate",
+		},
+		{
+			SessionID: "s1", Ordinal: 1, Role: "assistant",
+			Content: "not pinned", SourceUUID: "duplicate",
+		},
+	}, SessionSignalUpdate{}, nil), "ReplaceSessionContent")
+
+	pins, err := d.ListPinnedMessages(ctx, "s1", "")
+	require.NoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 1, "duplicate UUID must not duplicate the pin")
+	assert.Equal(t, 0, pins[0].Ordinal, "pin stays on its original message")
+}
+
+func TestReplaceSessionContentSourceUUIDBecomesDuplicateRestoresOnePin(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "s1", "p")
+	insertMessages(t, d,
+		Message{
+			SessionID: "s1", Ordinal: 0, Role: "user",
+			Content: "pinned", SourceUUID: "becomes-duplicate",
+		},
+		Message{
+			SessionID: "s1", Ordinal: 1, Role: "assistant",
+			Content: "old tail", SourceUUID: "old-tail",
+		},
+	)
+	msgs, err := d.GetAllMessages(ctx, "s1")
+	require.NoError(t, err, "GetAllMessages")
+	_, err = d.PinMessage(ctx, "s1", msgs[0].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	require.NoError(t, d.ReplaceSessionContent(ctx, "s1", []Message{
+		{
+			SessionID: "s1", Ordinal: 0, Role: "user",
+			Content: "pinned", SourceUUID: "becomes-duplicate",
+		},
+		{
+			SessionID: "s1", Ordinal: 1, Role: "assistant",
+			Content: "new duplicate", SourceUUID: "becomes-duplicate",
+		},
+	}, SessionSignalUpdate{}, nil), "ReplaceSessionContent")
+
+	pins, err := d.ListPinnedMessages(ctx, "s1", "")
+	require.NoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 1,
+		"a newly duplicated UUID must use the guarded identity fallback")
+	assert.Equal(t, 0, pins[0].Ordinal, "pin stays on its original message")
+}
+
+func TestReplaceSessionContentIdenticalDuplicatesKeepPin(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "s1", "p")
+	insertMessages(t, d,
+		Message{
+			SessionID: "s1", Ordinal: 0, Role: "user",
+			Content: "same", SourceUUID: "duplicate",
+		},
+		Message{
+			SessionID: "s1", Ordinal: 1, Role: "user",
+			Content: "same", SourceUUID: "duplicate",
+		},
+		Message{
+			SessionID: "s1", Ordinal: 2, Role: "assistant",
+			Content: "truncated tail", SourceUUID: "tail",
+		},
+	)
+	msgs, err := d.GetAllMessages(ctx, "s1")
+	require.NoError(t, err, "GetAllMessages")
+	require.Len(t, msgs, 3, "seeded messages")
+	_, err = d.PinMessage(ctx, "s1", msgs[1].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	// Only the tail changes; the identical duplicates survive intact,
+	// so the pin must keep its saved ordinal instead of being dropped.
+	require.NoError(t, d.ReplaceSessionContent(ctx, "s1", []Message{
+		{
+			SessionID: "s1", Ordinal: 0, Role: "user",
+			Content: "same", SourceUUID: "duplicate",
+		},
+		{
+			SessionID: "s1", Ordinal: 1, Role: "user",
+			Content: "same", SourceUUID: "duplicate",
+		},
+	}, SessionSignalUpdate{}, nil), "ReplaceSessionContent")
+
+	pins, err := d.ListPinnedMessages(ctx, "s1", "")
+	require.NoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 1,
+		"unchanged identical duplicates must keep the pin")
+	assert.Equal(t, 1, pins[0].Ordinal, "pin stays at its saved ordinal")
+}
+
+func TestReplaceSessionContentIdenticalDuplicateMultiplicityChangeDropsPin(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "s1", "p")
+	insertMessages(t, d,
+		Message{
+			SessionID: "s1", Ordinal: 0, Role: "user",
+			Content: "same", SourceUUID: "duplicate",
+		},
+		Message{
+			SessionID: "s1", Ordinal: 1, Role: "user",
+			Content: "same", SourceUUID: "duplicate",
+		},
+		Message{
+			SessionID: "s1", Ordinal: 2, Role: "assistant",
+			Content: "replaced tail", SourceUUID: "tail",
+		},
+	)
+	msgs, err := d.GetAllMessages(ctx, "s1")
+	require.NoError(t, err, "GetAllMessages")
+	require.Len(t, msgs, 3, "seeded messages")
+	_, err = d.PinMessage(ctx, "s1", msgs[1].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	// The tail's identity changes (forcing a full replacement) and a
+	// third identical duplicate takes its place: the saved ordinal can
+	// no longer prove which duplicate was pinned, so the pin is
+	// dropped.
+	require.NoError(t, d.ReplaceSessionContent(ctx, "s1", []Message{
+		{
+			SessionID: "s1", Ordinal: 0, Role: "user",
+			Content: "same", SourceUUID: "duplicate",
+		},
+		{
+			SessionID: "s1", Ordinal: 1, Role: "user",
+			Content: "same", SourceUUID: "duplicate",
+		},
+		{
+			SessionID: "s1", Ordinal: 2, Role: "user",
+			Content: "same", SourceUUID: "duplicate",
+		},
+	}, SessionSignalUpdate{}, nil), "ReplaceSessionContent")
+
+	pins, err := d.ListPinnedMessages(ctx, "s1", "")
+	require.NoError(t, err, "ListPinnedMessages")
+	assert.Empty(t, pins,
+		"changed duplicate multiplicity must drop the ambiguous pin")
+}
+
+func TestReplaceSessionMessagesIdenticalDuplicatesFollowLeadingInsert(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "s1", "p")
+	insertMessages(t, d,
+		Message{
+			SessionID: "s1", Ordinal: 0, Role: "user",
+			Content: "same", SourceUUID: "dup",
+		},
+		Message{
+			SessionID: "s1", Ordinal: 1, Role: "user",
+			Content: "same", SourceUUID: "dup",
+		},
+	)
+	msgs, err := d.GetAllMessages(ctx, "s1")
+	require.NoError(t, err, "GetAllMessages")
+	require.Len(t, msgs, 2, "seeded messages")
+	_, err = d.PinMessage(ctx, "s1", msgs[1].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	// A hidden row inserted before the duplicates shifts both while
+	// their multiplicity stays equal: the pin must follow its
+	// occurrence rank, not stay on the saved ordinal where the first
+	// duplicate now sits.
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "s1", []Message{
+		{
+			SessionID: "s1", Ordinal: 0, Role: "user",
+			Content: "context", SourceUUID: "env", IsSystem: true,
+			SourceType: "system", SourceSubtype: "ide_opened_file",
+		},
+		{
+			SessionID: "s1", Ordinal: 1, Role: "user",
+			Content: "same", SourceUUID: "dup",
+		},
+		{
+			SessionID: "s1", Ordinal: 2, Role: "user",
+			Content: "same", SourceUUID: "dup",
+		},
+	}), "ReplaceSessionMessages")
+
+	pins, err := d.ListPinnedMessages(ctx, "s1", "")
+	require.NoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 1, "shifted duplicates must keep the pin")
+	assert.Equal(t, 2, pins[0].Ordinal,
+		"pin follows the second occurrence, not the saved ordinal")
+}
+
+func TestReplaceSessionMessagesLegacyPinFollowsEqualMessageShift(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "s1", "p")
+	insertMessages(t, d,
+		Message{SessionID: "s1", Ordinal: 0, Role: "user", Content: "intro"},
+		Message{SessionID: "s1", Ordinal: 1, Role: "user", Content: "x"},
+		Message{SessionID: "s1", Ordinal: 2, Role: "user", Content: "x"},
+	)
+	msgs, err := d.GetAllMessages(ctx, "s1")
+	require.NoError(t, err, "GetAllMessages")
+	require.Len(t, msgs, 3, "seeded messages")
+	_, err = d.PinMessage(ctx, "s1", msgs[2].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	// A hidden row inserted at the front shifts two equal visible
+	// messages. The pin on the second "x" must follow its occurrence
+	// rank to the shifted ordinal instead of re-attaching to the first
+	// "x" that now occupies the saved ordinal.
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "s1", []Message{
+		{
+			SessionID: "s1", Ordinal: 0, Role: "user",
+			Content: "context", IsSystem: true,
+			SourceType: "system", SourceSubtype: "ide_opened_file",
+		},
+		{SessionID: "s1", Ordinal: 1, Role: "user", Content: "intro"},
+		{SessionID: "s1", Ordinal: 2, Role: "user", Content: "x"},
+		{SessionID: "s1", Ordinal: 3, Role: "user", Content: "x"},
+	}), "ReplaceSessionMessages")
+
+	pins, err := d.ListPinnedMessages(ctx, "s1", "")
+	require.NoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 1, "shifted equal messages must keep the pin")
+	assert.Equal(t, 3, pins[0].Ordinal,
+		"pin follows the second occurrence, not the saved ordinal")
+}
+
+// TestWriteSessionBatchPreservesLegacyPinWhenMetadataBecomesHidden
+// models re-uploading an unchanged transcript across the server change
+// that started preserving IsSystem: the first upload stored every row
+// with is_system = 0, the re-upload reclassifies the metadata row as
+// hidden without moving anything, and the pin on the unchanged visible
+// row must survive.
+func TestWriteSessionBatchPreservesLegacyPinWhenMetadataBecomesHidden(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	base := Session{
+		ID:               "upload-1",
+		Project:          "proj",
+		Machine:          defaultMachine,
+		Agent:            "claude",
+		FirstMessage:     new("real question"),
+		StartedAt:        new("2024-01-15T10:00:00Z"),
+		MessageCount:     2,
+		UserMessageCount: 1,
+	}
+	envelope := "<ide_opened_file>f</ide_opened_file>"
+	oldUpload := []Message{
+		{
+			SessionID: "upload-1", Ordinal: 0, Role: "user",
+			Content: envelope,
+		},
+		{
+			SessionID: "upload-1", Ordinal: 1, Role: "user",
+			Content: "real question",
+		},
+	}
+	_, err := d.WriteSessionBatch([]SessionBatchWrite{{
+		Session:         base,
+		Messages:        oldUpload,
+		DataVersion:     CurrentDataVersion(),
+		ReplaceMessages: true,
+	}})
+	require.NoError(t, err, "initial upload")
+
+	msgs, err := d.GetAllMessages(ctx, "upload-1")
+	require.NoError(t, err, "GetAllMessages")
+	require.Len(t, msgs, 2, "uploaded messages")
+	_, err = d.PinMessage(ctx, "upload-1", msgs[1].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	reupload := []Message{
+		{
+			SessionID: "upload-1", Ordinal: 0, Role: "user",
+			Content: envelope, IsSystem: true,
+			SourceType: "system", SourceSubtype: "ide_opened_file",
+		},
+		{
+			SessionID: "upload-1", Ordinal: 1, Role: "user",
+			Content: "real question",
+		},
+	}
+	_, err = d.WriteSessionBatch([]SessionBatchWrite{{
+		Session:         base,
+		Messages:        reupload,
+		DataVersion:     CurrentDataVersion(),
+		ReplaceMessages: true,
+	}})
+	require.NoError(t, err, "re-upload")
+
+	pins, err := d.ListPinnedMessages(ctx, "upload-1", "")
+	require.NoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 1,
+		"reclassified metadata must not drop the unchanged pin")
+	assert.Equal(t, 1, pins[0].Ordinal, "pin stays at its saved ordinal")
+}
+
+func TestReplaceSessionContentMissingSourceUUIDDropsPin(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "s1", "p")
+	insertMessages(t, d,
+		Message{
+			SessionID: "s1", Ordinal: 0, Role: "user",
+			Content: "gone", SourceUUID: "gone-uuid",
+		},
+		Message{
+			SessionID: "s1", Ordinal: 1, Role: "assistant",
+			Content: "removed", SourceUUID: "tail",
+		},
+	)
+	msgs, err := d.GetAllMessages(ctx, "s1")
+	require.NoError(t, err, "GetAllMessages")
+	_, err = d.PinMessage(ctx, "s1", msgs[0].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	require.NoError(t, d.ReplaceSessionContent(ctx, "s1", []Message{{
+		SessionID: "s1", Ordinal: 0, Role: "assistant",
+		Content: "unrelated", SourceUUID: "other-uuid",
+	}}, SessionSignalUpdate{}, nil), "ReplaceSessionContent")
+
+	pins, err := d.ListPinnedMessages(ctx, "s1", "")
+	require.NoError(t, err, "ListPinnedMessages")
+	assert.Empty(t, pins,
+		"a vanished UUID must not fall back to an unrelated ordinal")
+}
+
+func TestGetSessionFilePath(t *testing.T) {
+	d := testDB(t)
+
+	fp := "/tmp/sessions/abc.jsonl"
+	insertSession(t, d, "zencoder:abc", "p", func(s *Session) {
+		s.FilePath = &fp
+	})
+
+	got := d.GetSessionFilePath(t.Context(), "zencoder:abc")
+	assert.Equal(t, fp, got, "GetSessionFilePath")
+
+	// Non-existent session returns empty.
+	got = d.GetSessionFilePath(t.Context(), "zencoder:nonexistent")
+	assert.Empty(t, got, "GetSessionFilePath(missing)")
+}
+
+func TestLinkSubagentSessionsOverridesContinuation(t *testing.T) {
+	d := testDB(t)
+
+	// Parent session with a tool call referencing a child.
+	insertSession(t, d, "parent", "p", func(s *Session) {
+		s.MessageCount = 1
+	})
+	// Child session initially classified as continuation
+	// (e.g. Zencoder header parentId).
+	insertSession(t, d, "child", "p", func(s *Session) {
+		s.MessageCount = 1
+		parentID := "header-parent"
+		s.ParentSessionID = &parentID
+		s.RelationshipType = "continuation"
+	})
+
+	// Insert a message with a tool call that references the child.
+	m := Message{
+		SessionID: "parent", Ordinal: 0,
+		Role: "assistant", Content: "spawning subagent",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			ToolName:          "subagent",
+			Category:          "Task",
+			SubagentSessionID: "child",
+		}},
+	}
+	insertMessages(t, d, m)
+
+	// Link should override continuation -> subagent.
+	err := d.LinkSubagentSessions()
+	require.NoError(t, err, "LinkSubagentSessions")
+
+	sess, err := d.GetSession(t.Context(), "child")
+	requireNoError(t, err, "GetSession")
+	assert.Equal(t, "subagent", sess.RelationshipType, "relationship_type")
+	if assert.NotNil(t, sess.ParentSessionID,
+		"parent_session_id want 'parent'") {
+		assert.Equal(t, "parent", *sess.ParentSessionID,
+			"parent_session_id")
+	}
+}
+
+func TestIsSystemPersisted(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s1", "p", func(s *Session) {
+		s.MessageCount = 2
+	})
+
+	m1 := userMsg("s1", 0, "normal user message")
+	m2 := userMsg("s1", 1, "system injected notice")
+	m2.IsSystem = true
+
+	insertMessages(t, d, m1, m2)
+
+	msgs, err := d.GetAllMessages(t.Context(), "s1")
+	requireNoError(t, err, "GetAllMessages")
+	require.Len(t, msgs, 2, "len")
+	assert.False(t, msgs[0].IsSystem,
+		"msgs[0].IsSystem want false")
+	assert.True(t, msgs[1].IsSystem,
+		"msgs[1].IsSystem want true")
+}
+
+func TestSearchBasic(t *testing.T) {
+	d := testDB(t)
+	requireFTS(t, d)
+
+	insertSession(t, d, "s1", "p", func(s *Session) {
+		s.MessageCount = 2
+	})
+
+	m1 := userMsg("s1", 0, "Fix the authentication bug")
+	m2 := asstMsgAt("s1", 1, "Looking at the auth module",
+		tsZeroS1)
+
+	insertMessages(t, d, m1, m2)
+
+	page, err := d.Search(t.Context(), SearchFilter{
+		Query: "authentication",
+		Limit: 10,
+	})
+	requireNoError(t, err, "Search")
+	require.Len(t, page.Results, 1, "len")
+	assert.Equal(t, "s1", page.Results[0].SessionID, "session_id")
+}
+
+func TestSearchExcludesSystemMessages(t *testing.T) {
+	d := testDB(t)
+	requireFTS(t, d)
+
+	insertSession(t, d, "s1", "p", func(s *Session) {
+		s.MessageCount = 3
+	})
+
+	m1 := userMsg("s1", 0, "unique searchterm here")
+	m2 := userMsg("s1", 1, "system unique searchterm notice")
+	m2.IsSystem = true
+	m3 := asstMsg("s1", 2, "response to user")
+
+	insertMessages(t, d, m1, m2, m3)
+
+	page, err := d.Search(t.Context(), SearchFilter{
+		Query: "searchterm",
+		Limit: 10,
+	})
+	requireNoError(t, err, "Search")
+	// Only the non-system message should appear
+	require.Len(t, page.Results, 1, "got")
+	assert.Equal(t, 0, page.Results[0].Ordinal, "ordinal")
+}
+
+func TestCanceledContext(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s1", "p", func(s *Session) {
+		s.MessageCount = 1
+	})
+	insertMessages(t, d, userMsg("s1", 0, "searchable content"))
+
+	ctx := canceledCtx()
+
+	tests := []struct {
+		name string
+		fn   func() error
+		skip bool
+	}{
+		{"Search", func() error {
+			_, err := d.Search(ctx, SearchFilter{
+				Query: "searchable", Limit: 10,
+			})
+			return err
+		}, !d.HasFTS(ctx)},
+		{"ListSessions", func() error {
+			_, err := d.ListSessions(ctx, SessionFilter{Limit: 10})
+			return err
+		}, false},
+		{"GetMessages", func() error {
+			_, err := d.GetMessages(ctx, "s1", 0, 10, true)
+			return err
+		}, false},
+		{"GetStats", func() error {
+			_, err := d.GetStats(ctx, false, false)
+			return err
+		}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.skip {
+				t.Skip("no FTS support")
+			}
+			requireCanceledErr(t, tt.fn())
+		})
+	}
+}
+
+func TestStats(t *testing.T) {
+	d := testDB(t)
+
+	// Empty DB returns nil EarliestSession
+	stats, err := d.GetStats(t.Context(), false, false)
+	requireNoError(t, err, "GetStats empty")
+	assert.Nil(t, stats.EarliestSession, "earliest_session")
+
+	early := "2024-01-15T09:00:00Z"
+	late := "2024-06-01T14:00:00Z"
+	insertSession(t, d, "s1", "p1", func(s *Session) {
+		s.StartedAt = &late
+	})
+	insertSession(t, d, "s2", "p2", func(s *Session) {
+		s.Machine = "remote"
+		s.Agent = "codex"
+		s.StartedAt = &early
+	})
+	insertMessages(t, d,
+		userMsg("s1", 0, "hi"),
+		userMsg("s2", 0, "bye"),
+	)
+
+	stats, err = d.GetStats(t.Context(), false, false)
+	requireNoError(t, err, "GetStats")
+	assert.Equal(t, 2, stats.SessionCount, "session_count")
+	assert.Equal(t, 2, stats.MessageCount, "message_count")
+	assert.Equal(t, 2, stats.ProjectCount, "project_count")
+	assert.Equal(t, 2, stats.MachineCount, "machine_count")
+	require.NotNil(t, stats.EarliestSession,
+		"earliest_session is nil, want non-nil")
+	assert.Equal(t, early, *stats.EarliestSession,
+		"earliest_session")
+}
+
+func TestStatsEarliestFallsBackToCreatedAt(t *testing.T) {
+	d := testDB(t)
+
+	// Session with NULL started_at — earliest should fall
+	// back to created_at instead of being nil.
+	insertSession(t, d, "s-null-start", "proj")
+	insertMessages(t, d, userMsg("s-null-start", 0, "hi"))
+
+	stats, err := d.GetStats(t.Context(), false, false)
+	requireNoError(t, err, "GetStats null started_at")
+	require.NotNil(t, stats.EarliestSession,
+		"earliest_session nil when started_at is NULL; "+
+			"should fall back to created_at")
+
+	// Session with empty-string started_at — NULLIF should
+	// treat it the same as NULL.
+	insertSession(t, d, "s-empty-start", "proj", func(s *Session) {
+		s.StartedAt = new("")
+	})
+	insertMessages(t, d, userMsg("s-empty-start", 0, "hey"))
+
+	stats, err = d.GetStats(t.Context(), false, false)
+	requireNoError(t, err, "GetStats empty started_at")
+	require.NotNil(t, stats.EarliestSession,
+		"earliest_session nil when started_at is ''; "+
+			"should fall back to created_at")
+	require.NotEmpty(t, *stats.EarliestSession,
+		"earliest_session is empty string; "+
+			"NULLIF should have converted '' to NULL")
+
+	// Add a session with an explicit started_at that is
+	// older than the auto-generated created_at.
+	old := "2020-01-01T00:00:00Z"
+	insertSession(t, d, "s-old", "proj", func(s *Session) {
+		s.StartedAt = &old
+	})
+	insertMessages(t, d, userMsg("s-old", 0, "hello"))
+
+	stats, err = d.GetStats(t.Context(), false, false)
+	requireNoError(t, err, "GetStats with old session")
+	require.NotNil(t, stats.EarliestSession, "earliest_session nil")
+	assert.Equal(t, old, *stats.EarliestSession, "earliest_session")
+}
+
+func TestGetProjects(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s1", "alpha")
+	insertSession(t, d, "s2", "beta", func(s *Session) {
+		s.MessageCount = 2
+	})
+	insertSession(t, d, "s3", "alpha")
+
+	projects, err := d.GetProjects(t.Context(), false, false)
+	requireNoError(t, err, "GetProjects")
+	require.Len(t, projects, 2, "len")
+	assert.Equal(t, "alpha", projects[0].Name,
+		"alpha: %+v", projects[0])
+	assert.Equal(t, 2, projects[0].SessionCount,
+		"alpha: %+v", projects[0])
+}
+
+// setupPruneData inserts the standard sessions used by the prune
+// candidate filter tests. Each session gets real message rows so
+// the user-message subquery in FindPruneCandidates works.
+func setupPruneData(t *testing.T, d *DB) {
+	t.Helper()
+	// s1: 2 user messages
+	insertSession(t, d, "s1", "spicytakes", func(s *Session) {
+		s.FirstMessage = new("You are a code reviewer")
+		s.EndedAt = new("2024-01-15T00:00:00Z")
+		s.MessageCount = 2
+	})
+	b1 := &msgBuilder{id: "s1"}
+	b1.user("You are a code reviewer")
+	b1.user("Review this")
+	insertMessages(t, d, b1.msgs...)
+	// s2: 2 user messages
+	insertSession(t, d, "s2", "spicytakes", func(s *Session) {
+		s.FirstMessage = new("Analyze this blog post")
+		s.EndedAt = new("2024-03-01T00:00:00Z")
+		s.MessageCount = 2
+	})
+	b2 := &msgBuilder{id: "s2"}
+	b2.user("Analyze this blog post")
+	b2.user("More analysis")
+	insertMessages(t, d, b2.msgs...)
+	// s3: 2 user messages
+	insertSession(t, d, "s3", "roborev", func(s *Session) {
+		s.FirstMessage = new("You are a code reviewer")
+		s.EndedAt = new("2024-03-01T00:00:00Z")
+		s.MessageCount = 2
+	})
+	b3 := &msgBuilder{id: "s3"}
+	b3.user("You are a code reviewer")
+	b3.user("Check this file")
+	insertMessages(t, d, b3.msgs...)
+	// s4: 5 user messages + 5 assistant messages = 10 total
+	insertSession(t, d, "s4", "spicytakes", func(s *Session) {
+		s.FirstMessage = new("Help me refactor")
+		s.EndedAt = new("2024-06-01T00:00:00Z")
+		s.MessageCount = 10
+	})
+	b4 := &msgBuilder{id: "s4"}
+	b4.user("Help me refactor")
+	b4.asst("Sure, here's a plan")
+	b4.user("Do step 1")
+	b4.asst("Done with step 1")
+	b4.user("Do step 2")
+	b4.asst("Done with step 2")
+	b4.user("Do step 3")
+	b4.asst("Done with step 3")
+	b4.user("Looks good")
+	b4.asst("Thanks")
+	insertMessages(t, d, b4.msgs...)
+}
+
+func TestFindPruneCandidates(t *testing.T) {
+	d := testDB(t)
+	setupPruneData(t, d)
+
+	tests := []struct {
+		name   string
+		filter PruneFilter
+		want   []string
+	}{
+		{
+			name:   "ProjectSubstring",
+			filter: PruneFilter{Project: "spicy"},
+			want:   []string{"s1", "s2", "s4"},
+		},
+		{
+			name:   "MaxMessages",
+			filter: PruneFilter{MaxMessages: new(2)},
+			want:   []string{"s1", "s2", "s3"},
+		},
+		{
+			name: "BeforeDate",
+			filter: PruneFilter{
+				Before: "2024-02-01",
+			},
+			want: []string{"s1"},
+		},
+		{
+			name: "FirstMessagePrefix",
+			filter: PruneFilter{
+				FirstMessage: "You are a code reviewer",
+			},
+			want: []string{"s1", "s3"},
+		},
+		{
+			name: "CombinedProjectAndMaxMessages",
+			filter: PruneFilter{
+				Project: "spicytakes", MaxMessages: new(2),
+			},
+			want: []string{"s1", "s2"},
+		},
+		{
+			name: "AllFiltersNoMatch",
+			filter: PruneFilter{
+				Project:      "spicytakes",
+				MaxMessages:  new(2),
+				Before:       "2024-02-01",
+				FirstMessage: "Analyze",
+			},
+			want: []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := d.FindPruneCandidates(t.Context(), tt.filter)
+			requireNoError(t, err, "FindPruneCandidates")
+
+			gotIDs := collectIDs(got)
+			wantSorted := make([]string, len(tt.want))
+			copy(wantSorted, tt.want)
+			slices.Sort(wantSorted)
+
+			gotSorted := make([]string, len(gotIDs))
+			copy(gotSorted, gotIDs)
+			slices.Sort(gotSorted)
+
+			if diff := cmp.Diff(wantSorted, gotSorted); diff != "" {
+				assert.Failf(t, "candidates mismatch", "(-want +got):\n%s", diff)
+			}
+		})
+	}
+
+	// The "before" case also checks the specific ID returned.
+	t.Run("BeforeDateReturnsCorrectID", func(t *testing.T) {
+		got, err := d.FindPruneCandidates(t.Context(), PruneFilter{
+			Before: "2024-02-01",
+		})
+		requireNoError(t, err, "FindPruneCandidates")
+		require.Len(t, got, 1, "len")
+		assert.Equal(t, "s1", got[0].ID, "got ID")
+	})
+
+	// File metadata returned correctly.
+	t.Run("ReturnsFileMetadata", func(t *testing.T) {
+		fp := "/path/to/file.jsonl"
+		insertSession(t, d, "s5", "test", func(s *Session) {
+			s.FilePath = new(fp)
+			s.FileSize = new(int64(4096))
+		})
+		got, err := d.FindPruneCandidates(t.Context(), PruneFilter{
+			Project: "test",
+		})
+		requireNoError(t, err, "FindPruneCandidates")
+		require.Len(t, got, 1, "len")
+		require.NotNil(t, got[0].FilePath, "file_path")
+		assert.Equal(t, fp, *got[0].FilePath, "file_path")
+		require.NotNil(t, got[0].FileSize, "file_size")
+		assert.Equal(t, int64(4096), *got[0].FileSize, "file_size")
+	})
+}
+
+// collectIDs extracts session IDs for error messages.
+func collectIDs(sessions []Session) []string {
+	ids := make([]string, len(sessions))
+	for i, s := range sessions {
+		ids[i] = s.ID
+	}
+	return ids
+}
+
+func TestFindPruneCandidatesExcludesParents(t *testing.T) {
+	d := testDB(t)
+
+	// Create a parent -> child chain.
+	insertSession(t, d, "parent1", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T10:00:00Z")
+		s.EndedAt = new("2024-06-01T11:00:00Z")
+	})
+	insertSession(t, d, "child1", "proj", func(s *Session) {
+		s.ParentSessionID = new("parent1")
+		s.StartedAt = new("2024-06-01T12:00:00Z")
+		s.EndedAt = new("2024-06-01T13:00:00Z")
+	})
+	// A standalone session with no children.
+	insertSession(t, d, "standalone", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T14:00:00Z")
+		s.EndedAt = new("2024-06-01T15:00:00Z")
+	})
+
+	got, err := d.FindPruneCandidates(t.Context(), PruneFilter{
+		Project: "proj",
+	})
+	requireNoError(t, err, "FindPruneCandidates")
+
+	ids := collectIDs(got)
+
+	// Parent should be excluded; child and standalone eligible.
+	require.Len(t, got, 2, "got candidates %v", ids)
+	for _, s := range got {
+		assert.NotEqual(t, "parent1", s.ID,
+			"parent1 should be excluded, got candidates: %v", ids)
+	}
+}
+
+func TestFindPruneCandidatesLikeEscaping(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "e1", "my%project", func(s *Session) {
+		s.FirstMessage = new("100% complete")
+	})
+	insertSession(t, d, "e2", "my_project", func(s *Session) {
+		s.FirstMessage = new("100% complete")
+	})
+	insertSession(t, d, "e3", "myXproject")
+	insertSession(t, d, "e4", `my\project`, func(s *Session) {
+		s.FirstMessage = new(`path\to\file`)
+	})
+
+	tests := []struct {
+		name     string
+		filter   PruneFilter
+		wantN    int
+		wantOnly string
+	}{
+		{
+			name: "LiteralPercent",
+			filter: PruneFilter{
+				Project: "%",
+			},
+			wantN: 1, wantOnly: "e1",
+		},
+		{
+			name: "LiteralUnderscore",
+			filter: PruneFilter{
+				Project: "_",
+			},
+			wantN: 1, wantOnly: "e2",
+		},
+		{
+			name: "PercentInFirstMessage",
+			filter: PruneFilter{
+				FirstMessage: "100%",
+			},
+			wantN: 2,
+		},
+		{
+			name: "BackslashInProject",
+			filter: PruneFilter{
+				Project: `\`,
+			},
+			wantN: 1, wantOnly: "e4",
+		},
+		{
+			name: "BackslashInFirstMessage",
+			filter: PruneFilter{
+				FirstMessage: `path\to`,
+			},
+			wantN: 1, wantOnly: "e4",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := d.FindPruneCandidates(t.Context(), tt.filter)
+			requireNoError(t, err, "FindPruneCandidates")
+			require.Len(t, got, tt.wantN,
+				"got %v", collectIDs(got))
+			if tt.wantOnly != "" {
+				assert.Equal(t, tt.wantOnly, got[0].ID,
+					"got %v", collectIDs(got))
+			}
+		})
+	}
+}
+
+func TestFindPruneCandidatesMaxMessagesSentinel(t *testing.T) {
+	d := testDB(t)
+
+	// m1: 0 user messages
+	insertSession(t, d, "m1", "p", func(s *Session) {
+		s.MessageCount = 0
+	})
+	// m2: 1 user message (default from insertSession)
+	insertSession(t, d, "m2", "p")
+	insertMessages(t, d, userMsg("m2", 0, "hello"))
+	// m3: 3 user messages + 2 assistant = 5 total
+	insertSession(t, d, "m3", "p", func(s *Session) {
+		s.MessageCount = 5
+	})
+	insertMessages(t, d,
+		userMsg("m3", 0, "msg1"),
+		asstMsg("m3", 1, "reply1"),
+		userMsg("m3", 2, "msg2"),
+		asstMsg("m3", 3, "reply2"),
+		userMsg("m3", 4, "msg3"),
+	)
+
+	tests := []struct {
+		name   string
+		filter PruneFilter
+		want   int
+	}{
+		{
+			name:   "ZeroMatchesOnlyZero",
+			filter: PruneFilter{MaxMessages: new(0)},
+			want:   1,
+		},
+		{
+			name: "NilDisablesFilter",
+			filter: PruneFilter{
+				Project: "p",
+			},
+			want: 3,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := d.FindPruneCandidates(t.Context(), tt.filter)
+			requireNoError(t, err, "FindPruneCandidates")
+			assert.Len(t, got, tt.want, "got")
+		})
+	}
+
+	// Additional check: MaxMessages=0 returns m1 specifically.
+	got, err := d.FindPruneCandidates(t.Context(), PruneFilter{MaxMessages: new(0)})
+	requireNoError(t, err, "FindPruneCandidates MaxMessages=0")
+	require.Len(t, got, 1, "MaxMessages 0:")
+	assert.Equal(t, "m1", got[0].ID, "MaxMessages 0")
+}
+
+func TestFindPruneCandidatesIgnoresSystemMessages(t *testing.T) {
+	d := testDB(t)
+
+	// Session with 1 real user message and 2 system user
+	// messages (Zencoder skill/finish). Only the real one
+	// should count toward MaxMessages.
+	insertSession(t, d, "zen1", "proj")
+	realMsg := userMsg("zen1", 0, "real user msg")
+	sysMsg1 := userMsg("zen1", 1, "system init")
+	sysMsg1.IsSystem = true
+	sysMsg2 := userMsg("zen1", 2, "skill finish")
+	sysMsg2.IsSystem = true
+	insertMessages(t, d, realMsg, sysMsg1, sysMsg2)
+
+	// MaxMessages=1 should include zen1 (1 real user msg).
+	got, err := d.FindPruneCandidates(t.Context(),
+		PruneFilter{MaxMessages: new(1)},
+	)
+	requireNoError(t, err, "FindPruneCandidates")
+	require.Len(t, got, 1, "expected 1 result")
+	assert.Equal(t, "zen1", got[0].ID, "got")
+
+	// MaxMessages=0 should NOT include zen1 (it has 1 real
+	// user message).
+	got, err = d.FindPruneCandidates(t.Context(),
+		PruneFilter{MaxMessages: new(0)},
+	)
+	requireNoError(t, err, "FindPruneCandidates")
+	require.Empty(t, got, "expected 0 results")
+}
+
+func TestDeleteSessions(t *testing.T) {
+	d := testDB(t)
+
+	for _, id := range []string{"s1", "s2", "s3"} {
+		insertSession(t, d, id, "p")
+		insertMessages(t, d, userMsg(id, 0, "msg for "+id))
+	}
+
+	stats, _ := d.GetStats(t.Context(), false, false)
+	require.Equal(t, 3, stats.SessionCount, "initial sessions")
+	require.Equal(t, 3, stats.MessageCount, "initial messages")
+
+	deleted, err := d.DeleteSessions(t.Context(), []string{"s1", "s3"})
+	requireNoError(t, err, "DeleteSessions")
+	assert.Equal(t, 2, deleted, "deleted")
+
+	requireSessionGone(t, d, "s1")
+	requireSessionExists(t, d, "s2")
+	requireSessionGone(t, d, "s3")
+
+	msgs, _ := d.GetAllMessages(t.Context(), "s1")
+	assert.Empty(t, msgs, "s1 messages")
+	msgs, _ = d.GetAllMessages(t.Context(), "s2")
+	assert.Len(t, msgs, 1, "s2 messages")
+
+	stats, _ = d.GetStats(t.Context(), false, false)
+	assert.Equal(t, 1, stats.SessionCount, "session_count")
+	assert.Equal(t, 1, stats.MessageCount, "message_count")
+
+	// Deleted sessions must be excluded.
+	assert.True(t, d.IsSessionExcluded(t.Context(), "s1"),
+		"s1 should be excluded after DeleteSessions")
+	assert.True(t, d.IsSessionExcluded(t.Context(), "s3"),
+		"s3 should be excluded after DeleteSessions")
+	assert.False(t, d.IsSessionExcluded(t.Context(), "s2"),
+		"s2 should not be excluded (not deleted)")
+
+	deleted, err = d.DeleteSessions(t.Context(), nil)
+	requireNoError(t, err, "DeleteSessions empty")
+	assert.Equal(t, 0, deleted, "deleted empty")
+}
+
+func TestDeleteSessionNonExistentNoGhostExclusion(t *testing.T) {
+	d := testDB(t)
+
+	// Deleting a non-existent ID should not create an exclusion.
+	requireNoError(t, d.DeleteSession(t.Context(), "bogus"), "DeleteSession bogus")
+	assert.False(t, d.IsSessionExcluded(t.Context(), "bogus"),
+		"bogus should not be excluded (no row deleted)")
+}
+
+func TestDeleteSessionsMixedBatchNoGhostExclusion(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "real", "p")
+
+	deleted, err := d.DeleteSessions(t.Context(), []string{"real", "bogus"})
+	requireNoError(t, err, "DeleteSessions mixed")
+	assert.Equal(t, 1, deleted, "deleted")
+	assert.True(t, d.IsSessionExcluded(t.Context(), "real"),
+		"real should be excluded after bulk delete")
+	assert.False(t, d.IsSessionExcluded(t.Context(), "bogus"),
+		"bogus should not be excluded (never existed)")
+}
+
+func TestSessionFileInfo(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s1", "p", func(s *Session) {
+		s.FileSize = new(int64(1024))
+		s.FileMtime = new(int64(1700000000))
+		s.FileHash = new("abc123def456")
+	})
+
+	gotSize, gotMtime, ok := d.GetSessionFileInfo(t.Context(), "s1")
+	require.True(t, ok, "expected ok")
+	assert.Equal(t, int64(1024), gotSize, "got size=")
+	assert.Equal(t, int64(1700000000), gotMtime, "got mtime=")
+
+	_, _, ok = d.GetSessionFileInfo(t.Context(), "nonexistent")
+	assert.False(t, ok, "expected !ok for nonexistent")
+}
+
+func TestGetSessionFull(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	t.Run("AllMetadata", func(t *testing.T) {
+		insertSession(t, d, "full-1", "proj", func(s *Session) {
+			s.FirstMessage = new("hello")
+			s.StartedAt = new(tsZero)
+			s.EndedAt = new(tsHour1)
+			s.MessageCount = 5
+			s.FilePath = new("/tmp/session.jsonl")
+			s.FileSize = new(int64(2048))
+			s.FileMtime = new(int64(1700000000))
+			s.FileHash = new("abc123")
+		})
+
+		got, err := d.GetSessionFull(ctx, "full-1")
+		requireNoError(t, err, "GetSessionFull")
+		require.NotNil(t, got, "expected non-nil session")
+		want := &Session{
+			ID:                 "full-1",
+			Project:            "proj",
+			MessageCount:       5,
+			FilePath:           new("/tmp/session.jsonl"),
+			FileSize:           new(int64(2048)),
+			FileMtime:          new(int64(1700000000)),
+			FileHash:           new("abc123"),
+			TranscriptRevision: new("0"),
+			FirstMessage:       new("hello"),
+			StartedAt:          new(tsZero),
+			EndedAt:            new(tsHour1),
+			Machine:            defaultMachine,
+			Agent:              defaultAgent,
+			Outcome:            "unknown",
+			OutcomeConfidence:  "low",
+			CreatedAt:          got.CreatedAt,
+		}
+		if diff := cmp.Diff(want, got); diff != "" {
+			assert.Failf(t, "GetSessionFull mismatch", "(-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("NullMetadata", func(t *testing.T) {
+		insertSession(t, d, "full-2", "proj", func(s *Session) {
+			s.MessageCount = 1
+		})
+
+		got, err := d.GetSessionFull(ctx, "full-2")
+		requireNoError(t, err, "GetSessionFull")
+		require.NotNil(t, got, "expected non-nil session")
+		want := &Session{
+			ID:                 "full-2",
+			Project:            "proj",
+			MessageCount:       1,
+			TranscriptRevision: new("0"),
+			Machine:            defaultMachine,
+			Agent:              defaultAgent,
+			Outcome:            "unknown",
+			OutcomeConfidence:  "low",
+			CreatedAt:          got.CreatedAt,
+		}
+		if diff := cmp.Diff(want, got); diff != "" {
+			assert.Failf(t, "GetSessionFull mismatch", "(-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("NotFound", func(t *testing.T) {
+		got, err := d.GetSessionFull(ctx, "nonexistent")
+		requireNoError(t, err, "GetSessionFull")
+		assert.Nil(t, got, "expected nil session")
+	})
+}
+
+func TestCursorEncodeDecode(t *testing.T) {
+	d := testDB(t)
+	encoded := d.EncodeCursor(SessionCursor{EndedAt: tsZero, ID: "session-1"})
+	cur, err := d.DecodeCursor(encoded)
+	requireNoError(t, err, "DecodeCursor")
+	assert.Equal(t, tsZero, cur.EndedAt, "EndedAt")
+	assert.Equal(t, "session-1", cur.ID, "ID")
+
+	encodedWithTotal := d.EncodeCursor(SessionCursor{
+		EndedAt: tsZero,
+		ID:      "session-1",
+		Total:   123,
+	})
+	cur, err = d.DecodeCursor(encodedWithTotal)
+	requireNoError(t, err, "DecodeCursor with total")
+	assert.Equal(t, 123, cur.Total, "Total")
+}
+
+func TestCursorTampering(t *testing.T) {
+	d := testDB(t)
+	// 1. Create a valid signed cursor
+	original := d.EncodeCursor(SessionCursor{EndedAt: tsZero, ID: "s1", Total: 100})
+
+	parts := strings.Split(original, ".")
+	require.Len(t, parts, 2, "expected 2 parts (payload.sig)")
+
+	payload := parts[0]
+	sig := parts[1]
+
+	// 2. Decode payload, modify Total, re-encode
+	data, err := base64.RawURLEncoding.DecodeString(payload)
+	requireNoError(t, err, "DecodeString payload")
+	var c SessionCursor
+	err = json.Unmarshal(data, &c)
+	require.NoError(t, err, "Unmarshal payload")
+	c.Total = 999
+	tamperedData, err := json.Marshal(c)
+	requireNoError(t, err, "Marshal tampered")
+	tamperedPayload := base64.RawURLEncoding.EncodeToString(tamperedData)
+
+	// 3. Construct tampered cursor with original signature
+	tamperedCursor := tamperedPayload + "." + sig
+
+	// 4. Decode should fail signature check
+	_, err = d.DecodeCursor(tamperedCursor)
+	require.Error(t, err, "expected error for tampered cursor, got nil")
+	assert.Contains(t, err.Error(), "signature mismatch",
+		"expected signature mismatch error")
+}
+
+func TestLegacyCursor(t *testing.T) {
+	d := testDB(t)
+	// Create a legacy cursor (base64 json only, no signature)
+	c := SessionCursor{
+		EndedAt: tsZero,
+		ID:      "s1",
+		Total:   100, // Should be ignored
+	}
+	data, err := json.Marshal(c)
+	requireNoError(t, err, "Marshal legacy")
+	legacy := base64.RawURLEncoding.EncodeToString(data)
+
+	// Decode
+	got, err := d.DecodeCursor(legacy)
+	requireNoError(t, err, "DecodeCursor legacy")
+
+	// Verify ID/EndedAt are preserved
+	assert.Equal(t, "s1", got.ID, "ID")
+	// Verify Total is ZEROED out
+	assert.Equal(t, 0, got.Total, "Total")
+}
+
+func TestCursorSecretConcurrency(t *testing.T) {
+	d := testDB(t)
+
+	const goroutines = 8
+	const iterations = 100
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for i := range goroutines {
+		go func(id int) {
+			defer wg.Done()
+			for j := range iterations {
+				switch id % 3 {
+				case 0:
+					secret := fmt.Appendf(
+						nil, "secret-%d-%d", id, j,
+					)
+					d.SetCursorSecret(secret)
+				case 1:
+					d.EncodeCursor(SessionCursor{
+						EndedAt: tsZero,
+						ID:      fmt.Sprintf("s-%d-%d", id, j),
+						Total:   42,
+					})
+				case 2:
+					encoded := d.EncodeCursor(SessionCursor{
+						EndedAt: tsZero, ID: "s1",
+					})
+					// Decode may fail if secret rotated
+					// between encode and decode; that's OK.
+					_, err := d.DecodeCursor(encoded)
+					if err != nil {
+						assert.ErrorIs(t, err, ErrInvalidCursor,
+							"unexpected DecodeCursor error")
+					}
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+func TestSetCursorSecretDefensiveCopy(t *testing.T) {
+	d := testDB(t)
+
+	secret := []byte("my-secret-key-for-testing-copy!!")
+	d.SetCursorSecret(secret)
+
+	encoded := d.EncodeCursor(SessionCursor{EndedAt: tsZero, ID: "s1"})
+
+	// Mutate the original slice — should not affect the DB.
+	for i := range secret {
+		secret[i] = 0
+	}
+
+	_, err := d.DecodeCursor(encoded)
+	require.NoError(t, err,
+		"DecodeCursor failed after caller mutated secret")
+}
+
+func TestDeleteSession(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s1", "p")
+	insertMessages(t, d, userMsg("s1", 0, "test"))
+
+	err := d.DeleteSession(t.Context(), "s1")
+	require.NoError(t, err, "DeleteSession")
+
+	requireSessionGone(t, d, "s1")
+
+	msgs, _ := d.GetAllMessages(t.Context(), "s1")
+	assert.Empty(t, msgs, "expected 0 messages after cascade, got")
+}
+
+func TestMigrationRace(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "race.db")
+
+	// 1. Create a current schema so concurrent Opens exercise
+	// the normal init path (old schemas are now dropped and
+	// rebuilt, making concurrent migration less interesting).
+	db1, err := Open(t.Context(), path)
+	requireNoError(t, err, "setup")
+	db1.Close()
+
+	// 2. Run concurrent Open.
+	errCh := make(chan error, 2)
+	var (
+		mu         sync.Mutex
+		cond       = sync.NewCond(&mu)
+		readyCount = 0
+		start      = false
+	)
+
+	for range 2 {
+		go func() {
+			mu.Lock()
+			readyCount++
+			if readyCount == 2 {
+				cond.Broadcast()
+			}
+			for !start {
+				cond.Wait()
+			}
+			mu.Unlock()
+
+			db, err := Open(t.Context(), path)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			db.Close()
+			errCh <- nil
+		}()
+	}
+
+	mu.Lock()
+	for readyCount < 2 {
+		cond.Wait()
+	}
+	start = true
+	cond.Broadcast()
+	mu.Unlock()
+
+	var successes int
+	for range 2 {
+		if err := <-errCh; err != nil {
+			msg := err.Error()
+			isLockErr := strings.Contains(msg, "database is locked") ||
+				strings.Contains(msg, "database schema is locked") ||
+				strings.Contains(msg, "SQLITE_BUSY") ||
+				strings.Contains(msg, "SQLITE_LOCKED")
+			if isLockErr {
+				t.Logf("concurrent Open lock contention: %v", err)
+			} else {
+				assert.Fail(t,
+					"unexpected concurrent Open error",
+					err.Error())
+			}
+		} else {
+			successes++
+		}
+	}
+	require.NotEqual(t, 0, successes, "both concurrent Opens failed")
+
+	// 3. Verify schema is intact
+	dbCheck, err := Open(t.Context(), path)
+	requireNoError(t, err, "re-open")
+	defer dbCheck.Close()
+
+	_, err = dbCheck.getWriter().Exec(t.Context(),
+		"SELECT parent_session_id FROM sessions LIMIT 1",
+	)
+	assert.NoError(t, err, "parent_session_id column missing")
+}
+
+func TestToolCallsInsertedWithMessages(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s1", "p", func(s *Session) {
+		s.MessageCount = 2
+	})
+
+	m1 := userMsg("s1", 0, "hello")
+	m2 := asstMsg("s1", 1, "[Read: main.go]")
+	m2.HasToolUse = true
+	m2.ToolCalls = []ToolCall{
+		{SessionID: "s1", ToolName: "Read", Category: "Read"},
+		{SessionID: "s1", ToolName: "Grep", Category: "Grep"},
+	}
+
+	insertMessages(t, d, m1, m2)
+
+	// Query tool_calls directly
+	rows, err := d.Reader().Query(t.Context(),
+		`SELECT message_id, session_id, tool_name, category
+		 FROM tool_calls WHERE session_id = ?
+		 ORDER BY id`, "s1")
+	requireNoError(t, err, "query tool_calls")
+	defer rows.Close()
+
+	var calls []ToolCall
+	for rows.Next() {
+		var tc ToolCall
+		require.NoError(t, rows.Scan(
+			&tc.MessageID, &tc.SessionID,
+			&tc.ToolName, &tc.Category,
+		), "scan tool_call")
+		calls = append(calls, tc)
+	}
+	err = rows.Err()
+	require.NoError(t, err, "rows.Err")
+
+	require.Len(t, calls, 2, "len")
+	assert.Equal(t, "Read", calls[0].ToolName,
+		"calls[0]: %+v", calls[0])
+	assert.Equal(t, "Read", calls[0].Category,
+		"calls[0]: %+v", calls[0])
+	assert.Equal(t, "Grep", calls[1].ToolName,
+		"calls[1]: %+v", calls[1])
+	assert.Equal(t, "Grep", calls[1].Category,
+		"calls[1]: %+v", calls[1])
+	assert.NotEqual(t, int64(0), calls[0].MessageID,
+		"message_id should be non-zero")
+	assert.Equal(t, "s1", calls[0].SessionID, "session_id")
+}
+
+func TestToolCallsCascadeOnSessionDelete(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s1", "p")
+
+	m := asstMsg("s1", 0, "[Bash]")
+	m.HasToolUse = true
+	m.ToolCalls = []ToolCall{
+		{SessionID: "s1", ToolName: "Bash", Category: "Bash"},
+	}
+	insertMessages(t, d, m)
+
+	err := d.DeleteSession(t.Context(), "s1")
+	require.NoError(t, err, "DeleteSession")
+
+	var count int
+	require.NoError(t, d.Reader().QueryRow(t.Context(),
+		"SELECT COUNT(*) FROM tool_calls WHERE session_id = ?",
+		"s1",
+	).Scan(&count), "count tool_calls")
+	assert.Equal(t, 0, count, "tool_calls count")
+}
+
+func TestReplaceSessionMessagesReplacesToolCalls(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s1", "p")
+
+	m := asstMsg("s1", 0, "[Read: a.go]")
+	m.HasToolUse = true
+	m.ToolCalls = []ToolCall{
+		{SessionID: "s1", ToolName: "Read", Category: "Read"},
+	}
+	insertMessages(t, d, m)
+
+	// Replace with different tool calls
+	m2 := asstMsg("s1", 0, "[Bash]")
+	m2.HasToolUse = true
+	m2.ToolCalls = []ToolCall{
+		{SessionID: "s1", ToolName: "Bash", Category: "Bash"},
+		{SessionID: "s1", ToolName: "Write", Category: "Write"},
+	}
+	err := d.ReplaceSessionMessages(t.Context(), "s1", []Message{m2})
+	require.NoError(t, err, "ReplaceSessionMessages")
+
+	var names []string
+	rows, err := d.Reader().Query(t.Context(),
+		`SELECT tool_name FROM tool_calls
+		 WHERE session_id = ? ORDER BY id`, "s1")
+	requireNoError(t, err, "query")
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		err := rows.Scan(&name)
+		require.NoError(t, err, "scan")
+		names = append(names, name)
+	}
+	err = rows.Err()
+	require.NoError(t, err, "rows.Err")
+
+	require.Len(t, names, 2, "len")
+	assert.Equal(t, "Bash", names[0], "names[0]")
+	assert.Equal(t, "Write", names[1], "names[1]")
+}
+
+func TestReplaceSessionMessagesReplacesToolResultEvents(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s1", "p")
+
+	m1 := asstMsg("s1", 0, "[Wait]")
+	m1.HasToolUse = true
+	m1.ToolCalls = []ToolCall{{
+		SessionID:           "s1",
+		ToolName:            "wait",
+		Category:            "Other",
+		ToolUseID:           "call_wait",
+		ResultContent:       "old result",
+		ResultContentLength: len("old result"),
+		ResultEvents: []ToolResultEvent{{
+			ToolUseID:     "call_wait",
+			AgentID:       "agent-1",
+			Source:        "wait_output",
+			Status:        "completed",
+			Content:       "old result",
+			ContentLength: len("old result"),
+			EventIndex:    0,
+		}},
+	}}
+	insertMessages(t, d, m1)
+
+	m2 := asstMsg("s1", 0, "[Wait]")
+	m2.HasToolUse = true
+	m2.ToolCalls = []ToolCall{{
+		SessionID:           "s1",
+		ToolName:            "wait",
+		Category:            "Other",
+		ToolUseID:           "call_wait",
+		ResultContent:       "new result",
+		ResultContentLength: len("new result"),
+		ResultEvents: []ToolResultEvent{{
+			ToolUseID:     "call_wait",
+			AgentID:       "agent-1",
+			Source:        "wait_output",
+			Status:        "completed",
+			Content:       "new result",
+			ContentLength: len("new result"),
+			EventIndex:    0,
+		}},
+	}}
+	err := d.ReplaceSessionMessages(t.Context(), "s1", []Message{m2})
+	require.NoError(t, err, "ReplaceSessionMessages")
+
+	msgs, err := d.GetAllMessages(t.Context(), "s1")
+	requireNoError(t, err, "GetAllMessages")
+	require.Len(t, msgs, 1, "messages len =")
+	require.Len(t, msgs[0].ToolCalls, 1, "tool calls len =")
+	tc := msgs[0].ToolCalls[0]
+	require.Equal(t, "new result", tc.ResultContent, "result_content")
+	require.Len(t, tc.ResultEvents, 1, "result events len =")
+	require.Equal(t, "new result", tc.ResultEvents[0].Content, "event content")
+
+	var count int
+	err = d.Reader().QueryRow(t.Context(),
+		"SELECT COUNT(*) FROM tool_result_events WHERE session_id = ?",
+		"s1",
+	).Scan(&count)
+	requireNoError(t, err, "count tool_result_events")
+	require.Equal(t, 1, count, "tool_result_events count")
+}
+
+func TestToolCallsNoToolCalls(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s1", "p")
+	insertMessages(t, d, userMsg("s1", 0, "hello"))
+
+	var count int
+	require.NoError(t, d.Reader().QueryRow(t.Context(),
+		"SELECT COUNT(*) FROM tool_calls WHERE session_id = ?",
+		"s1",
+	).Scan(&count), "count")
+	assert.Equal(t, 0, count, "tool_calls count")
+}
+
+func TestToolCallsMixedSessionsOverlappingOrdinals(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s1", "p")
+	insertSession(t, d, "s2", "p")
+
+	// Both sessions have ordinal 0 with tool calls
+	m1 := asstMsg("s1", 0, "[Read]")
+	m1.HasToolUse = true
+	m1.ToolCalls = []ToolCall{
+		{SessionID: "s1", ToolName: "Read", Category: "Read"},
+	}
+	m2 := asstMsg("s2", 0, "[Bash]")
+	m2.HasToolUse = true
+	m2.ToolCalls = []ToolCall{
+		{SessionID: "s2", ToolName: "Bash", Category: "Bash"},
+	}
+
+	insertMessages(t, d, m1, m2)
+
+	// Verify each tool_call.message_id joins to the correct
+	// session: Read→s1, Bash→s2.
+	rows, err := d.Reader().Query(t.Context(), `
+		SELECT tc.tool_name, tc.session_id, m.session_id
+		FROM tool_calls tc
+		JOIN messages m ON m.id = tc.message_id
+		ORDER BY tc.tool_name`)
+	requireNoError(t, err, "query")
+	defer rows.Close()
+
+	type row struct {
+		toolName, tcSession, msgSession string
+	}
+	var got []row
+	for rows.Next() {
+		var r row
+		require.NoError(t, rows.Scan(
+			&r.toolName, &r.tcSession, &r.msgSession,
+		), "scan")
+		got = append(got, r)
+	}
+	err = rows.Err()
+	require.NoError(t, err, "rows.Err")
+
+	require.Len(t, got, 2, "len")
+	// Bash should be linked to s2
+	assert.Equal(t, "Bash", got[0].toolName, "Bash toolName")
+	assert.Equal(t, "s2", got[0].tcSession, "Bash tcSession")
+	assert.Equal(t, "s2", got[0].msgSession, "Bash msgSession")
+	// Read should be linked to s1
+	assert.Equal(t, "Read", got[1].toolName, "Read toolName")
+	assert.Equal(t, "s1", got[1].tcSession, "Read tcSession")
+	assert.Equal(t, "s1", got[1].msgSession, "Read msgSession")
+}
+
+func TestResolveToolCallsPanicsOnLengthMismatch(t *testing.T) {
+	defer func() {
+		r := recover()
+		require.NotNil(t, r, "expected panic, got none")
+		msg, ok := r.(string)
+		assert.True(t, ok && strings.Contains(msg, "resolveToolCalls"),
+			"unexpected panic value: %v", r)
+	}()
+
+	msgs := []Message{
+		{SessionID: "s1", Ordinal: 0, Role: "user"},
+		{SessionID: "s1", Ordinal: 1, Role: "assistant"},
+	}
+	ids := []int64{1} // length mismatch
+	resolveToolCalls(msgs, ids)
+}
+
+func TestToolCallNewColumns(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:     "s1",
+		Ordinal:       0,
+		Role:          "assistant",
+		Content:       "[Read: main.go]",
+		ContentLength: 15,
+		Timestamp:     tsZero,
+		ToolCalls: []ToolCall{{
+			SessionID:           "s1",
+			ToolName:            "Read",
+			Category:            "Read",
+			ToolUseID:           "toolu_abc",
+			InputJSON:           `{"file_path":"main.go"}`,
+			ResultContentLength: 500,
+		}},
+	})
+
+	var toolUseID, inputJSON sql.NullString
+	var resultLen sql.NullInt64
+	err := d.Reader().QueryRow(t.Context(), `
+        SELECT tool_use_id, input_json, result_content_length
+        FROM tool_calls WHERE session_id = 's1'
+    `).Scan(&toolUseID, &inputJSON, &resultLen)
+	requireNoError(t, err, "query tool_calls")
+	require.True(t, toolUseID.Valid, "tool_use_id valid")
+	assert.Equal(t, "toolu_abc", toolUseID.String, "tool_use_id")
+	require.True(t, inputJSON.Valid, "input_json valid")
+	assert.Equal(t, `{"file_path":"main.go"}`, inputJSON.String, "input_json")
+	require.True(t, resultLen.Valid, "result_content_length valid")
+	assert.Equal(t, int64(500), resultLen.Int64, "result_content_length")
+}
+
+func TestToolCallSkillName(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:     "s1",
+		Ordinal:       0,
+		Role:          "assistant",
+		Content:       "[Skill: superpowers:brainstorming]",
+		ContentLength: 34,
+		Timestamp:     tsZero,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "Skill",
+			Category:  "Tool",
+			ToolUseID: "toolu_skill1",
+			InputJSON: `{"skill":"superpowers:brainstorming"}`,
+			SkillName: "superpowers:brainstorming",
+		}},
+	})
+
+	var skillName sql.NullString
+	err := d.Reader().QueryRow(t.Context(), `
+        SELECT skill_name FROM tool_calls WHERE session_id = 's1'
+    `).Scan(&skillName)
+	requireNoError(t, err, "query")
+	require.True(t, skillName.Valid, "skill_name valid")
+	assert.Equal(t, "superpowers:brainstorming", skillName.String, "skill_name")
+}
+
+func TestGetMessagesReturnsToolCalls(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:     "s1",
+		Ordinal:       0,
+		Role:          "assistant",
+		Content:       "[Skill: superpowers:brainstorming]",
+		ContentLength: 34,
+		Timestamp:     tsZero,
+		HasToolUse:    true,
+		ToolCalls: []ToolCall{{
+			SessionID:           "s1",
+			ToolName:            "Skill",
+			Category:            "Tool",
+			ToolUseID:           "toolu_s1",
+			InputJSON:           `{"skill":"superpowers:brainstorming"}`,
+			SkillName:           "superpowers:brainstorming",
+			ResultContentLength: 42,
+		}},
+	})
+
+	msgs, err := d.GetMessages(
+		t.Context(), "s1", 0, 100, true,
+	)
+	requireNoError(t, err, "GetMessages")
+	require.Len(t, msgs, 1, "len")
+	require.Len(t, msgs[0].ToolCalls, 1, "got")
+	tc := msgs[0].ToolCalls[0]
+	assert.Equal(t, "Skill", tc.ToolName, "ToolName")
+	assert.Equal(t, "superpowers:brainstorming", tc.SkillName, "SkillName")
+	assert.Equal(t, `{"skill":"superpowers:brainstorming"}`,
+		tc.InputJSON, "InputJSON")
+	assert.Equal(t, 42, tc.ResultContentLength, "ResultContentLength =")
+}
+
+func TestToolCallResultContent(t *testing.T) {
+	database := testDB(t)
+	sess := Session{
+		ID: "sess-rc", Project: "p", Machine: "m", Agent: "claude",
+	}
+	err := database.UpsertSession(t.Context(), sess)
+	require.NoError(t, err, "upsert")
+	msgs := []Message{
+		{
+			SessionID: "sess-rc",
+			Ordinal:   0,
+			Role:      "assistant",
+			Content:   "ok",
+			ToolCalls: []ToolCall{
+				{
+					SessionID:     "sess-rc",
+					ToolName:      "Bash",
+					Category:      "Bash",
+					ToolUseID:     "tu-rc",
+					ResultContent: "[main abc1234] Add feature\n 1 file changed",
+				},
+			},
+		},
+	}
+	err = database.InsertMessages(t.Context(), msgs)
+	require.NoError(t, err, "insert")
+	retrieved, err := database.GetMessages(
+		t.Context(), "sess-rc", 0, 10, true,
+	)
+	require.NoError(t, err, "get")
+	require.Len(t, retrieved, 1, "expected 1 msg")
+	require.Len(t, retrieved[0].ToolCalls, 1, "expected 1 tool call")
+	tc := retrieved[0].ToolCalls[0]
+	assert.Equal(t, "[main abc1234] Add feature\n 1 file changed",
+		tc.ResultContent, "ResultContent")
+}
+
+func TestGetAllMessagesReturnsToolCallsAcrossBatches(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	total := attachToolCallBatchSize + 25
+	msgs := make([]Message, 0, total)
+	for i := range total {
+		content := fmt.Sprintf("[Read: file-%d.txt]", i)
+		msgs = append(msgs, Message{
+			SessionID:     "s1",
+			Ordinal:       i,
+			Role:          "assistant",
+			Content:       content,
+			ContentLength: len(content),
+			Timestamp:     tsZero,
+			HasToolUse:    true,
+			ToolCalls: []ToolCall{{
+				SessionID: "s1",
+				ToolName:  "Read",
+				Category:  "Read",
+				ToolUseID: fmt.Sprintf("toolu_%d", i),
+			}},
+		})
+	}
+	insertMessages(t, d, msgs...)
+
+	got, err := d.GetAllMessages(t.Context(), "s1")
+	requireNoError(t, err, "GetAllMessages")
+	require.Len(t, got, total, "got")
+
+	for i := range total {
+		require.Len(t, got[i].ToolCalls, 1,
+			"msg %d: tool_calls", i)
+		require.Equal(t, fmt.Sprintf("toolu_%d", i),
+			got[i].ToolCalls[0].ToolUseID,
+			"msg %d: tool_use_id", i)
+	}
+}
+
+func TestToolCallSubagentSessionID(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:     "s1",
+		Ordinal:       0,
+		Role:          "assistant",
+		Content:       "[Task: implement feature]",
+		ContentLength: 24,
+		Timestamp:     tsZero,
+		HasToolUse:    true,
+		ToolCalls: []ToolCall{{
+			SessionID:         "s1",
+			ToolName:          "Task",
+			Category:          "Tool",
+			ToolUseID:         "toolu_task1",
+			SubagentSessionID: "agent-abc123",
+		}},
+	})
+
+	// Verify via raw SQL that the column is stored
+	var subagentID sql.NullString
+	err := d.Reader().QueryRow(t.Context(), `
+		SELECT subagent_session_id
+		FROM tool_calls WHERE session_id = 's1'
+	`).Scan(&subagentID)
+	requireNoError(t, err, "query tool_calls")
+	require.True(t, subagentID.Valid, "subagent_session_id valid")
+	assert.Equal(t, "agent-abc123", subagentID.String,
+		"subagent_session_id")
+
+	// Verify via GetMessages that it round-trips
+	msgs, err := d.GetMessages(
+		t.Context(), "s1", 0, 100, true,
+	)
+	requireNoError(t, err, "GetMessages")
+	require.Len(t, msgs, 1, "len")
+	require.Len(t, msgs[0].ToolCalls, 1, "got")
+	tc := msgs[0].ToolCalls[0]
+	assert.Equal(t, "agent-abc123", tc.SubagentSessionID, "SubagentSessionID")
+
+	// Verify empty SubagentSessionID stores as NULL
+	insertSession(t, d, "s2", "proj")
+	insertMessages(t, d, Message{
+		SessionID:     "s2",
+		Ordinal:       0,
+		Role:          "assistant",
+		Content:       "[Read: main.go]",
+		ContentLength: 15,
+		Timestamp:     tsZero,
+		HasToolUse:    true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s2",
+			ToolName:  "Read",
+			Category:  "Read",
+			ToolUseID: "toolu_read1",
+		}},
+	})
+
+	var nullSubagent sql.NullString
+	err = d.Reader().QueryRow(t.Context(), `
+		SELECT subagent_session_id
+		FROM tool_calls WHERE session_id = 's2'
+	`).Scan(&nullSubagent)
+	requireNoError(t, err, "query tool_calls s2")
+	assert.False(t, nullSubagent.Valid,
+		"expected NULL subagent_session_id for s2, got %q",
+		nullSubagent.String)
+}
+
+func TestSetToolCallSubagentSession(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:     "s1",
+		Ordinal:       0,
+		Role:          "assistant",
+		Content:       "[Task: implement feature]",
+		ContentLength: 24,
+		Timestamp:     tsZero,
+		HasToolUse:    true,
+		ToolCalls: []ToolCall{
+			{
+				SessionID: "s1",
+				ToolName:  "Task",
+				Category:  "Task",
+				ToolUseID: "toolu_task1",
+			},
+			{
+				SessionID:         "s1",
+				ToolName:          "Task",
+				Category:          "Task",
+				ToolUseID:         "toolu_task2",
+				SubagentSessionID: "agent-existing",
+			},
+		},
+	})
+
+	requireNoError(t, d.SetToolCallSubagentSession(t.Context(), "s1", "toolu_task1", "agent-new"), "set subagent session")
+
+	rows, err := d.Reader().Query(t.Context(), `
+		SELECT tool_use_id, COALESCE(subagent_session_id, '')
+		FROM tool_calls
+		WHERE session_id = 's1'
+		ORDER BY tool_use_id`)
+	requireNoError(t, err, "query tool_calls")
+	defer rows.Close()
+
+	got := map[string]string{}
+	for rows.Next() {
+		var toolUseID, subagent string
+		requireNoError(t, rows.Scan(&toolUseID, &subagent), "scan tool_calls")
+		got[toolUseID] = subagent
+	}
+	requireNoError(t, rows.Err(), "rows")
+	assert.Equal(t, "agent-new", got["toolu_task1"], "toolu_task1 subagent")
+	assert.Equal(t, "agent-existing", got["toolu_task2"], "toolu_task2 subagent")
+}
+
+func TestWriteSessionIncrementalBlocksLinkedResultContent(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "Agent",
+			Category:  "Task",
+			ToolUseID: "toolu_blocked",
+		}},
+	})
+	before, err := d.GetSession(t.Context(), "s1")
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.NotNil(t, before.TranscriptRevision)
+	assert.Equal(t, "1", *before.TranscriptRevision)
+
+	update := IncrementalSessionUpdate{
+		MsgCount:    1,
+		NextOrdinal: 1,
+		SubagentLinks: []ToolCallSubagentLink{{
+			ToolUseID:         "toolu_blocked",
+			SubagentSessionID: "agent-child",
+			ResultContent:     "secret result",
+			ResultContentLen:  len("secret result"),
+			HasResult:         true,
+		}},
+		BlockedResultCategories: map[string]bool{"Task": true},
+	}
+	_, werr := d.WriteSessionIncremental(t.Context(), "s1", nil, update)
+	require.NoError(t, werr, "incremental write")
+
+	var subagent, content string
+	var contentLen int
+	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+		SELECT COALESCE(subagent_session_id, ''), result_content_length,
+		       COALESCE(result_content, '')
+		FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "toolu_blocked",
+	).Scan(&subagent, &contentLen, &content), "query linked result")
+	assert.Equal(t, "agent-child", subagent)
+	assert.Equal(t, len("secret result"), contentLen)
+	assert.Empty(t, content)
+	after, err := d.GetSession(t.Context(), "s1")
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.TranscriptRevision)
+	assert.Equal(t, "2", *after.TranscriptRevision)
+
+	_, werr = d.WriteSessionIncremental(t.Context(), "s1", nil, update)
+	require.NoError(t, werr, "idempotent incremental write")
+	idempotent, err := d.GetSession(t.Context(), "s1")
+	require.NoError(t, err)
+	require.NotNil(t, idempotent)
+	require.NotNil(t, idempotent.TranscriptRevision)
+	assert.Equal(t, "2", *idempotent.TranscriptRevision)
+}
+
+// A result-only link (empty SubagentSessionID, HasResult set) carries a
+// tool_result appended after its tool_use was stored. It must update
+// the stored call's result fields without touching an existing
+// subagent linkage, and no-op for unknown tool_use ids.
+func TestWriteSessionIncrementalResultOnlyLink(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID:         "s1",
+			ToolName:          "Task",
+			Category:          "Task",
+			ToolUseID:         "toolu_linked",
+			SubagentSessionID: "agent-existing",
+		}, {
+			SessionID: "s1",
+			ToolName:  "Bash",
+			Category:  "Bash",
+			ToolUseID: "toolu_bash",
+		}},
+	})
+
+	update := IncrementalSessionUpdate{
+		MsgCount:    1,
+		NextOrdinal: 1,
+		SubagentLinks: []ToolCallSubagentLink{{
+			ToolUseID:        "toolu_bash",
+			ResultContent:    "late result",
+			ResultContentLen: len("late result"),
+			HasResult:        true,
+		}, {
+			ToolUseID:        "toolu_unknown",
+			ResultContent:    "orphan result",
+			ResultContentLen: len("orphan result"),
+			HasResult:        true,
+		}},
+	}
+	_, werr := d.WriteSessionIncremental(t.Context(), "s1", nil, update)
+	require.NoError(t, werr)
+
+	var subagent, content string
+	var contentLen int
+	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+		SELECT COALESCE(subagent_session_id, ''), result_content_length,
+		       COALESCE(result_content, '')
+		FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "toolu_bash",
+	).Scan(&subagent, &contentLen, &content))
+	assert.Empty(t, subagent)
+	assert.Equal(t, len("late result"), contentLen)
+	assert.Equal(t, "late result", content)
+
+	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+		SELECT COALESCE(subagent_session_id, '')
+		FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "toolu_linked",
+	).Scan(&subagent))
+	assert.Equal(t, "agent-existing", subagent,
+		"result-only link must not disturb other calls")
+}
+
+func TestWriteSessionIncrementalToolCallResultUpdate(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			ToolUseID: "call_cmd",
+		}},
+	})
+
+	update := IncrementalSessionUpdate{
+		MsgCount:    1,
+		NextOrdinal: 1,
+		ToolCallResultUpdates: []ToolCallResultUpdate{{
+			ToolUseID: "call_cmd",
+			Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
+			Events: []ToolResultEvent{{
+				ToolUseID:     "call_cmd",
+				Source:        "function_call_output",
+				Content:       "command finished",
+				ContentLength: len("command finished"),
+				Timestamp:     "2026-08-02T09:00:00Z",
+			}},
+		}},
+	}
+	_, werr := d.WriteSessionIncremental(t.Context(), "s1", nil, update)
+	require.NoError(t, werr)
+
+	var result string
+	var resultLen int
+	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+		SELECT COALESCE(result_content, ''), result_content_length
+		FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "call_cmd",
+	).Scan(&result, &resultLen))
+	assert.Empty(t, result, "the sole event already stores the summary")
+	loaded, err := d.GetAllMessages(t.Context(), "s1")
+	require.NoError(t, err)
+	require.Len(t, loaded, 1)
+	require.Len(t, loaded[0].ToolCalls, 1)
+	assert.Equal(t, "command finished", loaded[0].ToolCalls[0].ResultContent)
+	assert.Equal(t, len("command finished"), resultLen)
+
+	var source, content, timestamp string
+	var eventIndex, eventCount int
+	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+		SELECT source, content, COALESCE(timestamp, ''), event_index
+		FROM tool_result_events
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "call_cmd",
+	).Scan(&source, &content, &timestamp, &eventIndex))
+	assert.Equal(t, "function_call_output", source)
+	assert.Equal(t, "command finished", content)
+	assert.Equal(t, "2026-08-02T09:00:00Z", timestamp)
+	assert.Zero(t, eventIndex)
+
+	_, werr = d.WriteSessionIncremental(t.Context(), "s1", nil, update)
+	require.NoError(t, werr,
+		"replaying an identical output must be idempotent")
+	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+		SELECT COUNT(*) FROM tool_result_events
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "call_cmd",
+	).Scan(&eventCount))
+	assert.Equal(t, 1, eventCount)
+
+	sess, err := d.GetSession(t.Context(), "s1")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TranscriptRevision)
+	assert.Equal(t, "2", *sess.TranscriptRevision,
+		"idempotent replay must not bump the transcript revision")
+}
+
+func TestWriteSessionIncrementalTargetsDuplicateCallIDOccurrence(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	for ordinal := range 2 {
+		insertMessages(t, d, Message{
+			SessionID:  "s1",
+			Ordinal:    ordinal,
+			Role:       "assistant",
+			HasToolUse: true,
+			ToolCalls: []ToolCall{{
+				SessionID: "s1",
+				ToolName:  "exec_command",
+				Category:  "Bash",
+				ToolUseID: "reused-call",
+			}},
+		})
+	}
+
+	write := func(position ToolCallPosition, content string) {
+		t.Helper()
+		_, err := d.WriteSessionIncremental(t.Context(), "s1", nil, IncrementalSessionUpdate{
+			MsgCount:    2,
+			NextOrdinal: 2,
+			ToolCallResultUpdates: []ToolCallResultUpdate{{
+				ToolUseID: "reused-call",
+				Position:  position,
+				Events: []ToolResultEvent{{
+					ToolUseID:     "reused-call",
+					Source:        "function_call_output",
+					Content:       content,
+					ContentLength: len(content),
+				}},
+			}},
+		})
+		require.NoError(t, err)
+	}
+
+	write(ToolCallPosition{MessageOrdinal: 1, CallIndex: 0}, "second")
+
+	msgs, err := d.GetAllMessages(t.Context(), "s1")
+	require.NoError(t, err)
+	got := make(map[int]string)
+	for _, msg := range msgs {
+		require.Len(t, msg.ToolCalls, 1)
+		got[msg.Ordinal] = msg.ToolCalls[0].ResultContent
+	}
+	assert.Equal(t, map[int]string{0: "", 1: "second"}, got)
+
+	var eventCount int
+	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+		SELECT COUNT(*) FROM tool_result_events
+		WHERE session_id = ? AND tool_call_message_ordinal = ?
+		  AND call_index = ?`, "s1", 1, 0).Scan(&eventCount))
+	assert.Equal(t, 1, eventCount)
+
+	write(ToolCallPosition{MessageOrdinal: 0, CallIndex: 0}, "first")
+	var stateOccurrences int
+	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+		SELECT COUNT(DISTINCT printf('%d/%d', message_ordinal, call_index))
+		FROM tool_call_occurrence_agent_state
+		WHERE session_id = ?`, "s1").Scan(&stateOccurrences))
+	assert.Equal(t, 2, stateOccurrences,
+		"reused provider IDs must keep independent per-occurrence state")
+}
+
+func TestWriteSessionIncrementalLateResultAndCommittedUsageAreAtomic(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			ToolUseID: "call_cmd",
+		}},
+	})
+
+	update := IncrementalSessionUpdate{
+		MsgCount:    1,
+		NextOrdinal: 1,
+		ToolCallResultUpdates: []ToolCallResultUpdate{{
+			ToolUseID: "call_cmd",
+			Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
+			Events: []ToolResultEvent{{
+				ToolUseID:     "call_cmd",
+				Source:        "function_call_output",
+				Content:       "command finished",
+				ContentLength: len("command finished"),
+			}},
+		}},
+		MessageTokenUsageUpdates: []MessageTokenUsageUpdate{{
+			Ordinal:          0,
+			TokenUsage:       jsontext.Value(`{"input_tokens":100000,"output_tokens":250}`),
+			ContextTokens:    100000,
+			OutputTokens:     250,
+			HasContextTokens: true,
+			HasOutputTokens:  true,
+		}},
+	}
+	_, werr := d.WriteSessionIncremental(t.Context(), "s1", nil, update)
+	require.NoError(t, werr)
+
+	var tokenUsage string
+	var contextTokens, outputTokens int
+	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+		SELECT token_usage, context_tokens, output_tokens
+		FROM messages WHERE session_id = ? AND ordinal = ?`,
+		"s1", 0,
+	).Scan(&tokenUsage, &contextTokens, &outputTokens))
+	assert.JSONEq(t, `{"input_tokens":100000,"output_tokens":250}`, tokenUsage)
+	assert.Equal(t, 100000, contextTokens)
+	assert.Equal(t, 250, outputTokens)
+	msgs, err := d.GetAllMessages(t.Context(), "s1")
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.Len(t, msgs[0].ToolCalls, 1)
+	assert.Equal(t, "command finished", msgs[0].ToolCalls[0].ResultContent)
+
+	sess, err := d.GetSession(t.Context(), "s1")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TranscriptRevision)
+	assert.Equal(t, "2", *sess.TranscriptRevision)
+
+	_, werr = d.WriteSessionIncremental(t.Context(), "s1", nil, update)
+	require.NoError(t, werr, "identical late-result usage replay must be idempotent")
+	sess, err = d.GetSession(t.Context(), "s1")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TranscriptRevision)
+	assert.Equal(t, "2", *sess.TranscriptRevision)
+}
+
+func TestWriteSessionIncrementalResultEventIndexesAreMonotonic(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			ToolUseID: "call_cmd",
+		}},
+	})
+
+	for _, content := range []string{"first output", "second output"} {
+		_, werr := d.WriteSessionIncremental(t.Context(), "s1", nil, IncrementalSessionUpdate{
+			MsgCount:    1,
+			NextOrdinal: 1,
+			ToolCallResultUpdates: []ToolCallResultUpdate{{
+				ToolUseID: "call_cmd",
+				Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
+				Events: []ToolResultEvent{{
+					ToolUseID:     "call_cmd",
+					Source:        "function_call_output",
+					Content:       content,
+					ContentLength: len(content),
+				}},
+			}},
+		})
+		require.NoError(t, werr)
+	}
+
+	var secondRows int
+	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+		SELECT COUNT(*) FROM tool_result_events
+		WHERE session_id = ? AND tool_use_id = ? AND event_index = 1`,
+		"s1", "call_cmd",
+	).Scan(&secondRows))
+	assert.Equal(t, 1, secondRows,
+		"each late result event must get the next per-call event index")
+
+	var latestIndex int
+	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+		SELECT latest_event_index FROM tool_call_occurrence_agent_state
+		WHERE session_id = ? AND message_ordinal = ? AND call_index = ?
+		  AND agent_id = ''`,
+		"s1", 0, 0,
+	).Scan(&latestIndex))
+	assert.Equal(t, 1, latestIndex,
+		"the agent state must point at the newest event")
+
+	var result string
+	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+		SELECT COALESCE(result_content, '') FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "call_cmd",
+	).Scan(&result))
+	assert.Equal(t, "second output", result)
+}
+
+func TestWriteSessionIncrementalBlockedResultKeepsLength(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			ToolUseID: "call_cmd",
+		}},
+	})
+
+	_, werr := d.WriteSessionIncremental(t.Context(), "s1", nil, IncrementalSessionUpdate{
+		MsgCount:                1,
+		NextOrdinal:             1,
+		BlockedResultCategories: map[string]bool{"Bash": true},
+		ToolCallResultUpdates: []ToolCallResultUpdate{{
+			ToolUseID: "call_cmd",
+			Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
+			Events: []ToolResultEvent{
+				{
+					AgentID:       "a",
+					ToolUseID:     "call_cmd",
+					Source:        "function_call_output",
+					Content:       "x",
+					ContentLength: 1,
+				},
+				{
+					AgentID:       "b",
+					ToolUseID:     "call_cmd",
+					Source:        "function_call_output",
+					Content:       "yy",
+					ContentLength: 2,
+				},
+			},
+		}},
+	})
+	require.NoError(t, werr)
+
+	var storedContent string
+	var storedLen int
+	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+		SELECT COALESCE(result_content, ''), result_content_length
+		FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "call_cmd",
+	).Scan(&storedContent, &storedLen))
+	assert.Empty(t, storedContent, "blocked result content stays blank")
+	assert.Equal(t, 11, storedLen,
+		"blocked result length keeps agent labels and separators: "+
+			"\"a:\\nx\\n\\nb:\\nyy\"")
+}
+
+// TestWriteSessionIncrementalBlockedResultKeepsRawLengthWithControlChars
+// pins the length invariant blocked categories keep on the full-parse and
+// staged paths: sanitizing (which strips control/NUL bytes) must never run
+// against content this path is about to blank, or the stored length would
+// come up short by however many bytes sanitize removed instead of
+// reflecting the original raw output size.
+func TestWriteSessionIncrementalBlockedResultKeepsRawLengthWithControlChars(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			ToolUseID: "call_cmd",
+		}},
+	})
+
+	const raw = "before\x00after\x1b[31mred\u0085done"
+	_, werr := d.WriteSessionIncremental(t.Context(), "s1", nil, IncrementalSessionUpdate{
+		MsgCount:                1,
+		NextOrdinal:             1,
+		BlockedResultCategories: map[string]bool{"Bash": true},
+		ToolCallResultUpdates: []ToolCallResultUpdate{{
+			ToolUseID: "call_cmd",
+			Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
+			Events: []ToolResultEvent{{
+				ToolUseID:     "call_cmd",
+				Source:        "function_call_output",
+				Content:       raw,
+				ContentLength: len(raw),
+			}},
+		}},
+	})
+	require.NoError(t, werr)
+
+	var storedContent string
+	var storedLen int
+	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+		SELECT COALESCE(result_content, ''), result_content_length
+		FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "call_cmd",
+	).Scan(&storedContent, &storedLen))
+	assert.Empty(t, storedContent, "blocked result content stays blank")
+	assert.Equal(t, len(raw), storedLen,
+		"blocked result length must be the original raw byte count, "+
+			"not the sanitized (control-stripped) count")
+
+	var eventLen int
+	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+		SELECT content_length FROM tool_result_events
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "call_cmd",
+	).Scan(&eventLen))
+	assert.Equal(t, len(raw), eventLen,
+		"the stored event's content_length must also be the raw byte count")
+}
+
+// Distinct blocked outputs retain provider identity even at equal byte lengths.
+func TestWriteSessionIncrementalBlockedResultsDedupByRawContentAcrossBatches(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			ToolUseID: "call_cmd",
+		}},
+	})
+	write := func(content string) {
+		t.Helper()
+		_, err := d.WriteSessionIncremental(t.Context(), "s1", nil, IncrementalSessionUpdate{
+			MsgCount:                1,
+			NextOrdinal:             1,
+			BlockedResultCategories: map[string]bool{"Bash": true},
+			ToolCallResultUpdates: []ToolCallResultUpdate{{
+				ToolUseID: "call_cmd",
+				Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
+				Events: []ToolResultEvent{{
+					ToolUseID:     "call_cmd",
+					Source:        "function_call_output",
+					Content:       content,
+					ContentLength: len(content),
+				}},
+			}},
+		})
+		require.NoError(t, err)
+	}
+	countEvents := func() int {
+		t.Helper()
+		var n int
+		require.NoError(t, d.Reader().QueryRow(t.Context(), `
+			SELECT COUNT(*) FROM tool_result_events
+			WHERE session_id = ? AND tool_use_id = ?`,
+			"s1", "call_cmd",
+		).Scan(&n))
+		return n
+	}
+
+	write("x")
+	write("yy")
+	assert.Equal(t, 2, countEvents(),
+		"blocked events of different length are distinct and must both be stored")
+
+	write("zz")
+	assert.Equal(t, 3, countEvents(), "different raw bytes are distinct events")
+	write("yy")
+	assert.Equal(t, 3, countEvents(), "replaying raw content does not add an event")
+
+	var lengths []int
+	rows, err := d.Reader().Query(t.Context(), `
+		SELECT content_length FROM tool_result_events
+		WHERE session_id = ? AND tool_use_id = ? ORDER BY event_index`,
+		"s1", "call_cmd")
+	require.NoError(t, err)
+	defer rows.Close()
+	for rows.Next() {
+		var n int
+		require.NoError(t, rows.Scan(&n))
+		lengths = append(lengths, n)
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, []int{1, 2, 2}, lengths)
+}
+
+func TestBackfillToolCallAgentStateTracksFirstAndLatest(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			ToolUseID: "call_cmd",
+		}},
+	})
+
+	tx, err := d.getWriter().BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	for i, content := range []string{"old", "mid", "new"} {
+		event := ToolResultEvent{Content: content}
+		PrepareToolResultEvent(&event)
+		_, err := tx.ExecContext(t.Context(), `
+			INSERT INTO tool_result_events
+				(session_id, tool_call_message_ordinal, call_index, tool_use_id,
+				 agent_id, source, status, content, content_length, event_index,
+				 raw_content_digest, summary_participates)
+			 VALUES (?, 0, 0, ?, 'agent-a', 'function_call_output',
+			         'completed', ?, ?, ?, ?, ?)`,
+			"s1", "call_cmd", content, len(content), i,
+			event.RawContentDigest, event.SummaryParticipates,
+		)
+		require.NoError(t, err)
+	}
+	require.NoError(t, backfillToolCallAgentStateTx(t.Context(),
+		tx, "s1", ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
+	))
+	require.NoError(t, tx.Commit())
+
+	var first, latest int
+	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+		SELECT first_event_index, latest_event_index
+		FROM tool_call_occurrence_agent_state
+		WHERE session_id = ? AND message_ordinal = ? AND call_index = ?
+		  AND agent_id = 'agent-a'`,
+		"s1", 0, 0,
+	).Scan(&first, &latest))
+	assert.Equal(t, 0, first)
+	assert.Equal(t, 2, latest,
+		"backfill keeps the newest event index per agent")
+}
+
+func TestReplaceSessionContentDiffClearsStaleAgentState(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	msgs := []Message{{
+		SessionID: "s1", Ordinal: 0, Role: "assistant", Content: "running",
+		HasToolUse: true, ToolCalls: []ToolCall{{
+			SessionID: "s1", ToolName: "exec_command",
+			Category: "Bash", ToolUseID: "call_1",
+		}},
+	}}
+	require.NoError(t, d.ReplaceSessionContent(t.Context(), "s1", msgs, SessionSignalUpdate{}, nil))
+	_, err := d.WriteSessionIncremental(t.Context(), "s1", nil, IncrementalSessionUpdate{
+		MsgCount: 1, NextOrdinal: 1, ToolCallResultUpdates: []ToolCallResultUpdate{{
+			ToolUseID: "call_1", Position: ToolCallPosition{}, Events: []ToolResultEvent{
+				{ToolUseID: "call_1", AgentID: "a", Content: "a1"},
+				{ToolUseID: "call_1", AgentID: "b", Content: "b1"},
+			},
+		}},
+	})
+	require.NoError(t, err)
+	msgs[0].Content = "done"
+	require.NoError(t, d.ReplaceSessionContent(t.Context(), "s1", msgs, SessionSignalUpdate{}, nil))
+	_, err = d.WriteSessionIncremental(t.Context(), "s1", nil, IncrementalSessionUpdate{
+		MsgCount: 1, NextOrdinal: 1, ToolCallResultUpdates: []ToolCallResultUpdate{{
+			ToolUseID: "call_1", Position: ToolCallPosition{},
+			Events: []ToolResultEvent{{ToolUseID: "call_1", AgentID: "a", Content: "a2"}},
+		}},
+	})
+	require.NoError(t, err)
+	stored, err := d.GetAllMessages(t.Context(), "s1")
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+	require.Len(t, stored[0].ToolCalls, 1)
+	assert.Equal(t, "a2", stored[0].ToolCalls[0].ResultContent,
+		"replacing a transcript must discard the removed agent's summary")
+}
+
+// claude_linear_parse round-trips through upsert and the incremental
+// lookup, stays NULL for legacy rows, and survives an upsert that
+// carries no verdict.
+func TestClaudeLinearParseRoundTrip(t *testing.T) {
+	d := testDB(t)
+
+	linear := true
+	sess := Session{
+		ID:                "s-linear",
+		Project:           "proj",
+		Machine:           "local",
+		Agent:             "claude",
+		FilePath:          new("/tmp/s-linear.jsonl"),
+		ClaudeLinearParse: &linear,
+	}
+	require.NoError(t, d.UpsertSession(t.Context(), sess))
+
+	info, ok := d.GetSessionForIncremental(t.Context(), "/tmp/s-linear.jsonl", "claude")
+	require.True(t, ok)
+	require.NotNil(t, info.ClaudeLinearParse)
+	assert.True(t, *info.ClaudeLinearParse)
+
+	sess.ClaudeLinearParse = nil
+	require.NoError(t, d.UpsertSession(t.Context(), sess))
+	info, ok = d.GetSessionForIncremental(t.Context(), "/tmp/s-linear.jsonl", "claude")
+	require.True(t, ok)
+	require.NotNil(t, info.ClaudeLinearParse,
+		"verdict-free upsert must keep the stored flag")
+	assert.True(t, *info.ClaudeLinearParse)
+
+	legacy := Session{
+		ID:       "s-legacy",
+		Project:  "proj",
+		Machine:  "local",
+		Agent:    "claude",
+		FilePath: new("/tmp/s-legacy.jsonl"),
+	}
+	require.NoError(t, d.UpsertSession(t.Context(), legacy))
+	info, ok = d.GetSessionForIncremental(t.Context(), "/tmp/s-legacy.jsonl", "claude")
+	require.True(t, ok)
+	assert.Nil(t, info.ClaudeLinearParse)
+}
+
+func TestFTSBackfill(t *testing.T) {
+	dCheck := testDB(t)
+	requireFTS(t, dCheck)
+	dCheck.Close()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "backfill.db")
+
+	// 1. Create DB and drop FTS to simulate "old" DB or broken state
+	d1, err := Open(t.Context(), path)
+	requireNoError(t, err, "Open 1")
+	// Use writer directly to ensure it happens
+	w := d1.getWriter()
+	_, err = w.Exec(t.Context(), "DROP TABLE IF EXISTS messages_fts")
+	require.NoError(t, err, "dropping fts")
+	// Also drop triggers, otherwise inserts will fail
+	for _, tr := range []string{"messages_ai", "messages_ad", "messages_au"} {
+		_, err := w.Exec(t.Context(), "DROP TRIGGER IF EXISTS "+tr)
+		require.NoError(t, err, "dropping trigger %s", tr)
+	}
+
+	// 2. Insert messages while FTS is missing
+	insertSession(t, d1, "s1", "proj")
+	insertMessages(t, d1, userMsg("s1", 0, "unique_keyword"))
+
+	err = d1.Close()
+	require.NoError(t, err, "Close 1")
+
+	// 3. Re-open. This should detect missing FTS, create it, and backfill.
+	d2, err := Open(t.Context(), path)
+	requireNoError(t, err, "Open 2")
+	defer d2.Close()
+
+	require.True(t, d2.HasFTS(t.Context()), "FTS should be available after re-open")
+
+	// 4. Verify search finds the message
+	page, err := d2.Search(t.Context(), SearchFilter{
+		Query: "unique_keyword",
+		Limit: 1,
+	})
+	requireNoError(t, err, "Search")
+	require.Len(t, page.Results, 1, "len")
+	assert.Equal(t, "s1", page.Results[0].SessionID, "result session_id")
+}
+
+func TestOpenRejectsArchiveWhoseFTSModuleIsUnavailable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "archive.db")
+	d, err := Open(t.Context(), path)
+	require.NoError(t, err, "Open with fts5 available")
+	requireFTS(t, d)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, userMsg("s1", 0, "indexed text"))
+	require.NoError(t, d.Close())
+
+	// An archive created by an fts5 build stores messages_fts as
+	// "USING fts5(...)" plus the messages triggers that feed it. A build
+	// whose SQLite lacks fts5 opens that schema fine and only fails once
+	// a trigger fires ("no such module: fts5"). This process cannot drop
+	// its own fts5 module, so point the stored definition at a module
+	// name nothing registers; SQLite reports the same failure mode.
+	raw, err := sql.Open("sqlite3", makeDSN(path, false))
+	require.NoError(t, err)
+	for _, stmt := range []string{
+		"PRAGMA writable_schema=ON",
+		`UPDATE sqlite_master
+		 SET sql = replace(sql, 'USING fts5(', 'USING fts5_absent(')
+		 WHERE type = 'table' AND name = 'messages_fts'`,
+		"PRAGMA writable_schema=OFF",
+	} {
+		_, err := raw.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
+	require.NoError(t, raw.Close())
+
+	_, err = Open(t.Context(), path)
+	require.Error(t, err, "Open must refuse an archive whose FTS index this executable cannot load")
+	require.ErrorContains(t, err, "no such module: fts5_absent")
+	require.ErrorContains(t, err, "-tags fts5")
+}
+
+func TestPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	d, err := Open(t.Context(), path)
+	requireNoError(t, err, "Open")
+	defer d.Close()
+
+	assert.Equal(t, path, d.Path(), "Path()")
+}
+
+func TestOpenConfiguresWALJournalSizeLimit(t *testing.T) {
+	d := testDB(t)
+
+	var got int64
+	err := d.getWriter().QueryRow(t.Context(), "PRAGMA journal_size_limit").Scan(&got)
+	requireNoError(t, err, "PRAGMA journal_size_limit")
+	assert.Equal(t, int64(walJournalSizeLimitBytes), got)
+}
+
+func TestCheckpointWALTruncate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	d, err := Open(t.Context(), path)
+	requireNoError(t, err, "Open")
+	defer d.Close()
+
+	_, err = d.getWriter().Exec(t.Context(), `PRAGMA wal_autocheckpoint=0`)
+	requireNoError(t, err, "disable wal autocheckpoint")
+
+	for i := range 100 {
+		insertSession(t, d, fmt.Sprintf("wal-session-%03d", i), "proj")
+	}
+	require.FileExists(t, path+"-wal")
+
+	err = d.CheckpointWALTruncateWithRetry(t.Context())
+	requireNoError(t, err, "CheckpointWALTruncateWithRetry")
+
+	if info, err := os.Stat(path + "-wal"); err == nil {
+		assert.LessOrEqual(t, info.Size(), int64(walJournalSizeLimitBytes))
+	} else {
+		require.True(t, os.IsNotExist(err), "stat wal: %v", err)
+	}
+}
+
+func TestReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	d, err := Open(t.Context(), path)
+	requireNoError(t, err, "Open")
+	defer d.Close()
+
+	// Insert data before reopen.
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, userMsg("s1", 0, "hello"))
+
+	err = d.Reopen()
+	require.NoError(t, err, "Reopen")
+
+	// Data should still be accessible after reopen.
+	got := requireSessionExists(t, d, "s1")
+	assert.Equal(t, "proj", got.Project, "project")
+
+	msgs, err := d.GetAllMessages(t.Context(), "s1")
+	requireNoError(t, err, "GetAllMessages")
+	require.Len(t, msgs, 1, "messages = %v, want [hello]", msgs)
+	assert.Equal(t, "hello", msgs[0].Content,
+		"messages = %v, want [hello]", msgs)
+
+	// Writes should work after reopen.
+	insertSession(t, d, "s2", "proj2")
+	requireSessionExists(t, d, "s2")
+}
+
+func TestReopenAfterSwap(t *testing.T) {
+	dir := t.TempDir()
+	origPath := filepath.Join(dir, "orig.db")
+	tempPath := filepath.Join(dir, "temp.db")
+
+	// Create original DB with data.
+	origDB, err := Open(t.Context(), origPath)
+	requireNoError(t, err, "Open orig")
+	defer origDB.Close()
+	insertSession(t, origDB, "old-session", "old-proj")
+
+	// Create temp DB with different data.
+	tempDB, err := Open(t.Context(), tempPath)
+	requireNoError(t, err, "Open temp")
+	insertSession(t, tempDB, "new-session", "new-proj")
+	tempDB.Close()
+
+	// Close connections before rename (Windows-safe flow).
+	err = origDB.CloseConnections(t.Context())
+	require.NoError(t, err, "CloseConnections")
+
+	// Remove WAL/SHM while connections are closed.
+	os.Remove(origPath + "-wal")
+	os.Remove(origPath + "-shm")
+
+	// Swap: rename temp over original.
+	err = os.Rename(tempPath, origPath)
+	require.NoError(t, err, "rename")
+	os.Remove(tempPath + "-wal")
+	os.Remove(tempPath + "-shm")
+
+	// Reopen to pick up the new file.
+	err = origDB.Reopen()
+	require.NoError(t, err, "Reopen")
+
+	// Original DB handle should now see the new data.
+	requireSessionGone(t, origDB, "old-session")
+	got := requireSessionExists(t, origDB, "new-session")
+	assert.Equal(t, "new-proj", got.Project, "project")
+}
+
+func TestCloseConnections(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	// Close connections.
+	err := d.CloseConnections(t.Context())
+	require.NoError(t, err, "CloseConnections")
+
+	// Queries should fail after close.
+	_, err = d.GetSession(t.Context(), "s1")
+	require.Error(t, err, "expected error querying after CloseConnections")
+
+	// Reopen should restore service.
+	err = d.Reopen()
+	require.NoError(t, err, "Reopen")
+
+	// Queries should work again.
+	s, err := d.GetSession(t.Context(), "s1")
+	require.NoError(t, err, "GetSession after Reopen")
+	assert.NotNil(t, s, "session s1 missing after Reopen")
+}
+
+func TestCloseRenameReopen(t *testing.T) {
+	dir := t.TempDir()
+	origPath := filepath.Join(dir, "orig.db")
+	tempPath := filepath.Join(dir, "temp.db")
+
+	// Create original with old data.
+	origDB, err := Open(t.Context(), origPath)
+	requireNoError(t, err, "Open orig")
+	defer origDB.Close()
+	insertSession(t, origDB, "old", "old-proj")
+
+	// Create replacement with new data.
+	tempDB, err := Open(t.Context(), tempPath)
+	requireNoError(t, err, "Open temp")
+	insertSession(t, tempDB, "new", "new-proj")
+	tempDB.Close()
+
+	// Simulate the ResyncAll sequence:
+	// close -> removeWAL -> rename -> reopen
+	err = origDB.CloseConnections(t.Context())
+	require.NoError(t, err, "CloseConnections")
+	for _, p := range []string{origPath, tempPath} {
+		os.Remove(p + "-wal")
+		os.Remove(p + "-shm")
+	}
+	err = os.Rename(tempPath, origPath)
+	require.NoError(t, err, "rename")
+	err = origDB.Reopen()
+	require.NoError(t, err, "Reopen")
+
+	// Verify swap succeeded.
+	requireSessionGone(t, origDB, "old")
+	got := requireSessionExists(t, origDB, "new")
+	assert.Equal(t, "new-proj", got.Project, "project")
+}
+
+func TestCloseRecoveryOnRenameFail(t *testing.T) {
+	dir := t.TempDir()
+	origPath := filepath.Join(dir, "orig.db")
+
+	origDB, err := Open(t.Context(), origPath)
+	requireNoError(t, err, "Open orig")
+	defer origDB.Close()
+	insertSession(t, origDB, "s1", "proj")
+
+	// Close connections as ResyncAll would.
+	err = origDB.CloseConnections(t.Context())
+	require.NoError(t, err, "CloseConnections")
+
+	// Simulate rename failure (temp file doesn't exist).
+	nonexistent := filepath.Join(dir, "no-such-file.db")
+	renameErr := os.Rename(nonexistent, origPath)
+	require.Error(t, renameErr, "expected rename to fail")
+
+	// Recovery: reopen original to restore service.
+	err = origDB.Reopen()
+	require.NoError(t, err, "recovery Reopen")
+
+	// Data should still be accessible.
+	s, err := origDB.GetSession(t.Context(), "s1")
+	require.NoError(t, err, "GetSession after recovery")
+	assert.NotNil(t, s, "session s1 missing after recovery Reopen")
+}
+
+func TestConcurrentReadsWhileReopen(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	// Spin up readers that continuously query.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var readErrors atomic.Int64
+
+	for range 4 {
+		wg.Go(func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				_, err := d.GetSession(ctx, "s1")
+				if err != nil && ctx.Err() == nil {
+					readErrors.Add(1)
+					return
+				}
+			}
+		})
+	}
+
+	// Reopen while readers are active.
+	for range 5 {
+		err := d.Reopen()
+		require.NoError(t, err, "Reopen")
+	}
+
+	cancel()
+	wg.Wait()
+
+	assert.Equal(t, int64(0), readErrors.Load(),
+		"got %d concurrent read errors", readErrors.Load())
+}
+
+func TestExportedReaderAcquiredBeforeReopenStaysUsable(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	reader := d.Reader()
+	for range 2 {
+		err := d.Reopen()
+		require.NoError(t, err, "Reopen")
+	}
+
+	var id string
+	err := reader.QueryRow(t.Context(),
+		"SELECT id FROM sessions WHERE id = ?", "s1",
+	).Scan(&id)
+	require.NoError(t, err, "query with pre-reopen reader handle")
+	require.Equal(t, "s1", id, "id")
+}
+
+func TestReopenDoesNotBlockNewReadsWhileClosingRetiredPool(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	blockingPool, closeStarted, releaseClose := openBlockingCloseDB(t)
+	d.connMu.Lock()
+	d.retired = append(d.retired, blockingPool)
+	d.connMu.Unlock()
+
+	reopenDone := make(chan error, 1)
+	go func() {
+		reopenDone <- d.Reopen()
+	}()
+
+	select {
+	case <-closeStarted:
+	case err := <-reopenDone:
+		require.Failf(t, "Reopen finished early",
+			"Reopen finished before blocking close: %v", err)
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "Reopen did not start closing retired pool")
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := d.GetSession(t.Context(), "s1")
+		readDone <- err
+	}()
+
+	select {
+	case err := <-readDone:
+		require.NoError(t, err, "new read while closing retired pool")
+	case <-time.After(200 * time.Millisecond):
+		require.Fail(t, "new read blocked while Reopen closed a retired pool")
+	}
+
+	releaseClose()
+	err := <-reopenDone
+	require.NoError(t, err, "Reopen")
+}
+
+func TestRepeatedReopenBoundsRetiredPools(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	// Reopen many times; retired pools from earlier rounds
+	// should be closed by subsequent reopens, keeping only
+	// the most recent pair alive.
+	for range 20 {
+		err := d.Reopen()
+		require.NoError(t, err, "Reopen")
+	}
+
+	// After 20 reopens the retired slice should hold at most
+	// the last pair (2 entries), not 40.
+	d.mu.Lock()
+	n := len(d.retired)
+	d.mu.Unlock()
+	assert.LessOrEqual(t, n, 2,
+		"retired pool count = %d, want <= 2", n)
+
+	// Data should still be readable.
+	s, err := d.GetSession(t.Context(), "s1")
+	require.NoError(t, err, "GetSession")
+	assert.NotNil(t, s, "session s1 missing after repeated Reopen")
+}
+
+func TestCloseConnectionsWaitsForInFlightReads(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	rows, err := d.Reader().Query(t.Context(), "SELECT id FROM sessions")
+	require.NoError(t, err, "Query")
+	defer rows.Close()
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- d.CloseConnections(t.Context()) }()
+
+	// The open rows hold a reader connection with a live file
+	// handle. CloseConnections promises the database file can be
+	// renamed afterwards, which fails on Windows while any handle
+	// survives, so it must not return before the rows are released.
+	select {
+	case err := <-closeDone:
+		require.Failf(t, "CloseConnections returned early",
+			"returned while rows were still open: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	require.NoError(t, rows.Err(), "rows.Err")
+	require.NoError(t, rows.Close(), "rows.Close")
+
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err, "CloseConnections")
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "CloseConnections did not return after rows were released")
+	}
+
+	require.NoError(t, d.Reopen(), "Reopen")
+	s, err := d.GetSession(t.Context(), "s1")
+	require.NoError(t, err, "GetSession after Reopen")
+	assert.NotNil(t, s, "session s1 missing after Reopen")
+}
+
+func TestCloseConnectionsBlocksConcurrentReopen(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	rows, err := d.Reader().Query(t.Context(), "SELECT id FROM sessions")
+	require.NoError(t, err, "Query")
+	defer rows.Close()
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- d.CloseConnections(t.Context()) }()
+
+	// Once new reads fail fast the pools are closed, so
+	// CloseConnections holds db.mu and is draining the open rows.
+	require.Eventually(t, func() bool {
+		probe, err := d.Reader().Query(t.Context(), "SELECT 1")
+		if err != nil {
+			return true
+		}
+		defer probe.Close()
+		return probe.Err() != nil
+	}, 2*time.Second, 5*time.Millisecond, "pools never closed")
+
+	reopenDone := make(chan error, 1)
+	go func() { reopenDone <- d.Reopen() }()
+
+	// Reopen must serialize behind the drain: fresh handles opened
+	// mid-drain would let CloseConnections return while the database
+	// file is still unrenameable on Windows.
+	select {
+	case err := <-reopenDone:
+		require.Failf(t, "Reopen returned early",
+			"returned while CloseConnections was draining: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	require.NoError(t, rows.Err(), "rows.Err")
+	require.NoError(t, rows.Close(), "rows.Close")
+
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err, "CloseConnections")
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "CloseConnections did not return after rows were released")
+	}
+	select {
+	case err := <-reopenDone:
+		require.NoError(t, err, "Reopen")
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "Reopen did not return after CloseConnections finished")
+	}
+
+	s, err := d.GetSession(t.Context(), "s1")
+	require.NoError(t, err, "GetSession after Reopen")
+	assert.NotNil(t, s, "session s1 missing after Reopen")
+}
+
+func TestCloseWriterWaitsForInFlightWriterQuery(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	rows, err := d.getWriter().Query(t.Context(), "SELECT id FROM sessions")
+	require.NoError(t, err, "Query")
+	defer rows.Close()
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- d.CloseWriter() }()
+
+	// The open rows hold the single writer connection. CloseWriter's
+	// caller releases the write-ownership flock once it returns, so it
+	// must not return while that connection survives.
+	select {
+	case err := <-closeDone:
+		require.Failf(t, "CloseWriter returned early",
+			"returned while writer rows were still open: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	require.NoError(t, rows.Err(), "rows.Err")
+	require.NoError(t, rows.Close(), "rows.Close")
+
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err, "CloseWriter")
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "CloseWriter did not return after rows were released")
+	}
+
+	require.NoError(t, d.ReopenWriter(), "ReopenWriter")
+	s, err := d.GetSession(t.Context(), "s1")
+	require.NoError(t, err, "GetSession after ReopenWriter")
+	assert.NotNil(t, s, "session s1 missing after ReopenWriter")
+}
+
+func TestCloseWriterDrainTimeoutIsAnError(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	prev := closeDrainTimeout
+	closeDrainTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { closeDrainTimeout = prev })
+
+	rows, err := d.getWriter().Query(t.Context(), "SELECT id FROM sessions")
+	require.NoError(t, err, "Query")
+	defer rows.Close()
+
+	// A connection that never drains must surface as an error so the
+	// caller keeps the flock instead of releasing write ownership while
+	// the connection is live.
+	err = d.CloseWriter()
+	require.Error(t, err,
+		"CloseWriter must fail while a writer connection is held")
+	assert.Contains(t, err.Error(), "still in use")
+
+	// A retry sees a nil writer pointer, but the undrained pool is
+	// retained: success here would release the flock while the original
+	// connection still holds the file.
+	err = d.CloseWriter()
+	require.Error(t, err,
+		"retried CloseWriter must keep failing while the connection is held")
+
+	// Once the connection is released the retry drains and succeeds.
+	require.NoError(t, rows.Err(), "rows.Err")
+	require.NoError(t, rows.Close(), "rows.Close")
+	require.NoError(t, d.CloseWriter(),
+		"CloseWriter after release must drain the retained pool")
+	require.NoError(t, d.ReopenWriter(), "ReopenWriter")
+}
+
+// TestReopenWriterAfterFailedCloseRestoresWrites pins same-process recovery
+// from a drain-timeout CloseWriter failure. Ownership was never handed off
+// (the caller keeps the flock and launches no worker), so reopening the writer
+// restores service; the undrained pool stays retained, and a later CloseWriter
+// still refuses to succeed until that connection actually drains.
+func TestReopenWriterAfterFailedCloseRestoresWrites(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	prev := closeDrainTimeout
+	closeDrainTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { closeDrainTimeout = prev })
+
+	rows, err := d.getWriter().Query(t.Context(), "SELECT id FROM sessions")
+	require.NoError(t, err, "Query")
+	defer rows.Close()
+
+	require.Error(t, d.CloseWriter(),
+		"CloseWriter must fail while a writer connection is held")
+	require.ErrorIs(t, d.Update(t.Context(), func(*sql.Tx) error { return nil }),
+		ErrWriterClosed, "the barrier stays active after the failed close")
+
+	require.NoError(t, d.ReopenWriter(), "ReopenWriter")
+	insertSession(t, d, "s2", "proj")
+
+	// The retained pool still holds a live connection: a later CloseWriter
+	// must keep failing so ownership is never released alongside it.
+	require.Error(t, d.CloseWriter(),
+		"CloseWriter must not succeed while the retained pool is undrained")
+	require.NoError(t, d.ReopenWriter(), "ReopenWriter after retried close")
+
+	require.NoError(t, rows.Err(), "rows.Err")
+	require.NoError(t, rows.Close(), "rows.Close")
+	require.NoError(t, d.CloseWriter(),
+		"CloseWriter succeeds once the retained connection drained")
+	require.NoError(t, d.ReopenWriter(), "final ReopenWriter")
+}
+
+func TestCloseConnectionsDrainTimeoutIsAnError(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	prev := closeDrainTimeout
+	closeDrainTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { closeDrainTimeout = prev })
+
+	rows, err := d.Reader().Query(t.Context(), "SELECT id FROM sessions")
+	require.NoError(t, err, "Query")
+	defer rows.Close()
+
+	// A connection that never drains must surface as an error: the resync
+	// swap deletes the WAL and renames the database file right after this
+	// returns, which is unsafe while a connection still holds the file.
+	err = d.CloseConnections(t.Context())
+	require.Error(t, err,
+		"CloseConnections must fail while a reader connection is held")
+	assert.Contains(t, err.Error(), "still in use")
+
+	// The undrained pool is retained, so a retry keeps failing until the
+	// connection is actually released.
+	err = d.CloseConnections(t.Context())
+	require.Error(t, err,
+		"retried CloseConnections must keep failing while the connection is held")
+
+	require.NoError(t, rows.Err(), "rows.Err")
+	require.NoError(t, rows.Close(), "rows.Close")
+	require.NoError(t, d.CloseConnections(t.Context()),
+		"CloseConnections after release must drain the retained pool")
+	require.NoError(t, d.Reopen(), "Reopen")
+
+	s, err := d.GetSession(t.Context(), "s1")
+	require.NoError(t, err, "GetSession after Reopen")
+	assert.NotNil(t, s, "session s1 missing after Reopen")
+}
+
+func TestCloseDrainsUndrainedPoolsBeforeSuccess(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	prev := closeDrainTimeout
+	closeDrainTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { closeDrainTimeout = prev })
+
+	rows, err := d.getWriter().Query(t.Context(), "SELECT id FROM sessions")
+	require.NoError(t, err, "Query")
+	defer rows.Close()
+
+	// The open rows hold the single writer connection, so CloseWriter
+	// times out and retains the undrained writer pool.
+	err = d.CloseWriter()
+	require.Error(t, err,
+		"CloseWriter must fail while a writer connection is held")
+
+	// The final Close must not report success while the retained pool
+	// still holds the SQLite file: closeWriteDB releases the write-owner
+	// flock on a nil error, and another process could then acquire writer
+	// ownership alongside the surviving connection.
+	err = d.Close()
+	require.Error(t, err,
+		"Close must fail while the undrained writer pool survives")
+	assert.Contains(t, err.Error(), "still in use")
+
+	// Once the connection is released, the retained pool drains and the
+	// final Close succeeds.
+	require.NoError(t, rows.Err(), "rows.Err")
+	require.NoError(t, rows.Close(), "rows.Close")
+	require.NoError(t, d.Close(),
+		"Close after release must drain the retained pool")
+}
+
+func TestCloseDrainTimeoutIsAnError(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	prev := closeDrainTimeout
+	closeDrainTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { closeDrainTimeout = prev })
+
+	rows, err := d.Reader().Query(t.Context(), "SELECT id FROM sessions")
+	require.NoError(t, err, "Query")
+	defer rows.Close()
+
+	// Close's own pools need the same drain guarantee as pools retained
+	// from earlier failed closes: a connection checked out by in-flight
+	// rows survives sql.DB.Close until it is returned to the pool.
+	err = d.Close()
+	require.Error(t, err,
+		"Close must fail while a reader connection is held")
+	assert.Contains(t, err.Error(), "still in use")
+
+	require.NoError(t, rows.Err(), "rows.Err")
+	require.NoError(t, rows.Close(), "rows.Close")
+	require.NoError(t, d.Close(), "Close after release must succeed")
+}
+
+func TestCloseAfterCloseConnectionsReopen(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	// CloseConnections + Reopen is the normal resync lifecycle.
+	err := d.CloseConnections(t.Context())
+	require.NoError(t, err, "CloseConnections")
+	err = d.Reopen()
+	require.NoError(t, err, "Reopen")
+
+	// Close should succeed without "database is closed" errors
+	// from double-closing the pools that CloseConnections
+	// already closed.
+	err = d.Close()
+	require.NoError(t, err, "Close")
+}
+
+func TestInsertSessionIfAbsentDoesNotOverwriteRealSession(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	// A real session already synced from source files.
+	insertSession(t, d, "s1", "agentsview", func(s *Session) {
+		s.Machine = "laptop"
+		s.MessageCount = 7
+	})
+
+	now := "2026-01-01T00:00:00Z"
+	first := "Recall import placeholder for s1"
+	placeholder := Session{
+		ID: "s1", Project: "agentsview", Machine: "recall-import",
+		FirstMessage: &first, DisplayName: &first,
+		StartedAt: &now, EndedAt: &now, MessageCount: 0,
+		SourceVersion: "recall-import-placeholder",
+	}
+
+	// The placeholder must not clobber the real session's metadata.
+	require.NoError(t, d.insertSessionIfAbsent(ctx, placeholder))
+	got, err := d.GetSession(ctx, "s1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "laptop", got.Machine, "real machine preserved")
+	assert.Equal(t, 7, got.MessageCount, "real message_count preserved")
+
+	// For an absent id the placeholder row is created.
+	placeholder.ID = "s2"
+	require.NoError(t, d.insertSessionIfAbsent(ctx, placeholder))
+	created, err := d.GetSession(ctx, "s2")
+	require.NoError(t, err)
+	require.NotNil(t, created)
+	assert.Equal(t, "recall-import", created.Machine)
+	assert.Equal(t, 0, created.MessageCount)
+}
+
+func TestInsertSessionIfAbsentRejectsTrashedSession(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	// A real session that the user later trashed (soft-deleted).
+	insertSession(t, d, "s1", "agentsview", func(s *Session) {
+		s.MessageCount = 7
+	})
+	require.NoError(t, d.SoftDeleteSession(ctx, "s1"))
+
+	now := "2026-01-01T00:00:00Z"
+	first := "Recall import placeholder for s1"
+	placeholder := Session{
+		ID: "s1", Project: "agentsview", Machine: "recall-import",
+		FirstMessage: &first, DisplayName: &first,
+		StartedAt: &now, EndedAt: &now, MessageCount: 0,
+		SourceVersion: "recall-import-placeholder",
+	}
+
+	// A trashed row satisfies ON CONFLICT DO NOTHING, so without the guard the
+	// import would silently attach to a hidden session. It must be rejected.
+	err := d.insertSessionIfAbsent(ctx, placeholder)
+	require.ErrorIs(t, err, ErrSessionTrashed)
+
+	// The session stays trashed; the placeholder did not resurrect it.
+	var deletedAt sql.NullString
+	require.NoError(t, d.getWriter().QueryRowContext(
+		ctx, "SELECT deleted_at FROM sessions WHERE id = ?", "s1",
+	).Scan(&deletedAt))
+	assert.True(t, deletedAt.Valid, "session remains soft-deleted")
+}
+
+func TestCopyInsightsFrom(t *testing.T) {
+	dir := t.TempDir()
+
+	// Source DB with insights.
+	srcPath := filepath.Join(dir, "src.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	_, err := srcDB.InsertInsight(t.Context(), Insight{
+		Type:     "daily_activity",
+		DateFrom: "2025-01-15",
+		DateTo:   "2025-01-15",
+		Agent:    "claude",
+		Content:  "test insight content",
+	})
+	requireNoError(t, err, "InsertInsight")
+	srcDB.Close()
+
+	// Destination DB (empty).
+	dstPath := filepath.Join(dir, "dst.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+
+	// Copy insights from source.
+	err = dstDB.CopyInsightsFrom(srcPath)
+	require.NoError(t, err, "CopyInsightsFrom")
+
+	// Verify insights were copied.
+	insights, err := dstDB.ListInsights(
+		t.Context(), InsightFilter{},
+	)
+	requireNoError(t, err, "ListInsights")
+	require.Len(t, insights, 1, "len")
+	assert.Equal(t, "test insight content", insights[0].Content, "content")
+}
+
+func TestCopyModelPricingFrom(t *testing.T) {
+	dir := t.TempDir()
+
+	// Source DB with pricing rows and a sentinel meta row.
+	srcPath := filepath.Join(dir, "src.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	require.NoError(t, srcDB.UpsertModelPricing([]ModelPricing{
+		{
+			ModelPattern:         "claude-opus-4-8",
+			InputPerMTok:         money.MustParseDollars("15"),
+			OutputPerMTok:        money.MustParseDollars("75"),
+			CacheCreationPerMTok: money.MustParseDollars("18.75"),
+			CacheReadPerMTok:     money.MustParseDollars("1.5"),
+			Bands: []PricingBand{{
+				AboveInputTokens: 200_000,
+				InputPerMTok:     money.MustParseDollars("30"),
+			}},
+		},
+	}), "UpsertModelPricing")
+	require.NoError(t, srcDB.SetPricingMeta("_fallback_version", "v42"),
+		"SetPricingMeta")
+	srcDB.Close()
+
+	// Destination DB with a stale row for the same pattern.
+	dstPath := filepath.Join(dir, "dst.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+	require.NoError(t, dstDB.UpsertModelPricing([]ModelPricing{
+		{ModelPattern: "claude-opus-4-8", InputPerMTok: money.MustParseDollars("1")},
+	}), "UpsertModelPricing stale row")
+
+	require.NoError(t, dstDB.CopyModelPricingFrom(srcPath),
+		"CopyModelPricingFrom")
+
+	copied, err := dstDB.GetModelPricing("claude-opus-4-8")
+	require.NoError(t, err, "GetModelPricing")
+	require.NotNil(t, copied, "copied pattern present")
+	assert.Equal(t, money.MustParseDollars("15.0"), copied.InputPerMTok,
+		"source row replaces stale destination row")
+	assert.Equal(t, money.MustParseDollars("75.0"), copied.OutputPerMTok, "output rate")
+	require.Len(t, copied.Bands, 1)
+	assert.Equal(t, 200_000, copied.Bands[0].AboveInputTokens)
+	assert.Equal(t, money.MustParseDollars("30"), copied.Bands[0].InputPerMTok)
+
+	meta, err := dstDB.GetPricingMeta("_fallback_version")
+	require.NoError(t, err, "GetPricingMeta")
+	assert.Equal(t, "v42", meta, "sentinel meta row copied")
+}
+
+func TestCopyModelPricingFromRollsBackParentWhenBandCopyFails(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "legacy.db")
+	src := testDBAtPath(t, srcPath, "src")
+	require.NoError(t, src.UpsertModelPricing([]ModelPricing{{
+		ModelPattern: "model",
+		InputPerMTok: money.MustParseDollars("1"),
+	}}))
+	require.NoError(t, src.Close())
+	execRawSQLite(t, srcPath, `DROP TABLE model_pricing_bands`)
+
+	dst := testDBAtPath(t, filepath.Join(dir, "destination.db"), "dst")
+	defer dst.Close()
+	require.NoError(t, dst.UpsertModelPricing([]ModelPricing{{
+		ModelPattern: "model",
+		InputPerMTok: money.MustParseDollars("9"),
+	}}))
+
+	err := dst.CopyModelPricingFrom(srcPath)
+	require.Error(t, err)
+	got, getErr := dst.GetModelPricing("model")
+	require.NoError(t, getErr)
+	require.NotNil(t, got)
+
+	assert.Equal(t, money.MustParseDollars("9"), got.InputPerMTok)
+}
+
+func TestCopySessionMetadataFrom_PreservesCursorUsageEvents(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	srcPath := filepath.Join(dir, "src.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	require.NoError(t, srcDB.InsertCursorUsageEvents(ctx, []CursorUsageEvent{
+		{
+			OccurredAt:       "2026-05-14T10:05:00Z",
+			Model:            "claude-4.6-opus-high-thinking",
+			Kind:             "USAGE_EVENT_KIND_USAGE_BASED",
+			InputTokens:      1234,
+			OutputTokens:     567,
+			CacheWriteTokens: 12,
+			CacheReadTokens:  34,
+			Charged:          money.MustParseDollars("0.1566"),
+			CursorTokenFee:   money.MustParseDollars("0.0332"),
+			UserID:           "152683922",
+			UserEmail:        "member@example.com",
+			DedupKey:         "first",
+		},
+		{
+			OccurredAt:     "2026-05-15T11:15:00Z",
+			Model:          "gpt-5",
+			Kind:           "USAGE_EVENT_KIND_USAGE_BASED",
+			InputTokens:    80,
+			OutputTokens:   20,
+			Charged:        money.MustParseDollars("0.0125"),
+			CursorTokenFee: money.MustParseDollars("0.005"),
+			UserID:         "777",
+			UserEmail:      "next@example.com",
+			IsHeadless:     true,
+			DedupKey:       "second",
+		},
+	}), "InsertCursorUsageEvents src")
+	wantFingerprint, err := srcDB.CursorUsageEventFingerprint(ctx)
+	require.NoError(t, err, "CursorUsageEventFingerprint src")
+	require.NoError(t, srcDB.CloseConnections(ctx), "CloseConnections src")
+	defer srcDB.Close()
+
+	dstPath := filepath.Join(dir, "dst.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+	require.NoError(t, dstDB.InsertCursorUsageEvents(ctx, []CursorUsageEvent{{
+		OccurredAt: "2026-01-01T00:00:00Z",
+		Model:      "stale-model",
+		Kind:       "USAGE_EVENT_KIND_USAGE_BASED",
+		Charged:    money.MustParseDollars("0.99"),
+		DedupKey:   "stale",
+	}}), "InsertCursorUsageEvents dst")
+
+	require.NoError(t, dstDB.CopySessionMetadataFrom(srcPath), "CopySessionMetadataFrom")
+
+	gotEvents, err := dstDB.GetCursorUsageEvents(ctx, 0)
+	require.NoError(t, err, "GetCursorUsageEvents")
+	require.Len(t, gotEvents, 2, "cursor usage events")
+	gotFingerprint, err := dstDB.CursorUsageEventFingerprint(ctx)
+	require.NoError(t, err, "CursorUsageEventFingerprint dst")
+	assert.Equal(t, wantFingerprint, gotFingerprint,
+		"final metadata copy should preserve cursor usage rows verbatim")
+}
+
+func TestCopyOrphanedDataFrom(t *testing.T) {
+	dir := t.TempDir()
+
+	// Source (old) DB with two sessions: s1 and s2.
+	srcPath := filepath.Join(dir, "old.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	insertSession(t, srcDB, "s1", "proj", func(s *Session) {
+		s.Agent = "claude"
+	})
+	insertSession(t, srcDB, "s2", "proj", func(s *Session) {
+		s.Agent = "codex"
+	})
+	insertMessages(t, srcDB,
+		userMsg("s1", 0, "hello from s1"),
+		asstMsg("s1", 1, "reply from s1"),
+		userMsg("s2", 0, "hello from s2"),
+	)
+	_, err := srcDB.getWriter().Exec(t.Context(),
+		`UPDATE sessions SET transcript_revision = '7' WHERE id = 's2'`,
+	)
+	requireNoError(t, err, "set orphan transcript revision")
+	// Insert tool_calls for s1 via raw SQL since
+	// insertToolCallsTx is unexported.
+	_, err = srcDB.getWriter().Exec(t.Context(), `
+		INSERT INTO tool_calls
+			(message_id, session_id, tool_name, category)
+		SELECT id, session_id, 'Read', 'file'
+		FROM messages
+		WHERE session_id = 's1' AND ordinal = 1`,
+	)
+	requireNoError(t, err, "insert tool_call")
+	srcDB.Close()
+
+	// Destination (new) DB: only has s1 (re-synced from
+	// file). s2 is orphaned (file gone).
+	dstPath := filepath.Join(dir, "new.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+	insertSession(t, dstDB, "s1", "proj", func(s *Session) {
+		s.Agent = "claude"
+	})
+	insertMessages(t, dstDB,
+		userMsg("s1", 0, "hello from s1"),
+		asstMsg("s1", 1, "reply from s1"),
+	)
+
+	// Copy orphaned data from source.
+	count, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	requireNoError(t, err, "CopyOrphanedDataFrom")
+	require.Equal(t, 1, count, "expected 1 orphaned session, got")
+
+	// s2 should now exist in dst.
+	s, err := dstDB.GetSession(
+		t.Context(), "s2",
+	)
+	requireNoError(t, err, "GetSession s2")
+	require.NotNil(t, s, "orphaned session s2 not found in dst")
+	assert.Equal(t, "codex", s.Agent, "s2 agent")
+	require.NotNil(t, s.TranscriptRevision)
+	assert.Equal(t, "7", *s.TranscriptRevision)
+
+	// s2 messages should be copied.
+	ctx := t.Context()
+	msgs, err := dstDB.GetMessages(ctx, "s2", 0, 100, true)
+	requireNoError(t, err, "GetMessages s2")
+	require.Len(t, msgs, 1, "expected 1 message for s2, got")
+	assert.Equal(t, "hello from s2", msgs[0].Content, "s2 message content")
+
+	// s1 should still exist and not be duplicated.
+	s1msgs, err := dstDB.GetMessages(ctx, "s1", 0, 100, true)
+	requireNoError(t, err, "GetMessages s1")
+	require.Len(t, s1msgs, 2, "expected 2 messages for s1, got")
+
+	// Tool calls for s1 should NOT be copied (s1 exists in
+	// dst, so it's not orphaned). Only verify s2's tool_calls
+	// aren't present (s2 had no tool_calls on ordinal 0).
+	var tcCount int
+	err = dstDB.getReader().QueryRow(ctx,
+		"SELECT count(*) FROM tool_calls "+
+			"WHERE session_id = 's2'",
+	).Scan(&tcCount)
+	requireNoError(t, err, "count s2 tool_calls")
+	assert.Equal(t, 0, tcCount,
+		"expected 0 tool_calls for s2, got %d", tcCount)
+}
+
+func TestCopyOrphanedDataFrom_DuplicateSourceUUIDKeepsOnePin(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	srcPath := filepath.Join(dir, "old.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	insertSession(t, srcDB, "orphan", "proj")
+	insertMessages(t, srcDB,
+		Message{
+			SessionID: "orphan", Ordinal: 0, Role: "user",
+			Content: "pinned", ContentLength: 6,
+			SourceUUID: "duplicate",
+		},
+		Message{
+			SessionID: "orphan", Ordinal: 1, Role: "assistant",
+			Content: "not pinned", ContentLength: 10,
+			SourceUUID: "duplicate",
+		},
+	)
+	var pinnedMessageID int64
+	require.NoError(t, srcDB.getReader().QueryRow(ctx, `
+		SELECT id FROM messages
+		WHERE session_id = 'orphan' AND ordinal = 0`,
+	).Scan(&pinnedMessageID), "resolve pinned source message")
+	_, err := srcDB.PinMessage(ctx, "orphan", pinnedMessageID, nil)
+	require.NoError(t, err, "pin source message")
+	require.NoError(t, srcDB.Close(), "close source database")
+
+	dstPath := filepath.Join(dir, "new.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+
+	copied, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	require.NoError(t, err, "CopyOrphanedDataFrom")
+	require.Equal(t, 1, copied, "copied orphaned sessions")
+
+	pins, err := dstDB.ListPinnedMessages(ctx, "orphan", "")
+	require.NoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 1,
+		"a duplicated source UUID must not duplicate the source pin")
+	assert.Equal(t, 0, pins[0].Ordinal, "pin stays on its copied ordinal")
+}
+
+// TestCopyOrphanedDataFrom_SkipsStaleCodexForkRows covers the
+// dataVersion 40 upgrade path (#643): a pre-fix DB stored a forked
+// Codex rollout under the replayed parent's id with double-counted
+// totals. After the fresh sync reparses the same file under the
+// fork's own id, the stale parent-ID row must not be resurrected as
+// an orphan — but genuine Codex orphans (file gone) and SQLite-backed
+// agents that share a file_path across sessions must still be copied.
+func TestCopyOrphanedDataFrom_SkipsStaleCodexForkRows(t *testing.T) {
+	dir := t.TempDir()
+	forkFile := filepath.Join(dir, "fork.jsonl")
+	goneFile := filepath.Join(dir, "gone.jsonl")
+	sharedDB := filepath.Join(dir, "chats.db")
+
+	srcPath := filepath.Join(dir, "old.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	// Stale pre-fix row: the fork file stored under the parent's id.
+	insertSession(t, srcDB, "codex:parent-1", "proj", func(s *Session) {
+		s.Agent = "codex"
+		s.FilePath = &forkFile
+	})
+	// Genuine Codex orphan: its file no longer exists.
+	insertSession(t, srcDB, "codex:gone-1", "proj", func(s *Session) {
+		s.Agent = "codex"
+		s.FilePath = &goneFile
+	})
+	// SQLite-backed agent: many sessions share one file_path. An id
+	// missing from the fresh parse is an evicted chat, not a stale
+	// duplicate, and must survive as an orphan.
+	insertSession(t, srcDB, "piebald:old-chat", "proj", func(s *Session) {
+		s.Agent = "piebald"
+		s.FilePath = &sharedDB
+	})
+	srcDB.Close()
+
+	dstPath := filepath.Join(dir, "new.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+	// The fork file reparsed under the fork's own id.
+	insertSession(t, dstDB, "codex:fork-1", "proj", func(s *Session) {
+		s.Agent = "codex"
+		s.FilePath = &forkFile
+	})
+	insertSession(t, dstDB, "piebald:new-chat", "proj", func(s *Session) {
+		s.Agent = "piebald"
+		s.FilePath = &sharedDB
+	})
+
+	count, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	require.NoError(t, err, "CopyOrphanedDataFrom")
+	assert.Equal(t, 2, count, "gone-1 and old-chat are the only orphans")
+
+	ctx := t.Context()
+	stale, err := dstDB.GetSession(ctx, "codex:parent-1")
+	require.NoError(t, err, "GetSession codex:parent-1")
+	assert.Nil(t, stale,
+		"stale parent-ID row for a reparsed fork file must not be copied")
+
+	gone, err := dstDB.GetSession(ctx, "codex:gone-1")
+	require.NoError(t, err, "GetSession codex:gone-1")
+	assert.NotNil(t, gone, "genuine codex orphan must be copied")
+
+	evicted, err := dstDB.GetSession(ctx, "piebald:old-chat")
+	require.NoError(t, err, "GetSession piebald:old-chat")
+	assert.NotNil(t, evicted,
+		"evicted chat sharing a file_path must be copied")
+}
+
+func TestCopyOrphanedDataFrom_NoOrphans(t *testing.T) {
+	dir := t.TempDir()
+
+	srcPath := filepath.Join(dir, "old.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	insertSession(t, srcDB, "s1", "proj")
+	srcDB.Close()
+
+	dstPath := filepath.Join(dir, "new.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+	insertSession(t, dstDB, "s1", "proj")
+
+	count, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	requireNoError(t, err, "CopyOrphanedDataFrom")
+	require.Equal(t, 0, count,
+		"expected 0 orphaned sessions, got %d", count)
+}
+
+func TestCopyOrphanedDataFromReconcilesTranscriptRevisions(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "old.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	ids := []string{
+		"unchanged", "changed", "tool-changed",
+		"compact-changed", "subtype-changed",
+		"usage-changed", "claude-identity-changed", "source-identity-changed",
+	}
+	for _, id := range ids {
+		insertSession(t, srcDB, id, "proj")
+	}
+	insertMessages(t, srcDB,
+		userMsg("unchanged", 0, "same"),
+		userMsg("changed", 0, "old content"),
+		asstMsg("tool-changed", 0, "tool"),
+		userMsg("compact-changed", 0, "boundary"),
+		userMsg("subtype-changed", 0, "system event"),
+		asstMsg("usage-changed", 0, "same response"),
+		asstMsg("claude-identity-changed", 0, "same response"),
+		asstMsg("source-identity-changed", 0, "same response"),
+	)
+	_, err := srcDB.getWriter().Exec(t.Context(), `
+		UPDATE messages SET is_system = 1
+		WHERE session_id = 'subtype-changed'`)
+	requireNoError(t, err, "mark source system message")
+	_, err = srcDB.getWriter().Exec(t.Context(), `
+		UPDATE messages SET token_usage = '{"input_tokens":10}'
+		WHERE session_id = 'usage-changed';
+		UPDATE messages
+		SET claude_message_id = 'msg-old', claude_request_id = 'req-old'
+		WHERE session_id = 'claude-identity-changed';
+		UPDATE messages SET source_uuid = 'source-old'
+		WHERE session_id = 'source-identity-changed'`)
+	requireNoError(t, err, "seed source usage identities")
+	_, err = srcDB.getWriter().Exec(t.Context(), `
+		INSERT INTO tool_calls
+			(message_id, session_id, tool_name, category, input_json, call_index)
+		SELECT id, session_id, 'Read', 'file', '{"path":"old"}', 0
+		FROM messages WHERE session_id = 'tool-changed'`)
+	requireNoError(t, err, "insert source tool call")
+	_, err = srcDB.getWriter().Exec(t.Context(),
+		`UPDATE sessions SET transcript_revision = '7'`,
+	)
+	requireNoError(t, err, "set source transcript revisions")
+	requireNoError(t, srcDB.Close(), "close source")
+
+	dstPath := filepath.Join(dir, "new.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+	for _, id := range ids {
+		insertSession(t, dstDB, id, "proj")
+	}
+	insertMessages(t, dstDB,
+		userMsg("unchanged", 0, "same"),
+		userMsg("changed", 0, "new content"),
+		asstMsg("tool-changed", 0, "tool"),
+		userMsg("compact-changed", 0, "boundary"),
+		userMsg("subtype-changed", 0, "system event"),
+		asstMsg("usage-changed", 0, "same response"),
+		asstMsg("claude-identity-changed", 0, "same response"),
+		asstMsg("source-identity-changed", 0, "same response"),
+	)
+	_, err = dstDB.getWriter().Exec(t.Context(), `
+		UPDATE messages
+		SET is_compact_boundary = 1
+		WHERE session_id = 'compact-changed';
+		UPDATE messages
+		SET is_system = 1, source_subtype = 'resume'
+		WHERE session_id = 'subtype-changed';
+		UPDATE messages SET token_usage = '{"input_tokens":20}'
+		WHERE session_id = 'usage-changed';
+		UPDATE messages
+		SET claude_message_id = 'msg-new', claude_request_id = 'req-new'
+		WHERE session_id = 'claude-identity-changed';
+		UPDATE messages SET source_uuid = 'source-new'
+		WHERE session_id = 'source-identity-changed'`)
+	requireNoError(t, err, "change destination display fields")
+	_, err = dstDB.getWriter().Exec(t.Context(), `
+		INSERT INTO tool_calls
+			(message_id, session_id, tool_name, category, input_json, call_index)
+		SELECT id, session_id, 'Read', 'file', '{"path":"new"}', 0
+		FROM messages WHERE session_id = 'tool-changed'`)
+	requireNoError(t, err, "insert destination tool call")
+	name := "metadata-only rename"
+	requireNoError(t, dstDB.RenameSession(t.Context(), "unchanged", &name), "rename session")
+
+	count, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	requireNoError(t, err, "CopyOrphanedDataFrom")
+	assert.Zero(t, count)
+
+	unchanged, err := dstDB.GetSession(t.Context(), "unchanged")
+	requireNoError(t, err, "GetSession unchanged")
+	require.NotNil(t, unchanged)
+	require.NotNil(t, unchanged.TranscriptRevision)
+	assert.Equal(t, "7", *unchanged.TranscriptRevision)
+
+	changed, err := dstDB.GetSession(t.Context(), "changed")
+	requireNoError(t, err, "GetSession changed")
+	require.NotNil(t, changed)
+	require.NotNil(t, changed.TranscriptRevision)
+	assert.Equal(t, "8", *changed.TranscriptRevision)
+
+	toolChanged, err := dstDB.GetSession(t.Context(), "tool-changed")
+	requireNoError(t, err, "GetSession tool-changed")
+	require.NotNil(t, toolChanged)
+	require.NotNil(t, toolChanged.TranscriptRevision)
+	assert.Equal(t, "8", *toolChanged.TranscriptRevision)
+
+	for _, id := range []string{
+		"compact-changed", "subtype-changed", "usage-changed",
+		"claude-identity-changed", "source-identity-changed",
+	} {
+		session, err := dstDB.GetSession(t.Context(), id)
+		requireNoError(t, err, "GetSession "+id)
+		require.NotNil(t, session)
+		require.NotNil(t, session.TranscriptRevision)
+		assert.Equal(t, "8", *session.TranscriptRevision, id)
+	}
+}
+
+func TestCopyOrphanedDataFrom_PreservesCopiedDetails(t *testing.T) {
+	dir := t.TempDir()
+
+	srcPath := filepath.Join(dir, "old.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+
+	insertSession(t, srcDB, "tool-call", "proj")
+	insertMessages(t, srcDB,
+		userMsg("tool-call", 0, "hello"),
+		asstMsg("tool-call", 1, "used a tool"),
+	)
+	_, err := srcDB.getWriter().Exec(t.Context(), `
+		INSERT INTO tool_calls
+			(message_id, session_id, tool_name, category,
+			 tool_use_id)
+		SELECT id, session_id, 'Bash', 'command',
+			'tu_123'
+		FROM messages
+		WHERE session_id = 'tool-call' AND ordinal = 1`,
+	)
+	requireNoError(t, err, "insert tool_call")
+
+	insertSession(t, srcDB, "tool-result", "proj")
+	insertMessages(t, srcDB,
+		userMsg("tool-result", 0, "hello"),
+		asstMsg("tool-result", 1, "waited on child"),
+	)
+	_, err = srcDB.getWriter().Exec(t.Context(), `
+		INSERT INTO tool_calls
+			(message_id, session_id, tool_name, category,
+			 tool_use_id, result_content_length, result_content)
+		SELECT id, session_id, 'wait', 'Other',
+			'call_wait', 23, 'Finished successfully'
+		FROM messages
+		WHERE session_id = 'tool-result' AND ordinal = 1`,
+	)
+	requireNoError(t, err, "insert tool_call")
+	_, err = srcDB.getWriter().Exec(t.Context(), `
+		INSERT INTO tool_result_events
+			(session_id, tool_call_message_ordinal, call_index,
+			 tool_use_id, agent_id, subagent_session_id,
+			 source, status, content, content_length,
+			 timestamp, event_index)
+		VALUES
+			('tool-result', 1, 0, 'call_wait', 'agent-1', 'codex:agent-1',
+			 'wait_output', 'completed', 'Finished successfully',
+			 23, '2026-03-27T18:00:00Z', 0)`,
+	)
+	requireNoError(t, err, "insert tool_result_event")
+
+	insertSession(t, srcDB, "system", "proj")
+	systemMsg := userMsg("system", 0, "system init")
+	systemMsg.IsSystem = true
+	insertMessages(t, srcDB, systemMsg, asstMsg("system", 1, "reply"))
+
+	insertSession(t, srcDB, "token", "proj", func(s *Session) {
+		s.TotalOutputTokens = 5000
+		s.PeakContextTokens = 120000
+		s.HasTotalOutputTokens = true
+		s.HasPeakContextTokens = true
+	})
+	tokenMsg := asstMsg("token", 0, "response")
+	tokenMsg.Model = "claude-opus-4-20250514"
+	tokenMsg.TokenUsage = jsontext.Value(`{"output_tokens":500}`)
+	tokenMsg.ContextTokens = 80000
+	tokenMsg.OutputTokens = 500
+	tokenMsg.HasContextTokens = true
+	tokenMsg.HasOutputTokens = true
+	insertMessages(t, srcDB, tokenMsg)
+
+	insertSession(t, srcDB, "named", "proj", func(s *Session) {
+		s.SessionName = Ptr("Agent Generated Name")
+		s.AgentLabel = "Claude Triage"
+		s.Entrypoint = "sdk-cli"
+	})
+	insertMessages(t, srcDB, userMsg("named", 0, "hello"))
+
+	insertSession(t, srcDB, "file-call", "proj")
+	insertMessages(t, srcDB,
+		userMsg("file-call", 0, "hello"),
+		asstMsg("file-call", 1, "used a tool"),
+	)
+	_, err = srcDB.getWriter().Exec(t.Context(), `
+		INSERT INTO tool_calls
+			(message_id, session_id, tool_name, category,
+			 tool_use_id, input_json, file_path, call_index)
+		SELECT id, session_id, 'Edit', 'Edit',
+			'tu_fp1', '{"file_path":"/repo/main.go"}', '/repo/main.go', 0
+		FROM messages
+		WHERE session_id = 'file-call' AND ordinal = 1`)
+	require.NoError(t, err, "insert file path tool_call")
+	require.NoError(t, srcDB.Close(), "Close src")
+
+	dstPath := filepath.Join(dir, "new.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+
+	count, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	requireNoError(t, err, "CopyOrphanedDataFrom")
+	require.Equal(t, 6, count, "expected orphaned session count")
+
+	ctx := t.Context()
+
+	t.Run("tool call message mapping", func(t *testing.T) {
+		var toolName, toolUseID string
+		var msgID int
+		err := dstDB.getReader().QueryRow(ctx, `
+			SELECT tc.message_id, tc.tool_name, tc.tool_use_id
+			FROM tool_calls tc
+			WHERE tc.session_id = 'tool-call'`,
+		).Scan(&msgID, &toolName, &toolUseID)
+		requireNoError(t, err, "query tool_call")
+		assert.Equal(t, "Bash", toolName, "tool_name")
+		assert.Equal(t, "tu_123", toolUseID, "tool_use_id")
+
+		var ordinal int
+		err = dstDB.getReader().QueryRow(ctx,
+			"SELECT ordinal FROM messages WHERE id = ?", msgID,
+		).Scan(&ordinal)
+		requireNoError(t, err, "verify FK")
+		assert.Equal(t, 1, ordinal, "tool_call message ordinal")
+	})
+
+	t.Run("tool result events", func(t *testing.T) {
+		msgs, err := dstDB.GetAllMessages(ctx, "tool-result")
+		requireNoError(t, err, "GetAllMessages")
+		require.Len(t, msgs, 2, "messages len =")
+		require.Len(t, msgs[1].ToolCalls, 1, "tool calls len =")
+		tc := msgs[1].ToolCalls[0]
+		require.Equal(t, "Finished successfully", tc.ResultContent,
+			"result_content")
+		require.Len(t, tc.ResultEvents, 1, "result events len =")
+		require.Equal(t, "wait_output", tc.ResultEvents[0].Source,
+			"event source")
+		require.Equal(t, "codex:agent-1",
+			tc.ResultEvents[0].SubagentSessionID, "subagent_session_id")
+	})
+
+	t.Run("system flags", func(t *testing.T) {
+		msgs, err := dstDB.GetMessages(ctx, "system", 0, 100, true)
+		requireNoError(t, err, "GetMessages")
+		require.Len(t, msgs, 2, "expected 2 messages")
+		assert.True(t, msgs[0].IsSystem, "ordinal 0: is_system should be true")
+		assert.False(t, msgs[1].IsSystem, "ordinal 1: is_system should be false")
+	})
+
+	t.Run("token metadata", func(t *testing.T) {
+		s, err := dstDB.GetSession(ctx, "token")
+		requireNoError(t, err, "GetSession token")
+		require.NotNil(t, s, "orphaned session token not found")
+		assert.Equal(t, 5000, s.TotalOutputTokens, "TotalOutputTokens")
+		assert.Equal(t, 120000, s.PeakContextTokens, "PeakContextTokens")
+		assert.True(t, s.HasTotalOutputTokens, "HasTotalOutputTokens should be true")
+		assert.True(t, s.HasPeakContextTokens, "HasPeakContextTokens should be true")
+
+		msgs, err := dstDB.GetMessages(ctx, "token", 0, 100, true)
+		requireNoError(t, err, "GetMessages token")
+		require.Len(t, msgs, 1, "expected 1 message")
+		m := msgs[0]
+		assert.Equal(t, "claude-opus-4-20250514", m.Model, "Model")
+		assert.Equal(t, 80000, m.ContextTokens, "ContextTokens")
+		assert.Equal(t, 500, m.OutputTokens, "OutputTokens")
+		assert.True(t, m.HasContextTokens, "HasContextTokens should be true")
+		assert.True(t, m.HasOutputTokens, "HasOutputTokens should be true")
+		assert.NotEmpty(t, m.TokenUsage, "TokenUsage should be preserved")
+	})
+
+	t.Run("session identity metadata", func(t *testing.T) {
+		s, err := dstDB.GetSession(ctx, "named")
+		requireNoError(t, err, "GetSession named")
+		require.NotNil(t, s, "orphaned session named not found")
+		assert.Equal(t, "Claude Triage", s.AgentLabel, "AgentLabel")
+		assert.Equal(t, "sdk-cli", s.Entrypoint, "Entrypoint")
+	})
+
+	t.Run("session name", func(t *testing.T) {
+		s, err := dstDB.GetSession(ctx, "named")
+		requireNoError(t, err, "GetSession named")
+		require.NotNil(t, s, "orphaned session named not found in dst")
+		require.NotNil(t, s.DisplayName,
+			"DisplayName should be populated via COALESCE")
+		assert.Equal(t, "Agent Generated Name", *s.DisplayName,
+			"DisplayName via COALESCE(display_name, session_name)")
+	})
+
+	t.Run("tool call file path and call index", func(t *testing.T) {
+		var fp sql.NullString
+		var ci int
+		require.NoError(t, dstDB.getReader().QueryRow(ctx, `
+			SELECT file_path, call_index FROM tool_calls
+			WHERE session_id = 'file-call'`,
+		).Scan(&fp, &ci))
+		assert.True(t, fp.Valid, "file_path should be non-NULL after copy")
+		assert.Equal(t, "/repo/main.go", fp.String, "file_path value")
+		assert.Equal(t, 0, ci, "call_index value")
+	})
+}
+
+func TestCopyTrashedDataFromPreservesPins(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	srcPath := filepath.Join(dir, "old.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	insertSession(t, srcDB, "s1", "proj")
+	insertMessages(t, srcDB,
+		userMsg("s1", 0, "keep this pinned"),
+		asstMsg("s1", 1, "reply"),
+	)
+	srcMsgs, err := srcDB.GetAllMessages(ctx, "s1")
+	requireNoError(t, err, "GetAllMessages src")
+	note := "important"
+	pinID, err := srcDB.PinMessage(ctx, "s1", srcMsgs[0].ID, &note)
+	require.NoError(t, err, "PinMessage src: id=%d", pinID)
+	require.NotZero(t, pinID, "PinMessage src returned id=0")
+	requireNoError(t, srcDB.SoftDeleteSession(ctx, "s1"), "SoftDelete src")
+	srcDB.Close()
+
+	dstPath := filepath.Join(dir, "new.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+
+	count, err := dstDB.CopyTrashedDataFrom(srcPath)
+	requireNoError(t, err, "CopyTrashedDataFrom")
+	require.Len(t, count, 1, "copied trashed sessions")
+
+	pins, err := dstDB.ListPinnedMessages(ctx, "s1", "")
+	requireNoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 1, "pins copied =")
+	require.Equal(t, 0, pins[0].Ordinal, "pin ordinal")
+	require.NotNil(t, pins[0].Note, "pin note nil")
+	require.Equal(t, note, *pins[0].Note, "pin note")
+
+	var messageContent string
+	requireNoError(t, dstDB.getReader().QueryRow(ctx,
+		"SELECT content FROM messages WHERE id = ?",
+		pins[0].MessageID,
+	).Scan(&messageContent), "query pinned message")
+	require.Equal(t, "keep this pinned", messageContent, "pinned content")
+}
+
+func TestCopyOrphanedDataFrom_AtomicOnFailure(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create source DB with a session and messages.
+	srcPath := filepath.Join(dir, "old.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	insertSession(t, srcDB, "s1", "proj")
+	insertMessages(t, srcDB, userMsg("s1", 0, "hello"))
+	srcDB.Close()
+
+	// Corrupt source: drop the messages table so the
+	// message-copy step fails.
+	raw, err := sql.Open("sqlite3", srcPath)
+	requireNoError(t, err, "raw open")
+	_, err = raw.ExecContext(t.Context(), "PRAGMA foreign_keys = OFF")
+	requireNoError(t, err, "disable fk")
+	_, err = raw.ExecContext(t.Context(), "DROP TABLE messages")
+	requireNoError(t, err, "drop messages")
+	raw.Close()
+
+	// Empty destination.
+	dstPath := filepath.Join(dir, "new.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+
+	// CopyOrphanedDataFrom should fail on the message
+	// copy step.
+	_, err = dstDB.CopyOrphanedDataFrom(srcPath)
+	require.Error(t, err, "expected error from corrupted source")
+
+	// The session insert must have been rolled back — no
+	// partial data in the destination.
+	page, err := dstDB.ListSessions(
+		t.Context(),
+		SessionFilter{Limit: 100},
+	)
+	requireNoError(t, err, "list sessions")
+	require.Empty(t, page.Sessions,
+		"expected 0 sessions after failed copy, got %d",
+		len(page.Sessions))
+}
+
+func TestCopyOrphanedDataFrom_LegacyNoIsSystem(t *testing.T) {
+	dir := t.TempDir()
+
+	// Source DB with is_system column removed to simulate
+	// a legacy database.
+	srcPath := filepath.Join(dir, "old.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	insertSession(t, srcDB, "s1", "proj")
+	insertMessages(t, srcDB, userMsg("s1", 0, "hello"))
+	srcDB.Close()
+
+	// Drop is_system via raw SQL to simulate legacy schema.
+	raw, err := sql.Open("sqlite3", srcPath)
+	requireNoError(t, err, "raw open")
+	// SQLite doesn't support DROP COLUMN before 3.35;
+	// recreate the table without is_system.
+	_, err = raw.ExecContext(t.Context(), `
+		CREATE TABLE messages_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL,
+			ordinal INTEGER NOT NULL,
+			role TEXT NOT NULL,
+			content TEXT NOT NULL DEFAULT '',
+			timestamp TEXT NOT NULL DEFAULT '',
+			has_thinking INTEGER NOT NULL DEFAULT 0,
+			has_tool_use INTEGER NOT NULL DEFAULT 0,
+			content_length INTEGER NOT NULL DEFAULT 0
+		)`)
+	requireNoError(t, err, "create messages_new")
+	_, err = raw.ExecContext(t.Context(), `
+		INSERT INTO messages_new
+			(id, session_id, ordinal, role, content,
+			 timestamp, has_thinking, has_tool_use,
+			 content_length)
+		SELECT id, session_id, ordinal, role, content,
+			timestamp, has_thinking, has_tool_use,
+			content_length
+		FROM messages`)
+	requireNoError(t, err, "copy to messages_new")
+	_, err = raw.ExecContext(t.Context(), "DROP TABLE messages")
+	requireNoError(t, err, "drop messages")
+	_, err = raw.ExecContext(t.Context(),
+		"ALTER TABLE messages_new RENAME TO messages",
+	)
+	requireNoError(t, err, "rename messages_new")
+	raw.Close()
+
+	// Empty destination (has is_system column).
+	dstPath := filepath.Join(dir, "new.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+
+	count, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	requireNoError(t, err, "CopyOrphanedDataFrom")
+	require.Equal(t, 1, count, "expected 1 orphaned, got")
+
+	// Message should be copied with is_system defaulting to
+	// false.
+	msgs, err := dstDB.GetMessages(
+		t.Context(), "s1", 0, 100, true,
+	)
+	requireNoError(t, err, "GetMessages")
+	require.Len(t, msgs, 1, "expected 1 message")
+	assert.False(t, msgs[0].IsSystem, "is_system should default to false")
+}
+
+func TestGetAgentsExcludesEmptyAgent(t *testing.T) {
+	d := testDB(t)
+
+	// Insert sessions with various agent values.
+	insertSession(t, d, "s1", "proj",
+		func(s *Session) { s.Agent = "claude" })
+	insertSession(t, d, "s2", "proj",
+		func(s *Session) { s.Agent = "cursor" })
+	insertSession(t, d, "s3", "proj",
+		func(s *Session) { s.Agent = "" })
+
+	agents, err := d.GetAgents(t.Context(), false, false)
+	require.NoError(t, err, "GetAgents")
+
+	for _, a := range agents {
+		assert.NotEmpty(t, a.Name, "GetAgents returned empty agent name")
+	}
+	assert.Len(t, agents, 2, "len")
+}
+
+func TestGetAgentsEmptyResultSerializesAsArray(t *testing.T) {
+	d := testDB(t)
+
+	agents, err := d.GetAgents(t.Context(), false, false)
+	require.NoError(t, err, "GetAgents")
+	require.NotNil(t, agents, "GetAgents returned nil, want empty slice")
+	assert.Empty(t, agents, "len")
+
+	b, err := json.Marshal(agents)
+	require.NoError(t, err, "json.Marshal")
+	assert.Equal(t, "[]", string(b), "JSON")
+}
+
+func TestStarSession(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	insertSession(t, d, "s1", "proj")
+
+	// Star existing session.
+	ok, err := d.StarSession(ctx, "s1")
+	require.NoError(t, err, "StarSession")
+	require.True(t, ok, "StarSession should succeed for existing session")
+
+	// Idempotent re-star — should still return true (session exists).
+	ok, err = d.StarSession(ctx, "s1")
+	require.NoError(t, err, "re-star")
+	assert.True(t, ok, "re-star should return true (session exists, already starred)")
+	// This is acceptable — the session is already starred.
+
+	// Listed.
+	ids, err := d.ListStarredSessionIDs(ctx)
+	require.NoError(t, err, "ListStarredSessionIDs")
+	assert.Equal(t, []string{"s1"}, ids, "listed = %v, want [s1]", ids)
+
+	// Unstar.
+	err = d.UnstarSession(ctx, "s1")
+	require.NoError(t, err, "UnstarSession")
+	ids, err = d.ListStarredSessionIDs(ctx)
+	require.NoError(t, err, "ListStarredSessionIDs after unstar")
+	assert.Empty(t, ids, "listed after unstar = %v, want []", ids)
+
+	// Star non-existent session returns false (no FK error).
+	ok, err = d.StarSession(ctx, "nonexistent")
+	require.NoError(t, err, "StarSession nonexistent")
+	assert.False(t, ok, "StarSession should return false for non-existent session")
+}
+
+func TestBulkStarSessions(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	insertSession(t, d, "s1", "proj")
+	insertSession(t, d, "s2", "proj")
+
+	// Bulk star with mix of valid and invalid IDs.
+	err := d.BulkStarSessions(ctx, []string{"s1", "s2", "nonexistent"})
+	require.NoError(t, err, "BulkStarSessions")
+
+	ids, err := d.ListStarredSessionIDs(ctx)
+	require.NoError(t, err, "ListStarredSessionIDs")
+	assert.Len(t, ids, 2, "listed")
+}
+
+func TestListStarredSessionIDsForScope(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	insertSession(t, d, "s1", "alpha")
+	insertSession(t, d, "s2", "beta")
+	insertSession(t, d, "s3", "beta")
+
+	_, err := d.StarSession(ctx, "s1")
+	require.NoError(t, err, "StarSession s1")
+	_, err = d.StarSession(ctx, "s2")
+	require.NoError(t, err, "StarSession s2")
+
+	all, err := d.ListStarredSessionIDsForScope(ctx, nil, nil)
+	require.NoError(t, err, "unfiltered scope")
+	assert.ElementsMatch(t, []string{"s1", "s2"}, all)
+
+	alphaOnly, err := d.ListStarredSessionIDsForScope(ctx, []string{"alpha"}, nil)
+	require.NoError(t, err, "include alpha")
+	assert.Equal(t, []string{"s1"}, alphaOnly)
+
+	excludeAlpha, err := d.ListStarredSessionIDsForScope(ctx, nil, []string{"alpha"})
+	require.NoError(t, err, "exclude alpha")
+	assert.Equal(t, []string{"s2"}, excludeAlpha)
+
+	betaOnly, err := d.ListStarredSessionIDsForScope(ctx, []string{"beta"}, nil)
+	require.NoError(t, err, "include beta (s3 unstarred)")
+	assert.Equal(t, []string{"s2"}, betaOnly)
+}
+
+func TestDeleteSyncStateByPrefix(t *testing.T) {
+	d := testDB(t)
+
+	require.NoError(t, d.SetSyncState(t.Context(), "duckdb_last_push_at", "t1"))
+	require.NoError(t, d.SetSyncState(t.Context(), "duckdb_last_push_at:work", "t2"))
+	require.NoError(t, d.SetSyncState(t.Context(), "duckdb_last_push_boundary_state", "b1"))
+	require.NoError(t, d.SetSyncState(t.Context(), "last_push_at", "keep-me"))
+
+	require.NoError(t, d.DeleteSyncStateByPrefix(t.Context(), "duckdb_"))
+
+	for _, key := range []string{
+		"duckdb_last_push_at", "duckdb_last_push_at:work", "duckdb_last_push_boundary_state",
+	} {
+		value, err := d.GetSyncState(t.Context(), key)
+		require.NoError(t, err, "GetSyncState %s", key)
+		assert.Empty(t, value, "key %s should have been deleted", key)
+	}
+
+	kept, err := d.GetSyncState(t.Context(), "last_push_at")
+	require.NoError(t, err, "GetSyncState last_push_at")
+	assert.Equal(t, "keep-me", kept, "unrelated keys must not be deleted")
+}
+
+func TestDeleteSyncStateByPrefixEscapesLikeMetacharacters(t *testing.T) {
+	d := testDB(t)
+
+	// Keys containing literal LIKE metacharacters (% and _) must only match
+	// as literal characters, not as wildcards: a prefix of "a_b" must not
+	// also delete "axb".
+	require.NoError(t, d.SetSyncState(t.Context(), "a_b_target", "v1"))
+	require.NoError(t, d.SetSyncState(t.Context(), "axb_unrelated", "v2"))
+
+	require.NoError(t, d.DeleteSyncStateByPrefix(t.Context(), "a_b"))
+
+	deleted, err := d.GetSyncState(t.Context(), "a_b_target")
+	require.NoError(t, err)
+	assert.Empty(t, deleted)
+
+	kept, err := d.GetSyncState(t.Context(), "axb_unrelated")
+	require.NoError(t, err)
+	assert.Equal(t, "v2", kept, "underscore in prefix must not act as a wildcard")
+}
+
+func TestRestoreSession(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "s1", "p")
+
+	t.Run("restore non-trashed returns 0", func(t *testing.T) {
+		n, err := d.RestoreSession(ctx, "s1")
+		requireNoError(t, err, "RestoreSession")
+		assert.Equal(t, int64(0), n, "rows affected")
+	})
+
+	t.Run("restore non-existent returns 0", func(t *testing.T) {
+		n, err := d.RestoreSession(ctx, "no-such-session")
+		requireNoError(t, err, "RestoreSession")
+		assert.Equal(t, int64(0), n, "rows affected")
+	})
+
+	t.Run("restore trashed returns 1", func(t *testing.T) {
+		requireNoError(t, d.SoftDeleteSession(ctx, "s1"), "SoftDeleteSession")
+
+		// Should not appear in filtered list queries.
+		f := filterWith(func(f *SessionFilter) {})
+		page, err := d.ListSessions(ctx, f)
+		requireNoError(t, err, "ListSessions")
+		require.Empty(t, page.Sessions,
+			"soft-deleted session should not appear in list")
+
+		// Should appear in trash list.
+		trashed, err := d.ListTrashedSessions(ctx)
+		requireNoError(t, err, "ListTrashedSessions")
+		require.Len(t, trashed, 1, "trash count =")
+
+		n, err := d.RestoreSession(ctx, "s1")
+		requireNoError(t, err, "RestoreSession")
+		assert.Equal(t, int64(1), n, "rows affected")
+
+		// Should appear in list again.
+		page, err = d.ListSessions(ctx, f)
+		requireNoError(t, err, "ListSessions")
+		require.Len(t, page.Sessions, 1,
+			"restored session should appear in list")
+	})
+}
+
+func TestDeleteSessionExcludes(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s1", "p")
+
+	err := d.DeleteSession(t.Context(), "s1")
+	require.NoError(t, err, "DeleteSession")
+
+	// Session should be gone.
+	requireSessionGone(t, d, "s1")
+
+	// Session should be excluded.
+	assert.True(t, d.IsSessionExcluded(t.Context(), "s1"),
+		"session should be excluded after permanent delete")
+
+	// UpsertSession should return ErrSessionExcluded.
+	err = d.UpsertSession(t.Context(), Session{
+		ID: "s1", Project: "p", Machine: "m", Agent: "claude",
+	})
+	require.ErrorIs(t, err, ErrSessionExcluded,
+		"UpsertSession = %v, want ErrSessionExcluded", err)
+	requireSessionGone(t, d, "s1")
+}
+
+func TestVibeCanonicalDeleteExcludesFallbackAlias(t *testing.T) {
+	cases := []struct {
+		name       string
+		id         string
+		filePath   string
+		fallbackID string
+		delete     func(*testing.T, *DB, string) error
+	}{
+		{
+			name:       "single delete",
+			id:         "vibe:abc123def-0000-0000-0000-000000000000",
+			filePath:   "/tmp/vibe/session_20260616_083518_abc123/messages.jsonl",
+			fallbackID: "vibe:session_20260616_083518_abc123",
+			delete: func(t *testing.T, d *DB, id string) error {
+				t.Helper()
+
+				return d.DeleteSession(t.Context(), id)
+			},
+		},
+		{
+			name:       "remote single delete",
+			id:         "host~vibe:abc123def-0000-0000-0000-000000000000",
+			filePath:   "host:/remote/vibe/session_20260616_083518_abc123/messages.jsonl",
+			fallbackID: "host~vibe:session_20260616_083518_abc123",
+			delete: func(t *testing.T, d *DB, id string) error {
+				t.Helper()
+
+				return d.DeleteSession(t.Context(), id)
+			},
+		},
+		{
+			name:       "delete if trashed",
+			id:         "vibe:abc123def-0000-0000-0000-000000000001",
+			filePath:   "/tmp/vibe/session_20260616_083518_def456/messages.jsonl",
+			fallbackID: "vibe:session_20260616_083518_def456",
+			delete: func(t *testing.T, d *DB, id string) error {
+				t.Helper()
+
+				requireNoError(t, d.SoftDeleteSession(t.Context(), id), "SoftDeleteSession")
+				n, err := d.DeleteSessionIfTrashed(t.Context(), id)
+				require.Equal(t, int64(1), n, "DeleteSessionIfTrashed rows")
+				return err
+			},
+		},
+		{
+			name:       "batch delete",
+			id:         "vibe:abc123def-0000-0000-0000-000000000002",
+			filePath:   "/tmp/vibe/session_20260616_083518_ghi789/messages.jsonl",
+			fallbackID: "vibe:session_20260616_083518_ghi789",
+			delete: func(t *testing.T, d *DB, id string) error {
+				t.Helper()
+
+				n, err := d.DeleteSessions(t.Context(), []string{id})
+				require.Equal(t, 1, n, "DeleteSessions rows")
+				return err
+			},
+		},
+		{
+			name:       "empty trash",
+			id:         "vibe:abc123def-0000-0000-0000-000000000003",
+			filePath:   "/tmp/vibe/session_20260616_083518_jkl012/messages.jsonl",
+			fallbackID: "vibe:session_20260616_083518_jkl012",
+			delete: func(t *testing.T, d *DB, id string) error {
+				t.Helper()
+
+				requireNoError(t, d.SoftDeleteSession(t.Context(), id), "SoftDeleteSession")
+				n, err := d.EmptyTrash(t.Context())
+				require.Equal(t, 1, n, "EmptyTrash rows")
+				return err
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			insertSession(t, d, tc.id, "p", func(s *Session) {
+				s.Agent = "vibe"
+				s.FilePath = &tc.filePath
+			})
+
+			requireNoError(t, tc.delete(t, d, tc.id), "delete")
+
+			assert.True(t, d.IsSessionExcluded(t.Context(), tc.id),
+				"canonical ID should be excluded")
+			assert.True(t, d.IsSessionExcluded(t.Context(), tc.fallbackID),
+				"fallback alias should be excluded")
+			requireSessionGone(t, d, tc.id)
+		})
+	}
+}
+
+func TestUpsertSessionTrashedReturnsErrSessionTrashed(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s1", "p")
+	requireNoError(t, d.SoftDeleteSession(t.Context(), "s1"), "SoftDeleteSession")
+
+	err := d.UpsertSession(t.Context(), Session{
+		ID: "s1", Project: "p", Machine: "m", Agent: "claude",
+	})
+	require.ErrorIs(t, err, ErrSessionTrashed,
+		"UpsertSession = %v, want ErrSessionTrashed", err)
+}
+
+func TestEmptyTrashExcludes(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s1", "p")
+	insertSession(t, d, "s2", "p")
+	insertSession(t, d, "s3", "p")
+
+	requireNoError(t, d.SoftDeleteSession(t.Context(), "s1"), "SoftDeleteSession s1")
+	requireNoError(t, d.SoftDeleteSession(t.Context(), "s2"), "SoftDeleteSession s2")
+
+	n, err := d.EmptyTrash(t.Context())
+	requireNoError(t, err, "EmptyTrash")
+	assert.Equal(t, 2, n, "EmptyTrash deleted")
+
+	// Both should be excluded.
+	assert.True(t, d.IsSessionExcluded(t.Context(), "s1"), "s1 should be excluded")
+	assert.True(t, d.IsSessionExcluded(t.Context(), "s2"), "s2 should be excluded")
+
+	// s3 should NOT be excluded.
+	assert.False(t, d.IsSessionExcluded(t.Context(), "s3"),
+		"s3 should not be excluded")
+
+	// Re-upsert should return ErrSessionExcluded.
+	err = d.UpsertSession(t.Context(), Session{
+		ID: "s1", Project: "p", Machine: "m", Agent: "claude",
+	})
+	require.ErrorIs(t, err, ErrSessionExcluded,
+		"UpsertSession s1 = %v, want ErrSessionExcluded", err)
+	requireSessionGone(t, d, "s1")
+
+	// s3 should still be upsertable.
+	s, _ := d.GetSession(t.Context(), "s3")
+	assert.NotNil(t, s, "s3 should still be visible")
+}
+
+func TestCopyExcludedSessionsFrom(t *testing.T) {
+	dir := t.TempDir()
+
+	// Source DB with excluded sessions.
+	srcPath := filepath.Join(dir, "src.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+
+	insertSession(t, srcDB, "s1", "p")
+	requireNoError(t, srcDB.DeleteSession(t.Context(), "s1"), "DeleteSession")
+	require.True(t, srcDB.IsSessionExcluded(t.Context(), "s1"),
+		"s1 should be excluded in src")
+	srcDB.Close()
+
+	// Destination DB (empty, simulates fresh resync DB).
+	dstPath := filepath.Join(dir, "dst.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+
+	// Copy excluded sessions.
+	err := dstDB.CopyExcludedSessionsFrom(srcPath)
+	require.NoError(t, err, "CopyExcludedSessionsFrom")
+
+	// s1 should be excluded in destination.
+	assert.True(t, dstDB.IsSessionExcluded(t.Context(), "s1"),
+		"s1 should be excluded in dst after copy")
+
+	// Upserting s1 should be rejected.
+	err = dstDB.UpsertSession(t.Context(), Session{
+		ID: "s1", Project: "p", Machine: "m", Agent: "claude",
+	})
+	assert.ErrorIs(t, err, ErrSessionExcluded,
+		"UpsertSession = %v, want ErrSessionExcluded", err)
+}
+
+// TestCopyOrphanedDataFromClearsCopiedSelfParent covers an archive rebuild
+// whose source predates the self-edge guard: the fresh archive has already
+// run its one-time self-parent repair, so the copy itself must clear the
+// self-parented rows it brings over.
+func TestCopyOrphanedDataFromClearsCopiedSelfParent(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "src.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	insertSession(t, srcDB, "child", "p")
+	insertMessages(t, srcDB, spawnEdgeTo("child", "child", "legacy self spawn"))
+	insertSession(t, srcDB, "path-derived", "p", func(s *Session) {
+		s.ParentSessionID = Ptr("main")
+		s.RelationshipType = "subagent"
+	})
+	insertSession(t, srcDB, "kept", "p", func(s *Session) {
+		s.ParentSessionID = Ptr("real")
+		s.RelationshipType = "subagent"
+	})
+	forceSelfParent(t, srcDB, "child")
+	forceSelfParent(t, srcDB, "path-derived")
+	require.NoError(t, srcDB.Close(), "Close src")
+
+	dstDB := testDBAtPath(t, filepath.Join(dir, "dst.db"), "dst")
+	defer dstDB.Close()
+	require.NoError(t, dstDB.LinkSubagentSessions(),
+		"fresh archive linking pass runs before orphans are copied")
+	copied, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	require.NoError(t, err, "CopyOrphanedDataFrom")
+	assert.Equal(t, 3, copied)
+	require.NoError(t, dstDB.LinkSubagentSessions(), "post-copy relink")
+
+	child, err := dstDB.GetSession(t.Context(), "child")
+	requireNoError(t, err, "GetSession child")
+	assert.Nil(t, child.ParentSessionID,
+		"copied self-parent must be cleared even after the one-time repair ran")
+	assert.Equal(t, "subagent", child.RelationshipType)
+	assert.Equal(t, "main", parentOfSession(t, dstDB, "path-derived"),
+		"copied self-parent must fall back to the parser parent")
+	assert.Equal(t, "real", parentOfSession(t, dstDB, "kept"),
+		"copied real parents must survive")
+}
+
+func TestCopySyncStateFrom_NoSourceTable(t *testing.T) {
+	dir := t.TempDir()
+
+	// Source DB with no tables (legacy DB shape missing pg_sync_state).
+	srcPath := filepath.Join(dir, "src.db")
+	srcConn, err := sql.Open("sqlite3", srcPath)
+	require.NoError(t, err, "open src")
+	require.NoError(t, srcConn.Close(), "close src")
+
+	dstPath := filepath.Join(dir, "dst.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+
+	// Seed a marker that should be preserved when source has none.
+	require.NoError(t, dstDB.SetSyncState(t.Context(),
+		"pg_push_marker_id", "marker-123",
+	), "seed destination sync state")
+
+	// Copy should be a no-op for legacy source and return nil.
+	err = dstDB.CopySyncStateFrom(srcPath)
+	require.NoError(t, err, "CopySyncStateFrom")
+
+	got, err := dstDB.GetSyncState(t.Context(), "pg_push_marker_id")
+	require.NoError(t, err, "GetSyncState")
+	assert.Equal(t, "marker-123", got)
+}
+
+func TestCopySyncStateFrom_OnlyCopiesDurableKeys(t *testing.T) {
+	dir := t.TempDir()
+
+	srcPath := filepath.Join(dir, "src.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	require.NoError(t, srcDB.SetSyncState(t.Context(), "pg_push_marker_id", "marker-123"),
+		"seed source marker")
+	require.NoError(t, srcDB.SetSyncState(t.Context(), "artifact_origin_id", "laptop-a1b2c3"),
+		"seed source artifact origin")
+	require.NoError(t, srcDB.SetSyncState(t.Context(), "last_sync_started_at", "old-start"),
+		"seed source started")
+	require.NoError(t, srcDB.SetSyncState(t.Context(), "last_sync_finished_at", "old-finish"),
+		"seed source finished")
+	require.NoError(t, srcDB.QueueSubagentParentRepairs(t.Context(), []string{"queued-child"}),
+		"seed durable hierarchy repair")
+	require.NoError(t, srcDB.QueueSubagentParentCleanupRepairs(t.Context(),
+		[]string{"queued-former-child"},
+	), "seed durable hierarchy cleanup")
+	require.NoError(t, srcDB.UpsertSession(t.Context(), Session{
+		ID: "queued-session", Project: "p", Machine: "local", Agent: "claude",
+	}), "seed source queued session")
+	require.NoError(t, srcDB.Close(), "Close src")
+
+	dstPath := filepath.Join(dir, "dst.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+	require.NoError(t, dstDB.SetSyncState(t.Context(), "last_sync_started_at", "new-start"),
+		"seed destination started")
+	require.NoError(t, dstDB.SetSyncState(t.Context(), "last_sync_finished_at", "new-finish"),
+		"seed destination finished")
+
+	err := dstDB.CopySyncStateFrom(srcPath)
+	require.NoError(t, err, "CopySyncStateFrom")
+
+	gotMarker, err := dstDB.GetSyncState(t.Context(), "pg_push_marker_id")
+	require.NoError(t, err, "GetSyncState pg_push_marker_id")
+	assert.Equal(t, "marker-123", gotMarker)
+
+	gotOrigin, err := dstDB.GetSyncState(t.Context(), "artifact_origin_id")
+	require.NoError(t, err, "GetSyncState artifact_origin_id")
+	assert.Equal(t, "laptop-a1b2c3", gotOrigin,
+		"artifact_% sync-state keys must survive the copy")
+
+	assert.Contains(t, artifactExportQueueIDs(t, dstDB), "queued-session",
+		"artifact export queue rows must survive the copy")
+
+	var queuedRepairs int
+	require.NoError(t, dstDB.Reader().QueryRow(t.Context(), `
+		SELECT count(*) FROM subagent_parent_repair_queue
+		WHERE session_id = 'queued-child'`,
+	).Scan(&queuedRepairs), "query copied subagent repair queue")
+	assert.Equal(t, 1, queuedRepairs,
+		"pending hierarchy repairs must survive an archive rebuild")
+	var queuedCleanups int
+	require.NoError(t, dstDB.Reader().QueryRow(t.Context(), `
+		SELECT count(*) FROM subagent_parent_cleanup_queue
+		WHERE session_id = 'queued-former-child'`,
+	).Scan(&queuedCleanups), "query copied subagent cleanup queue")
+	assert.Equal(t, 1, queuedCleanups,
+		"pending destructive cleanup intent must survive an archive rebuild")
+
+	gotStarted, err := dstDB.GetSyncState(t.Context(), "last_sync_started_at")
+	require.NoError(t, err, "GetSyncState last_sync_started_at")
+	assert.Equal(t, "new-start", gotStarted)
+
+	gotFinished, err := dstDB.GetSyncState(t.Context(), "last_sync_finished_at")
+	require.NoError(t, err, "GetSyncState last_sync_finished_at")
+	assert.Equal(t, "new-finish", gotFinished)
+}
+
+func TestCopySyncStateFrom_PropagatesErrors(t *testing.T) {
+	dir := t.TempDir()
+
+	// Source is not a valid SQLite database, so probing state fails.
+	srcPath := filepath.Join(dir, "src.db")
+	require.NoError(t, os.WriteFile(srcPath, []byte("not sqlite"), 0o600),
+		"write invalid source")
+
+	dstPath := filepath.Join(dir, "dst.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+	require.NoError(t, dstDB.SetSyncState(t.Context(), "pg_push_marker_id", "safe"),
+		"seed destination sync state")
+
+	err := dstDB.CopySyncStateFrom(srcPath)
+	require.Error(t, err, "CopySyncStateFrom")
+	require.ErrorContains(t, err, "attaching source db")
+
+	got, err := dstDB.GetSyncState(t.Context(), "pg_push_marker_id")
+	require.NoError(t, err, "GetSyncState")
+	assert.Equal(t, "safe", got)
+}
+
+func TestCopySessionMetadataFrom(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	// Source DB: session with display_name, deleted_at, and a pin.
+	srcPath := filepath.Join(dir, "src.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	insertSession(t, srcDB, "s1", "proj")
+	insertMessages(t, srcDB, Message{
+		SessionID: "s1", Ordinal: 1, Role: "user",
+		Content: "hello", ContentLength: 5,
+	})
+	dn := "my-custom-name"
+	requireNoError(t, srcDB.RenameSession(ctx, "s1", &dn), "Rename")
+	requireNoError(t, srcDB.SoftDeleteSession(ctx, "s1"), "SoftDelete")
+	// Pin message ordinal 1.
+	pinID, err := srcDB.PinMessage(ctx, "s1", 1, nil)
+	require.NoError(t, err, "PinMessage in src: id=%d", pinID)
+	require.NotZero(t, pinID, "PinMessage in src returned id=0")
+	// Star the session.
+	_, err = srcDB.getWriter().Exec(ctx,
+		"INSERT INTO starred_sessions (session_id) VALUES (?)", "s1",
+	)
+	require.NoError(t, err, "star session in src")
+	srcDB.Close()
+
+	// Destination DB: same session re-synced (no user metadata).
+	dstPath := filepath.Join(dir, "dst.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+	insertSession(t, dstDB, "s1", "proj")
+	insertMessages(t, dstDB, Message{
+		SessionID: "s1", Ordinal: 1, Role: "user",
+		Content: "hello", ContentLength: 5,
+	})
+
+	// Before copy: no metadata, no pins.
+	s, err := dstDB.GetSession(ctx, "s1")
+	requireNoError(t, err, "GetSession before")
+	assert.Nil(t, s.DisplayName, "display_name before")
+	assert.Nil(t, s.DeletedAt, "deleted_at before")
+	pins, err := dstDB.ListPinnedMessages(ctx, "s1", "")
+	requireNoError(t, err, "ListPins before")
+	assert.Empty(t, pins, "pins before")
+	var starCount int
+	requireNoError(t, dstDB.getReader().QueryRow(ctx,
+		"SELECT count(*) FROM starred_sessions WHERE session_id = ?", "s1",
+	).Scan(&starCount), "count stars before")
+	assert.Equal(t, 0, starCount, "stars before")
+
+	// Copy metadata.
+	err = dstDB.CopySessionMetadataFrom(srcPath)
+	require.NoError(t, err, "CopySessionMetadataFrom")
+
+	// After copy: metadata, pin, and star should be merged.
+	// Use GetSessionFull because deleted_at was copied, so
+	// GetSession (which filters deleted_at IS NULL) returns nil.
+	sf, err := dstDB.GetSessionFull(ctx, "s1")
+	requireNoError(t, err, "GetSessionFull after")
+	require.NotNil(t, sf, "session should exist after metadata copy")
+	require.NotNil(t, sf.DisplayName, "display_name nil")
+	assert.Equal(t, dn, *sf.DisplayName, "display_name")
+	assert.NotNil(t, sf.DeletedAt, "deleted_at should be set after copy")
+	pins, err = dstDB.ListPinnedMessages(ctx, "s1", "")
+	requireNoError(t, err, "ListPins after")
+	require.Len(t, pins, 1, "pins after =")
+	assert.Equal(t, 1, pins[0].Ordinal, "pin ordinal")
+	requireNoError(t, dstDB.getReader().QueryRow(ctx,
+		"SELECT count(*) FROM starred_sessions WHERE session_id = ?", "s1",
+	).Scan(&starCount), "count stars after")
+	assert.Equal(t, 1, starCount, "stars after")
+}
+
+func TestCopySessionMetadataFrom_IdenticalDuplicatePins(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	identical := func(sessionID string, ordinals ...int) []Message {
+		msgs := make([]Message, 0, len(ordinals))
+		for _, ordinal := range ordinals {
+			msgs = append(msgs, Message{
+				SessionID: sessionID, Ordinal: ordinal, Role: "user",
+				Content: "same", ContentLength: 4,
+				SourceUUID: "duplicate",
+			})
+		}
+		return msgs
+	}
+
+	srcPath := filepath.Join(dir, "src.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	// Unchanged duplicate set: the fresh DB has the same two
+	// identical rows, so the pin keeps its ordinal.
+	insertSession(t, srcDB, "dup-keep", "proj")
+	insertMessages(t, srcDB, identical("dup-keep", 0, 1)...)
+	// Changed duplicate set: the fresh DB gained a third identical
+	// row, so the old ordinal no longer proves which duplicate was
+	// pinned and the pin is dropped.
+	insertSession(t, srcDB, "dup-changed", "proj")
+	insertMessages(t, srcDB, identical("dup-changed", 0, 1)...)
+	// Shifted duplicate set: the fresh DB inserted a context row
+	// before the duplicates, so the pin must follow its occurrence
+	// rank to the shifted ordinal.
+	insertSession(t, srcDB, "dup-shifted", "proj")
+	insertMessages(t, srcDB, identical("dup-shifted", 0, 1)...)
+	for _, sessionID := range []string{
+		"dup-keep", "dup-changed", "dup-shifted",
+	} {
+		var msgID int64
+		require.NoError(t, srcDB.getReader().QueryRow(ctx,
+			"SELECT id FROM messages WHERE session_id = ? AND ordinal = 1",
+			sessionID,
+		).Scan(&msgID), "resolve %s ordinal 1", sessionID)
+		pinID, err := srcDB.PinMessage(ctx, sessionID, msgID, nil)
+		require.NoError(t, err, "pin %s", sessionID)
+		require.NotZero(t, pinID, "pin %s not created", sessionID)
+	}
+	require.NoError(t, srcDB.Close(), "close source database")
+
+	dstPath := filepath.Join(dir, "dst.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+	insertSession(t, dstDB, "dup-keep", "proj")
+	insertMessages(t, dstDB, identical("dup-keep", 0, 1)...)
+	insertSession(t, dstDB, "dup-changed", "proj")
+	insertMessages(t, dstDB, identical("dup-changed", 0, 1, 2)...)
+	insertSession(t, dstDB, "dup-shifted", "proj")
+	insertMessages(t, dstDB, append([]Message{{
+		SessionID: "dup-shifted", Ordinal: 0, Role: "user",
+		Content: "context", ContentLength: 7, SourceUUID: "env",
+	}}, identical("dup-shifted", 1, 2)...)...)
+
+	require.NoError(t, dstDB.CopySessionMetadataFrom(srcPath),
+		"CopySessionMetadataFrom")
+
+	pins, err := dstDB.ListPinnedMessages(ctx, "dup-keep", "")
+	require.NoError(t, err, "ListPinnedMessages dup-keep")
+	require.Len(t, pins, 1,
+		"unchanged identical duplicates must keep the pin")
+	assert.Equal(t, 1, pins[0].Ordinal, "pin stays at its saved ordinal")
+
+	pins, err = dstDB.ListPinnedMessages(ctx, "dup-changed", "")
+	require.NoError(t, err, "ListPinnedMessages dup-changed")
+	assert.Empty(t, pins,
+		"changed duplicate multiplicity must drop the ambiguous pin")
+
+	pins, err = dstDB.ListPinnedMessages(ctx, "dup-shifted", "")
+	require.NoError(t, err, "ListPinnedMessages dup-shifted")
+	require.Len(t, pins, 1,
+		"shifted duplicates must keep the pin")
+	assert.Equal(t, 2, pins[0].Ordinal,
+		"pin follows the second occurrence, not the saved ordinal")
+}
+
+// TestCopySessionMetadataFrom_LegacyPinFollowsShiftedReply models a
+// full resync of a pre-uuid session across the IDE-envelope split: the
+// re-parse inserts a hidden envelope row, shifting the unchanged
+// pinned reply by one ordinal. The pin must follow its visible
+// (role, content) occurrence rank to the shifted row instead of being
+// dropped at the stale ordinal.
+func TestCopySessionMetadataFrom_LegacyPinFollowsShiftedReply(
+	t *testing.T,
+) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	srcPath := filepath.Join(dir, "src.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	insertSession(t, srcDB, "s1", "proj")
+	insertMessages(t, srcDB,
+		Message{
+			SessionID: "s1", Ordinal: 1, Role: "user",
+			Content:       "<ide_opened_file>f</ide_opened_file> explain",
+			ContentLength: 44,
+		},
+		Message{
+			SessionID: "s1", Ordinal: 2, Role: "assistant",
+			Content: "Legacy reply", ContentLength: 12,
+		},
+	)
+	var msgID int64
+	require.NoError(t, srcDB.getReader().QueryRow(ctx,
+		"SELECT id FROM messages WHERE session_id = 's1' AND ordinal = 2",
+	).Scan(&msgID), "resolve pinned reply")
+	pinID, err := srcDB.PinMessage(ctx, "s1", msgID, nil)
+	require.NoError(t, err, "pin legacy reply")
+	require.NotZero(t, pinID, "pin not created")
+	require.NoError(t, srcDB.Close(), "close source database")
+
+	// Fresh DB: the re-parse split the combined prompt and stamped
+	// provider uuids, shifting the unchanged reply to ordinal 3.
+	dstPath := filepath.Join(dir, "dst.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+	insertSession(t, dstDB, "s1", "proj")
+	insertMessages(t, dstDB,
+		Message{
+			SessionID: "s1", Ordinal: 1, Role: "user",
+			Content:       "<ide_opened_file>f</ide_opened_file>",
+			ContentLength: 36, IsSystem: true,
+			SourceType: "system", SourceSubtype: "ide_opened_file",
+			SourceUUID: "u1:ide-context",
+		},
+		Message{
+			SessionID: "s1", Ordinal: 2, Role: "user",
+			Content: "explain", ContentLength: 7, SourceUUID: "u1",
+		},
+		Message{
+			SessionID: "s1", Ordinal: 3, Role: "assistant",
+			Content: "Legacy reply", ContentLength: 12, SourceUUID: "u2",
+		},
+	)
+
+	require.NoError(t, dstDB.CopySessionMetadataFrom(srcPath),
+		"CopySessionMetadataFrom")
+
+	pins, err := dstDB.ListPinnedMessages(ctx, "s1", "")
+	require.NoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 1,
+		"shifted legacy reply must keep the pin")
+	assert.Equal(t, 3, pins[0].Ordinal,
+		"pin follows the reply to its shifted ordinal")
+}
+
+func TestCopySessionMetadataFrom_PinsFollowSourceUUID(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	// Source DB: pre-reparse shape where one entry held the IDE
+	// envelope and the prompt combined at ordinal 1.
+	srcPath := filepath.Join(dir, "src.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	insertSession(t, srcDB, "s1", "proj")
+	insertMessages(t, srcDB,
+		Message{
+			SessionID: "s1", Ordinal: 1, Role: "user",
+			Content:       "<ide_opened_file>f</ide_opened_file> explain",
+			ContentLength: 44, SourceUUID: "u1",
+		},
+		Message{
+			SessionID: "s1", Ordinal: 2, Role: "assistant",
+			Content: "sure", ContentLength: 4, SourceUUID: "u2",
+		},
+	)
+	for _, ordinal := range []int{1, 2} {
+		var msgID int64
+		require.NoError(t, srcDB.getReader().QueryRow(ctx,
+			"SELECT id FROM messages WHERE session_id = 's1' AND ordinal = ?",
+			ordinal,
+		).Scan(&msgID), "resolve s1 message id")
+		pinID, err := srcDB.PinMessage(ctx, "s1", msgID, nil)
+		require.NoError(t, err, "pin s1 ordinal %d", ordinal)
+		require.NotZero(t, pinID, "pin s1 ordinal %d not created", ordinal)
+	}
+
+	// Legacy session without source uuids still restores by ordinal.
+	insertSession(t, srcDB, "s2", "proj")
+	insertMessages(t, srcDB, Message{
+		SessionID: "s2", Ordinal: 1, Role: "user",
+		Content: "legacy", ContentLength: 6,
+	})
+	pinByOrdinal := func(d *DB, sessionID string, ordinal int) {
+		t.Helper()
+		var msgID int64
+		require.NoError(t, d.getReader().QueryRow(ctx,
+			"SELECT id FROM messages WHERE session_id = ? AND ordinal = ?",
+			sessionID, ordinal,
+		).Scan(&msgID), "resolve %s ordinal %d", sessionID, ordinal)
+		pinID, err := d.PinMessage(ctx, sessionID, msgID, nil)
+		require.NoError(t, err, "pin %s ordinal %d", sessionID, ordinal)
+		require.NotZero(t, pinID, "pin %s ordinal %d not created",
+			sessionID, ordinal)
+	}
+	pinByOrdinal(srcDB, "s2", 1)
+
+	// Session whose pinned message vanished in the re-parse while an
+	// unrelated message took over its ordinal.
+	insertSession(t, srcDB, "s3", "proj")
+	insertMessages(t, srcDB, Message{
+		SessionID: "s3", Ordinal: 1, Role: "user",
+		Content: "gone soon", ContentLength: 9, SourceUUID: "u-gone",
+	})
+	pinByOrdinal(srcDB, "s3", 1)
+
+	// Session whose pinned message's uuid is duplicated in the fresh
+	// DB; the old ordinal still identifies which duplicate was meant.
+	insertSession(t, srcDB, "s4", "proj")
+	insertMessages(t, srcDB,
+		Message{
+			SessionID: "s4", Ordinal: 1, Role: "user",
+			Content: "dup a", ContentLength: 5, SourceUUID: "u-dup",
+		},
+		Message{
+			SessionID: "s4", Ordinal: 2, Role: "user",
+			Content: "dup b", ContentLength: 5, SourceUUID: "u-dup",
+		},
+	)
+	pinByOrdinal(srcDB, "s4", 2)
+
+	// Session where the OLD DB itself holds duplicate uuids and only
+	// one row survives the re-parse. The uuid cannot identify which
+	// duplicate the pin was on, so a pin on the removed duplicate
+	// must not transfer to the survivor.
+	insertSession(t, srcDB, "s5", "proj")
+	insertMessages(t, srcDB,
+		Message{
+			SessionID: "s5", Ordinal: 1, Role: "user",
+			Content: "removed dup", ContentLength: 11,
+			SourceUUID: "u-old-dup",
+		},
+		Message{
+			SessionID: "s5", Ordinal: 2, Role: "user",
+			Content: "surviving dup", ContentLength: 13,
+			SourceUUID: "u-old-dup",
+		},
+	)
+	pinByOrdinal(srcDB, "s5", 1)
+
+	// Same old-side duplication, but the pin sits on the duplicate
+	// that survives at its ordinal: the guarded ordinal fallback
+	// still restores it.
+	insertSession(t, srcDB, "s6", "proj")
+	insertMessages(t, srcDB,
+		Message{
+			SessionID: "s6", Ordinal: 1, Role: "user",
+			Content: "removed dup", ContentLength: 11,
+			SourceUUID: "u-old-dup6",
+		},
+		Message{
+			SessionID: "s6", Ordinal: 2, Role: "user",
+			Content: "surviving dup", ContentLength: 13,
+			SourceUUID: "u-old-dup6",
+		},
+	)
+	pinByOrdinal(srcDB, "s6", 2)
+
+	// Matching role/content cannot disambiguate identical old-side
+	// duplicates when only one survives at the pinned ordinal.
+	insertSession(t, srcDB, "s7", "proj")
+	insertMessages(t, srcDB,
+		Message{
+			SessionID: "s7", Ordinal: 1, Role: "user",
+			Content: "same dup", ContentLength: 8,
+			SourceUUID: "u-identical-dup",
+		},
+		Message{
+			SessionID: "s7", Ordinal: 2, Role: "user",
+			Content: "same dup", ContentLength: 8,
+			SourceUUID: "u-identical-dup",
+		},
+	)
+	pinByOrdinal(srcDB, "s7", 1)
+
+	// Legacy session (no source uuids) whose pinned combined prompt
+	// is split by the re-parse: the hidden envelope row takes over
+	// the pinned ordinal.
+	insertSession(t, srcDB, "s8", "proj")
+	insertMessages(t, srcDB, Message{
+		SessionID: "s8", Ordinal: 1, Role: "user",
+		Content:       "<ide_opened_file>f</ide_opened_file> explain",
+		ContentLength: 44,
+	})
+	pinByOrdinal(srcDB, "s8", 1)
+	srcDB.Close()
+
+	// Destination DB: the re-parse split the envelope into its own
+	// hidden row, shifting the prompt and reply down by one ordinal.
+	dstPath := filepath.Join(dir, "dst.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+	insertSession(t, dstDB, "s1", "proj")
+	insertMessages(t, dstDB,
+		Message{
+			SessionID: "s1", Ordinal: 1, Role: "user",
+			Content:       "<ide_opened_file>f</ide_opened_file>",
+			ContentLength: 36, IsSystem: true,
+			SourceUUID: "u1:ide-context",
+		},
+		Message{
+			SessionID: "s1", Ordinal: 2, Role: "user",
+			Content: "explain", ContentLength: 7, SourceUUID: "u1",
+		},
+		Message{
+			SessionID: "s1", Ordinal: 3, Role: "assistant",
+			Content: "sure", ContentLength: 4, SourceUUID: "u2",
+		},
+	)
+	insertSession(t, dstDB, "s7", "proj")
+	insertMessages(t, dstDB, Message{
+		SessionID: "s7", Ordinal: 1, Role: "user",
+		Content: "same dup", ContentLength: 8,
+		SourceUUID: "u-identical-dup",
+	})
+	insertSession(t, dstDB, "s8", "proj")
+	insertMessages(t, dstDB,
+		Message{
+			SessionID: "s8", Ordinal: 1, Role: "user",
+			Content:       "<ide_opened_file>f</ide_opened_file>",
+			ContentLength: 36, IsSystem: true,
+			SourceUUID: "u8:ide-context",
+		},
+		Message{
+			SessionID: "s8", Ordinal: 2, Role: "user",
+			Content: "explain", ContentLength: 7, SourceUUID: "u8",
+		},
+	)
+	insertSession(t, dstDB, "s2", "proj")
+	insertMessages(t, dstDB, Message{
+		SessionID: "s2", Ordinal: 1, Role: "user",
+		Content: "legacy", ContentLength: 6,
+	})
+	insertSession(t, dstDB, "s3", "proj")
+	insertMessages(t, dstDB, Message{
+		SessionID: "s3", Ordinal: 1, Role: "user",
+		Content: "unrelated", ContentLength: 9, SourceUUID: "u-other",
+	})
+	insertSession(t, dstDB, "s4", "proj")
+	insertMessages(t, dstDB,
+		Message{
+			SessionID: "s4", Ordinal: 1, Role: "user",
+			Content: "dup a", ContentLength: 5, SourceUUID: "u-dup",
+		},
+		Message{
+			SessionID: "s4", Ordinal: 2, Role: "user",
+			Content: "dup b", ContentLength: 5, SourceUUID: "u-dup",
+		},
+	)
+
+	insertSession(t, dstDB, "s5", "proj")
+	insertMessages(t, dstDB, Message{
+		SessionID: "s5", Ordinal: 1, Role: "user",
+		Content: "surviving dup", ContentLength: 13,
+		SourceUUID: "u-old-dup",
+	})
+	insertSession(t, dstDB, "s6", "proj")
+	insertMessages(t, dstDB,
+		Message{
+			SessionID: "s6", Ordinal: 1, Role: "user",
+			Content: "unrelated", ContentLength: 9,
+			SourceUUID: "u-fresh6",
+		},
+		Message{
+			SessionID: "s6", Ordinal: 2, Role: "user",
+			Content: "surviving dup", ContentLength: 13,
+			SourceUUID: "u-old-dup6",
+		},
+	)
+
+	require.NoError(t, dstDB.CopySessionMetadataFrom(srcPath),
+		"CopySessionMetadataFrom")
+
+	// Pins follow source_uuid across the ordinal shift instead of
+	// landing on the hidden envelope row at their old ordinals, and
+	// no duplicate pin is created by the ordinal fallback.
+	pins, err := dstDB.ListPinnedMessages(ctx, "s1", "")
+	require.NoError(t, err, "ListPins s1")
+	require.Len(t, pins, 2, "pins s1")
+	gotOrdinals := []int{pins[0].Ordinal, pins[1].Ordinal}
+	slices.Sort(gotOrdinals)
+	assert.Equal(t, []int{2, 3}, gotOrdinals,
+		"pins should follow source_uuid to the shifted ordinals")
+
+	pins, err = dstDB.ListPinnedMessages(ctx, "s2", "")
+	require.NoError(t, err, "ListPins s2")
+	require.Len(t, pins, 1, "pins s2")
+	assert.Equal(t, 1, pins[0].Ordinal,
+		"legacy pin without source_uuid falls back to ordinal")
+
+	pins, err = dstDB.ListPinnedMessages(ctx, "s3", "")
+	require.NoError(t, err, "ListPins s3")
+	assert.Empty(t, pins,
+		"pin whose uuid vanished must be dropped, not attached to the "+
+			"unrelated message now at its ordinal")
+
+	pins, err = dstDB.ListPinnedMessages(ctx, "s4", "")
+	require.NoError(t, err, "ListPins s4")
+	require.Len(t, pins, 1, "pins s4")
+	assert.Equal(t, 2, pins[0].Ordinal,
+		"duplicated uuid resolves by old ordinal to the same-uuid row")
+
+	pins, err = dstDB.ListPinnedMessages(ctx, "s5", "")
+	require.NoError(t, err, "ListPins s5")
+	assert.Empty(t, pins,
+		"pin on a removed old-side duplicate must not transfer to the "+
+			"same-uuid survivor that shifted into its ordinal")
+
+	pins, err = dstDB.ListPinnedMessages(ctx, "s6", "")
+	require.NoError(t, err, "ListPins s6")
+	require.Len(t, pins, 1, "pins s6")
+	assert.Equal(t, 2, pins[0].Ordinal,
+		"pin on the surviving old-side duplicate restores at its ordinal")
+
+	pins, err = dstDB.ListPinnedMessages(ctx, "s7", "")
+	require.NoError(t, err, "ListPins s7")
+	assert.Empty(t, pins,
+		"pin on indistinguishable old duplicates must be dropped when "+
+			"their multiplicity changes")
+
+	pins, err = dstDB.ListPinnedMessages(ctx, "s8", "")
+	require.NoError(t, err, "ListPins s8")
+	assert.Empty(t, pins,
+		"uuid-less pin on a split combined prompt must not attach to "+
+			"the hidden envelope row at its old ordinal")
+}
+
+func TestCopySessionMetadataCopiesFromSource(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	// Source DB: session with display_name and deleted_at set.
+	srcPath := filepath.Join(dir, "src.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	insertSession(t, srcDB, "s1", "proj")
+	name := "my-name"
+	requireNoError(t, srcDB.RenameSession(ctx, "s1", &name), "Rename src")
+	requireNoError(t, srcDB.SoftDeleteSession(ctx, "s1"), "SoftDelete src")
+	srcDB.Close()
+
+	// Destination DB: same session, freshly synced (NULL metadata).
+	dstPath := filepath.Join(dir, "dst.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+	insertSession(t, dstDB, "s1", "proj")
+
+	requireNoError(t, dstDB.CopySessionMetadataFrom(srcPath), "CopySessionMetadataFrom")
+
+	sf, err := dstDB.GetSessionFull(ctx, "s1")
+	requireNoError(t, err, "GetSessionFull")
+	require.NotNil(t, sf, "session should exist")
+	require.NotNil(t, sf.DisplayName, "display_name nil")
+	assert.Equal(t, name, *sf.DisplayName, "display_name")
+	assert.NotNil(t, sf.DeletedAt, "deleted_at should be set from source")
+}
+
+func TestCopySessionMetadataPreservesWorktreeProjectMappings(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	srcPath := filepath.Join(dir, "src.db")
+	srcPrefix := filepath.Join(dir, "src.worktrees")
+	dstPrefix := filepath.Join(dir, "dst.worktrees")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	_, err := srcDB.CreateWorktreeProjectMapping(ctx, WorktreeProjectMapping{
+		Machine: "laptop", PathPrefix: srcPrefix, Project: "src-repo", Enabled: true,
+	})
+	requireNoError(t, err, "CreateWorktreeProjectMapping src")
+	_, err = srcDB.CreateWorktreeProjectMapping(ctx, WorktreeProjectMapping{
+		Machine: "laptop", PathPrefix: dstPrefix, Project: "src-conflict", Enabled: true,
+	})
+	requireNoError(t, err, "CreateWorktreeProjectMapping conflict")
+	srcDB.Close()
+
+	dstPath := filepath.Join(dir, "dst.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+	_, err = dstDB.CreateWorktreeProjectMapping(ctx, WorktreeProjectMapping{
+		Machine: "laptop", PathPrefix: dstPrefix, Project: "dst-repo", Enabled: true,
+	})
+	requireNoError(t, err, "CreateWorktreeProjectMapping dst")
+
+	requireNoError(t, dstDB.CopySessionMetadataFrom(srcPath), "CopySessionMetadataFrom")
+	requireNoError(t, dstDB.CopySessionMetadataFrom(srcPath), "CopySessionMetadataFrom again")
+
+	got, err := dstDB.ListWorktreeProjectMappings(ctx, "laptop")
+	requireNoError(t, err, "ListWorktreeProjectMappings")
+	require.Len(t, got, 2, "mapping count = %d, want 2: %+v", len(got), got)
+	projects := map[string]string{}
+	for _, m := range got {
+		projects[m.PathPrefix] = m.Project
+	}
+	require.Equal(t, "src_repo", projects[filepath.ToSlash(srcPrefix)],
+		"source mapping project")
+	require.Equal(t, "src_conflict", projects[filepath.ToSlash(dstPrefix)],
+		"destination mapping project")
+}
+
+func TestCopySessionMetadataPreservesClears(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	// Source DB: session was renamed and trashed, then user
+	// cleared the name and restored (both columns now NULL).
+	srcPath := filepath.Join(dir, "src.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	insertSession(t, srcDB, "s1", "proj")
+	srcDB.Close()
+	// Session has NULL display_name and NULL deleted_at.
+
+	// Destination DB: freshly synced — also NULL.
+	dstPath := filepath.Join(dir, "dst.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+	insertSession(t, dstDB, "s1", "proj")
+
+	requireNoError(t, dstDB.CopySessionMetadataFrom(srcPath), "CopySessionMetadataFrom")
+
+	sf, err := dstDB.GetSessionFull(ctx, "s1")
+	requireNoError(t, err, "GetSessionFull")
+	require.NotNil(t, sf, "session should exist")
+	assert.Nil(t, sf.DisplayName,
+		"display_name = %v, want nil (clear preserved)",
+		sf.DisplayName)
+	assert.Nil(t, sf.DeletedAt,
+		"deleted_at = %v, want nil (restore preserved)",
+		sf.DeletedAt)
+}
+
+func TestPinMessageIdempotent(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, userMsg("s1", 1, "hello"))
+
+	// First pin should succeed.
+	id1, err := d.PinMessage(t.Context(), "s1", 1, nil)
+	require.NoError(t, err, "first PinMessage: id=%d", id1)
+	require.NotZero(t, id1, "first PinMessage returned id=0")
+
+	// Idempotent re-pin with same note must not return 0.
+	id2, err := d.PinMessage(t.Context(), "s1", 1, nil)
+	require.NoError(t, err, "idempotent PinMessage err")
+	require.NotZero(t, id2,
+		"idempotent PinMessage returned id=0; should return existing id")
+	assert.Equal(t, id1, id2,
+		"idempotent PinMessage id=%d, want %d", id2, id1)
+
+	// Re-pin with different note should succeed and return same id.
+	note := "important"
+	id2b, err := d.PinMessage(t.Context(), "s1", 1, &note)
+	require.NoError(t, err, "re-pin with note err")
+	assert.Equal(t, id1, id2b,
+		"re-pin with note id=%d, want %d", id2b, id1)
+
+	// Pin with wrong session should return 0.
+	id3, err := d.PinMessage(t.Context(), "nonexistent", 1, nil)
+	require.NoError(t, err, "wrong-session PinMessage err")
+	assert.Equal(t, int64(0), id3, "wrong-session PinMessage id=")
+}
+
+func TestDeleteSessionIfTrashed(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	// Delete a non-trashed session should return 0.
+	n, err := d.DeleteSessionIfTrashed(t.Context(), "s1")
+	require.NoError(t, err, "DeleteSessionIfTrashed non-trashed")
+	assert.Equal(t, int64(0), n, "non-trashed: rows=")
+
+	// Soft-delete, then permanent delete should succeed.
+	requireNoError(t, d.SoftDeleteSession(t.Context(), "s1"), "soft delete")
+	n, err = d.DeleteSessionIfTrashed(t.Context(), "s1")
+	require.NoError(t, err, "DeleteSessionIfTrashed trashed")
+	assert.Equal(t, int64(1), n, "trashed: rows=")
+
+	// Session should be gone.
+	ctx := t.Context()
+	s, err := d.GetSessionFull(ctx, "s1")
+	require.NoError(t, err, "GetSessionFull after delete")
+	assert.Nil(t, s, "session should be nil after permanent delete")
+
+	// Session should be excluded.
+	assert.True(t, d.IsSessionExcluded(ctx, "s1"),
+		"session should be in excluded_sessions")
+
+	// Non-existent session should return 0.
+	n, err = d.DeleteSessionIfTrashed(ctx, "nonexistent")
+	require.NoError(t, err, "DeleteSessionIfTrashed nonexistent")
+	assert.Equal(t, int64(0), n, "nonexistent: rows=")
+}
+
+func TestSoftDeleteSessions(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "s1", "proj")
+	insertSession(t, d, "s2", "proj")
+	insertSession(t, d, "s3", "proj")
+
+	// Pre-trash s3 so we can verify it's not double-counted.
+	require.NoError(t, d.SoftDeleteSession(ctx, "s3"), "pre-trash s3")
+
+	n, err := d.SoftDeleteSessions(ctx, []string{"s1", "s2", "s3", "nonexistent"})
+	require.NoError(t, err, "SoftDeleteSessions")
+	assert.Equal(t, 2, n, "should soft-delete 2 new sessions")
+
+	// All three should now be trashed.
+	for _, id := range []string{"s1", "s2", "s3"} {
+		s, err := d.GetSession(ctx, id)
+		require.NoError(t, err, "GetSession", id)
+		assert.Nil(t, s, "trashed session should not be visible:", id)
+	}
+
+	// Empty input is a no-op.
+	n, err = d.SoftDeleteSessions(ctx, nil)
+	require.NoError(t, err, "SoftDeleteSessions nil")
+	assert.Equal(t, 0, n, "empty: rows=")
+}
+
+func TestSoftDeleteKeepsSourceMissingStateIndependent(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	paths := map[string]string{
+		"single": filepath.Join(t.TempDir(), "single.jsonl"),
+		"batch":  filepath.Join(t.TempDir(), "batch.jsonl"),
+	}
+	for id, path := range paths {
+		insertSession(t, d, id, "proj", func(s *Session) {
+			s.Agent = "claude"
+			s.FilePath = &path
+		})
+		baselineSessionSource(t, d, defaultMachine, "claude", path)
+		changed, err := d.MarkSessionSourceMissing(
+			ctx, defaultMachine, "claude", id, path,
+		)
+		require.NoError(t, err)
+		require.True(t, changed)
+	}
+
+	require.NoError(t, d.SoftDeleteSession(ctx, "single"))
+	count, err := d.SoftDeleteSessions(ctx, []string{"batch"})
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+
+	for id := range paths {
+		full, err := d.GetSessionFull(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, full)
+		assert.NotNil(t, full.SourceMissingAt)
+		assert.Nil(t, full.DeletionCause)
+		assert.True(t, d.IsSessionTrashed(ctx, id))
+	}
+}
+
+func TestMetadataQueriesExcludeTrashed(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "s1", "proj-a", func(s *Session) {
+		s.Agent = "claude"
+		s.Machine = "laptop"
+	})
+	insertSession(t, d, "s2", "proj-b", func(s *Session) {
+		s.Agent = "codex"
+		s.Machine = "desktop"
+	})
+
+	// Before trashing: both projects, agents, machines visible.
+	projects, err := d.GetProjects(ctx, false, false)
+	requireNoError(t, err, "GetProjects before trash")
+	require.Len(t, projects, 2, "projects before trash:")
+
+	agents, err := d.GetAgents(ctx, false, false)
+	requireNoError(t, err, "GetAgents before trash")
+	require.Len(t, agents, 2, "agents before trash:")
+
+	machines, err := d.GetMachines(ctx, false, false)
+	requireNoError(t, err, "GetMachines before trash")
+	require.Len(t, machines, 2, "machines before trash:")
+
+	// Soft-delete s2: its project/agent/machine should disappear.
+	requireNoError(t, d.SoftDeleteSession(ctx, "s2"), "soft delete s2")
+
+	projects, err = d.GetProjects(ctx, false, false)
+	requireNoError(t, err, "GetProjects after trash")
+	require.Len(t, projects, 1, "projects after trash:")
+	assert.Equal(t, "proj-a", projects[0].Name, "project name")
+
+	agents, err = d.GetAgents(ctx, false, false)
+	requireNoError(t, err, "GetAgents after trash")
+	require.Len(t, agents, 1, "agents after trash:")
+	assert.Equal(t, "claude", agents[0].Name, "agent name")
+
+	machines, err = d.GetMachines(ctx, false, false)
+	requireNoError(t, err, "GetMachines after trash")
+	require.Len(t, machines, 1, "machines after trash:")
+	assert.Equal(t, "laptop", machines[0], "machine")
+}
+
+func TestGetSessionExcludesTrashed(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "s1", "proj")
+
+	// Before trashing: GetSession returns the session.
+	s, err := d.GetSession(ctx, "s1")
+	requireNoError(t, err, "GetSession before trash")
+	require.NotNil(t, s, "session should exist before trash")
+
+	// After trashing: GetSession returns nil.
+	requireNoError(t, d.SoftDeleteSession(ctx, "s1"), "soft delete")
+	s, err = d.GetSession(ctx, "s1")
+	requireNoError(t, err, "GetSession after trash")
+	assert.Nil(t, s, "GetSession should return nil for trashed session")
+
+	// GetSessionFull still returns it.
+	sf, err := d.GetSessionFull(ctx, "s1")
+	requireNoError(t, err, "GetSessionFull after trash")
+	assert.NotNil(t, sf,
+		"GetSessionFull should still return trashed session")
+}
+
+func TestOpenMigratesColumnsWithoutDrop(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.db")
+
+	// Create a database with the pre-branch schema: sessions
+	// table lacks display_name and deleted_at columns.
+	conn, err := sql.Open("sqlite3", makeDSN(path, false))
+	requireNoError(t, err, "opening legacy db")
+	conn.SetMaxOpenConns(1)
+
+	oldSchema := `
+CREATE TABLE IF NOT EXISTS sessions (
+    id          TEXT PRIMARY KEY,
+    project     TEXT NOT NULL,
+    machine     TEXT NOT NULL DEFAULT 'local',
+    agent       TEXT NOT NULL DEFAULT 'claude',
+    first_message TEXT,
+    started_at  TEXT,
+    ended_at    TEXT,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    user_message_count INTEGER NOT NULL DEFAULT 0,
+    file_path   TEXT,
+    file_size   INTEGER,
+    file_mtime  INTEGER,
+    file_hash   TEXT,
+    parent_session_id TEXT,
+    relationship_type TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE TABLE IF NOT EXISTS messages (
+    id             INTEGER PRIMARY KEY,
+    session_id     TEXT NOT NULL
+        REFERENCES sessions(id) ON DELETE CASCADE,
+    ordinal        INTEGER NOT NULL,
+    role           TEXT NOT NULL,
+    content        TEXT NOT NULL,
+    timestamp      TEXT,
+    has_thinking   INTEGER NOT NULL DEFAULT 0,
+    has_tool_use   INTEGER NOT NULL DEFAULT 0,
+    content_length INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(session_id, ordinal)
+);
+CREATE TABLE IF NOT EXISTS stats (
+    key   TEXT PRIMARY KEY,
+    value INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO stats (key, value)
+    VALUES ('session_count', 0);
+INSERT OR IGNORE INTO stats (key, value)
+    VALUES ('message_count', 0);
+CREATE TABLE IF NOT EXISTS tool_calls (
+    id         INTEGER PRIMARY KEY,
+    message_id INTEGER NOT NULL
+        REFERENCES messages(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL
+        REFERENCES sessions(id) ON DELETE CASCADE,
+    tool_name  TEXT NOT NULL,
+    category   TEXT NOT NULL,
+    tool_use_id TEXT,
+    input_json  TEXT,
+    skill_name  TEXT,
+    result_content_length INTEGER,
+    subagent_session_id TEXT
+);
+CREATE TABLE IF NOT EXISTS insights (
+    id          INTEGER PRIMARY KEY,
+    type        TEXT NOT NULL,
+    date_from   TEXT NOT NULL,
+    date_to     TEXT NOT NULL,
+    project     TEXT,
+    agent       TEXT NOT NULL,
+    model       TEXT,
+    prompt      TEXT,
+    content     TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);`
+
+	_, err = conn.ExecContext(t.Context(), oldSchema)
+	requireNoError(t, err, "creating legacy schema")
+
+	// Stamp data version to current so we don't trigger resync.
+	_, err = conn.ExecContext(t.Context(),
+		fmt.Sprintf("PRAGMA user_version = %d", dataVersion),
+	)
+	requireNoError(t, err, "setting user_version")
+
+	// Insert a session that must survive migration.
+	_, err = conn.ExecContext(t.Context(),
+		`INSERT INTO sessions (id, project, machine, agent,
+			message_count)
+		VALUES ('keep-me', 'myproj', 'local', 'claude', 3)`,
+	)
+	requireNoError(t, err, "inserting legacy session")
+	requireNoError(t, conn.Close(), "closing legacy db")
+
+	// Open via the normal path — should migrate, not drop.
+	d, err := Open(t.Context(), path)
+	requireNoError(t, err, "Open with legacy schema")
+	defer d.Close()
+
+	// Session data must survive.
+	ctx := t.Context()
+	s, err := d.GetSession(ctx, "keep-me")
+	requireNoError(t, err, "GetSession after migration")
+	require.NotNil(t, s, "session lost during migration")
+	assert.Equal(t, "myproj", s.Project, "project")
+	assert.Equal(t, 3, s.MessageCount, "message_count")
+
+	// New columns must exist and be usable.
+	_, err = d.getWriter().Exec(ctx,
+		"UPDATE sessions SET display_name = 'test' WHERE id = 'keep-me'",
+	)
+	requireNoError(t, err, "writing display_name")
+	_, err = d.getWriter().Exec(ctx,
+		"UPDATE sessions SET deleted_at = '2024-01-01' WHERE id = 'keep-me'",
+	)
+	requireNoError(t, err, "writing deleted_at")
+}
+
+func TestOpenBackfillsLegacyTokenCoverageFlags(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy-token-flags.db")
+
+	conn, err := sql.Open("sqlite3", makeDSN(path, false))
+	requireNoError(t, err, "opening legacy db")
+	conn.SetMaxOpenConns(1)
+
+	legacySchema := `
+CREATE TABLE IF NOT EXISTS sessions (
+    id          TEXT PRIMARY KEY,
+    project     TEXT NOT NULL,
+    machine     TEXT NOT NULL DEFAULT 'local',
+    agent       TEXT NOT NULL DEFAULT 'claude',
+    first_message TEXT,
+    display_name TEXT,
+    started_at  TEXT,
+    ended_at    TEXT,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    user_message_count INTEGER NOT NULL DEFAULT 0,
+    file_path   TEXT,
+    file_size   INTEGER,
+    file_mtime  INTEGER,
+    file_hash   TEXT,
+    local_modified_at TEXT,
+    parent_session_id TEXT,
+    relationship_type TEXT NOT NULL DEFAULT '',
+    total_output_tokens INTEGER NOT NULL DEFAULT 0,
+    peak_context_tokens INTEGER NOT NULL DEFAULT 0,
+    deleted_at  TEXT,
+    created_at  TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE TABLE IF NOT EXISTS messages (
+    id             INTEGER PRIMARY KEY,
+    session_id     TEXT NOT NULL
+        REFERENCES sessions(id) ON DELETE CASCADE,
+    ordinal        INTEGER NOT NULL,
+    role           TEXT NOT NULL,
+    content        TEXT NOT NULL,
+    timestamp      TEXT,
+    has_thinking   INTEGER NOT NULL DEFAULT 0,
+    has_tool_use   INTEGER NOT NULL DEFAULT 0,
+    content_length INTEGER NOT NULL DEFAULT 0,
+    is_system      INTEGER NOT NULL DEFAULT 0,
+    model          TEXT NOT NULL DEFAULT '',
+    token_usage    TEXT NOT NULL DEFAULT '',
+    context_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens  INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(session_id, ordinal)
+);
+CREATE TABLE IF NOT EXISTS insights (
+    id          INTEGER PRIMARY KEY,
+    type        TEXT NOT NULL DEFAULT '',
+    date_from   TEXT NOT NULL,
+    date_to     TEXT NOT NULL DEFAULT '',
+    project     TEXT,
+    agent       TEXT NOT NULL DEFAULT '',
+    model       TEXT,
+    prompt      TEXT,
+    content     TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS tool_calls (
+    id                  INTEGER PRIMARY KEY,
+    message_id          INTEGER NOT NULL,
+    session_id          TEXT NOT NULL,
+    tool_name           TEXT NOT NULL DEFAULT '',
+    category            TEXT NOT NULL DEFAULT '',
+    tool_use_id         TEXT,
+    input_json          TEXT,
+    skill_name          TEXT,
+    result_content_length INTEGER,
+    result_content      TEXT,
+    subagent_session_id TEXT
+);`
+
+	_, err = conn.ExecContext(t.Context(), legacySchema)
+	requireNoError(t, err, "creating legacy schema")
+	_, err = conn.ExecContext(t.Context(),
+		fmt.Sprintf("PRAGMA user_version = %d", dataVersion),
+	)
+	requireNoError(t, err, "setting user_version")
+
+	_, err = conn.ExecContext(t.Context(),
+		`INSERT INTO sessions (
+			id, project, machine, agent, message_count,
+			total_output_tokens, peak_context_tokens
+		) VALUES
+			('legacy-nonzero', 'proj', 'local', 'claude', 0, 200, 600),
+			('legacy-zero', 'proj', 'local', 'claude', 1, 0, 0)`,
+	)
+	requireNoError(t, err, "inserting legacy sessions")
+	_, err = conn.ExecContext(t.Context(),
+		`INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp,
+			content_length, model, token_usage,
+			context_tokens, output_tokens
+		) VALUES
+			('legacy-zero', 0, 'assistant', 'hi',
+			 '2024-01-01T00:00:00Z', 2,
+			 'claude-sonnet-4-20250514',
+			 '{"input_tokens":0,"output_tokens":0}', 0, 0)`,
+	)
+	requireNoError(t, err, "inserting legacy message")
+	requireNoError(t, conn.Close(), "closing legacy db")
+
+	d, err := Open(t.Context(), path)
+	requireNoError(t, err, "Open with legacy token schema")
+	defer d.Close()
+
+	ctx := t.Context()
+	nonzero, err := d.GetSession(ctx, "legacy-nonzero")
+	requireNoError(t, err, "GetSession legacy-nonzero")
+	require.NotNil(t, nonzero, "legacy-nonzero missing")
+	assert.True(t, nonzero.HasTotalOutputTokens, "legacy-nonzero HasTotalOutputTokens = false, want true")
+	assert.True(t, nonzero.HasPeakContextTokens, "legacy-nonzero HasPeakContextTokens = false, want true")
+
+	zero, err := d.GetSession(ctx, "legacy-zero")
+	requireNoError(t, err, "GetSession legacy-zero")
+	require.NotNil(t, zero, "legacy-zero missing")
+	assert.True(t, zero.HasTotalOutputTokens, "legacy-zero HasTotalOutputTokens = false, want true")
+	assert.True(t, zero.HasPeakContextTokens, "legacy-zero HasPeakContextTokens = false, want true")
+
+	msgs, err := d.GetMessages(ctx, "legacy-zero", 0, 10, true)
+	requireNoError(t, err, "GetMessages legacy-zero")
+	require.Len(t, msgs, 1, "legacy-zero messages =")
+	assert.True(t, msgs[0].HasContextTokens,
+		"legacy-zero message HasContextTokens = false, want true")
+	assert.True(t, msgs[0].HasOutputTokens,
+		"legacy-zero message HasOutputTokens = false, want true")
+}
+
+func TestOpenRepairsLegacyCurrentSchemaTokenCoverageOnce(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "current-token-flags.db")
+
+	d, err := Open(t.Context(), path)
+	requireNoError(t, err, "Open initial")
+	_, err = d.getWriter().Exec(t.Context(),
+		`INSERT INTO sessions (
+			id, project, machine, agent, message_count,
+			total_output_tokens, peak_context_tokens,
+			has_total_output_tokens, has_peak_context_tokens
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"current", "proj", "local", "claude", 1,
+		0, 0, false, false,
+	)
+	requireNoError(t, err, "insert session")
+	_, err = d.getWriter().Exec(t.Context(),
+		`INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp,
+			token_usage, context_tokens, output_tokens,
+			has_context_tokens, has_output_tokens
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"current", 0, "assistant", "hello",
+		tsZero, `{"input_tokens":0,"output_tokens":0}`, 0, 0,
+		false, false,
+	)
+	requireNoError(t, err, "insert message")
+	// Backdate the marker signals so the repair's sync_marker advancement
+	// is observable: has_total_output_tokens/has_peak_context_tokens are
+	// mirrored by the push targets but are not sync_marker signals, so the
+	// repair must bump local_modified_at for the repaired rows to re-enter
+	// the incremental push window.
+	_, err = d.getWriter().Exec(t.Context(),
+		`UPDATE sessions SET created_at = '2026-07-01T10:00:00.000Z',
+			local_modified_at = '2026-07-01T10:00:00.000Z'
+		 WHERE id = 'current'`,
+	)
+	requireNoError(t, err, "backdate session")
+	_, err = d.getWriter().Exec(t.Context(),
+		`DELETE FROM stats WHERE key = ?`,
+		tokenCoverageRepairStatsKey,
+	)
+	requireNoError(t, err, "clear token coverage repair marker")
+	requireNoError(t, d.Close(), "Close initial")
+
+	d, err = Open(t.Context(), path)
+	requireNoError(
+		t, err,
+		"Open should repair legacy current-schema token coverage once",
+	)
+
+	ctx := t.Context()
+	sess, err := d.GetSession(ctx, "current")
+	requireNoError(t, err, "GetSession current")
+	require.NotNil(t, sess, "current session missing")
+	assert.True(t, sess.HasTotalOutputTokens, "HasTotalOutputTokens = false, want true")
+	assert.True(t, sess.HasPeakContextTokens, "HasPeakContextTokens = false, want true")
+
+	msgs, err := d.GetMessages(ctx, "current", 0, 10, true)
+	requireNoError(t, err, "GetMessages current")
+	require.Len(t, msgs, 1, "messages len =")
+	assert.True(t, msgs[0].HasContextTokens,
+		"HasContextTokens = false, want true")
+	assert.True(t, msgs[0].HasOutputTokens,
+		"HasOutputTokens = false, want true")
+	var marker string
+	requireNoError(t, d.getReader().QueryRowContext(ctx,
+		`SELECT sync_marker FROM sessions WHERE id = 'current'`).Scan(&marker),
+		"read sync_marker after repair")
+	assert.Greater(t, marker, "2026-07-01T10:00:00.000Z",
+		"the coverage repair must advance sync_marker so push targets re-select the row")
+	_, err = d.getWriter().Exec(ctx,
+		`UPDATE sessions
+		 SET has_total_output_tokens = 0,
+		     has_peak_context_tokens = 0
+		 WHERE id = ?`,
+		"current",
+	)
+	requireNoError(t, err, "reset session flags")
+	_, err = d.getWriter().Exec(ctx,
+		`UPDATE messages
+		 SET has_context_tokens = 0,
+		     has_output_tokens = 0
+		 WHERE session_id = ?`,
+		"current",
+	)
+	requireNoError(t, err, "reset message flags")
+	requireNoError(t, d.Close(), "Close repaired db")
+
+	d, err = Open(ctx, path)
+	requireNoError(
+		t, err,
+		"Open should skip token coverage repair after marker is stored",
+	)
+	defer d.Close()
+
+	sess, err = d.GetSession(ctx, "current")
+	requireNoError(t, err, "GetSession current after marker")
+	require.NotNil(t, sess, "current session missing after marker")
+	assert.False(t, sess.HasTotalOutputTokens, "HasTotalOutputTokens = true after marker, want false")
+	assert.False(t, sess.HasPeakContextTokens, "HasPeakContextTokens = true after marker, want false")
+
+	msgs, err = d.GetMessages(ctx, "current", 0, 10, true)
+	requireNoError(t, err, "GetMessages current after marker")
+	require.Len(t, msgs, 1, "messages len after marker =")
+	assert.False(t, msgs[0].HasContextTokens,
+		"HasContextTokens = true after marker, want false")
+	assert.False(t, msgs[0].HasOutputTokens,
+		"HasOutputTokens = true after marker, want false")
+}
+
+func TestBackfillMessageTokenCoverageSkipsRowsWithoutTokenSignals(
+	t *testing.T,
+) {
+	d := testDB(t)
+
+	_, err := d.getWriter().Exec(t.Context(),
+		`INSERT INTO sessions (
+			id, project, machine, agent, message_count
+		) VALUES (?, ?, ?, ?, ?)`,
+		"no-signal", "proj", "local", "claude", 1,
+	)
+	requireNoError(t, err, "insert session")
+	_, err = d.getWriter().Exec(t.Context(),
+		`INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp,
+			token_usage, context_tokens, output_tokens,
+			has_context_tokens, has_output_tokens
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"no-signal", 0, "assistant", "hello", tsZero, "", 0, 0,
+		false, false,
+	)
+	requireNoError(t, err, "insert message")
+
+	candidates, err := d.messageTokenCoverageBackfillCandidatesLocked(t.Context(),
+		d.getWriter(),
+	)
+	requireNoError(t, err, "messageTokenCoverageBackfillCandidatesLocked")
+	require.Empty(t, candidates, "candidate count =")
+}
+
+func TestOpenBackfillSessionTokenCoverageSkipsMessageScanWithoutCandidates(
+	t *testing.T,
+) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "no-session-backfill-candidates.db")
+
+	d, err := Open(t.Context(), path)
+	requireNoError(t, err, "Open")
+	defer d.Close()
+
+	_, err = d.getWriter().Exec(t.Context(),
+		`INSERT INTO sessions (
+			id, project, machine, agent, message_count,
+			has_total_output_tokens, has_peak_context_tokens
+		) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"done", "proj", "local", "claude", 1, 1, 1,
+	)
+	requireNoError(t, err, "insert session")
+
+	_, err = d.getWriter().Exec(t.Context(),
+		`INSERT INTO messages (
+			session_id, ordinal, role, content,
+			has_context_tokens, has_output_tokens
+		) VALUES (?, ?, ?, ?, ?, ?)`,
+		"done", 0, "assistant", "hello", "not-a-bool", "not-a-bool",
+	)
+	requireNoError(t, err, "insert message")
+
+	updates, err := d.backfillSessionTokenCoverageLocked(t.Context(),
+		d.getWriter(),
+	)
+	requireNoError(t, err, "backfillSessionTokenCoverageLocked")
+	require.Equal(t, 0, updates, "updates")
+}
+
+func TestGetSessionForIncremental(t *testing.T) {
+	d := testDB(t)
+
+	s := Session{
+		ID:                   "codex:inc-test",
+		Project:              "my-project",
+		Machine:              "test",
+		Agent:                "codex",
+		AgentLabel:           "triage",
+		Entrypoint:           "sdk-cli",
+		Cwd:                  "/tmp/sessions/project",
+		FirstMessage:         new("hello world"),
+		StartedAt:            new("2024-01-15T10:00:00Z"),
+		EndedAt:              new("2024-01-15T10:30:00Z"),
+		MessageCount:         5,
+		UserMessageCount:     2,
+		TotalOutputTokens:    500,
+		PeakContextTokens:    1500,
+		HasTotalOutputTokens: true,
+		HasPeakContextTokens: true,
+		FilePath:             new("/tmp/sessions/test.jsonl"),
+		FileSize:             new(int64(4096)),
+		FileMtime:            new(int64(999)),
+	}
+	requireNoError(t, d.UpsertSession(t.Context(), s), "upsert")
+
+	t.Run("found", func(t *testing.T) {
+		info, ok := d.GetSessionForIncremental(t.Context(),
+			"/tmp/sessions/test.jsonl", "codex",
+		)
+		require.True(t, ok, "expected to find session")
+		assert.Equal(t, "codex:inc-test", info.ID, "ID")
+		assert.Equal(t, "my-project", info.Project, "Project")
+		assert.Equal(t, "test", info.Machine, "Machine")
+		assert.Equal(t, "/tmp/sessions/project", info.Cwd, "Cwd")
+		assert.Equal(t, "triage", info.AgentLabel, "AgentLabel")
+		assert.Equal(t, "sdk-cli", info.Entrypoint, "Entrypoint")
+		assert.Equal(t, int64(4096), info.FileSize, "FileSize")
+		assert.Equal(t, 0, reflectedIntField(info, "NextOrdinal"), "NextOrdinal")
+		assert.Empty(t, reflectedStringField(info, "LastEntryUUID"), "LastEntryUUID")
+		assert.Equal(t, 5, info.MsgCount, "MsgCount")
+		assert.Equal(t, 2, info.UserMsgCount, "UserMsgCount")
+		assert.Equal(t, 500, info.TotalOutputTokens, "TotalOutputTokens")
+		assert.Equal(t, 1500, info.PeakContextTokens, "PeakContextTokens")
+		assert.True(t, info.HasTotalOutputTokens, "HasTotalOutputTokens = false, want true")
+		assert.True(t, info.HasPeakContextTokens, "HasPeakContextTokens = false, want true")
+	})
+
+	t.Run("wrong_agent", func(t *testing.T) {
+		_, ok := d.GetSessionForIncremental(t.Context(),
+			"/tmp/sessions/test.jsonl", "traex",
+		)
+		assert.False(t, ok,
+			"another agent's row must not satisfy incremental lookup")
+	})
+
+	t.Run("not_found", func(t *testing.T) {
+		_, ok := d.GetSessionForIncremental(t.Context(), "/no/such/file", "codex")
+		assert.False(t, ok, "expected not found")
+	})
+
+	t.Run("multi_session_bails_out", func(t *testing.T) {
+		// Two sessions sharing the same file_path (Claude
+		// DAG fork) should prevent incremental parsing.
+		path := "/tmp/sessions/forked.jsonl"
+		for _, id := range []string{"fork-main", "fork-1"} {
+			requireNoError(t, d.UpsertSession(t.Context(), Session{
+				ID:       id,
+				Agent:    "claude",
+				FilePath: new(path),
+				FileSize: new(int64(8192)),
+			}), "upsert "+id)
+		}
+		_, ok := d.GetSessionForIncremental(t.Context(), path, "claude")
+		assert.False(t, ok,
+			"expected false for multi-session file")
+	})
+
+	t.Run("legacy_false_flags_repaired", func(t *testing.T) {
+		path := "/tmp/sessions/legacy-flags.jsonl"
+		_, err := d.getWriter().Exec(t.Context(),
+			`INSERT INTO sessions (
+				id, project, machine, agent,
+				message_count, user_message_count,
+				file_path, file_size, file_mtime,
+				total_output_tokens, peak_context_tokens,
+				has_total_output_tokens, has_peak_context_tokens
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)`,
+			"legacy-flags", "proj", "local", "claude",
+			2, 1, path, 1024, 100, 400, 900,
+		)
+		requireNoError(t, err, "insert legacy false flags")
+
+		info, ok := d.GetSessionForIncremental(t.Context(), path, "claude")
+		require.True(t, ok, "expected legacy session for incremental")
+		assert.True(t, info.HasTotalOutputTokens, "HasTotalOutputTokens = false, want true")
+		assert.True(t, info.HasPeakContextTokens, "HasPeakContextTokens = false, want true")
+
+		err = callUpdateSessionIncrementalCompat(
+			t,
+			d,
+			info.ID,
+			nil,
+			info.MsgCount+1,
+			info.UserMsgCount,
+			info.FileSize+256,
+			200,
+			3,
+			"entry-3",
+			info.TotalOutputTokens+50,
+			info.PeakContextTokens,
+			info.HasTotalOutputTokens,
+			info.HasPeakContextTokens,
+		)
+		requireNoError(t, err, "UpdateSessionIncremental legacy")
+
+		got, err := d.GetSessionFull(t.Context(), info.ID)
+		requireNoError(t, err, "GetSessionFull legacy")
+		require.NotNil(t, got, "legacy session missing after incremental")
+		assert.Equal(t, 3, reflectedIntField(got, "NextOrdinal"), "NextOrdinal")
+		assert.Equal(t, "entry-3", reflectedStringField(got, "LastEntryUUID"), "LastEntryUUID")
+		assert.True(t, got.HasTotalOutputTokens, "stored HasTotalOutputTokens = false, want true")
+		assert.True(t, got.HasPeakContextTokens, "stored HasPeakContextTokens = false, want true")
+	})
+}
+
+func TestFileIdentityChanged(t *testing.T) {
+	d := testDB(t)
+	path := "/tmp/sessions/forked.jsonl"
+
+	requireNoError(t, d.UpsertSession(t.Context(), Session{
+		ID:         "fork-main",
+		Agent:      "claude",
+		FilePath:   new(path),
+		FileInode:  new(int64(10)),
+		FileDevice: new(int64(20)),
+	}), "upsert fork-main")
+	requireNoError(t, d.UpsertSession(t.Context(), Session{
+		ID:         "fork-side",
+		Agent:      "claude",
+		FilePath:   new(path),
+		FileInode:  new(int64(10)),
+		FileDevice: new(int64(20)),
+	}), "upsert fork-side")
+
+	assert.False(t, d.FileIdentityChanged(t.Context(), path, 10, 20), "same identity changed")
+	assert.True(t, d.FileIdentityChanged(t.Context(), path, 11, 20), "different inode unchanged")
+	assert.True(t, d.FileIdentityChanged(t.Context(), path, 10, 21), "different device unchanged")
+	assert.False(t, d.FileIdentityChanged(t.Context(), path, 0, 20), "zero inode changed")
+	assert.False(t, d.FileIdentityChanged(t.Context(), path, 10, 0), "zero device changed")
+	assert.False(t, d.FileIdentityChanged(t.Context(), "/tmp/sessions/missing.jsonl", 11, 20), "missing path changed")
+
+	legacyPath := "/tmp/sessions/legacy.jsonl"
+	requireNoError(t, d.UpsertSession(t.Context(), Session{
+		ID:       "legacy",
+		Agent:    "claude",
+		FilePath: new(legacyPath),
+	}), "upsert legacy")
+	assert.False(t, d.FileIdentityChanged(t.Context(), legacyPath, 1, 1), "missing stored identity changed")
+}
+
+func TestGetSessionForIncrementalReturnsImmutableSourceProject(t *testing.T) {
+	d := testDB(t)
+	for _, tc := range []struct {
+		name          string
+		sessionID     string
+		filePath      string
+		sourceProject string
+	}{
+		{
+			name:          "snapshot present",
+			sessionID:     "incremental-source-present",
+			filePath:      "/tmp/incremental-source-present.jsonl",
+			sourceProject: "parser-source",
+		},
+		{
+			name:      "snapshot absent",
+			sessionID: "incremental-source-absent",
+			filePath:  "/tmp/incremental-source-absent.jsonl",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, d.UpsertSessionWithProjectIdentity(t.Context(),
+				Session{
+					ID: tc.sessionID, Project: "mapped-target", Machine: "laptop",
+					Agent: "claude", Cwd: "/tmp/worktree",
+					FilePath: new(tc.filePath), FileSize: new(int64(128)),
+				},
+				export.ProjectIdentityObservation{
+					SessionID: tc.sessionID, Project: "mapped-target",
+					Machine: "laptop", RootPath: "/tmp/worktree",
+				},
+				tc.sourceProject,
+			))
+
+			info, ok := d.GetSessionForIncremental(t.Context(), tc.filePath, "claude")
+			require.True(t, ok)
+			assert.Equal(t, "mapped-target", info.Project)
+			assert.Equal(t, tc.sourceProject, info.SourceProject)
+		})
+	}
+}
+
+func TestUpdateSessionIncremental(t *testing.T) {
+	d := testDB(t)
+
+	// Insert a session with all fields populated.
+	s := Session{
+		ID:                   "inc-update",
+		Project:              "my-project",
+		Machine:              "test",
+		Agent:                "codex",
+		FirstMessage:         new("hello"),
+		StartedAt:            new("2024-01-15T10:00:00Z"),
+		MessageCount:         3,
+		UserMessageCount:     1,
+		ParentSessionID:      new("parent-1"),
+		RelationshipType:     "continuation",
+		FilePath:             new("/tmp/sessions/update.jsonl"),
+		FileSize:             new(int64(1024)),
+		FileMtime:            new(int64(100)),
+		FileHash:             new("abc123"),
+		TotalOutputTokens:    300,
+		PeakContextTokens:    1200,
+		HasTotalOutputTokens: true,
+		HasPeakContextTokens: true,
+	}
+	requireNoError(t, d.UpsertSession(t.Context(), s), "upsert")
+
+	// Incremental update: bump counts and file metadata.
+	ended := "2024-01-15T10:30:00Z"
+	err := callUpdateSessionIncrementalCompat(
+		t,
+		d,
+		"inc-update",
+		&ended,
+		7,
+		3,
+		2048,
+		200,
+		9,
+		"uuid-9",
+		500,
+		1600,
+		true,
+		true,
+	)
+	requireNoError(t, err, "incremental update")
+
+	// Verify updated fields changed.
+	got, err := d.GetSessionFull(
+		t.Context(), "inc-update",
+	)
+	requireNoError(t, err, "get session")
+	assert.Equal(t, 7, got.MessageCount, "MessageCount")
+	assert.Equal(t, 3, got.UserMessageCount, "UserMessageCount")
+	require.NotNil(t, got.EndedAt, "EndedAt nil")
+	assert.Equal(t, ended, *got.EndedAt, "EndedAt")
+	require.NotNil(t, got.FileSize, "FileSize nil")
+	assert.Equal(t, int64(2048), *got.FileSize, "FileSize")
+	assert.Equal(t, 9, reflectedIntField(got, "NextOrdinal"), "NextOrdinal")
+	assert.Equal(t, "uuid-9", reflectedStringField(got, "LastEntryUUID"), "LastEntryUUID")
+	assert.Equal(t, 500, got.TotalOutputTokens, "TotalOutputTokens")
+	assert.Equal(t, 1600, got.PeakContextTokens, "PeakContextTokens")
+	assert.True(t, got.HasTotalOutputTokens, "HasTotalOutputTokens = false, want true")
+	assert.True(t, got.HasPeakContextTokens, "HasPeakContextTokens = false, want true")
+
+	// Verify preserved fields were NOT cleared.
+	require.NotNil(t, got.FirstMessage, "FirstMessage cleared")
+	assert.Equal(t, "hello", *got.FirstMessage, "FirstMessage")
+	assert.Equal(t, "my-project", got.Project, "Project cleared")
+	require.NotNil(t, got.ParentSessionID,
+		"ParentSessionID cleared")
+	assert.Equal(t, "parent-1", *got.ParentSessionID, "ParentSessionID")
+	assert.Equal(t, "continuation", got.RelationshipType,
+		"RelationshipType cleared")
+	require.NotNil(t, got.FileHash, "FileHash cleared")
+	assert.Equal(t, "abc123", *got.FileHash, "FileHash")
+}
+
+func TestUpdateSessionIncrementalTerminationStatus(t *testing.T) {
+	tests := []struct {
+		name              string
+		terminationStatus *string
+		wantStatus        string
+		wantNull          bool
+	}{
+		{
+			name:              "stores authoritative status",
+			terminationStatus: new("awaiting_user"),
+			wantStatus:        "awaiting_user",
+		},
+		{
+			name:     "nil clears status",
+			wantNull: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDB(t)
+			require.NoError(t, d.UpsertSession(t.Context(), Session{
+				ID:                "incremental-status",
+				Agent:             "claude",
+				TerminationStatus: new("tool_call_pending"),
+			}), "seed session")
+
+			update := IncrementalSessionUpdate{
+				TerminationStatus: tt.terminationStatus,
+			}
+			require.NoError(t, d.UpdateSessionIncremental(t.Context(),
+				"incremental-status", update,
+			), "update session incrementally")
+
+			got, err := d.GetSessionFull(t.Context(), "incremental-status")
+			require.NoError(t, err, "read updated session")
+			require.NotNil(t, got, "updated session")
+			if tt.wantNull {
+				assert.Nil(t, got.TerminationStatus, "termination_status")
+				return
+			}
+			require.NotNil(t, got.TerminationStatus, "termination_status")
+			assert.Equal(t, tt.wantStatus, *got.TerminationStatus, "termination_status")
+		})
+	}
+}
+
+// TestLastWriteIncrementalMarker pins the parse-diff detection signal:
+// a fresh full write (UpsertSession) leaves last_write_incremental
+// false, an incremental append (WriteSessionIncremental) sets it true,
+// a bare UpsertSession afterward PRESERVES it (it rewrites only the
+// session row, not the still-incremental message rows), and only a full
+// message re-normalization (ReplaceSessionMessages) clears it. This is
+// the per-session ground truth parse-diff reads to classify incremental
+// skew, so its set/reset behavior across these write paths must hold.
+func TestLastWriteIncrementalMarker(t *testing.T) {
+	d := testDB(t)
+
+	base := Session{
+		ID:               "inc-marker",
+		Project:          "proj",
+		Machine:          "test",
+		Agent:            "claude",
+		FirstMessage:     new("hello"),
+		StartedAt:        new("2024-01-15T10:00:00Z"),
+		MessageCount:     1,
+		UserMessageCount: 1,
+		FilePath:         new("/tmp/sessions/inc-marker.jsonl"),
+		FileSize:         new(int64(512)),
+		FileMtime:        new(int64(100)),
+	}
+	requireNoError(t, d.UpsertSession(t.Context(), base), "initial full upsert")
+
+	got, err := d.GetSessionFull(t.Context(), "inc-marker")
+	requireNoError(t, err, "get after full upsert")
+	require.NotNil(t, got, "session after full upsert")
+	assert.False(t, got.LastWriteIncremental,
+		"full write path must leave last_write_incremental false")
+
+	_, werr := d.WriteSessionIncremental(t.Context(),
+		"inc-marker",
+		[]Message{asstMsg("inc-marker", 1, "appended reply")},
+		IncrementalSessionUpdate{
+			MsgCount:     2,
+			UserMsgCount: 1,
+			FileSize:     1024,
+			FileMtime:    200,
+			NextOrdinal:  2,
+		},
+	)
+	requireNoError(t, werr, "incremental write")
+
+	got, err = d.GetSessionFull(t.Context(), "inc-marker")
+	requireNoError(t, err, "get after incremental write")
+	require.NotNil(t, got, "session after incremental write")
+	assert.True(t, got.LastWriteIncremental,
+		"incremental append must set last_write_incremental true")
+
+	// A bare UpsertSession rewrites only the session row, not the message
+	// rows, so it must PRESERVE the marker: the stored messages are still
+	// the incrementally appended ones. Clearing here (as an earlier
+	// implementation did) would make parse-diff report that still-present
+	// benign skew as real drift after any routine append-only full-parse
+	// sync (Claude/Codex take ReplaceMessages=false).
+	requireNoError(t, d.UpsertSession(t.Context(), base), "second full upsert")
+	got, err = d.GetSessionFull(t.Context(), "inc-marker")
+	requireNoError(t, err, "get after second full upsert")
+	require.NotNil(t, got, "session after second full upsert")
+	assert.True(t, got.LastWriteIncremental,
+		"a bare session upsert must preserve the marker (messages not re-normalized)")
+
+	// A full message re-normalization clears it: this is the self-heal a
+	// full resync relies on to restore parse-diff scrutiny.
+	requireNoError(t, d.ReplaceSessionMessages(t.Context(),
+		"inc-marker",
+		[]Message{asstMsg("inc-marker", 1, "renormalized reply")},
+	), "full message replace")
+	got, err = d.GetSessionFull(t.Context(), "inc-marker")
+	requireNoError(t, err, "get after full message replace")
+	require.NotNil(t, got, "session after full message replace")
+	assert.False(t, got.LastWriteIncremental,
+		"a full message re-normalization must clear last_write_incremental")
+}
+
+// TestBatchWriteIncrementalMarkerReplaceMode pins the batch-path half of
+// the marker contract: the routine full-parse batch path takes
+// ReplaceMessages=false for append-only agents (Claude/Codex), where it
+// upserts the session row and appends new messages but does NOT rewrite
+// earlier incrementally written rows. That path must PRESERVE the marker;
+// only a ReplaceMessages=true batch, which deletes and reinserts every
+// row, may clear it. Without this, a single routine sync flips a benign
+// incremental_skew session into a spurious DiffChanged.
+func TestBatchWriteIncrementalMarkerReplaceMode(t *testing.T) {
+	d := testDB(t)
+
+	base := Session{
+		ID:               "batch-marker",
+		Project:          "proj",
+		Machine:          defaultMachine,
+		Agent:            "claude",
+		FirstMessage:     new("hello"),
+		StartedAt:        new("2024-01-15T10:00:00Z"),
+		MessageCount:     1,
+		UserMessageCount: 1,
+	}
+	requireNoError(t, d.UpsertSession(t.Context(), base), "initial upsert")
+	_, werr := d.WriteSessionIncremental(t.Context(),
+		"batch-marker",
+		[]Message{asstMsg("batch-marker", 1, "appended reply")},
+		IncrementalSessionUpdate{MsgCount: 2, UserMsgCount: 1, NextOrdinal: 2},
+	)
+	requireNoError(t, werr, "incremental write")
+
+	got, err := d.GetSessionFull(t.Context(), "batch-marker")
+	requireNoError(t, err, "get after incremental write")
+	require.NotNil(t, got, "session after incremental write")
+	require.True(t, got.LastWriteIncremental, "marker set by incremental write")
+
+	// Append-only full-parse batch (ReplaceMessages=false): must preserve.
+	appendOnly := []Message{userMsg("batch-marker", 0, "hello"), asstMsg("batch-marker", 2, "next")}
+	_, err = d.WriteSessionBatch([]SessionBatchWrite{{
+		Session:         base,
+		Messages:        appendOnly,
+		DataVersion:     CurrentDataVersion(),
+		ReplaceMessages: false,
+	}})
+	requireNoError(t, err, "append-only batch write")
+	got, err = d.GetSessionFull(t.Context(), "batch-marker")
+	requireNoError(t, err, "get after append-only batch")
+	require.NotNil(t, got, "session after append-only batch")
+	assert.True(t, got.LastWriteIncremental,
+		"append-only batch (ReplaceMessages=false) must preserve the marker")
+
+	// Full-replace batch (ReplaceMessages=true): must clear.
+	_, err = d.WriteSessionBatch([]SessionBatchWrite{{
+		Session:         base,
+		Messages:        []Message{userMsg("batch-marker", 0, "hello")},
+		DataVersion:     CurrentDataVersion(),
+		ReplaceMessages: true,
+	}})
+	requireNoError(t, err, "full-replace batch write")
+	got, err = d.GetSessionFull(t.Context(), "batch-marker")
+	requireNoError(t, err, "get after full-replace batch")
+	require.NotNil(t, got, "session after full-replace batch")
+	assert.False(t, got.LastWriteIncremental,
+		"full-replace batch (ReplaceMessages=true) must clear the marker")
+}
+
+func TestIncrementalWriteAtomicityRollsBackMessages(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "atomic-target", "proj")
+
+	_, err := d.getWriter().Exec(t.Context(), `
+		CREATE TRIGGER sessions_incremental_atomicity_abort
+		BEFORE UPDATE ON sessions
+		WHEN NEW.id = 'atomic-target'
+		BEGIN
+			SELECT RAISE(FAIL, 'atomicity proof trigger');
+		END;
+	`)
+	require.NoError(t, err, "create trigger")
+
+	msgsToWrite := []Message{asstMsg("atomic-target", 0, "should rollback")}
+	_, err = d.WriteSessionIncremental(t.Context(), "atomic-target", msgsToWrite,
+		IncrementalSessionUpdate{
+			MsgCount: 1, FileSize: 128, FileMtime: 10, NextOrdinal: 1,
+		},
+	)
+	require.Error(t, err, "expected session update trigger to fail")
+
+	msgs, getErr := d.GetMessages(
+		t.Context(), "atomic-target", 0, 10, true,
+	)
+	require.NoError(t, getErr, "GetMessages")
+	assert.Empty(t, msgs, "message rows should roll back with session metadata failure")
+}
+
+func TestSyncState_GetSetRoundtrip(t *testing.T) {
+	d := testDB(t)
+
+	// Initially empty.
+	val, err := d.GetSyncState(t.Context(), "last_push_at")
+	requireNoError(t, err, "get initial")
+	require.Empty(t, val, "initial value")
+
+	// Set and read back.
+	err = d.SetSyncState(t.Context(), "last_push_at", "2026-03-11T12:00:00.000Z")
+	require.NoError(t, err, "set")
+	val, err = d.GetSyncState(t.Context(), "last_push_at")
+	requireNoError(t, err, "get after set")
+	require.Equal(t, "2026-03-11T12:00:00.000Z", val, "value")
+
+	// Update.
+	err = d.SetSyncState(t.Context(), "last_push_at", "2026-03-11T13:00:00.000Z")
+	require.NoError(t, err, "update")
+	val, err = d.GetSyncState(t.Context(), "last_push_at")
+	requireNoError(t, err, "get after update")
+	require.Equal(t, "2026-03-11T13:00:00.000Z", val, "value")
+}
+
+func TestListSessionsModifiedBetween(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	// Insert sessions with different timestamps.
+	sessions := []Session{
+		{ID: "s1", Project: "p", Machine: "local", Agent: "claude", CreatedAt: "2026-03-10T12:00:00.000Z"},
+		{ID: "s2", Project: "p", Machine: "local", Agent: "claude", CreatedAt: "2026-03-11T12:00:00.000Z"},
+		{ID: "s3", Project: "p", Machine: "local", Agent: "claude", CreatedAt: "2026-03-12T12:00:00.000Z"},
+	}
+	for _, s := range sessions {
+		require.NoError(t, d.UpsertSession(ctx, s),
+			"upsert %s", s.ID)
+	}
+
+	// Backdate created_at for deterministic test results.
+	for _, s := range sessions {
+		_, err := d.getWriter().Exec(ctx,
+			"UPDATE sessions SET created_at = ? WHERE id = ?",
+			s.CreatedAt, s.ID,
+		)
+		require.NoError(t, err, "backdate %s", s.ID)
+	}
+
+	// Query all.
+	all, err := d.ListSessionsModifiedBetween(ctx, "", "", nil, nil)
+	require.NoError(t, err, "list all")
+	require.Len(t, all, 3, "list all =")
+
+	// Query with since.
+	since, err := d.ListSessionsModifiedBetween(ctx, "2026-03-11T00:00:00Z", "", nil, nil)
+	require.NoError(t, err, "list since")
+	require.Len(t, since, 2, "list since =")
+
+	// Query with until.
+	until, err := d.ListSessionsModifiedBetween(ctx, "", "2026-03-11T12:00:00.000Z", nil, nil)
+	require.NoError(t, err, "list until")
+	require.Len(t, until, 2, "list until =")
+
+	// Query with both.
+	between, err := d.ListSessionsModifiedBetween(ctx, "2026-03-10T12:00:00.000Z", "2026-03-11T12:00:00.000Z", nil, nil)
+	require.NoError(t, err, "list between")
+	require.Len(t, between, 1, "list between =")
+	assert.Equal(t, "s2", between[0].ID, "between[0].ID")
+}
+
+func TestMessageContentFingerprint(t *testing.T) {
+	d := testDB(t)
+	sess := Session{ID: "fp-sess", Project: "p", Machine: "local", Agent: "claude"}
+	err := d.UpsertSession(t.Context(), sess)
+	require.NoError(t, err, "upsert")
+	require.NoError(t, d.InsertMessages(t.Context(), []Message{
+		{SessionID: "fp-sess", Ordinal: 0, Role: "user", Content: "hello", ContentLength: 5},
+		{SessionID: "fp-sess", Ordinal: 1, Role: "assistant", Content: "hi there!", ContentLength: 9},
+	}), "insert")
+
+	sum, maximum, minimum, err := d.MessageContentFingerprint(t.Context(), "fp-sess")
+	require.NoError(t, err, "fingerprint")
+	assert.Equal(t, int64(14), sum, "sum")
+	assert.Equal(t, int64(9), maximum, "max")
+	assert.Equal(t, int64(5), minimum, "min")
+}
+
+func TestSystemMessageFingerprint(t *testing.T) {
+	d := testDB(t)
+	sess := Session{ID: "sys-fp", Project: "p", Machine: "local", Agent: "claude"}
+	err := d.UpsertSession(t.Context(), sess)
+	require.NoError(t, err, "upsert")
+	// System ordinals: 0 and 2 → "0,2".
+	require.NoError(t, d.InsertMessages(t.Context(), []Message{
+		{SessionID: "sys-fp", Ordinal: 0, Role: "user", Content: "sys", ContentLength: 3, IsSystem: true},
+		{SessionID: "sys-fp", Ordinal: 1, Role: "assistant", Content: "hi", ContentLength: 2},
+		{SessionID: "sys-fp", Ordinal: 2, Role: "user", Content: "sys2", ContentLength: 4, IsSystem: true},
+	}), "insert")
+
+	fp, err := d.SystemMessageFingerprint(t.Context(), "sys-fp")
+	require.NoError(t, err, "SystemMessageFingerprint")
+	assert.Equal(t, "0,2", fp, "fingerprint")
+
+	// Regression: {0,3} and {1,2} both produce sum=3 and sum-of-squares differs,
+	// but {0,4,5} and {1,2,6} (sum=9, sumSq=41) collide under the two-component
+	// scheme. The string fingerprint is exact.
+	for _, tc := range []struct {
+		id       string
+		ordinals []int // which ordinals are system
+		want     string
+	}{
+		{"fp-03", []int{0, 3}, "0,3"},
+		{"fp-12", []int{1, 2}, "1,2"},
+		{"fp-045", []int{0, 4, 5}, "0,4,5"},
+		{"fp-126", []int{1, 2, 6}, "1,2,6"},
+	} {
+		s := Session{ID: tc.id, Project: "p", Machine: "local", Agent: "claude"}
+		require.NoError(t, d.UpsertSession(t.Context(), s), "upsert %s", tc.id)
+		maxOrd := 0
+		for _, o := range tc.ordinals {
+			if o > maxOrd {
+				maxOrd = o
+			}
+		}
+		msgs := make([]Message, maxOrd+1)
+		systemSet := make(map[int]bool)
+		for _, o := range tc.ordinals {
+			systemSet[o] = true
+		}
+		for i := range maxOrd + 1 {
+			msgs[i] = Message{
+				SessionID: tc.id, Ordinal: i, Role: "user",
+				Content: "x", ContentLength: 1,
+				IsSystem: systemSet[i],
+			}
+		}
+		require.NoError(t, d.InsertMessages(t.Context(), msgs),
+			"insert %s", tc.id)
+		got, err := d.SystemMessageFingerprint(t.Context(), tc.id)
+		require.NoError(t, err, "SystemMessageFingerprint %s", tc.id)
+		assert.Equal(t, tc.want, got, "%s", tc.id)
+	}
+}
+
+func TestToolCallCountAndFingerprint(t *testing.T) {
+	d := testDB(t)
+	sess := Session{ID: "tc-sess", Project: "p", Machine: "local", Agent: "claude"}
+	err := d.UpsertSession(t.Context(), sess)
+	require.NoError(t, err, "upsert")
+	require.NoError(t, d.InsertMessages(t.Context(), []Message{
+		{
+			SessionID: "tc-sess", Ordinal: 0, Role: "assistant", Content: "tool",
+			ToolCalls: []ToolCall{
+				{ToolName: "Read", Category: "Read", ResultContentLength: 100},
+				{ToolName: "Write", Category: "Write", ResultContentLength: 50},
+			},
+		},
+	}), "insert")
+
+	count, err := d.ToolCallCount(t.Context(), "tc-sess")
+	require.NoError(t, err, "count")
+	assert.Equal(t, 2, count, "count")
+
+	sum, err := d.ToolCallContentFingerprint(t.Context(), "tc-sess")
+	require.NoError(t, err, "fingerprint")
+	assert.Equal(t, int64(150), sum, "sum")
+}
+
+func TestToolCallFingerprintIncludesStableFields(t *testing.T) {
+	d := testDB(t)
+	for _, id := range []string{"tc-old", "tc-new"} {
+		err := d.UpsertSession(t.Context(), Session{
+			ID: id, Project: "p", Machine: "local", Agent: "cursor",
+		})
+		require.NoError(t, err, "upsert %s", id)
+	}
+	require.NoError(t, d.InsertMessages(t.Context(), []Message{
+		{
+			SessionID: "tc-old", Ordinal: 0, Role: "assistant", Content: "tool",
+			ToolCalls: []ToolCall{
+				{
+					ToolName:            "ApplyPatch",
+					Category:            "ApplyPatch",
+					ToolUseID:           "toolu_patch",
+					ResultContentLength: 12,
+				},
+			},
+		},
+		{
+			SessionID: "tc-new", Ordinal: 0, Role: "assistant", Content: "tool",
+			ToolCalls: []ToolCall{
+				{
+					ToolName:            "ApplyPatch",
+					Category:            "Edit",
+					ToolUseID:           "toolu_patch",
+					InputJSON:           `{"patch":"@@\n-old\n+new"}`,
+					ResultContentLength: 12,
+				},
+			},
+		},
+	}), "insert")
+
+	oldFP, err := d.ToolCallFingerprint(t.Context(), "tc-old")
+	require.NoError(t, err, "old fingerprint")
+	newFP, err := d.ToolCallFingerprint(t.Context(), "tc-new")
+	require.NoError(t, err, "new fingerprint")
+
+	assert.NotEqual(t, oldFP, newFP)
+	assert.Contains(t, newFP, "Edit")
+	assert.Contains(t, newFP, `{"patch":"@@\n-old\n+new"}`)
+}
+
+func TestToolCallFingerprintHandlesEmptyToolUseID(t *testing.T) {
+	d := testDB(t)
+	err := d.UpsertSession(t.Context(), Session{
+		ID: "tc-empty-id", Project: "p", Machine: "local", Agent: "cursor",
+	})
+	require.NoError(t, err, "upsert")
+	require.NoError(t, d.InsertMessages(t.Context(), []Message{
+		{
+			SessionID: "tc-empty-id", Ordinal: 0, Role: "assistant",
+			Content: "tool",
+			ToolCalls: []ToolCall{
+				{
+					ToolName:  "ApplyPatch",
+					Category:  "Edit",
+					InputJSON: `{"patch":"@@\n-old\n+new"}`,
+				},
+			},
+		},
+	}), "insert")
+
+	fp, err := d.ToolCallFingerprint(t.Context(), "tc-empty-id")
+	require.NoError(t, err, "fingerprint")
+
+	assert.Contains(t, fp, "ApplyPatch")
+	assert.Contains(t, fp, "Edit")
+}
+
+func TestToolCallFingerprintIncludesFilePath(t *testing.T) {
+	d := testDB(t)
+	for _, id := range []string{"fp-nofile", "fp-file"} {
+		require.NoError(t, d.UpsertSession(t.Context(), Session{
+			ID: id, Project: "p", Machine: "local", Agent: "cursor",
+		}), "upsert %s", id)
+	}
+	base := ToolCall{ToolName: "Edit", Category: "Edit", ToolUseID: "toolu_1"}
+	withFile := base
+	withFile.FilePath = "internal/db/messages.go"
+	require.NoError(t, d.InsertMessages(t.Context(), []Message{
+		{
+			SessionID: "fp-nofile", Ordinal: 0, Role: "assistant",
+			Content: "tool", ToolCalls: []ToolCall{base},
+		},
+		{
+			SessionID: "fp-file", Ordinal: 0, Role: "assistant",
+			Content: "tool", ToolCalls: []ToolCall{withFile},
+		},
+	}), "insert")
+
+	noFileFP, err := d.ToolCallFingerprint(t.Context(), "fp-nofile")
+	require.NoError(t, err, "no-file fingerprint")
+	fileFP, err := d.ToolCallFingerprint(t.Context(), "fp-file")
+	require.NoError(t, err, "file fingerprint")
+
+	// A file_path-only difference must change the fingerprint so the PG/DuckDB
+	// push fast paths re-push a file_path backfill instead of skipping it.
+	assert.NotEqual(t, noFileFP, fileFP)
+	assert.Contains(t, fileFP, "internal/db/messages.go")
+}
+
+func TestResolveToolCallsDerivesPositionalCallIndex(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	require.NoError(t, d.UpsertSession(ctx, Session{
+		ID: "ci", Project: "p", Machine: "local", Agent: "cursor",
+	}), "upsert")
+	// Three tool calls in one message with no explicit CallIndex, mirroring
+	// the importer write path. resolveToolCalls must number them by position.
+	require.NoError(t, d.InsertMessages(ctx, []Message{
+		{
+			SessionID: "ci", Ordinal: 0, Role: "assistant", Content: "tools",
+			HasToolUse: true,
+			ToolCalls: []ToolCall{
+				{ToolName: "Read", Category: "Read", FilePath: "a.go"},
+				{ToolName: "Edit", Category: "Edit", FilePath: "b.go"},
+				{ToolName: "Write", Category: "Write", FilePath: "c.go"},
+			},
+		},
+	}), "insert")
+
+	msgs, err := d.GetAllMessages(ctx, "ci")
+	require.NoError(t, err, "get all messages")
+	require.Len(t, msgs, 1)
+	calls := msgs[0].ToolCalls
+	require.Len(t, calls, 3)
+	for i, tc := range calls {
+		assert.Equal(t, i, tc.CallIndex, "call %d index", i)
+	}
+	// FilePath must survive the write path too (sync + importer parity).
+	assert.Equal(t, "a.go", calls[0].FilePath)
+	assert.Equal(t, "b.go", calls[1].FilePath)
+	assert.Equal(t, "c.go", calls[2].FilePath)
+}
+
+func TestToolCallParseDiffFingerprintIncludesFilePath(t *testing.T) {
+	d := testDB(t)
+	for _, id := range []string{"pd-nofile", "pd-file"} {
+		require.NoError(t, d.UpsertSession(t.Context(), Session{
+			ID: id, Project: "p", Machine: "local", Agent: "cursor",
+		}), "upsert %s", id)
+	}
+	base := ToolCall{ToolName: "Edit", Category: "Edit", ToolUseID: "t1"}
+	withFile := base
+	withFile.FilePath = "internal/db/messages.go"
+	require.NoError(t, d.InsertMessages(t.Context(), []Message{
+		{
+			SessionID: "pd-nofile", Ordinal: 0, Role: "assistant",
+			Content: "tool", ToolCalls: []ToolCall{base},
+		},
+		{
+			SessionID: "pd-file", Ordinal: 0, Role: "assistant",
+			Content: "tool", ToolCalls: []ToolCall{withFile},
+		},
+	}), "insert")
+
+	noFileFP, err := d.ToolCallParseDiffFingerprint(t.Context(), "pd-nofile")
+	require.NoError(t, err, "no-file parse-diff fingerprint")
+	fileFP, err := d.ToolCallParseDiffFingerprint(t.Context(), "pd-file")
+	require.NoError(t, err, "file parse-diff fingerprint")
+
+	// A file_path-only difference must move the parse-diff fingerprint so a
+	// parser change that only alters extracted paths triggers a reparse.
+	assert.NotEqual(t, noFileFP, fileFP)
+	assert.Contains(t, fileFP, "internal/db/messages.go")
+}
+
+func TestListSessionsModifiedBetween_ProjectFilter(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	sessions := []Session{
+		{ID: "s1", Project: "alpha", Machine: "local", Agent: "claude", CreatedAt: "2026-03-10T12:00:00.000Z"},
+		{ID: "s2", Project: "beta", Machine: "local", Agent: "claude", CreatedAt: "2026-03-10T12:00:00.000Z"},
+		{ID: "s3", Project: "gamma", Machine: "local", Agent: "claude", CreatedAt: "2026-03-10T12:00:00.000Z"},
+	}
+	for _, s := range sessions {
+		require.NoError(t, d.UpsertSession(ctx, s),
+			"upsert %s", s.ID)
+	}
+	for _, s := range sessions {
+		_, err := d.getWriter().Exec(ctx,
+			"UPDATE sessions SET created_at = ? WHERE id = ?",
+			s.CreatedAt, s.ID,
+		)
+		require.NoError(t, err, "backdate %s", s.ID)
+	}
+
+	tests := []struct {
+		name            string
+		projects        []string
+		excludeProjects []string
+		wantIDs         []string
+	}{
+		{
+			name:    "no filter returns all",
+			wantIDs: []string{"s1", "s2", "s3"},
+		},
+		{
+			name:     "include alpha only",
+			projects: []string{"alpha"},
+			wantIDs:  []string{"s1"},
+		},
+		{
+			name:     "include alpha and gamma",
+			projects: []string{"alpha", "gamma"},
+			wantIDs:  []string{"s1", "s3"},
+		},
+		{
+			name:            "exclude beta",
+			excludeProjects: []string{"beta"},
+			wantIDs:         []string{"s1", "s3"},
+		},
+		{
+			name:     "include nonexistent project",
+			projects: []string{"nope"},
+			wantIDs:  []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := d.ListSessionsModifiedBetween(
+				ctx, "", "", tt.projects, tt.excludeProjects,
+			)
+			require.NoError(t, err, "ListSessionsModifiedBetween")
+			var gotIDs []string
+			for _, s := range got {
+				gotIDs = append(gotIDs, s.ID)
+			}
+			require.Len(t, gotIDs, len(tt.wantIDs),
+				"got %v, want %v", gotIDs, tt.wantIDs)
+			for i, id := range tt.wantIDs {
+				assert.Equal(t, id, gotIDs[i],
+					"got[%d] = %q, want %q", i, gotIDs[i], id)
+			}
+		})
+	}
+}
+
+func TestSessionsHasTerminationStatusColumn(t *testing.T) {
+	d := testDB(t)
+
+	var count int
+	err := d.getReader().QueryRow(t.Context(),
+		`SELECT count(*) FROM pragma_table_info('sessions')
+		 WHERE name = 'termination_status'`,
+	).Scan(&count)
+	requireNoError(t, err, "probing termination_status column")
+
+	require.Equal(t, 1, count,
+		"expected 1 termination_status column, got %d", count)
+}
+
+func TestSessionsTerminationStatusIndex(t *testing.T) {
+	d := testDB(t)
+
+	var count int
+	err := d.getReader().QueryRow(t.Context(),
+		`SELECT count(*) FROM sqlite_master
+		 WHERE type = 'index' AND name = 'idx_sessions_termination_status'`,
+	).Scan(&count)
+	requireNoError(t, err, "probing idx_sessions_termination_status")
+
+	require.Equal(t, 1, count,
+		"expected idx_sessions_termination_status to exist, got count=%d",
+		count)
+}
+
+func TestMessagesUsageIndexes(t *testing.T) {
+	d := testDB(t)
+
+	var count int
+	err := d.getReader().QueryRow(t.Context(),
+		`SELECT count(*) FROM sqlite_master
+		 WHERE type = 'index' AND name = 'idx_messages_usage_covering'`,
+	).Scan(&count)
+	requireNoError(t, err, "probing idx_messages_usage_covering")
+
+	require.Equal(t, 0, count,
+		"expected superseded idx_messages_usage_covering to be absent, got count=%d",
+		count)
+
+	err = d.getReader().QueryRow(t.Context(),
+		`SELECT count(*) FROM sqlite_master
+		 WHERE type = 'index' AND name = 'idx_messages_usage_timestamp'`,
+	).Scan(&count)
+	requireNoError(t, err, "probing idx_messages_usage_timestamp")
+	require.Equal(t, 1, count,
+		"expected idx_messages_usage_timestamp to exist")
+}
+
+// TestMigration_TerminationStatusColumn simulates upgrading from a
+// pre-termination_status schema. Drops the column and its index from
+// a freshly-opened DB, reopens, and verifies the migration restores
+// both without losing existing session data.
+func TestMigration_TerminationStatusColumn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	d := testDBAtPath(t, path, "initial migration db")
+	insertSession(t, d, "s1", "proj")
+	d.Close()
+
+	conn, err := sql.Open("sqlite3", path)
+	requireNoError(t, err, "raw open")
+
+	// SQLite supports DROP COLUMN as of 3.35; the in-tree driver is
+	// recent enough. Drop the index and the trigger that references the
+	// column first since SQLite blocks dropping a column referenced by an
+	// index or a trigger.
+	_, err = conn.ExecContext(t.Context(), `DROP INDEX IF EXISTS idx_sessions_termination_status`)
+	requireNoError(t, err, "drop termination_status index")
+	_, err = conn.ExecContext(t.Context(), `DROP TRIGGER IF EXISTS artifact_sessions_update_queue`)
+	requireNoError(t, err, "drop artifact_sessions_update_queue trigger")
+	_, err = conn.ExecContext(t.Context(), `ALTER TABLE sessions DROP COLUMN termination_status`)
+	requireNoError(t, err, "drop termination_status column")
+
+	// Verify column and index are gone, and the row survived.
+	var count int
+	err = conn.QueryRowContext(t.Context(),
+		`SELECT count(*) FROM pragma_table_info('sessions')
+		 WHERE name = 'termination_status'`,
+	).Scan(&count)
+	requireNoError(t, err, "verify column removed")
+	require.Equal(t, 0, count,
+		"expected termination_status column to be absent")
+	err = conn.QueryRowContext(t.Context(),
+		`SELECT count(*) FROM sqlite_master
+		 WHERE type='index' AND name='idx_sessions_termination_status'`,
+	).Scan(&count)
+	requireNoError(t, err, "verify index removed")
+	require.Equal(t, 0, count,
+		"expected termination_status index to be absent")
+	var sessCount int
+	err = conn.QueryRowContext(t.Context(), `SELECT count(*) FROM sessions`).Scan(&sessCount)
+	requireNoError(t, err, "count sessions pre-migration")
+	require.Equal(t, 1, sessCount, "expected 1 session row, got")
+
+	// Force the migration path: bump user_version down so Open()
+	// re-runs the ADD COLUMN / CREATE INDEX steps.
+	_, err = conn.ExecContext(t.Context(), `PRAGMA user_version = 0`)
+	requireNoError(t, err, "reset user_version")
+	conn.Close()
+
+	d2, err := Open(t.Context(), path)
+	requireNoError(t, err, "reopen after migration")
+	defer d2.Close()
+
+	// Column and index restored, row preserved.
+	err = d2.getReader().QueryRow(t.Context(),
+		`SELECT count(*) FROM pragma_table_info('sessions')
+		 WHERE name = 'termination_status'`,
+	).Scan(&count)
+	requireNoError(t, err, "verify column added")
+	require.Equal(t, 1, count,
+		"expected termination_status column after migration")
+	err = d2.getReader().QueryRow(t.Context(),
+		`SELECT count(*) FROM sqlite_master
+		 WHERE type='index' AND name='idx_sessions_termination_status'`,
+	).Scan(&count)
+	requireNoError(t, err, "verify index added")
+	require.Equal(t, 1, count,
+		"expected termination_status index after migration")
+
+	sessions, err := d2.ListSessions(t.Context(), SessionFilter{})
+	requireNoError(t, err, "list sessions")
+	require.Len(t, sessions.Sessions, 1,
+		"expected 1 session 's1' after migration, got %v",
+		sessions.Sessions)
+	require.Equal(t, "s1", sessions.Sessions[0].ID,
+		"expected session id 's1' after migration, got %v",
+		sessions.Sessions)
+	if sessions.Sessions[0].TerminationStatus != nil {
+		assert.Failf(t, "termination_status not NULL",
+			"expected NULL termination_status after migration, got %q",
+			*sessions.Sessions[0].TerminationStatus)
+	}
+}
+
+// TestDisplayNameNotOverwrittenByUpsert verifies that display_name (the user
+// override column) is never touched by UpsertSession. Only RenameSession
+// may write it. This replaces the old BackfillNameSource tests which tested
+// a migration helper that no longer exists.
+func TestDisplayNameNotOverwrittenByUpsert(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	fp := "/home/user/.claude/sessions/s1.jsonl"
+	// Fresh session with a session_name from the parser.
+	requireNoError(t, d.UpsertSession(ctx, Session{
+		ID:          "s1",
+		Project:     "p",
+		Machine:     "local",
+		Agent:       "claude",
+		SessionName: Ptr("Agent Name"),
+		FilePath:    &fp,
+	}), "initial upsert")
+
+	// User renames it.
+	requireNoError(t, d.RenameSession(ctx, "s1", Ptr("Manual Name")), "RenameSession")
+
+	// Re-parse with a new agent name: display_name must NOT be overwritten.
+	requireNoError(t, d.UpsertSession(ctx, Session{
+		ID:          "s1",
+		Project:     "p",
+		Machine:     "local",
+		Agent:       "claude",
+		SessionName: Ptr("New Agent Name"),
+		FilePath:    &fp,
+	}), "re-upsert with new agent name")
+
+	s, err := d.GetSession(ctx, "s1")
+	require.NoError(t, err, "GetSession")
+	require.NotNil(t, s, "session not found")
+	require.NotNil(t, s.DisplayName, "display_name must not be nil")
+	assert.Equal(t, "Manual Name", *s.DisplayName,
+		"user's display_name must survive re-parse")
+}
+
+func TestCopySessionMetadataPreservesUserNotAgent(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old.db")
+
+	// Old DB: one user-renamed session, one agent-named session.
+	oldDB, err := Open(t.Context(), oldPath)
+	requireNoError(t, err, "open old")
+	requireNoError(t, oldDB.UpsertSession(t.Context(), Session{
+		ID: "u", Project: "p", Machine: "local", Agent: "claude",
+	}), "upsert u")
+	requireNoError(t, oldDB.RenameSession(t.Context(), "u", Ptr("User Name")), "rename u")
+	requireNoError(t, oldDB.UpsertSession(t.Context(), Session{
+		ID: "a", Project: "p", Machine: "local", Agent: "claude",
+		SessionName: Ptr("Old Agent"),
+	}), "upsert a")
+	requireNoError(t, oldDB.Close(), "close old")
+
+	// Fresh DB: both re-parsed with new agent names.
+	fresh := testDB(t)
+	requireNoError(t, fresh.UpsertSession(t.Context(), Session{
+		ID: "u", Project: "p", Machine: "local", Agent: "claude",
+		SessionName: Ptr("Fresh Agent U"),
+	}), "fresh u")
+	requireNoError(t, fresh.UpsertSession(t.Context(), Session{
+		ID: "a", Project: "p", Machine: "local", Agent: "claude",
+		SessionName: Ptr("Fresh Agent A"),
+	}), "fresh a")
+
+	requireNoError(t, fresh.CopySessionMetadataFrom(oldPath), "copy")
+
+	u := getSessionRow(t, fresh, "u")
+	require.NotNil(t, u.DisplayName, "user rename overlaid")
+	assert.Equal(t, "User Name", *u.DisplayName, "user rename overlaid")
+
+	a := getSessionRow(t, fresh, "a")
+	assert.Nil(t, a.DisplayName, "agent session has no user display_name")
+	require.NotNil(t, a.SessionName, "fresh session_name preserved")
+	assert.Equal(t, "Fresh Agent A", *a.SessionName, "agent keeps fresh session_name")
+}
+
+// A name the user cleared in the old DB (display_name NULL) must NOT be
+// re-applied on resync; the fresh re-parsed session_name wins.
+func TestCopySessionMetadataClearedNameYieldsToAgent(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old.db")
+
+	oldDB, err := Open(t.Context(), oldPath)
+	requireNoError(t, err, "open old")
+	requireNoError(t, oldDB.UpsertSession(t.Context(), Session{
+		ID: "c", Project: "p", Machine: "local", Agent: "claude",
+	}), "upsert c")
+	requireNoError(t, oldDB.RenameSession(t.Context(), "c", Ptr("Once Named")), "rename")
+	requireNoError(t, oldDB.RenameSession(t.Context(), "c", nil), "clear")
+	requireNoError(t, oldDB.Close(), "close old")
+
+	fresh := testDB(t)
+	requireNoError(t, fresh.UpsertSession(t.Context(), Session{
+		ID: "c", Project: "p", Machine: "local", Agent: "claude",
+		SessionName: Ptr("Fresh Agent C"),
+	}), "fresh c")
+
+	requireNoError(t, fresh.CopySessionMetadataFrom(oldPath), "copy")
+
+	c := getSessionRow(t, fresh, "c")
+	assert.Nil(t, c.DisplayName,
+		"cleared old display_name must not be re-applied")
+	require.NotNil(t, c.SessionName, "fresh session_name preserved")
+	assert.Equal(t, "Fresh Agent C", *c.SessionName,
+		"cleared old name must yield to fresh session_name")
+}
+
+func TestCopySessionMetadataPreservesArchiveIdentityMetadata(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+	oldPath := filepath.Join(dir, "old.db")
+
+	oldDB, err := Open(ctx, oldPath)
+	requireNoError(t, err, "open old")
+	requireNoError(t, oldDB.SetDatabaseIDForTest(ctx, "old-db-id"),
+		"set old database id")
+	requireNoError(t, oldDB.SetArchiveIdentityForTest(
+		ctx, "old-archive-id", strings.Repeat("a", 64)),
+		"set old archive identity")
+	requireNoError(t, oldDB.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			Project:    "alpha",
+			Machine:    "laptop",
+			RootPath:   filepath.Join(dir, "alpha"),
+			GitRemote:  "https://github.com/acme/alpha.git",
+			ObservedAt: time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+		}), "upsert old project identity")
+	requireNoError(t, oldDB.Close(), "close old")
+
+	fresh := testDB(t)
+	requireNoError(t, fresh.SetDatabaseIDForTest(ctx, "fresh-db-id"),
+		"set fresh database id")
+	requireNoError(t, fresh.SetArchiveIdentityForTest(
+		ctx, "fresh-archive-id", strings.Repeat("b", 64)),
+		"set fresh archive identity")
+	requireNoError(t, fresh.CopySessionMetadataFrom(oldPath), "copy")
+
+	gotID, err := fresh.GetOrCreateDatabaseID(ctx)
+	requireNoError(t, err, "GetOrCreateDatabaseID")
+	assert.Equal(t, "fresh-db-id", gotID)
+	archiveID, err := fresh.GetArchiveID(ctx)
+	requireNoError(t, err, "GetArchiveID")
+	assert.Equal(t, "old-archive-id", archiveID)
+	archiveSalt, err := fresh.GetArchiveSalt(ctx)
+	requireNoError(t, err, "GetArchiveSalt")
+	assert.Equal(t, strings.Repeat("a", 64), archiveSalt)
+	observations, err := fresh.ListProjectIdentityObservations(
+		ctx, []string{"alpha"})
+	requireNoError(t, err, "ListProjectIdentityObservations")
+	require.Len(t, observations, 1)
+	assert.Equal(t, "alpha", observations[0].Project)
+	assert.Equal(t, "https://github.com/acme/alpha.git",
+		observations[0].GitRemote)
+}
+
+func TestCopySessionMetadataScrubsProjectIdentityGitRemoteCredentials(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+	oldPath := filepath.Join(dir, "old.db")
+	root := filepath.Join(dir, "alpha")
+
+	oldDB, err := Open(ctx, oldPath)
+	requireNoError(t, err, "open old")
+	_, err = oldDB.rawWriter().ExecContext(ctx, `
+		INSERT INTO project_identity_observations (
+			project, machine, root_path, git_remote, git_remote_name,
+			worktree_name, worktree_root_path, observed_at,
+			normalized_remote, key_source, key
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"alpha", "laptop", root,
+		"https://"+"user:token@"+"github.com/acme/alpha.git", "origin",
+		"", "", "2026-05-01T00:00:00Z",
+		"github.com/acme/alpha", "git_remote",
+		projectIdentitySHA("git_remote\n"+"github.com/acme/alpha"),
+	)
+	requireNoError(t, err, "insert raw old project identity")
+	requireNoError(t, oldDB.Close(), "close old")
+
+	fresh := testDB(t)
+	requireNoError(t, fresh.CopySessionMetadataFrom(oldPath), "copy")
+
+	observations, err := fresh.ListProjectIdentityObservations(
+		ctx, []string{"alpha"})
+	requireNoError(t, err, "ListProjectIdentityObservations")
+	require.Len(t, observations, 1)
+	assert.Equal(t, "https://github.com/acme/alpha.git",
+		observations[0].GitRemote)
+	assert.Equal(t, "github.com/acme/alpha",
+		observations[0].NormalizedRemote)
+}
+
+func TestCopySessionMetadataKeepsFreshProjectIdentityObservationOnConflict(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+	oldPath := filepath.Join(dir, "old.db")
+	root := filepath.Join(dir, "repo")
+
+	oldDB, err := Open(ctx, oldPath)
+	requireNoError(t, err, "open old")
+	requireNoError(t, oldDB.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			Project:          "alpha",
+			Machine:          "laptop",
+			RootPath:         root,
+			WorktreeName:     "pkg",
+			WorktreeRootPath: filepath.Join(root, "pkg"),
+			ObservedAt:       time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+		}), "upsert old project identity")
+	requireNoError(t, oldDB.Close(), "close old")
+
+	fresh := testDB(t)
+	requireNoError(t, fresh.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			Project:          "alpha",
+			Machine:          "laptop",
+			RootPath:         root,
+			WorktreeName:     filepath.Base(root),
+			WorktreeRootPath: root,
+			ObservedAt:       time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+		}), "upsert fresh project identity")
+
+	requireNoError(t, fresh.CopySessionMetadataFrom(oldPath), "copy")
+
+	observations, err := fresh.ListProjectIdentityObservations(
+		ctx, []string{"alpha"})
+	requireNoError(t, err, "ListProjectIdentityObservations")
+	require.Len(t, observations, 1)
+	assert.Equal(t, root, observations[0].WorktreeRootPath)
+	assert.Equal(t, filepath.Base(root), observations[0].WorktreeName)
+}
+
+func TestCopySessionMetadataKeepsIdentityRevisionMonotonic(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+	oldPath := filepath.Join(dir, "old.db")
+	oldDB, err := Open(ctx, oldPath)
+	requireNoError(t, err, "open old")
+	_, err = oldDB.rawWriter().ExecContext(ctx, `
+		INSERT INTO archive_metadata (key, value)
+		VALUES (?, '1')
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		archiveMetadataProjectIdentityRevisionKey,
+	)
+	requireNoError(t, err, "set old revision")
+	requireNoError(t, oldDB.Close(), "close old")
+
+	fresh := testDB(t)
+	for _, id := range []string{"session-a", "session-b", "session-c"} {
+		requireNoError(t, fresh.UpsertSession(ctx, Session{
+			ID: id, Project: "app", Machine: "host", Agent: "codex",
+		}), "insert fresh session")
+	}
+	before, err := fresh.ProjectIdentityPublicationRevision(ctx)
+	requireNoError(t, err, "revision before copy")
+	require.Greater(t, before, int64(1))
+
+	requireNoError(t, fresh.CopySessionMetadataFrom(oldPath), "copy")
+	after, err := fresh.ProjectIdentityPublicationRevision(ctx)
+	requireNoError(t, err, "revision after copy")
+	assert.GreaterOrEqual(t, after, before)
+}
+
+func TestCopySessionMetadataKeepsWorktreeMappingRevisionMonotonic(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+	oldPath := filepath.Join(dir, "old.db")
+	oldDB, err := Open(ctx, oldPath)
+	requireNoError(t, err, "open old")
+	_, err = oldDB.rawWriter().ExecContext(ctx, `
+		INSERT INTO archive_metadata (key, value)
+		VALUES (?, '1')
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		archiveMetadataWorktreeMappingRevisionKey,
+	)
+	requireNoError(t, err, "set old revision")
+	requireNoError(t, oldDB.Close(), "close old")
+
+	fresh := testDB(t)
+	_, err = fresh.rawWriter().ExecContext(ctx, `
+		INSERT INTO archive_metadata (key, value)
+		VALUES (?, '5')
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		archiveMetadataWorktreeMappingRevisionKey,
+	)
+	requireNoError(t, err, "set fresh revision")
+	before, err := fresh.WorktreeMappingPublicationRevision(ctx)
+	requireNoError(t, err, "revision before copy")
+	require.Equal(t, int64(5), before)
+
+	requireNoError(t, fresh.CopySessionMetadataFrom(oldPath), "copy")
+	after, err := fresh.WorktreeMappingPublicationRevision(ctx)
+	requireNoError(t, err, "revision after copy")
+	assert.GreaterOrEqual(t, after, before,
+		"resync copy must not regress the worktree mapping publication revision")
+}
+
+func TestCopySessionMetadataPreservesFirstConclusiveSessionSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+	oldPath := filepath.Join(dir, "old.db")
+	oldDB, err := Open(ctx, oldPath)
+	requireNoError(t, err, "open old")
+	requireNoError(t, oldDB.UpsertSession(ctx, Session{
+		ID: "session-a", Project: "app", Machine: "host", Agent: "codex",
+	}), "insert old session")
+	requireNoError(t, oldDB.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			SessionID: "session-a", Project: "app", Machine: "host",
+			RootPath: "/old/app", GitRemote: "https://github.com/acme/app.git",
+			ObservedAt: time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+		}), "insert old snapshot")
+	requireNoError(t, oldDB.Close(), "close old")
+
+	fresh := testDB(t)
+	requireNoError(t, fresh.UpsertSession(ctx, Session{
+		ID: "session-a", Project: "app", Machine: "host", Agent: "codex",
+	}), "insert fresh session")
+	requireNoError(t, fresh.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			SessionID: "session-a", Project: "app", Machine: "host",
+			RootPath: "/new/app", GitRemote: "https://gitlab.com/acme/app.git",
+			ObservedAt: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+		}), "insert fresh snapshot")
+
+	requireNoError(t, fresh.CopySessionMetadataFrom(oldPath), "copy")
+	snapshots, err := fresh.listSessionProjectIdentitySnapshots(
+		ctx, []string{"session-a"},
+	)
+	requireNoError(t, err, "list snapshots")
+	assert.Equal(t, "https://github.com/acme/app.git",
+		snapshots["session-a"].GitRemote)
+}
+
+func TestCopySessionMetadataPreservesHistoricalUnknownSessionSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+	oldPath := filepath.Join(dir, "old.db")
+	oldDB, err := Open(ctx, oldPath)
+	requireNoError(t, err, "open old")
+	requireNoError(t, oldDB.UpsertSession(ctx, Session{
+		ID: "session-a", Project: "app", Machine: "host", Agent: "codex",
+		Cwd: "/historical/app",
+	}), "insert old session")
+	requireNoError(t, oldDB.Close(), "close old")
+
+	fresh := testDB(t)
+	requireNoError(t, fresh.UpsertSession(ctx, Session{
+		ID: "session-a", Project: "app", Machine: "host", Agent: "codex",
+		Cwd: "/rediscovered/app",
+	}), "insert fresh session")
+	requireNoError(t, fresh.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			SessionID: "session-a", Project: "app", Machine: "host",
+			RootPath:   "/rediscovered/app",
+			GitRemote:  "https://example.com/acme/app.git",
+			ObservedAt: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+		}), "insert fresh resolved snapshot")
+
+	requireNoError(t, fresh.CopySessionMetadataFrom(oldPath), "copy")
+	snapshots, err := fresh.listSessionProjectIdentitySnapshots(
+		ctx, []string{"session-a"},
+	)
+	requireNoError(t, err, "list snapshots")
+	require.Contains(t, snapshots, "session-a")
+	assert.Equal(t, export.ProjectResolutionUnknown,
+		snapshots["session-a"].RemoteResolution)
+	assert.Equal(t, "/historical/app", snapshots["session-a"].RootPath)
+	assert.Empty(t, snapshots["session-a"].GitRemote)
+}
+
+func TestCopySessionMetadataSuppressesOldRootFallbackWhenFreshRemoteExists(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+	oldPath := filepath.Join(dir, "old.db")
+	root := filepath.Join(dir, "repo")
+
+	oldDB, err := Open(ctx, oldPath)
+	requireNoError(t, err, "open old")
+	requireNoError(t, oldDB.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			Project:    "alpha",
+			Machine:    "laptop",
+			RootPath:   root,
+			ObservedAt: time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+		}), "upsert old fallback project identity")
+	requireNoError(t, oldDB.Close(), "close old")
+
+	fresh := testDB(t)
+	requireNoError(t, fresh.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			Project:       "alpha",
+			Machine:       "laptop",
+			RootPath:      root,
+			GitRemote:     "https://github.com/acme/alpha.git",
+			GitRemoteName: "origin",
+			ObservedAt:    time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+		}), "upsert fresh remote project identity")
+
+	requireNoError(t, fresh.CopySessionMetadataFrom(oldPath), "copy")
+
+	observations, err := fresh.ListProjectIdentityObservations(
+		ctx, []string{"alpha"})
+	requireNoError(t, err, "ListProjectIdentityObservations")
+	require.Len(t, observations, 1)
+	assert.Equal(t, "https://github.com/acme/alpha.git", observations[0].GitRemote)
+	assert.Equal(t, "git_remote", observations[0].KeySource)
+}
+
+func TestUpsertSessionPersistsSessionName(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	// Simulate what a converter should produce: SessionName set, DisplayName nil.
+	require.NoError(t, d.UpsertSession(ctx, Session{
+		ID:           "conv-test-1",
+		Project:      "p",
+		Machine:      "local",
+		Agent:        "claude",
+		SessionName:  Ptr("My /rename Title"),
+		MessageCount: 1,
+	}), "upsert")
+
+	s, err := d.GetSession(ctx, "conv-test-1")
+	require.NoError(t, err)
+	require.NotNil(t, s)
+	require.NotNil(t, s.DisplayName,
+		"COALESCE should expose session_name as display_name")
+	assert.Equal(t, "My /rename Title", *s.DisplayName)
+}
+
+func TestUpsertWithDisplayNameInsteadOfSessionNameDropsName(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	// Bug: converter sets DisplayName instead of SessionName.
+	// The upsert only writes session_name from SessionName field,
+	// so setting DisplayName is silently dropped.
+	require.NoError(t, d.UpsertSession(ctx, Session{
+		ID:           "conv-test-2",
+		Project:      "p",
+		Machine:      "local",
+		Agent:        "claude",
+		DisplayName:  Ptr("Wrongly set in DisplayName"),
+		MessageCount: 1,
+	}), "upsert")
+
+	s, err := d.GetSession(ctx, "conv-test-2")
+	require.NoError(t, err)
+	require.NotNil(t, s)
+	// display_name was passed in but upsert never writes it — should be nil.
+	assert.Nil(t, s.DisplayName,
+		"upsert must not write display_name; only RenameSession should")
+}
+
+// seedSessionWithMessage inserts a session and one user message (ordinal 0)
+// into d. The inserted message gets the next auto-assigned integer id.
+func seedSessionWithMessage(t *testing.T, d *DB, sessionID string) {
+	t.Helper()
+	insertSession(t, d, sessionID, "proj")
+	insertMessages(t, d, userMsg(sessionID, 0, "hello"))
+}
+
+// clearToolCallFieldBackfillSentinel removes the one-time backfill marker so a
+// test can drive backfillToolCallFieldsLocked as a first run against rows it
+// inserts after Open.
+func clearToolCallFieldBackfillSentinel(t *testing.T, d *DB) {
+	t.Helper()
+	_, err := d.getWriter().Exec(t.Context(),
+		`DELETE FROM stats WHERE key = ?`, toolCallFieldBackfillStatsKey)
+	require.NoError(t, err, "clear tool_call backfill sentinel")
+}
+
+func TestBackfillToolCallFields(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	seedSessionWithMessage(t, d, "sess-bf") // message id = 1
+
+	var msgID int64
+	require.NoError(t, d.getReader().QueryRowContext(ctx,
+		`SELECT id FROM messages WHERE session_id = 'sess-bf' AND ordinal = 0`,
+	).Scan(&msgID))
+
+	w := d.getWriter()
+	_, err := w.Exec(ctx, `INSERT INTO tool_calls
+		(message_id, session_id, tool_name, category, tool_use_id, input_json,
+		 file_path, call_index)
+		VALUES
+		(?,?,?,?,?,?,NULL,NULL),
+		(?,?,?,?,?,?,NULL,NULL),
+		(?,?,?,?,?,?,NULL,NULL)`,
+		msgID, "sess-bf", "Edit", "Edit", "a", `{"file_path":"/x.go"}`,
+		msgID, "sess-bf", "Edit", "Edit", "b", "a raw diff not json",
+		msgID, "sess-bf", "Write", "Write", "c", `{"file":"/y.go"}`,
+	)
+	require.NoError(t, err, "insert legacy tool_calls")
+
+	// Open already ran the one-time backfill on the empty table during
+	// testDB setup; clear the sentinel so it runs against these legacy rows
+	// the way it would when columns are first added to a populated database.
+	clearToolCallFieldBackfillSentinel(t, d)
+	require.NoError(t, d.backfillToolCallFieldsLocked(ctx, w), "backfill")
+
+	type row struct {
+		fp sql.NullString
+		ci int
+	}
+	rows := map[string]row{}
+	r, err := w.QueryContext(ctx,
+		`SELECT tool_use_id, file_path, call_index FROM tool_calls`)
+	require.NoError(t, err)
+	defer r.Close()
+	for r.Next() {
+		var id string
+		var fp sql.NullString
+		var ci int
+		require.NoError(t, r.Scan(&id, &fp, &ci))
+		rows[id] = row{fp, ci}
+	}
+	require.NoError(t, r.Err())
+	assert.Equal(t, "/x.go", rows["a"].fp.String, "a file_path")
+	assert.False(t, rows["b"].fp.Valid, "b file_path should be NULL (raw diff)")
+	assert.Equal(t, "/y.go", rows["c"].fp.String, "c file_path")
+	assert.Equal(t, 0, rows["a"].ci, "a call_index")
+	assert.Equal(t, 1, rows["b"].ci, "b call_index")
+	assert.Equal(t, 2, rows["c"].ci, "c call_index")
+}
+
+func TestBackfillToolCallFieldsRunsOnce(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	seedSessionWithMessage(t, d, "sess-once")
+
+	var msgID int64
+	require.NoError(t, d.getReader().QueryRowContext(ctx,
+		`SELECT id FROM messages WHERE session_id = 'sess-once' AND ordinal = 0`,
+	).Scan(&msgID))
+
+	w := d.getWriter()
+	insertNullEdit := func(toolUseID, inputJSON string) {
+		t.Helper()
+		_, err := w.Exec(ctx, `INSERT INTO tool_calls
+			(message_id, session_id, tool_name, category, tool_use_id,
+			 input_json, file_path, call_index)
+			VALUES (?,?,?,?,?,?,NULL,NULL)`,
+			msgID, "sess-once", "Edit", "Edit", toolUseID, inputJSON)
+		require.NoError(t, err, "insert %s", toolUseID)
+	}
+
+	// Open already ran (and sentineled) the backfill on the empty table;
+	// clear it so this first manual run does real work, as it would when
+	// columns are first added to a populated database.
+	clearToolCallFieldBackfillSentinel(t, d)
+
+	// First run backfills the legacy row and records the sentinel.
+	insertNullEdit("first", `{"file_path":"/first.go"}`)
+	require.NoError(t, d.backfillToolCallFieldsLocked(ctx, w), "first backfill")
+
+	should, err := d.shouldRunToolCallFieldBackfillLocked(ctx, w)
+	require.NoError(t, err, "probe sentinel")
+	assert.False(t, should, "sentinel should be set after first backfill")
+
+	// A row inserted after the sentinel is set must be left untouched: the
+	// gate skips the rerun instead of rescanning tool_calls. This is what
+	// distinguishes one-time gating from plain per-Open idempotency.
+	insertNullEdit("second", `{"file_path":"/second.go"}`)
+	require.NoError(t, d.backfillToolCallFieldsLocked(ctx, w), "second backfill")
+
+	fp := map[string]sql.NullString{}
+	r, err := w.QueryContext(ctx,
+		`SELECT tool_use_id, file_path FROM tool_calls`)
+	require.NoError(t, err)
+	defer r.Close()
+	for r.Next() {
+		var id string
+		var p sql.NullString
+		require.NoError(t, r.Scan(&id, &p))
+		fp[id] = p
+	}
+	require.NoError(t, r.Err())
+	assert.Equal(t, "/first.go", fp["first"].String, "first row backfilled")
+	assert.False(t, fp["second"].Valid,
+		"second row left NULL: one-time gate skipped the rerun")
+}

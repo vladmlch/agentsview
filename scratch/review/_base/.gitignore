@@ -1,0 +1,87 @@
+# Go binaries
+/agentsview
+/agentsview.exe
+/agentsv
+/custom-gcl
+/testfixture
+*.test.exe
+
+# Frontend
+node_modules/
+frontend/dist/
+frontend/src/lib/paraglide/
+frontend/.paraglide/
+frontend/test-results/
+test-results/
+frontend/playwright-report/
+
+# Embedded frontend build output
+internal/web/dist/*
+!internal/web/dist/.keep
+
+# Test/build artifacts
+/dist/
+/.sqlite-include/
+*.out
+coverage.out
+*.test
+
+# Air (live-reload dev server)
+/tmp/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+
+# Build caches
+.gocache
+# Per-checkout golangci-lint cache isolates sibling worktrees.
+/.golangci-cache/
+.cache
+.gomodcache/
+.gopath/
+
+# Docs build and hydrated assets
+docs/.venv/
+docs/.zensical-build.*
+docs/zensical-public-docs.*
+docs/site/
+docs/assets/static/
+docs/assets/generated/
+docs/.gitignore
+docs/.vercel/
+docs/.env*.local
+.vercel
+.env*.local
+
+# Local data
+/data/
+/sessions/
+/html/
+.superset/
+.github/hooks/
+.superpowers/
+.worktrees/
+
+# Visual verification scratch — per-task screenshot/HTML capture dirs.
+.test-data*/
+
+# Antigravity CLI session dir created when AGY runs inside this repo
+.antigravitycli/
+
+# graphify knowledge-graph output (local analysis)
+graphify-out/
+.kata.local.toml
+# roborev snapshots
+/.roborev/
+.env*

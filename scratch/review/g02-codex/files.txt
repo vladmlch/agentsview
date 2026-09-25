@@ -1,0 +1,15 @@
+internal/parser/codex.go
+internal/parser/codex_checkpoint_test.go
+internal/parser/codex_collecting_sink.go
+internal/parser/codex_cursor.go
+internal/parser/codex_cursor_test.go
+internal/parser/codex_metadata.go
+internal/parser/codex_metadata_test.go
+internal/parser/codex_parser_test.go
+internal/parser/codex_provider.go
+internal/parser/codex_provider_test.go
+internal/parser/codex_seed_sink.go
+internal/parser/codex_sink.go
+internal/sync/codex_staging.go
+internal/sync/codex_staging_summary_test.go
+internal/sync/codex_staging_test.go

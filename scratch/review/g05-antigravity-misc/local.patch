@@ -1,0 +1,2204 @@
+diff --git a/internal/parser/antigravity.go b/internal/parser/antigravity.go
+index 40ba361f..89b8a1b4 100644
+--- a/internal/parser/antigravity.go
++++ b/internal/parser/antigravity.go
+@@ -80,6 +80,44 @@ func antigravityIDECompanionPaths(path string) []string {
+ 	)...)
+ }
+ 
++func lookupAntigravitySummary(dbPath, id string) (antigravitySummary, bool) {
++	return lookupAntigravitySummaryContext(context.Background(), dbPath, id)
++}
++
++func lookupAntigravitySummaryContext(ctx context.Context, dbPath, id string) (antigravitySummary, bool) {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	if !IsRegularFile(dbPath) || id == "" {
++		return antigravitySummary{}, false
++	}
++	var sum antigravitySummary
++	var found bool
++	err := WithSQLiteReadOnly(ctx, dbPath, sqliteReadOptions{busyTimeoutMS: 3000}, func(db *sql.DB) error {
++		var ws, title string
++		err := db.QueryRowContext(ctx, "SELECT COALESCE(workspace_uris, ''), COALESCE(title, '') FROM conversation_summaries WHERE conversation_id = ?", id).Scan(&ws, &title)
++		if err != nil {
++			err = db.QueryRowContext(ctx, "SELECT COALESCE(workspace_uris, '') FROM conversation_summaries WHERE conversation_id = ?", id).Scan(&ws)
++			if err != nil {
++				return err
++			}
++		}
++		cwd, proj := parseAntigravityWorkspaceURI(ws)
++		sum = antigravitySummary{
++			workspaceURIs: ws,
++			title:         title,
++			cwd:           cwd,
++			project:       proj,
++		}
++		found = true
++		return nil
++	})
++	if err != nil || !found {
++		return antigravitySummary{}, false
++	}
++	return sum, true
++}
++
+ // parseSession parses one IDE session DB. It is owned by the
+ // antigravityProvider; the package-level ParseAntigravitySession
+ // entrypoint was folded onto the provider.
+@@ -108,7 +146,7 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
+ 
+ 	// Open read-only; SQLite session files have WAL/SHM
+ 	// sidecars that the driver expects in the same dir.
+-	db, err := openSQLiteReadOnly(path, sqliteReadOptions{})
++	db, err := openSQLiteReadOnly(path, sqliteReadOptions{busyTimeoutMS: 3000})
+ 	if err != nil {
+ 		return nil, nil, nil, fmt.Errorf(
+ 			"open antigravity db %s: %w", path, err,
+@@ -121,7 +159,9 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
+ 	// schema cannot be read.
+ 	sourceVersion := antigravitySourceVersion(ctx, db)
+ 
+-	dbResult, err := loadAntigravityStepsWithRawCount(ctx, db)
++	dbResult, err := loadAntigravityStepsWithRawCount(
++		ctx, db, antigravityIDPrefix,
++	)
+ 	if err != nil {
+ 		// Fail closed on an unreadable steps table, deliberately: a
+ 		// covering sidecar cannot rescue an unreadable DB because
+@@ -151,6 +191,10 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
+ 	// TranscriptFidelityFull explicitly below.
+ 	transcriptFidelity := ""
+ 
++	sidecarPath := strings.TrimSuffix(path, ".db") + ".trajectory.json"
++	tRes, tErr := parseAntigravityCLITrajectory(
++		sidecarPath, dbResult.executors,
++	)
+ 	// Prefer the agy-reader trajectory sidecar: it is the daemon's own
+ 	// decode, with structured tool calls/results and thinking, where the
+ 	// heuristic DB decode only recovers loose strings. Selection is
+@@ -159,10 +203,6 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
+ 	// behind a live session loses until agy-reader catches up. When the
+ 	// sidecar is absent, malformed, or fails the coverage gate the parser
+ 	// falls back to the heuristic decode exactly as before.
+-	sidecarPath := strings.TrimSuffix(path, ".db") + ".trajectory.json"
+-	tRes, tErr := parseAntigravityCLITrajectory(
+-		sidecarPath, dbResult.executors,
+-	)
+ 	sidecarOK := tErr == nil &&
+ 		hasDisplayableAntigravityCLITrajectoryMessage(tRes.messages)
+ 	sidecarCovers := dbResult.rawStepCount == 0 ||
+@@ -176,7 +216,7 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
+ 	// underreport totals on a row that looks current. sidecarCovers stays
+ 	// true when the DB offers no coverage signal (zero rows), so gap-fill
+ 	// still applies there.
+-	if len(usageEvents) == 0 && tErr == nil && sidecarCovers {
++	if len(usageEvents) == 0 && tErr == nil && (dbResult.rawStepCount == 0 || tRes.rawSteps >= dbResult.rawStepCount) {
+ 		usageEvents = tRes.usageEvents
+ 	}
+ 
+@@ -247,12 +287,31 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
+ 		mtime = info.ModTime().UnixNano()
+ 	}
+ 
++	var cwd string
++	var sessionTitle string
++	if sum, ok := p.sources.summaries.lookup(root, id); ok {
++		if project == "" {
++			project = sum.project
++		}
++		cwd = sum.cwd
++		sessionTitle = sum.title
++	} else if sum, ok := lookupAntigravitySummaryContext(ctx, filepath.Join(root, "conversation_summaries.db"), id); ok {
++		if project == "" {
++			project = sum.project
++		}
++		cwd = sum.cwd
++		sessionTitle = sum.title
++	}
++
+ 	sess := &ParsedSession{
+ 		ID:                 antigravityIDPrefix + id,
+ 		Project:            project,
++		Cwd:                cwd,
+ 		Machine:            machine,
+ 		Agent:              AgentAntigravity,
+ 		FirstMessage:       firstMessage,
++		SessionName:        sessionTitle,
++		SessionNamePresent: sessionTitle != "",
+ 		StartedAt:          startedAt,
+ 		EndedAt:            endedAt,
+ 		MessageCount:       len(messages),
+@@ -265,6 +324,23 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
+ 			Mtime: mtime,
+ 		},
+ 	}
++	// Subagent link precedence: the brain descriptor is authoritative,
++	// then the agy-reader sidecar's parentCascadeId (mirroring the CLI
++	// convention: parser sets ParentSessionID with the provider prefix).
++	// The descriptor also supplies the session name from the subagent
++	// role.
++	if d, ok := p.sources.subagentDescriptor(root, id); ok {
++		sess.ParentSessionID = antigravityIDPrefix + d.parentID
++		sess.RelationshipType = RelSubagent
++		if name := d.sessionName(); name != "" {
++			sess.SessionName = name
++			sess.SessionNamePresent = true
++		}
++	} else if tErr == nil && tRes.parentCascadeID != "" &&
++		!strings.EqualFold(tRes.parentCascadeID, id) {
++		sess.ParentSessionID = antigravityIDPrefix + tRes.parentCascadeID
++		sess.RelationshipType = RelSubagent
++	}
+ 	accumulateMessageTokenUsage(sess, messages)
+ 	applyUsageEventTokenTotals(sess, usageEvents)
+ 	// gen_metadata rows with zero decoded usage events flag a possible
+@@ -385,7 +461,7 @@ func roleForAntigravityStepKind(kind antigravityStepKind) RoleType {
+ }
+ 
+ func loadAntigravityStepsWithRawCount(ctx context.Context,
+-	db *sql.DB,
++	db *sql.DB, sessionIDPrefix string,
+ ) (antigravityStepLoadResult, error) {
+ 	generations := loadAntigravityGenerationMetadata(ctx, db)
+ 	executors := loadAntigravityExecutorMetadata(ctx, db)
+@@ -415,14 +491,16 @@ func loadAntigravityStepsWithRawCount(ctx context.Context,
+ 		parsedStep, parsed := newAntigravityStep(idx, stepType, payload)
+ 		var msg ParsedMessage
+ 		var decoded bool
++		var fields []agProtoField
+ 		kind := antigravityStepKind(stepType)
+ 		if parsed {
+ 			kind = parsedStep.kind
++			fields = parsedStep.fields
+ 			msg, decoded = decodeAntigravityParsedStep(parsedStep)
+ 		}
+ 		stepPositions[idx] = len(steps)
+ 		steps = append(steps, antigravityLoadedStep{
+-			kind: kind, msg: msg, decoded: decoded,
++			kind: kind, fields: fields, msg: msg, decoded: decoded,
+ 		})
+ 		result.rawStepCount++
+ 	}
+@@ -449,6 +527,12 @@ func loadAntigravityStepsWithRawCount(ctx context.Context,
+ 			generation.data, step.msg, step.decoded, executorModel,
+ 		)
+ 	}
++	// Spawn edges need sequence context (the result steps after an
++	// invoke_subagent call), so they are resolved on the loaded step
++	// list rather than inside single-step decode. The caller's session
++	// id prefix stamps SubagentSessionID with the same ids the parse
++	// writes, matching how Codex emits codex: links.
++	linkAntigravitySubagentSpawnEdges(steps, sessionIDPrefix)
+ 	for _, step := range steps {
+ 		if step.decoded {
+ 			result.messages = append(result.messages, step.msg)
+@@ -459,6 +543,7 @@ func loadAntigravityStepsWithRawCount(ctx context.Context,
+ 
+ type antigravityLoadedStep struct {
+ 	kind    antigravityStepKind
++	fields  []agProtoField
+ 	msg     ParsedMessage
+ 	decoded bool
+ }
+@@ -1329,7 +1414,10 @@ func cleanAntigravityStepStrings(step antigravityStep) (cleaned, urlOnly []strin
+ 		// candidates; prose, when present, still outscores a bare link.
+ 		candidates := append(append([]string{}, cleaned...), bareURLs...)
+ 		if prompt := bestAntigravityUserPrompt(candidates); prompt != "" {
+-			return []string{prompt}, nil
++			return []string{cleanAntigravityPrompt(prompt)}, nil
++		}
++		for i := range cleaned {
++			cleaned[i] = cleanAntigravityPrompt(cleaned[i])
+ 		}
+ 		return cleaned, nil
+ 	}
+@@ -1472,6 +1560,44 @@ func antigravityPromptScore(s string) int {
+ 	return score
+ }
+ 
++var antigravityMetadataEnvelopes = regexp.MustCompile(
++	`(?s)<ADDITIONAL_METADATA>.*?(?:</ADDITIONAL_METADATA>|$)|<USER_SETTINGS_CHANGE>.*?(?:</USER_SETTINGS_CHANGE>|$)|<SYSTEM_INFORMATION>.*?(?:</SYSTEM_INFORMATION>|$)`,
++)
++
++// cleanAntigravityPrompt extracts the human-authored prompt from Antigravity's
++// prompt-envelope format. Antigravity IDE and CLI wrap user turns in
++// <USER_REQUEST>...</USER_REQUEST> and append runtime-injected metadata blocks
++// (<ADDITIONAL_METADATA>, <USER_SETTINGS_CHANGE>). If an outer <USER_REQUEST>
++// envelope is present, its inner text is returned; any metadata blocks are
++// stripped. Prompts without the envelope are preserved unchanged.
++func cleanAntigravityPrompt(content string) string {
++	trimmed := strings.TrimSpace(content)
++	if trimmed == "" {
++		return content
++	}
++
++	if strings.HasPrefix(trimmed, "<USER_REQUEST>") {
++		inner := trimmed[len("<USER_REQUEST>"):]
++		if lastIdx := strings.LastIndex(inner, "</USER_REQUEST>"); lastIdx >= 0 {
++			inner = inner[:lastIdx]
++		} else {
++			if idx := strings.Index(inner, "<ADDITIONAL_METADATA>"); idx >= 0 {
++				inner = inner[:idx]
++			}
++			if idx := strings.Index(inner, "<USER_SETTINGS_CHANGE>"); idx >= 0 {
++				inner = inner[:idx]
++			}
++		}
++		return strings.TrimSpace(inner)
++	}
++
++	stripped := antigravityMetadataEnvelopes.ReplaceAllString(trimmed, "")
++	if s := strings.TrimSpace(stripped); s != "" {
++		return s
++	}
++	return trimmed
++}
++
+ // earliestAntigravityTimestamp walks the field tree and returns
+ // the earliest plausible google.protobuf.Timestamp value.
+ // Plausible = seconds field in the year 2000..2100 range.
+diff --git a/internal/parser/antigravity_brain_transcript.go b/internal/parser/antigravity_brain_transcript.go
+index 57885692..a02d727f 100644
+--- a/internal/parser/antigravity_brain_transcript.go
++++ b/internal/parser/antigravity_brain_transcript.go
+@@ -248,6 +248,9 @@ func collectAntigravityBrainTranscriptMessages(path string) ([]ParsedMessage, er
+ 	for _, entry := range entries {
+ 		role, isSystem := roleForAntigravityBrainSource(entry.source)
+ 		content := entry.content
++		if role == RoleUser {
++			content = cleanAntigravityPrompt(content)
++		}
+ 		toolCalls := entry.toolCalls
+ 		if content == "" && len(toolCalls) > 0 {
+ 			// A step that only called tools has no prose of its own, so the
+diff --git a/internal/parser/antigravity_brain_transcript_test.go b/internal/parser/antigravity_brain_transcript_test.go
+index ac7f998a..a82c3e36 100644
+--- a/internal/parser/antigravity_brain_transcript_test.go
++++ b/internal/parser/antigravity_brain_transcript_test.go
+@@ -418,3 +418,28 @@ func TestAntigravityDefaultRootsCoverTheIDETree(t *testing.T) {
+ 			"the CLI reader must not be pointed at %s", dir)
+ 	}
+ }
++
++func TestAntigravityBrainTranscriptCleansUserPromptEnvelopes(t *testing.T) {
++	root := t.TempDir()
++	id := "05385df3-99c4-4772-81a9-24fb6508046b"
++	body := `{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-09-18T21:55:05Z","content":"<USER_REQUEST>\n/systematic-debugging\nпока ничего не меняй\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-18T23:55:05+02:00.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting Model Selection from None to Gemini 3.8 Flash (High).\n</USER_SETTINGS_CHANGE>"}
++{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-09-18T21:55:10Z","content":"understood"}
++`
++	path := writeAntigravityBrainTranscript(t, root, id, body)
++	assert.NotEmpty(t, path)
++	provider := newAntigravityProviderForRoots(t, root)
++
++	sources, err := provider.Discover(t.Context())
++	require.NoError(t, err, "Discover")
++	require.Len(t, sources, 1)
++
++	results := parseAntigravitySources(t, provider, sources)
++	require.Len(t, results, 1)
++	sess := results[0].Session
++	msgs := results[0].Messages
++
++	require.Len(t, msgs, 2)
++	assert.Equal(t, RoleUser, msgs[0].Role)
++	assert.Equal(t, "/systematic-debugging\nпока ничего не меняй", msgs[0].Content)
++	assert.Equal(t, "/systematic-debugging пока ничего не меняй", sess.FirstMessage)
++}
+diff --git a/internal/parser/antigravity_cli.go b/internal/parser/antigravity_cli.go
+index fc2f338c..d920db76 100644
+--- a/internal/parser/antigravity_cli.go
++++ b/internal/parser/antigravity_cli.go
+@@ -397,7 +397,9 @@ func loadAntigravityCLIDBSteps(ctx context.Context,
+ 	// back to the trajectory sidecar (antigravitySourceVersion returns "" when
+ 	// the schema itself is unreadable, so an undecodable .db is never labeled).
+ 	sourceVersion := antigravitySourceVersion(ctx, db)
+-	result, err := loadAntigravityStepsWithRawCount(ctx, db)
++	result, err := loadAntigravityStepsWithRawCount(
++		ctx, db, antigravityCLIIDPrefix,
++	)
+ 	result.sourceVersion = sourceVersion
+ 	if err != nil {
+ 		return result, err
+@@ -1534,10 +1536,11 @@ func parseAntigravityCLITrajectory(
+ 			if step.UserInput == nil {
+ 				continue
+ 			}
++			prompt := cleanAntigravityPrompt(step.UserInput.UserResponse)
+ 			msgs = append(msgs, ParsedMessage{
+ 				Role:          RoleUser,
+-				Content:       step.UserInput.UserResponse,
+-				ContentLength: len(step.UserInput.UserResponse),
++				Content:       prompt,
++				ContentLength: len(prompt),
+ 				Timestamp:     stepTime,
+ 			})
+ 
+diff --git a/internal/parser/antigravity_provider.go b/internal/parser/antigravity_provider.go
+index ad152916..41e70246 100644
+--- a/internal/parser/antigravity_provider.go
++++ b/internal/parser/antigravity_provider.go
+@@ -2,12 +2,16 @@ package parser
+ 
+ import (
+ 	"context"
++	"database/sql"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"net/url"
+ 	"os"
+ 	"path/filepath"
+ 	"slices"
+ 	"strings"
++	"sync"
+ )
+ 
+ var _ Provider = (*antigravityProvider)(nil)
+@@ -135,14 +139,159 @@ type antigravitySource struct {
+ 	Root string
+ 	Path string
+ 	ID   string
++	// SubagentParentID and SubagentRole carry the resolved
++	// brain/<parent>/.system_generated/subagents/<id>.json link when one
++	// claims this session. In-memory only; lookup fallbacks re-resolve
++	// them when the cache missed at ref construction.
++	SubagentParentID string
++	SubagentRole     string
++}
++
++type antigravitySummary struct {
++	workspaceURIs string
++	title         string
++	cwd           string
++	project       string
++}
++
++type antigravitySummaryIndex struct {
++	mu      sync.RWMutex
++	entries map[string]antigravitySummary
++}
++
++func newAntigravitySummaryIndex() *antigravitySummaryIndex {
++	return &antigravitySummaryIndex{
++		entries: make(map[string]antigravitySummary),
++	}
++}
++
++func (x *antigravitySummaryIndex) lookup(root, id string) (antigravitySummary, bool) {
++	return x.lookupContext(context.Background(), root, id)
++}
++
++func (x *antigravitySummaryIndex) lookupContext(ctx context.Context, root, id string) (antigravitySummary, bool) {
++	if x == nil || id == "" {
++		return antigravitySummary{}, false
++	}
++	cleanRoot := filepath.Clean(root)
++	key := cleanRoot + "\x00" + id
++	x.mu.RLock()
++	s, ok := x.entries[key]
++	x.mu.RUnlock()
++	if ok {
++		return s, true
++	}
++	sum, found := lookupAntigravitySummaryContext(ctx, filepath.Join(cleanRoot, "conversation_summaries.db"), id)
++	if !found {
++		return antigravitySummary{}, false
++	}
++	x.mu.Lock()
++	x.entries[key] = sum
++	x.mu.Unlock()
++	return sum, true
++}
++
++func (x *antigravitySummaryIndex) scan(root string) {
++	if x == nil || root == "" {
++		return
++	}
++	dbPath := filepath.Join(root, "conversation_summaries.db")
++	if !IsRegularFile(dbPath) {
++		return
++	}
++	_ = WithSQLiteReadOnly(context.Background(), dbPath, sqliteReadOptions{busyTimeoutMS: 3000}, func(db *sql.DB) error {
++		rows, err := db.Query("SELECT conversation_id, COALESCE(workspace_uris, ''), COALESCE(title, '') FROM conversation_summaries WHERE conversation_id != ''")
++		if err != nil {
++			rows, err = db.Query("SELECT conversation_id, COALESCE(workspace_uris, '') FROM conversation_summaries WHERE conversation_id != ''")
++			if err != nil {
++				return err
++			}
++		}
++		defer rows.Close()
++
++		cleanRoot := filepath.Clean(root)
++		cols, _ := rows.Columns()
++		hasTitle := len(cols) >= 3
++
++		batch := make(map[string]antigravitySummary)
++		for rows.Next() {
++			var id, ws, title string
++			var scanErr error
++			if hasTitle {
++				scanErr = rows.Scan(&id, &ws, &title)
++			} else {
++				scanErr = rows.Scan(&id, &ws)
++			}
++			if scanErr != nil || id == "" {
++				continue
++			}
++			cwd, project := parseAntigravityWorkspaceURI(ws)
++			batch[cleanRoot+"\x00"+id] = antigravitySummary{
++				workspaceURIs: ws,
++				title:         title,
++				cwd:           cwd,
++				project:       project,
++			}
++		}
++		if err := rows.Err(); err != nil {
++			return err
++		}
++		x.mu.Lock()
++		for k, v := range batch {
++			x.entries[k] = v
++		}
++		x.mu.Unlock()
++		return nil
++	})
++}
++
++func parseAntigravityWorkspaceURI(raw string) (cwd, project string) {
++	trimmed := strings.TrimSpace(raw)
++	if trimmed == "" {
++		return "", ""
++	}
++	var uris []string
++	if err := json.Unmarshal([]byte(trimmed), &uris); err == nil && len(uris) > 0 {
++		raw = uris[0]
++	} else {
++		raw = strings.Trim(trimmed, "[]\"' ")
++	}
++	raw = strings.TrimSpace(raw)
++	if raw == "" {
++		return "", ""
++	}
++	if parsed, err := url.Parse(raw); err == nil && parsed.Scheme == "file" {
++		cwd = parsed.Path
++	} else if strings.HasPrefix(raw, "file://") {
++		cwd = strings.TrimPrefix(raw, "file://")
++	} else {
++		cwd = raw
++	}
++	if unescaped, err := url.PathUnescape(cwd); err == nil && unescaped != "" {
++		cwd = unescaped
++	}
++	if len(cwd) >= 3 && cwd[0] == '/' && cwd[2] == ':' {
++		cwd = cwd[1:]
++	}
++	cwd = filepath.Clean(cwd)
++	if cwd != "" && cwd != "/" && cwd != "." {
++		project = filepath.Base(cwd)
++	}
++	return cwd, project
+ }
+ 
+ type antigravitySourceSet struct {
+-	roots []string
++	roots     []string
++	subagents *antigravitySubagentIndex
++	summaries *antigravitySummaryIndex
+ }
+ 
+ func newAntigravitySourceSet(roots []string) antigravitySourceSet {
+-	return antigravitySourceSet{roots: cleanJSONLRoots(roots)}
++	return antigravitySourceSet{
++		roots:     cleanJSONLRoots(roots),
++		subagents: newAntigravitySubagentIndex(),
++		summaries: newAntigravitySummaryIndex(),
++	}
+ }
+ 
+ func (s antigravitySourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
+@@ -152,6 +301,8 @@ func (s antigravitySourceSet) Discover(ctx context.Context) ([]SourceRef, error)
+ 		if err := ctx.Err(); err != nil {
+ 			return nil, err
+ 		}
++		s.subagents.scan(root)
++		s.summaries.scan(root)
+ 		for _, path := range s.discoverSessionPaths(root) {
+ 			source, ok := s.sourceRef(root, path, false)
+ 			if ok {
+@@ -168,6 +319,8 @@ func (s antigravitySourceSet) DiscoverEach(ctx context.Context, yield func(Sourc
+ 		if err := ctx.Err(); err != nil {
+ 			return err
+ 		}
++		s.subagents.scan(root)
++		s.summaries.scan(root)
+ 		dir := filepath.Join(root, "conversations")
+ 		err := streamDirectoryEntries(ctx, dir, func(entry os.DirEntry) error {
+ 			name := entry.Name()
+@@ -255,7 +408,7 @@ func (s antigravitySourceSet) findSourceFile(root, id string) string {
+ }
+ 
+ func (s antigravitySourceSet) WatchPlan(context.Context) (WatchPlan, error) {
+-	roots := make([]WatchRoot, 0, len(s.roots)*3)
++	roots := make([]WatchRoot, 0, len(s.roots)*4)
+ 	for _, root := range s.roots {
+ 		roots = append(roots,
+ 			WatchRoot{
+@@ -280,6 +433,8 @@ func (s antigravitySourceSet) WatchPlan(context.Context) (WatchPlan, error) {
+ 					"*.md",
+ 					"*.md.metadata.json",
+ 					antigravityBrainTranscriptName,
++					"*/.system_generated/subagents/*.json",
++					"*/.system_generated/logs/transcript.jsonl",
+ 				},
+ 				DebounceKey: string(AgentAntigravity) + ":brain:" + root,
+ 			},
+@@ -289,6 +444,12 @@ func (s antigravitySourceSet) WatchPlan(context.Context) (WatchPlan, error) {
+ 				IncludeGlobs: []string{"*.db", "*.db-wal", "*.trajectory.json"},
+ 				DebounceKey:  string(AgentAntigravity) + ":conversations:" + root,
+ 			},
++			WatchRoot{
++				Path:         root,
++				Recursive:    false,
++				IncludeGlobs: []string{"conversation_summaries.db*"},
++				DebounceKey:  string(AgentAntigravity) + ":summaries:" + root,
++			},
+ 		)
+ 	}
+ 	return WatchPlan{Roots: roots}, nil
+@@ -305,6 +466,16 @@ func (s antigravitySourceSet) SourcesForChangedPath(
+ 		if req.WatchRoot != "" && !antigravityWatchRootMatches(root, req.WatchRoot) {
+ 			continue
+ 		}
++		if isAntigravitySummaryDB(root, req.Path) {
++			s.summaries.scan(root)
++			var sources []SourceRef
++			for _, p := range s.discoverSessionPaths(root) {
++				if src, ok := s.sourceRef(root, p, false); ok {
++					sources = append(sources, src)
++				}
++			}
++			return sources, nil
++		}
+ 		source, ok := s.sourceForChangedPath(root, req.Path)
+ 		if ok {
+ 			return []SourceRef{source}, nil
+@@ -313,6 +484,18 @@ func (s antigravitySourceSet) SourcesForChangedPath(
+ 	return nil, nil
+ }
+ 
++func isAntigravitySummaryDB(root, path string) bool {
++	cleanPath := filepath.Clean(path)
++	cleanRoot := filepath.Clean(root)
++	if filepath.Dir(cleanPath) != cleanRoot {
++		return false
++	}
++	base := filepath.Base(cleanPath)
++	return base == "conversation_summaries.db" ||
++		base == "conversation_summaries.db-wal" ||
++		base == "conversation_summaries.db-shm"
++}
++
+ func (s antigravitySourceSet) FindSource(
+ 	ctx context.Context,
+ 	req FindSourceRequest,
+@@ -376,10 +559,15 @@ func (s antigravitySourceSet) Fingerprint(
+ 		}
+ 		return SourceFingerprint{}, err
+ 	}
+-	hash, err := antigravityCompositeHash(
+-		src.Path,
+-		antigravityIDECompanionPaths(src.Path)...,
+-	)
++	companions := antigravityIDECompanionPaths(src.Path)
++	// A resolved subagent descriptor is hashed as a companion of the
++	// child it claims so a descriptor write/delete alone re-syncs the
++	// child's parent link. The parent's companions never include it:
++	// parent parse does not read .system_generated.
++	if d, ok := s.subagentDescriptor(src.Root, src.ID); ok {
++		companions = append(companions, d.path)
++	}
++	hash, err := antigravityCompositeHash(src.Path, companions...)
+ 	if err != nil {
+ 		return SourceFingerprint{}, err
+ 	}
+@@ -417,6 +605,17 @@ func (s antigravitySourceSet) sourceForChangedPath(root, path string) (SourceRef
+ 	if dbPath, _, ok := antigravityConversationDBForPath(root, path); ok {
+ 		return s.sourceRef(root, dbPath, true)
+ 	}
++	if childID, ok := antigravitySubagentDescriptorID(root, path); ok {
++		// A descriptor create/write/remove can change the child's
++		// parent link, so refresh the cached entry before the
++		// returned source ref is built.
++		s.subagents.refresh(root, childID)
++		dbPath := filepath.Join(root, "conversations", childID+".db")
++		if IsRegularFile(dbPath) {
++			return s.newSourceRef(root, dbPath, childID), true
++		}
++		return SourceRef{}, false
++	}
+ 	if id, ok := antigravityIDETrajectoryID(root, path); ok {
+ 		dbPath := filepath.Join(root, "conversations", id+".db")
+ 		if IsRegularFile(dbPath) {
+@@ -479,16 +678,27 @@ func (s antigravitySourceSet) sourceRef(
+ }
+ 
+ func (s antigravitySourceSet) newSourceRef(root, path, id string) SourceRef {
++	src := antigravitySource{Root: root, Path: path, ID: id}
++	if d, ok := s.subagents.lookup(root, id); ok {
++		src.SubagentParentID = d.parentID
++		src.SubagentRole = d.role
++	}
++	var projectHint string
++	var resolution SourceCwdResolution
++	if sum, ok := s.summaries.lookup(root, id); ok {
++		projectHint = sum.project
++		if sum.cwd != "" {
++			resolution = SourceCwdResolution{State: SourceCwdResolved, Path: sum.cwd}
++		}
++	}
+ 	return SourceRef{
+ 		Provider:       AgentAntigravity,
+ 		Key:            path,
+ 		DisplayPath:    path,
+ 		FingerprintKey: path,
+-		Opaque: antigravitySource{
+-			Root: root,
+-			Path: path,
+-			ID:   id,
+-		},
++		ProjectHint:    projectHint,
++		CwdResolution:  resolution,
++		Opaque:         src,
+ 	}
+ }
+ 
+@@ -554,7 +764,7 @@ func antigravityBrainID(root, path string) (string, bool) {
+ 		return "", false
+ 	}
+ 	parts := strings.Split(rel, string(filepath.Separator))
+-	if len(parts) != 3 || parts[0] != "brain" {
++	if len(parts) < 2 || parts[0] != "brain" {
+ 		return "", false
+ 	}
+ 	return parts[1], IsValidSessionID(parts[1])
+@@ -578,6 +788,7 @@ func antigravityProviderCapabilities() Capabilities {
+ 		Source: source,
+ 		Content: ContentCapabilities{
+ 			FirstMessage:         CapabilitySupported,
++			Cwd:                  CapabilitySupported,
+ 			Thinking:             CapabilitySupported,
+ 			ToolCalls:            CapabilitySupported,
+ 			ToolResults:          CapabilitySupported,
+diff --git a/internal/parser/antigravity_provider_test.go b/internal/parser/antigravity_provider_test.go
+index c30d2386..76a31fa5 100644
+--- a/internal/parser/antigravity_provider_test.go
++++ b/internal/parser/antigravity_provider_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
++	"slices"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -27,7 +28,7 @@ func TestAntigravityProviderSourceMethods(t *testing.T) {
+ 
+ 	plan, err := provider.WatchPlan(t.Context())
+ 	require.NoError(t, err)
+-	require.Len(t, plan.Roots, 3)
++	require.Len(t, plan.Roots, 4)
+ 	assert.Equal(t, filepath.Join(root, "annotations"), plan.Roots[0].Path)
+ 	assert.False(t, plan.Roots[0].Recursive)
+ 	assert.Equal(t, filepath.Join(root, "brain"), plan.Roots[1].Path)
+@@ -38,6 +39,9 @@ func TestAntigravityProviderSourceMethods(t *testing.T) {
+ 		"the plaintext transcript directory stays watched")
+ 	assert.Equal(t, filepath.Join(root, "conversations"), plan.Roots[2].Path)
+ 	assert.False(t, plan.Roots[2].Recursive)
++	assert.Equal(t, root, plan.Roots[3].Path)
++	assert.False(t, plan.Roots[3].Recursive)
++	assert.Equal(t, []string{"conversation_summaries.db*"}, plan.Roots[3].IncludeGlobs)
+ 
+ 	discovered, err := provider.Discover(t.Context())
+ 	require.NoError(t, err)
+@@ -987,7 +991,7 @@ func TestAntigravityProviderRoutesTrajectorySidecar(t *testing.T) {
+ 
+ 	plan, err := provider.WatchPlan(t.Context())
+ 	require.NoError(t, err)
+-	require.Len(t, plan.Roots, 3)
++	require.Len(t, plan.Roots, 4)
+ 	assert.Equal(t, filepath.Join(root, "conversations"), plan.Roots[2].Path)
+ 	assert.Contains(t, plan.Roots[2].IncludeGlobs, "*.trajectory.json",
+ 		"conversations watch must include the trajectory sidecar")
+@@ -1061,6 +1065,7 @@ func TestAntigravityProviderCapabilitiesAdvertiseSidecarContent(t *testing.T) {
+ 	assert.Equal(t, CapabilitySupported, caps.Content.ToolResults)
+ 	assert.Equal(t, CapabilitySupported, caps.Content.Model)
+ 	assert.Equal(t, CapabilitySupported, caps.Content.ToolCalls)
++	assert.Equal(t, CapabilitySupported, caps.Content.Cwd)
+ }
+ 
+ // antigravitySQLiteProviderCase describes one Antigravity provider whose
+@@ -1286,3 +1291,114 @@ func leaveAntigravityWALSidecars(t *testing.T, dbPath string) {
+ 	require.NoError(t, conn.Close())
+ 	require.NoError(t, db.Close())
+ }
++
++func TestAntigravityProviderConversationSummaries(t *testing.T) {
++	root := t.TempDir()
++	id := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
++	writeAntigravityIDEProviderFixture(t, root, id)
++
++	dbPath := filepath.Join(root, "conversation_summaries.db")
++	db, err := sql.Open("sqlite3", dbPath)
++	require.NoError(t, err)
++	_, err = db.Exec("CREATE TABLE conversation_summaries (conversation_id text primary key, workspace_uris text, title text)")
++	require.NoError(t, err)
++	_, err = db.Exec("INSERT INTO conversation_summaries (conversation_id, workspace_uris, title) VALUES (?, ?, ?)",
++		id, `["file:///Users/dev/repos/my-service"]`, "Fix indexing bug")
++	require.NoError(t, err)
++	require.NoError(t, db.Close())
++
++	provider, ok := NewProvider(AgentAntigravity, ProviderConfig{
++		Roots:   []string{root},
++		Machine: "devbox",
++	})
++	require.True(t, ok)
++
++	discovered, err := provider.Discover(t.Context())
++	require.NoError(t, err)
++	require.Len(t, discovered, 1)
++	assert.Equal(t, "my-service", discovered[0].ProjectHint)
++	assert.Equal(t, SourceCwdResolved, discovered[0].CwdResolution.State)
++	assert.Equal(t, "/Users/dev/repos/my-service", discovered[0].CwdResolution.Path)
++
++	outcome, err := provider.Parse(t.Context(), ParseRequest{
++		Source: discovered[0],
++	})
++	require.NoError(t, err)
++	require.Len(t, outcome.Results, 1)
++
++	sess := outcome.Results[0].Result.Session
++	assert.Equal(t, "my-service", sess.Project)
++	assert.Equal(t, "/Users/dev/repos/my-service", sess.Cwd)
++	assert.Equal(t, "Fix indexing bug", sess.SessionName)
++	assert.True(t, sess.SessionNamePresent)
++}
++
++func TestAntigravityFindSourceDirectSummaryLookup(t *testing.T) {
++	root := t.TempDir()
++	id := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
++	writeAntigravityIDEProviderFixture(t, root, id)
++
++	dbPath := filepath.Join(root, "conversation_summaries.db")
++	db, err := sql.Open("sqlite3", dbPath)
++	require.NoError(t, err)
++	_, err = db.Exec("CREATE TABLE conversation_summaries (conversation_id text primary key, workspace_uris text, title text)")
++	require.NoError(t, err)
++	_, err = db.Exec("INSERT INTO conversation_summaries (conversation_id, workspace_uris, title) VALUES (?, ?, ?)",
++		id, `["file:///Users/dev/repos/my-service"]`, "Fix indexing bug")
++	require.NoError(t, err)
++	require.NoError(t, db.Close())
++
++	provider, ok := NewProvider(AgentAntigravity, ProviderConfig{
++		Roots:   []string{root},
++		Machine: "devbox",
++	})
++	require.True(t, ok)
++
++	// Call FindSource directly without Discover to verify cache miss fallback
++	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: id})
++	require.NoError(t, err)
++	require.True(t, ok)
++	assert.Equal(t, "my-service", source.ProjectHint)
++	assert.Equal(t, SourceCwdResolved, source.CwdResolution.State)
++	assert.Equal(t, "/Users/dev/repos/my-service", source.CwdResolution.Path)
++
++	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
++	require.NoError(t, err)
++	require.Len(t, outcome.Results, 1)
++	sess := outcome.Results[0].Result.Session
++	assert.Equal(t, "my-service", sess.Project)
++	assert.Equal(t, "/Users/dev/repos/my-service", sess.Cwd)
++	assert.Equal(t, "Fix indexing bug", sess.SessionName)
++}
++
++func TestAntigravityWatchPlanAndSummaryChange(t *testing.T) {
++	root := t.TempDir()
++	id := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
++	writeAntigravityIDEProviderFixture(t, root, id)
++
++	provider, ok := NewProvider(AgentAntigravity, ProviderConfig{
++		Roots:   []string{root},
++		Machine: "devbox",
++	})
++	require.True(t, ok)
++
++	plan, err := provider.WatchPlan(t.Context())
++	require.NoError(t, err)
++	var foundSummariesWatch bool
++	for _, wr := range plan.Roots {
++		if wr.Path == root && slices.Contains(wr.IncludeGlobs, "conversation_summaries.db*") {
++			foundSummariesWatch = true
++			break
++		}
++	}
++	assert.True(t, foundSummariesWatch, "expected WatchPlan to watch conversation_summaries.db* under root")
++
++	// Trigger changed path for conversation_summaries.db
++	sources, err := provider.SourcesForChangedPath(t.Context(), ChangedPathRequest{
++		Path:      filepath.Join(root, "conversation_summaries.db"),
++		EventKind: "write",
++	})
++	require.NoError(t, err)
++	require.Len(t, sources, 1)
++	assert.Equal(t, filepath.Join(root, "conversations", id+".db"), sources[0].DisplayPath)
++}
+diff --git a/internal/parser/antigravity_subagents.go b/internal/parser/antigravity_subagents.go
+new file mode 100644
+index 00000000..d1f75abb
+--- /dev/null
++++ b/internal/parser/antigravity_subagents.go
+@@ -0,0 +1,329 @@
++package parser
++
++import (
++	"encoding/json/v2"
++	"log"
++	"os"
++	"path/filepath"
++	"regexp"
++	"strings"
++	"sync"
++)
++
++// Antigravity IDE records spawned subagents in
++// brain/<parentUUID>/.system_generated/subagents/<childUUID>.json. The
++// descriptor is the authoritative parent->child edge; the filename equals
++// the child's conversationId. One invoke_subagent call may spawn a batch
++// of children sharing the same spawnStepIndex (the result step that
++// echoes each spawned conversation id back to the planner).
++
++type antigravitySubagentDescriptor struct {
++	childID        string
++	parentID       string
++	role           string
++	typeName       string
++	spawnStepIndex int
++	path           string
++}
++
++// sessionName prefers the human-authored subagent role and falls back
++// to the descriptor's type name so a role-less child still gets a
++// descriptive session name.
++func (d antigravitySubagentDescriptor) sessionName() string {
++	return firstNonEmptyJSONLString(d.role, d.typeName)
++}
++
++type antigravitySubagentDescriptorJSON struct {
++	ConversationID string `json:"conversationId"`
++	SpawnStepIndex int    `json:"spawnStepIndex"`
++	Descriptor     struct {
++		TypeName string `json:"typeName"`
++		Role     string `json:"role"`
++	} `json:"subagentDescriptor"`
++}
++
++// antigravitySubagentIndex caches child-id -> descriptor resolutions for
++// one provider instance so discovery, changed-path routing, fingerprint,
++// and parse share a single scan of the brain descriptor dirs. It is a
++// pointer field on the value-typed antigravitySourceSet, so every copied
++// method receiver still sees the same cache.
++type antigravitySubagentIndex struct {
++	mu      sync.RWMutex
++	entries map[string]antigravitySubagentDescriptor
++}
++
++func newAntigravitySubagentIndex() *antigravitySubagentIndex {
++	return &antigravitySubagentIndex{
++		entries: make(map[string]antigravitySubagentDescriptor),
++	}
++}
++
++func antigravitySubagentKey(root, childID string) string {
++	return filepath.Clean(root) + "\x00" + childID
++}
++
++// lookup returns the cached descriptor for childID under root. Only
++// descriptor files that passed validation are cached, so a hit is
++// already link-safe.
++func (x *antigravitySubagentIndex) lookup(
++	root, childID string,
++) (antigravitySubagentDescriptor, bool) {
++	if x == nil {
++		return antigravitySubagentDescriptor{}, false
++	}
++	x.mu.RLock()
++	defer x.mu.RUnlock()
++	d, ok := x.entries[antigravitySubagentKey(root, childID)]
++	return d, ok
++}
++
++// scan rebuilds root's descriptor entries from one glob pass over
++// brain/*/.system_generated/subagents/*.json. Stale entries for removed
++// or rewritten descriptors are dropped with the rebuild.
++func (x *antigravitySubagentIndex) scan(root string) {
++	if x == nil {
++		return
++	}
++	paths, err := filepath.Glob(filepath.Join(
++		root, "brain", "*", ".system_generated", "subagents", "*.json",
++	))
++	if err != nil {
++		return
++	}
++	x.mu.Lock()
++	defer x.mu.Unlock()
++	prefix := antigravitySubagentKey(root, "")
++	for key := range x.entries {
++		if strings.HasPrefix(key, prefix) {
++			delete(x.entries, key)
++		}
++	}
++	x.upsertPathsLocked(root, paths)
++}
++
++// refresh re-resolves one child id after a descriptor path event. The
++// rescan is a single glob over the child's descriptor files across all
++// parent dirs, so a deleted or malformed descriptor drops the link and a
++// competing parent's surviving descriptor takes over.
++func (x *antigravitySubagentIndex) refresh(root, childID string) {
++	if x == nil {
++		return
++	}
++	paths, err := filepath.Glob(filepath.Join(
++		root, "brain", "*", ".system_generated", "subagents",
++		childID+".json",
++	))
++	if err != nil {
++		return
++	}
++	x.mu.Lock()
++	defer x.mu.Unlock()
++	delete(x.entries, antigravitySubagentKey(root, childID))
++	x.upsertPathsLocked(root, paths)
++}
++
++// upsertPathsLocked inserts each valid descriptor. When two parents
++// claim the same child the first (glob-sorted) entry wins and the
++// conflict is logged without ids or roles.
++func (x *antigravitySubagentIndex) upsertPathsLocked(
++	root string, paths []string,
++) {
++	for _, path := range paths {
++		d, ok := readAntigravitySubagentDescriptor(path)
++		if !ok {
++			continue
++		}
++		key := antigravitySubagentKey(root, d.childID)
++		if prev, exists := x.entries[key]; exists {
++			if prev.parentID != d.parentID {
++				log.Printf(
++					"antigravity: conflicting subagent descriptors; keeping first",
++				)
++			}
++			continue
++		}
++		x.entries[key] = d
++	}
++}
++
++// readAntigravitySubagentDescriptor parses and validates one descriptor
++// file. Skipped: malformed JSON, an empty or non-UUID conversationId, a
++// conversationId that differs from the filename, a non-UUID parent dir,
++// and a self link. The link is trusted regardless of the descriptor's
++// state value.
++func readAntigravitySubagentDescriptor(
++	path string,
++) (antigravitySubagentDescriptor, bool) {
++	base := filepath.Base(path)
++	childID := canonicalAgyCascadeID(strings.TrimSuffix(base, ".json"))
++	// path = <root>/brain/<parent>/.system_generated/subagents/<child>.json
++	parentID := canonicalAgyCascadeID(
++		filepath.Base(filepath.Dir(filepath.Dir(filepath.Dir(path)))),
++	)
++	if childID == "" || parentID == "" || childID == parentID {
++		return antigravitySubagentDescriptor{}, false
++	}
++	data, err := os.ReadFile(path)
++	if err != nil {
++		return antigravitySubagentDescriptor{}, false
++	}
++	var doc antigravitySubagentDescriptorJSON
++	if err := json.Unmarshal(data, &doc); err != nil {
++		return antigravitySubagentDescriptor{}, false
++	}
++	if canonicalAgyCascadeID(doc.ConversationID) != childID {
++		return antigravitySubagentDescriptor{}, false
++	}
++	return antigravitySubagentDescriptor{
++		childID:        childID,
++		parentID:       parentID,
++		role:           doc.Descriptor.Role,
++		typeName:       doc.Descriptor.TypeName,
++		spawnStepIndex: doc.SpawnStepIndex,
++		path:           path,
++	}, true
++}
++
++// findAntigravitySubagentDescriptor resolves a child id's descriptor by
++// globbing its descriptor files across parents. It is the bounded
++// fallback for refs that were built without map data (stored-path
++// lookups, ad-hoc sources); per-event work stays at one glob.
++func findAntigravitySubagentDescriptor(
++	root, childID string,
++) (antigravitySubagentDescriptor, bool) {
++	if !IsValidSessionID(childID) {
++		return antigravitySubagentDescriptor{}, false
++	}
++	paths, err := filepath.Glob(filepath.Join(
++		root, "brain", "*", ".system_generated", "subagents",
++		childID+".json",
++	))
++	if err != nil {
++		return antigravitySubagentDescriptor{}, false
++	}
++	for _, path := range paths {
++		if d, ok := readAntigravitySubagentDescriptor(path); ok {
++			return d, true
++		}
++	}
++	return antigravitySubagentDescriptor{}, false
++}
++
++// antigravitySubagentDescriptorID reports whether path is a
++// brain/<parent>/.system_generated/subagents/<child>.json descriptor
++// under root and returns the child session id.
++func antigravitySubagentDescriptorID(root, path string) (string, bool) {
++	rel, ok := relUnder(filepath.Clean(root), filepath.Clean(path))
++	if !ok {
++		return "", false
++	}
++	parts := strings.Split(rel, string(filepath.Separator))
++	if len(parts) != 5 || parts[0] != "brain" ||
++		parts[2] != ".system_generated" || parts[3] != "subagents" ||
++		!strings.HasSuffix(parts[4], ".json") {
++		return "", false
++	}
++	id := strings.TrimSuffix(parts[4], ".json")
++	return id, IsValidSessionID(id)
++}
++
++// subagentDescriptor resolves a session's subagent descriptor from the
++// cached index, falling back to one bounded glob for refs that carry no
++// map data.
++func (s antigravitySourceSet) subagentDescriptor(
++	root, id string,
++) (antigravitySubagentDescriptor, bool) {
++	if d, ok := s.subagents.lookup(root, id); ok {
++		return d, true
++	}
++	return findAntigravitySubagentDescriptor(root, id)
++}
++
++// antigravitySubagentResultWindow bounds how far past an invoke_subagent
++// planner step the spawned-conversation scan reaches. The result step
++// follows the call within a few rows; a wide window risks attributing a
++// later batch's children to the wrong call.
++const antigravitySubagentResultWindow = 3
++
++// antigravitySubagentSpawnMarker appears only in spawn-result steps.
++// It gates conversationId extraction: manage_subagents list results
++// quote genuine child conversation ids and define_subagent results can
++// quote invoke_subagent payloads, so an unmarked id is never a spawn
++// edge.
++const antigravitySubagentSpawnMarker = "Created the following subagents"
++
++var antigravityConversationIDRE = regexp.MustCompile(
++	`"conversationId"\s*:\s*"` +
++		`([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-` +
++		`[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"`,
++)
++
++var antigravitySnakeConversationIDRE = regexp.MustCompile(
++	`"conversation_id"\s*:\s*"` +
++		`([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-` +
++		`[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"`,
++)
++
++// linkAntigravitySubagentSpawnEdges attaches spawned session ids to
++// invoke_subagent tool calls. Only steps carrying the
++// "Created the following subagents" marker are spawn results; all
++// "conversationId" matches in marked steps are collected and the Nth
++// invoke_subagent call takes the Nth id, so a batch of three children
++// still links exactly one child per call (tool_calls stores one id
++// each). Unmarked results -- including manage_subagents list output that
++// legitimately names running children -- are never scanned.
++func linkAntigravitySubagentSpawnEdges(
++	steps []antigravityLoadedStep, sessionIDPrefix string,
++) {
++	for i := range steps {
++		var spawnCalls []int
++		if steps[i].decoded {
++			for k, call := range steps[i].msg.ToolCalls {
++				if call.ToolName == "invoke_subagent" {
++					spawnCalls = append(spawnCalls, k)
++				}
++			}
++		}
++		if len(spawnCalls) == 0 {
++			continue
++		}
++		var spawnIDs []string
++		for j := i + 1; j < len(steps) &&
++			j-i <= antigravitySubagentResultWindow; j++ {
++			next := steps[j]
++			if next.kind == antigravityStepKindPlannerResponse {
++				// Another planner step means the result step was
++				// missed; ids beyond it belong to a different call.
++				break
++			}
++			strs := agProtoCollectStrings(next.fields, 1)
++			marked := false
++			for _, s := range strs {
++				if strings.Contains(
++					s, antigravitySubagentSpawnMarker,
++				) {
++					marked = true
++					break
++				}
++			}
++			if !marked {
++				continue
++			}
++			for _, s := range strs {
++				for _, m := range antigravityConversationIDRE.
++					FindAllStringSubmatch(s, -1) {
++					if id := canonicalAgyCascadeID(m[1]); id != "" {
++						spawnIDs = append(spawnIDs, id)
++					}
++				}
++			}
++		}
++		for n, k := range spawnCalls {
++			if n >= len(spawnIDs) {
++				break
++			}
++			steps[i].msg.ToolCalls[k].SubagentSessionID =
++				sessionIDPrefix + spawnIDs[n]
++		}
++	}
++}
+diff --git a/internal/parser/antigravity_subagents_test.go b/internal/parser/antigravity_subagents_test.go
+new file mode 100644
+index 00000000..bfb86e51
+--- /dev/null
++++ b/internal/parser/antigravity_subagents_test.go
+@@ -0,0 +1,574 @@
++package parser
++
++import (
++	"database/sql"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	_ "github.com/mattn/go-sqlite3"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// writeAntigravitySubagentDescriptor writes one
++// brain/<parent>/.system_generated/subagents/<child>.json fixture.
++func writeAntigravitySubagentDescriptor(
++	t *testing.T, root, parentID, childID, body string,
++) string {
++	t.Helper()
++	path := filepath.Join(
++		root, "brain", parentID, ".system_generated", "subagents",
++		childID+".json",
++	)
++	mustMkdir(t, filepath.Dir(path))
++	mustWrite(t, path, []byte(body))
++	return path
++}
++
++func antigravitySubagentDescriptorBody(childID, role string) string {
++	return `{"conversationId":"` + childID + `",` +
++		`"subagentDescriptor":{"typeName":"test-type","role":"` +
++		role + `"},` +
++		`"state":"SUBAGENT_STATE_RUNNING","spawnStepIndex":2,` +
++		`"workspaceUris":["file:///tmp/proj"]}`
++}
++
++// createAntigravitySpawnEdgeDB writes a .db with a user step, a
++// planner-response step invoking toolName, and a result step whose
++// payload strings carry resultJSON.
++func createAntigravitySpawnEdgeDB(
++	t *testing.T, path, toolName string, resultStrings []string,
++) {
++	t.Helper()
++	db, err := sql.Open("sqlite3", path)
++	require.NoError(t, err, "open")
++	defer db.Close()
++	createAntigravityStepTables(t, db)
++
++	ts := encodePB([]pbField{
++		{num: 1, wire: pbWireVarint, varint: 1779000000},
++	})
++	userPayload := encodePB([]pbField{
++		{num: 5, wire: pbWireBytes, bytes: ts},
++		{num: 17, wire: pbWireBytes,
++			bytes: []byte("spawn a helper for this task please")},
++	})
++
++	toolCallNested := encodePB([]pbField{
++		{num: 3, wire: pbWireBytes, bytes: []byte(toolName)},
++		{num: 4, wire: pbWireBytes,
++			bytes: []byte("99999999-8888-4777-a666-555555555555")},
++	})
++	plannerPayload := encodePB([]pbField{
++		{num: 5, wire: pbWireBytes, bytes: ts},
++		{num: 17, wire: pbWireBytes,
++			bytes: []byte("delegating to a subagent now")},
++		{num: 8, wire: pbWireBytes, bytes: toolCallNested},
++	})
++
++	resultFields := []pbField{
++		{num: 5, wire: pbWireBytes, bytes: ts},
++	}
++	for i, s := range resultStrings {
++		resultFields = append(resultFields, pbField{
++			num: 17 + i, wire: pbWireBytes, bytes: []byte(s),
++		})
++	}
++	resultPayload := encodePB(resultFields)
++
++	mustExec(t, db,
++		`INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)`,
++		0, 14, userPayload)
++	mustExec(t, db,
++		`INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)`,
++		1, 15, plannerPayload)
++	mustExec(t, db,
++		`INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)`,
++		2, 132, resultPayload)
++}
++
++// TestAntigravitySubagentDescriptorLink covers the authoritative
++// descriptor edge: discovery resolves the child's parent/role onto the
++// source ref and parse emits the linked session.
++func TestAntigravitySubagentDescriptorLink(t *testing.T) {
++	root := t.TempDir()
++	parentID := "11111111-2222-4333-8444-555555555555"
++	childID := "66666666-7777-4888-8999-000000000000"
++	mustMkdir(t, filepath.Join(root, "conversations"))
++	createAntigravityTestDB(t,
++		filepath.Join(root, "conversations", parentID+".db"))
++	childDB := filepath.Join(root, "conversations", childID+".db")
++	createAntigravityTestDB(t, childDB)
++	writeAntigravitySubagentDescriptor(t, root, parentID, childID,
++		antigravitySubagentDescriptorBody(childID, "Test Helper Role"))
++
++	provider := newAntigravityTestProvider(t, root)
++	discovered, err := provider.Discover(t.Context())
++	require.NoError(t, err)
++	require.Len(t, discovered, 2)
++	var childSource *SourceRef
++	for i := range discovered {
++		if discovered[i].DisplayPath == childDB {
++			childSource = &discovered[i]
++		}
++	}
++	require.NotNil(t, childSource)
++	src := childSource.Opaque.(antigravitySource)
++	assert.Equal(t, parentID, src.SubagentParentID)
++	assert.Equal(t, "Test Helper Role", src.SubagentRole)
++
++	sess, _, _, err := provider.parseSession(
++		t.Context(), childDB, "", "test-machine",
++	)
++	require.NoError(t, err)
++	assert.Equal(t, antigravityIDPrefix+parentID, sess.ParentSessionID)
++	assert.Equal(t, RelSubagent, sess.RelationshipType)
++	assert.Equal(t, "Test Helper Role", sess.SessionName)
++}
++
++// TestAntigravitySubagentDescriptorKilledNoWorkspace: the descriptor
++// link is trusted regardless of state -- SUBAGENT_STATE_KILLED children
++// are still real subagents -- and workspaceUris is optional.
++func TestAntigravitySubagentDescriptorKilledNoWorkspace(t *testing.T) {
++	root := t.TempDir()
++	parentID := "10101010-2020-4303-8404-505050505050"
++	childID := "60606060-7070-4808-8909-101010101010"
++	mustMkdir(t, filepath.Join(root, "conversations"))
++	childDB := filepath.Join(root, "conversations", childID+".db")
++	createAntigravityTestDB(t, childDB)
++	writeAntigravitySubagentDescriptor(t, root, parentID, childID,
++		`{"conversationId":"`+childID+`",`+
++			`"subagentDescriptor":{"typeName":"test-type","role":"Killed Role"},`+
++			`"state":"SUBAGENT_STATE_KILLED","spawnStepIndex":2}`)
++
++	sess, _, _, err := parseAntigravityTestSession(t,
++		childDB, "", "test-machine",
++	)
++	require.NoError(t, err)
++	assert.Equal(t, antigravityIDPrefix+parentID, sess.ParentSessionID)
++	assert.Equal(t, RelSubagent, sess.RelationshipType)
++	assert.Equal(t, "Killed Role", sess.SessionName)
++}
++
++func TestAntigravitySubagentDescriptorMissing(t *testing.T) {
++	root := t.TempDir()
++	id := "22222222-3333-4444-8555-666666666666"
++	mustMkdir(t, filepath.Join(root, "conversations"))
++	dbPath := filepath.Join(root, "conversations", id+".db")
++	createAntigravityTestDB(t, dbPath)
++
++	sess, _, _, err := parseAntigravityTestSession(t,
++		dbPath, "", "test-machine",
++	)
++	require.NoError(t, err)
++	assert.Empty(t, sess.ParentSessionID)
++	assert.Equal(t, RelNone, sess.RelationshipType)
++}
++
++// TestAntigravitySubagentDescriptorValidation covers every skip rule:
++// malformed JSON, a conversationId that does not match the filename, a
++// non-UUID conversationId, and a self link.
++func TestAntigravitySubagentDescriptorValidation(t *testing.T) {
++	childID := "33333333-4444-4555-8666-777777777777"
++	parentID := "88888888-9999-4aaa-bbbb-cccccccccccc"
++	tests := []struct {
++		name     string
++		parent   string
++		filename string
++		body     string
++	}{
++		{
++			name:     "malformed json",
++			parent:   parentID,
++			filename: childID + ".json",
++			body:     `{"conversationId":`,
++		},
++		{
++			name:     "conversationId mismatch",
++			parent:   parentID,
++			filename: childID + ".json",
++			body: antigravitySubagentDescriptorBody(
++				"dddddddd-eeee-4fff-aaaa-111111111111", "role"),
++		},
++		{
++			name:     "non-uuid conversationId",
++			parent:   parentID,
++			filename: childID + ".json",
++			body:     `{"conversationId":"not-a-uuid"}`,
++		},
++		{
++			name:     "self link",
++			parent:   childID,
++			filename: childID + ".json",
++			body:     antigravitySubagentDescriptorBody(childID, "role"),
++		},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			root := t.TempDir()
++			mustMkdir(t, filepath.Join(root, "conversations"))
++			dbPath := filepath.Join(root, "conversations", childID+".db")
++			createAntigravityTestDB(t, dbPath)
++			descPath := filepath.Join(
++				root, "brain", tc.parent, ".system_generated",
++				"subagents", tc.filename,
++			)
++			mustMkdir(t, filepath.Dir(descPath))
++			mustWrite(t, descPath, []byte(tc.body))
++
++			sess, _, _, err := parseAntigravityTestSession(t,
++				dbPath, "", "test-machine",
++			)
++			require.NoError(t, err)
++			assert.Empty(t, sess.ParentSessionID)
++			assert.Equal(t, RelNone, sess.RelationshipType)
++		})
++	}
++}
++
++// TestAntigravitySubagentConflictingParents pins the keep-first rule:
++// two parents claiming one child resolve to the first glob-sorted
++// parent.
++func TestAntigravitySubagentConflictingParents(t *testing.T) {
++	root := t.TempDir()
++	firstParent := "00000000-1111-4222-8333-444444444444"
++	secondParent := "99999999-aaaa-4bbb-cccc-dddddddddddd"
++	childID := "55555555-6666-4777-8888-999999999999"
++	mustMkdir(t, filepath.Join(root, "conversations"))
++	dbPath := filepath.Join(root, "conversations", childID+".db")
++	createAntigravityTestDB(t, dbPath)
++	for _, p := range []string{firstParent, secondParent} {
++		writeAntigravitySubagentDescriptor(t, root, p, childID,
++			antigravitySubagentDescriptorBody(childID, "role"))
++	}
++
++	provider := newAntigravityTestProvider(t, root)
++	_, err := provider.Discover(t.Context())
++	require.NoError(t, err)
++	sess, _, _, err := provider.parseSession(
++		t.Context(), dbPath, "", "test-machine",
++	)
++	require.NoError(t, err)
++	assert.Equal(t, antigravityIDPrefix+firstParent, sess.ParentSessionID)
++}
++
++// TestAntigravityInvokeSubagentSpawnEdge verifies a marked spawn-result
++// step echoing conversationId links the invoke_subagent tool call to the
++// spawned session in both providers' .db decode paths. The two-space
++// colon pins whitespace tolerance; compact and one-space variants are
++// covered by the other fixtures.
++func TestAntigravityInvokeSubagentSpawnEdge(t *testing.T) {
++	childID := "77777777-8888-4999-aaaa-bbbbbbbbbbbb"
++	result := `Created the following subagents: ` +
++		`[{"conversationId":  "` + childID + `","status":"spawned"}]`
++
++	t.Run("ide", func(t *testing.T) {
++		root := t.TempDir()
++		id := "12345678-9abc-4def-8123-456789abcdef"
++		mustMkdir(t, filepath.Join(root, "conversations"))
++		dbPath := filepath.Join(root, "conversations", id+".db")
++		createAntigravitySpawnEdgeDB(t, dbPath, "invoke_subagent",
++			[]string{result})
++
++		_, msgs, _, err := parseAntigravityTestSession(t,
++			dbPath, "", "test-machine",
++		)
++		require.NoError(t, err)
++		call := findAntigravityTestToolCall(t, msgs, "invoke_subagent")
++		assert.Equal(t, antigravityIDPrefix+childID,
++			call.SubagentSessionID)
++	})
++
++	t.Run("cli", func(t *testing.T) {
++		root := t.TempDir()
++		id := "12345678-9abc-4def-8123-456789abcdef"
++		mustMkdir(t, filepath.Join(root, "conversations"))
++		dbPath := filepath.Join(root, "conversations", id+".db")
++		createAntigravitySpawnEdgeDB(t, dbPath, "invoke_subagent",
++			[]string{result})
++
++		_, msgs, err := parseAntigravityCLITestSession(t,
++			dbPath, "", "test-machine",
++		)
++		require.NoError(t, err)
++		call := findAntigravityTestToolCall(t, msgs, "invoke_subagent")
++		assert.Equal(t, antigravityCLIIDPrefix+childID,
++			call.SubagentSessionID)
++	})
++}
++
++// findAntigravityTestToolCall returns the first tool call with the
++// given name across the parsed messages.
++func findAntigravityTestToolCall(
++	t *testing.T, msgs []ParsedMessage, name string,
++) ParsedToolCall {
++	t.Helper()
++	for _, m := range msgs {
++		for _, c := range m.ToolCalls {
++			if c.ToolName == name {
++				return c
++			}
++		}
++	}
++	require.FailNow(t, fmt.Sprintf("tool call %q not found", name))
++	return ParsedToolCall{}
++}
++
++// TestAntigravityInvokeSubagentMultiUUID takes only the first
++// conversationId out of a multi-child marked result step.
++func TestAntigravityInvokeSubagentMultiUUID(t *testing.T) {
++	root := t.TempDir()
++	id := "23456789-abcd-4ef0-8234-56789abcdef0"
++	first := "aaaaaaaa-1111-4222-8333-444444444444"
++	second := "bbbbbbbb-2222-4333-8444-555555555555"
++	mustMkdir(t, filepath.Join(root, "conversations"))
++	dbPath := filepath.Join(root, "conversations", id+".db")
++	createAntigravitySpawnEdgeDB(t, dbPath, "invoke_subagent", []string{
++		`Created the following subagents: ` +
++			`[{"conversationId":"` + first + `"},` +
++			`{"conversationId":"` + second + `"}]`,
++	})
++
++	_, msgs, _, err := parseAntigravityTestSession(t,
++		dbPath, "", "test-machine",
++	)
++	require.NoError(t, err)
++	call := findAntigravityTestToolCall(t, msgs, "invoke_subagent")
++	assert.Equal(t, antigravityIDPrefix+first, call.SubagentSessionID)
++}
++
++// TestAntigravityInvokeSubagentMarkerGate: a result step echoing
++// conversationId strings without the "Created the following subagents"
++// marker -- exactly what manage_subagents list output looks like --
++// must not create a spawn edge.
++func TestAntigravityInvokeSubagentMarkerGate(t *testing.T) {
++	childID := "eeeeeeee-7777-4888-9999-000000000000"
++	manageListResult := `You have 1 active subagent(s): ` +
++		`[{"conversationId":"` + childID + `","state":"running"}]`
++
++	root := t.TempDir()
++	id := "4567890a-cdef-4123-8567-890abcdef123"
++	mustMkdir(t, filepath.Join(root, "conversations"))
++	dbPath := filepath.Join(root, "conversations", id+".db")
++	createAntigravitySpawnEdgeDB(t, dbPath, "invoke_subagent",
++		[]string{manageListResult})
++
++	_, msgs, _, err := parseAntigravityTestSession(t,
++		dbPath, "", "test-machine",
++	)
++	require.NoError(t, err)
++	call := findAntigravityTestToolCall(t, msgs, "invoke_subagent")
++	assert.Empty(t, call.SubagentSessionID,
++		"unmarked conversationId echoes are not spawn edges")
++}
++
++// TestAntigravityInvokeSubagentFailedNoEdge: an invoke whose result
++// never arrives (no marked step follows) leaves SubagentSessionID
++// empty.
++func TestAntigravityInvokeSubagentFailedNoEdge(t *testing.T) {
++	root := t.TempDir()
++	id := "567890ab-def1-4234-8678-90abcdef1234"
++	mustMkdir(t, filepath.Join(root, "conversations"))
++	dbPath := filepath.Join(root, "conversations", id+".db")
++	createAntigravitySpawnEdgeDB(t, dbPath, "invoke_subagent",
++		[]string{`the invoke failed; no subagent was created`})
++
++	_, msgs, _, err := parseAntigravityTestSession(t,
++		dbPath, "", "test-machine",
++	)
++	require.NoError(t, err)
++	call := findAntigravityTestToolCall(t, msgs, "invoke_subagent")
++	assert.Empty(t, call.SubagentSessionID)
++}
++
++// TestAntigravityNonInvokeToolsNoSpawnEdge: even a marked spawn-result
++// step does not create an edge for define_subagent or manage_subagents
++// calls -- only invoke_subagent carries spawn links.
++func TestAntigravityNonInvokeToolsNoSpawnEdge(t *testing.T) {
++	childID := "cccccccc-3333-4444-8555-666666666666"
++	for _, tool := range []string{"define_subagent", "manage_subagents"} {
++		t.Run(tool, func(t *testing.T) {
++			root := t.TempDir()
++			id := "3456789a-bcde-4f01-8345-6789abcdef01"
++			mustMkdir(t, filepath.Join(root, "conversations"))
++			dbPath := filepath.Join(root, "conversations", id+".db")
++			createAntigravitySpawnEdgeDB(t, dbPath, tool, []string{
++				`Created the following subagents: ` +
++					`[{"conversationId":"` + childID + `"}]`,
++			})
++
++			_, msgs, _, err := parseAntigravityTestSession(t,
++				dbPath, "", "test-machine",
++			)
++			require.NoError(t, err)
++			call := findAntigravityTestToolCall(t, msgs, tool)
++			assert.Empty(t, call.SubagentSessionID)
++		})
++	}
++}
++
++// TestAntigravityIDESidecarParentCascadeLink covers the IDE fallback:
++// without a descriptor, agyReader.parentCascadeId links the session even
++// when the sidecar lags the raw step count (mirroring the CLI rule that
++// lineage metadata is independent of transcript coverage).
++func TestAntigravityIDESidecarParentCascadeLink(t *testing.T) {
++	root := t.TempDir()
++	id := "456789ab-cdef-4012-8456-789abcdef012"
++	parentID := "dddddddd-4444-4555-8666-777777777777"
++	mustMkdir(t, filepath.Join(root, "conversations"))
++	dbPath := filepath.Join(root, "conversations", id+".db")
++	createAntigravityTestDB(t, dbPath) // 2 raw steps
++	// One displayable step deliberately lags the two-step DB.
++	sidecar := `{"trajectoryId":"traj","cascadeId":"` + id + `",` +
++		`"agyReader":{"parentCascadeId":"` + parentID + `"},` +
++		`"steps":[{"type":"CORTEX_STEP_TYPE_USER_INPUT",` +
++		`"metadata":{"createdAt":"2026-07-15T00:00:00Z"},` +
++		`"userInput":{"userResponse":"child prompt"}}]}`
++	mustWrite(t, strings.TrimSuffix(dbPath, ".db")+".trajectory.json",
++		[]byte(sidecar))
++
++	sess, _, _, err := parseAntigravityTestSession(t,
++		dbPath, "", "test-machine",
++	)
++	require.NoError(t, err)
++	assert.Equal(t, antigravityIDPrefix+parentID, sess.ParentSessionID)
++	assert.Equal(t, RelSubagent, sess.RelationshipType)
++	assert.Empty(t, sess.SessionName)
++}
++
++// TestAntigravityDescriptorBeatsSidecar pins the precedence rule:
++// descriptor wins over agyReader.parentCascadeId.
++func TestAntigravityDescriptorBeatsSidecar(t *testing.T) {
++	root := t.TempDir()
++	id := "56789abc-def0-4123-8567-89abcdef0123"
++	descParent := "eeeeeeee-5555-4666-8777-888888888888"
++	sidecarParent := "ffffffff-6666-4777-8888-999999999999"
++	mustMkdir(t, filepath.Join(root, "conversations"))
++	dbPath := filepath.Join(root, "conversations", id+".db")
++	createAntigravityTestDB(t, dbPath)
++	writeAntigravitySubagentDescriptor(t, root, descParent, id,
++		antigravitySubagentDescriptorBody(id, "Descriptor Role"))
++	sidecar := `{"trajectoryId":"traj","cascadeId":"` + id + `",` +
++		`"agyReader":{"parentCascadeId":"` + sidecarParent + `"},` +
++		`"steps":[{"type":"CORTEX_STEP_TYPE_USER_INPUT",` +
++		`"metadata":{"createdAt":"2026-07-15T00:00:00Z"},` +
++		`"userInput":{"userResponse":"child prompt"}}]}`
++	mustWrite(t, strings.TrimSuffix(dbPath, ".db")+".trajectory.json",
++		[]byte(sidecar))
++
++	sess, _, _, err := parseAntigravityTestSession(t,
++		dbPath, "", "test-machine",
++	)
++	require.NoError(t, err)
++	assert.Equal(t, antigravityIDPrefix+descParent, sess.ParentSessionID)
++	assert.Equal(t, "Descriptor Role", sess.SessionName)
++}
++
++// TestAntigravityWatchPlanIncludesSubagentGlob asserts the recursive
++// brain watch root carries the descriptor include glob.
++func TestAntigravityWatchPlanIncludesSubagentGlob(t *testing.T) {
++	root := t.TempDir()
++	provider := newAntigravityTestProvider(t, root)
++	plan, err := provider.WatchPlan(t.Context())
++	require.NoError(t, err)
++	require.Len(t, plan.Roots, 4)
++	assert.Equal(t, filepath.Join(root, "brain"), plan.Roots[1].Path)
++	assert.True(t, plan.Roots[1].Recursive)
++	assert.Contains(t, plan.Roots[1].IncludeGlobs,
++		"*/.system_generated/subagents/*.json")
++}
++
++// TestAntigravityRoutesSubagentDescriptor covers live descriptor
++// updates: a descriptor write event routes to the child's .db source
++// and refreshes the link cache so a subsequent parse picks the parent
++// up; a remove event drops it again.
++func TestAntigravityRoutesSubagentDescriptor(t *testing.T) {
++	root := t.TempDir()
++	parentID := "abcdefab-1234-4567-8899-aabbccddeeff"
++	childID := "fedcba98-7654-4321-8fff-eeddccbbaa00"
++	mustMkdir(t, filepath.Join(root, "conversations"))
++	childDB := filepath.Join(root, "conversations", childID+".db")
++	createAntigravityTestDB(t, childDB)
++
++	provider := newAntigravityTestProvider(t, root)
++	_, err := provider.Discover(t.Context())
++	require.NoError(t, err)
++
++	sess, _, _, err := provider.parseSession(
++		t.Context(), childDB, "", "test-machine",
++	)
++	require.NoError(t, err)
++	assert.Empty(t, sess.ParentSessionID)
++
++	descPath := writeAntigravitySubagentDescriptor(t,
++		root, parentID, childID,
++		antigravitySubagentDescriptorBody(childID, "role"))
++	changed, err := provider.SourcesForChangedPath(
++		t.Context(),
++		ChangedPathRequest{Path: descPath, EventKind: "write"},
++	)
++	require.NoError(t, err)
++	require.Len(t, changed, 1)
++	assert.Equal(t, childDB, changed[0].DisplayPath,
++		"a descriptor write must route to the child's .db source")
++
++	sess, _, _, err = provider.parseSession(
++		t.Context(), childDB, "", "test-machine",
++	)
++	require.NoError(t, err)
++	assert.Equal(t, antigravityIDPrefix+parentID, sess.ParentSessionID)
++	assert.Equal(t, RelSubagent, sess.RelationshipType)
++
++	require.NoError(t, os.Remove(descPath))
++	changed, err = provider.SourcesForChangedPath(
++		t.Context(),
++		ChangedPathRequest{Path: descPath, EventKind: "remove"},
++	)
++	require.NoError(t, err)
++	require.Len(t, changed, 1)
++	sess, _, _, err = provider.parseSession(
++		t.Context(), childDB, "", "test-machine",
++	)
++	require.NoError(t, err)
++	assert.Empty(t, sess.ParentSessionID,
++		"descriptor removal must drop the parent link")
++}
++
++// TestAntigravityFingerprintTracksSubagentDescriptor verifies the
++// composite fingerprint changes when the descriptor appears or
++// disappears, so descriptor-only changes re-sync the child.
++func TestAntigravityFingerprintTracksSubagentDescriptor(t *testing.T) {
++	root := t.TempDir()
++	parentID := "01230123-4567-4890-8abc-def012345678"
++	childID := "32103210-6543-4098-8cba-fed098765432"
++	mustMkdir(t, filepath.Join(root, "conversations"))
++	createAntigravityTestDB(t,
++		filepath.Join(root, "conversations", childID+".db"))
++
++	provider := newAntigravityTestProvider(t, root)
++	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
++		RawSessionID: childID,
++	})
++	require.NoError(t, err)
++	require.True(t, ok)
++
++	before, err := provider.Fingerprint(t.Context(), source)
++	require.NoError(t, err)
++
++	descPath := writeAntigravitySubagentDescriptor(t,
++		root, parentID, childID,
++		antigravitySubagentDescriptorBody(childID, "role"))
++	afterCreate, err := provider.Fingerprint(t.Context(), source)
++	require.NoError(t, err)
++	assert.NotEqual(t, before.Hash, afterCreate.Hash,
++		"descriptor creation must change the child fingerprint")
++
++	require.NoError(t, os.Remove(descPath))
++	afterRemove, err := provider.Fingerprint(t.Context(), source)
++	require.NoError(t, err)
++	assert.NotEqual(t, afterCreate.Hash, afterRemove.Hash,
++		"descriptor removal must change the child fingerprint")
++}
+diff --git a/internal/parser/antigravity_test.go b/internal/parser/antigravity_test.go
+index 3e3f2ad6..1f308ca6 100644
+--- a/internal/parser/antigravity_test.go
++++ b/internal/parser/antigravity_test.go
+@@ -4725,3 +4725,112 @@ func TestAntigravityIDEUnreadableStepsFailsClosed(t *testing.T) {
+ 		assert.Empty(t, usageEvents)
+ 	})
+ }
++
++func TestLookupAntigravitySummary_LockContentionRetry(t *testing.T) {
++	t.Parallel()
++
++	dir := t.TempDir()
++	dbPath := filepath.Join(dir, "conversation_summaries.db")
++	id := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
++
++	writer, err := sql.Open("sqlite3", dbPath)
++	require.NoError(t, err)
++	defer writer.Close()
++	writer.SetMaxOpenConns(1)
++
++	_, err = writer.ExecContext(t.Context(), `
++		PRAGMA journal_mode=WAL;
++		CREATE TABLE conversation_summaries (conversation_id text primary key, workspace_uris text, title text);
++		INSERT INTO conversation_summaries VALUES ('`+id+`', '["file:///Users/dev/repos/my-service"]', 'Fix indexing bug');
++	`)
++	require.NoError(t, err)
++
++	// Acquire an exclusive lock on the database to simulate an active IDE writer holding a lock.
++	_, err = writer.ExecContext(t.Context(), "PRAGMA locking_mode=EXCLUSIVE")
++	require.NoError(t, err)
++
++	tx, err := writer.BeginTx(t.Context(), nil)
++	require.NoError(t, err)
++	defer func() { _ = tx.Rollback() }()
++
++	_, err = tx.ExecContext(t.Context(), "INSERT INTO conversation_summaries VALUES ('other-id', '[]', 'other')")
++	require.NoError(t, err)
++
++	// lookupAntigravitySummary must succeed via WithSQLiteReadOnly scratch copy fallback despite lock contention.
++	sum, ok := lookupAntigravitySummary(dbPath, id)
++	require.True(t, ok, "lookupAntigravitySummary must succeed via scratch fallback when db is locked")
++	assert.Equal(t, "/Users/dev/repos/my-service", sum.cwd)
++	assert.Equal(t, "my-service", sum.project)
++	assert.Equal(t, "Fix indexing bug", sum.title)
++}
++
++func TestCleanAntigravityPrompt(t *testing.T) {
++	tests := []struct {
++		name  string
++		input string
++		want  string
++	}{
++		{
++			name:  "plain prompt unchanged",
++			input: "list the files in the project",
++			want:  "list the files in the project",
++		},
++		{
++			name:  "empty prompt unchanged",
++			input: "",
++			want:  "",
++		},
++		{
++			name:  "whitespace only unchanged",
++			input: "   \n\t  ",
++			want:  "   \n\t  ",
++		},
++		{
++			name:  "basic user request envelope unwrapped",
++			input: "<USER_REQUEST>\nhello world\n</USER_REQUEST>",
++			want:  "hello world",
++		},
++		{
++			name:  "user request with additional metadata",
++			input: "<USER_REQUEST>\nlist files\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-30T21:02:41+02:00.\n</ADDITIONAL_METADATA>",
++			want:  "list files",
++		},
++		{
++			name: "full prompt with slash command and settings change",
++			input: "<USER_REQUEST>\n/systematic-debugging\nпока ничего не меняй\nhttp://127.0.0.1:8000/?provider=junie&cid=session-123\n</USER_REQUEST>\n" +
++				"<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-18T23:55:05+02:00.\n\n" +
++				"/systematic-debugging is a [Slash Command]:\n<SKILL>The user requested you read the skill</SKILL>\n</ADDITIONAL_METADATA>\n" +
++				"<USER_SETTINGS_CHANGE>\nThe user changed setting Model Selection from None to Gemini 3.8 Flash (High).\n</USER_SETTINGS_CHANGE>",
++			want: "/systematic-debugging\nпока ничего не меняй\nhttp://127.0.0.1:8000/?provider=junie&cid=session-123",
++		},
++		{
++			name: "user request mentioning tags inside prompt",
++			input: "<USER_REQUEST>\nпосмотри почему появились \n<USER_REQUEST>, <ADDITIONAL_METADATA> и  тп\n</USER_REQUEST>\n" +
++				"<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-30T21:02:41+02:00.\n</ADDITIONAL_METADATA>",
++			want: "посмотри почему появились \n<USER_REQUEST>, <ADDITIONAL_METADATA> и  тп",
++		},
++		{
++			name: "user request mentioning closing tag inside prompt",
++			input: "<USER_REQUEST>\nwhy is </USER_REQUEST> shown here?\n</USER_REQUEST>\n" +
++				"<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-30T21:02:41+02:00.\n</ADDITIONAL_METADATA>",
++			want: "why is </USER_REQUEST> shown here?",
++		},
++		{
++			name:  "unwrapped prompt with trailing metadata stripped",
++			input: "plain prompt text\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-30T21:02:41+02:00.\n</ADDITIONAL_METADATA>",
++			want:  "plain prompt text",
++		},
++		{
++			name:  "unclosed user request envelope with trailing metadata",
++			input: "<USER_REQUEST>\nincomplete tag prompt\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-30T21:02:41+02:00.\n</ADDITIONAL_METADATA>",
++			want:  "incomplete tag prompt",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got := cleanAntigravityPrompt(tt.input)
++			assert.Equal(t, tt.want, got)
++		})
++	}
++}
+diff --git a/internal/parser/discovery.go b/internal/parser/discovery.go
+index 10e4fa02..6d560a18 100644
+--- a/internal/parser/discovery.go
++++ b/internal/parser/discovery.go
+@@ -18,10 +18,12 @@ import (
+ 	"github.com/tidwall/gjson"
+ )
+ 
+-// uuidRe matches a standard UUID (8-4-4-4-12 hex) at the end of a rollout filename stem.
++// uuidRe matches a standard UUID (8-4-4-4-12 hex) in a rollout filename stem,
++// with an optional continuation segment suffix (_<segment_uuid>).
+ var uuidRe = regexp.MustCompile(
+ 	`^rollout-.*-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-` +
+-		`[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$`,
++		`[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})` +
++		`(?:_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})?$`,
+ )
+ 
+ const (
+diff --git a/internal/parser/discovery_test.go b/internal/parser/discovery_test.go
+index 058912de..2790dc99 100644
+--- a/internal/parser/discovery_test.go
++++ b/internal/parser/discovery_test.go
+@@ -469,6 +469,10 @@ func TestExtractUUIDFromRollout(t *testing.T) {
+ 			"rollout-20240115-abc12345-1234-5678-9abc-def012345678-suffix.jsonl",
+ 			"",
+ 		},
++		{
++			"rollout-2026-09-25T23-54-13-01a0da77-5113-7a91-a159-a02da927e59f_01a0da8f-d2a9-7fa1-85e4-d0ee0f72587d.jsonl",
++			"01a0da77-5113-7a91-a159-a02da927e59f",
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
+diff --git a/internal/parser/sqlite_dsn.go b/internal/parser/sqlite_dsn.go
+index e9270849..1c8faf58 100644
+--- a/internal/parser/sqlite_dsn.go
++++ b/internal/parser/sqlite_dsn.go
+@@ -1,9 +1,16 @@
+ package parser
+ 
+ import (
++	"context"
+ 	"database/sql"
++	"errors"
++	"io"
++	"os"
++	"path/filepath"
+ 	"strconv"
+ 	"strings"
++
++	"github.com/mattn/go-sqlite3"
+ )
+ 
+ type sqliteReadOptions struct {
+@@ -26,6 +33,111 @@ func openSQLiteReadOnly(path string, options sqliteReadOptions) (*sql.DB, error)
+ 	return sql.Open("sqlite3", dsn)
+ }
+ 
++// WithSQLiteReadOnly opens the SQLite database at path for reading and executes fn.
++// If opening or querying fails due to SQLite lock contention (SQLITE_BUSY or SQLITE_LOCKED),
++// WithSQLiteReadOnly creates an isolated scratch copy of the database (including its WAL
++// and journal files if present) in a temporary directory and retries fn against the scratch copy.
++// The scratch copy is guaranteed to be cleaned up when fn completes.
++func WithSQLiteReadOnly(
++	ctx context.Context,
++	path string,
++	options sqliteReadOptions,
++	fn func(db *sql.DB) error,
++) error {
++	if ctx.Err() != nil {
++		return ctx.Err()
++	}
++	db, err := openSQLiteReadOnly(path, options)
++	if err == nil {
++		fnErr := fn(db)
++		_ = db.Close()
++		if fnErr == nil {
++			return nil
++		}
++		if ctx.Err() != nil || !isSQLiteBusyOrLocked(fnErr) {
++			return fnErr
++		}
++	} else if ctx.Err() != nil || !isSQLiteBusyOrLocked(err) {
++		return err
++	}
++
++	scratchDir, tmpErr := os.MkdirTemp("", "agentsview-sqlite-scratch-*")
++	if tmpErr != nil {
++		return err
++	}
++	defer os.RemoveAll(scratchDir)
++
++	scratchDB := filepath.Join(scratchDir, filepath.Base(path))
++	if copyErr := copySQLiteContainerFiles(path, scratchDB); copyErr != nil {
++		return err
++	}
++
++	scratchConn, openErr := openSQLiteReadOnly(scratchDB, sqliteReadOptions{
++		stableSnapshot: false,
++		busyTimeoutMS:  options.busyTimeoutMS,
++	})
++	if openErr != nil {
++		return err
++	}
++	defer scratchConn.Close()
++
++	return fn(scratchConn)
++}
++
++func copySQLiteContainerFiles(src, dst string) error {
++	if err := copySingleFile(src, dst); err != nil {
++		return err
++	}
++	for _, suffix := range []string{"-wal", "-journal"} {
++		srcSibling := src + suffix
++		if _, err := os.Stat(srcSibling); err == nil {
++			if err := copySingleFile(srcSibling, dst+suffix); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++func copySingleFile(src, dst string) error {
++	in, err := os.Open(src)
++	if err != nil {
++		return err
++	}
++	defer in.Close()
++
++	out, err := os.Create(dst)
++	if err != nil {
++		return err
++	}
++	defer out.Close()
++
++	_, err = io.Copy(out, in)
++	return err
++}
++
++func isSQLiteBusyOrLocked(err error) bool {
++	if err == nil {
++		return false
++	}
++	if sqliteErr, ok := errors.AsType[sqlite3.Error](err); ok {
++		if sqliteErr.Code == sqlite3.ErrBusy || sqliteErr.Code == sqlite3.ErrLocked {
++			return true
++		}
++	}
++	if sqliteErrPtr, ok := errors.AsType[*sqlite3.Error](err); ok && sqliteErrPtr != nil {
++		if sqliteErrPtr.Code == sqlite3.ErrBusy || sqliteErrPtr.Code == sqlite3.ErrLocked {
++			return true
++		}
++	}
++	msg := strings.ToLower(err.Error())
++	return strings.Contains(msg, "database is locked") ||
++		strings.Contains(msg, "database table is locked") ||
++		strings.Contains(msg, "sqlite_busy") ||
++		strings.Contains(msg, "sqlite_locked") ||
++		strings.Contains(msg, "busy")
++}
++
+ // sqliteURIPath escapes a filesystem path for use in a SQLite file: URI.
+ // SQLite percent-decodes URI paths and stops parsing them at '?' or '#',
+ // and go-sqlite3 splits its driver parameters at the first '?', so these
+diff --git a/internal/parser/sqlite_dsn_test.go b/internal/parser/sqlite_dsn_test.go
+index 2bccaacb..aec155fe 100644
+--- a/internal/parser/sqlite_dsn_test.go
++++ b/internal/parser/sqlite_dsn_test.go
+@@ -84,3 +84,72 @@ func TestOpenSQLiteReadOnlyStableSnapshot(t *testing.T) {
+ 	_, err = reader.ExecContext(t.Context(), "DELETE FROM messages")
+ 	require.Error(t, err)
+ }
++
++func TestWithSQLiteReadOnly_FallbackOnBusy(t *testing.T) {
++	dir := t.TempDir()
++	dbPath := filepath.Join(dir, "locked.db")
++
++	writer, err := sql.Open("sqlite3", dbPath)
++	require.NoError(t, err)
++	defer writer.Close()
++	writer.SetMaxOpenConns(1)
++
++	_, err = writer.ExecContext(t.Context(), `
++		PRAGMA journal_mode=WAL;
++		CREATE TABLE items (id TEXT PRIMARY KEY, value TEXT);
++		INSERT INTO items VALUES ('item1', 'committed_value');
++	`)
++	require.NoError(t, err)
++
++	// Acquire an exclusive lock on the database to simulate an active writer holding lock.
++	_, err = writer.ExecContext(t.Context(), "PRAGMA locking_mode=EXCLUSIVE")
++	require.NoError(t, err)
++
++	tx, err := writer.BeginTx(t.Context(), nil)
++	require.NoError(t, err)
++	defer func() { _ = tx.Rollback() }()
++
++	_, err = tx.ExecContext(t.Context(), "INSERT INTO items VALUES ('item2', 'uncommitted_value')")
++	require.NoError(t, err)
++
++	// A normal connection with a low busy timeout should fail with SQLITE_BUSY / database is locked.
++	normalConn, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{busyTimeoutMS: 50})
++	require.NoError(t, err)
++	defer normalConn.Close()
++
++	var dummy string
++	err = normalConn.QueryRowContext(t.Context(), "SELECT value FROM items WHERE id = 'item1'").Scan(&dummy)
++	require.Error(t, err, "normal read must fail when writer holds exclusive transaction")
++	assert.Contains(t, err.Error(), "locked")
++
++	// WithSQLiteReadOnly must catch the busy/locked error, make an isolated scratch copy,
++	// and read the committed data successfully without failing.
++	var readVal string
++	err = WithSQLiteReadOnly(t.Context(), dbPath, sqliteReadOptions{busyTimeoutMS: 50}, func(db *sql.DB) error {
++		return db.QueryRowContext(t.Context(), "SELECT value FROM items WHERE id = 'item1'").Scan(&readVal)
++	})
++	require.NoError(t, err, "WithSQLiteReadOnly must succeed via scratch copy fallback")
++	assert.Equal(t, "committed_value", readVal)
++}
++
++func TestWithSQLiteReadOnly_PropagatesNonBusyErrors(t *testing.T) {
++	dir := t.TempDir()
++	dbPath := filepath.Join(dir, "test.db")
++
++	writer, err := sql.Open("sqlite3", dbPath)
++	require.NoError(t, err)
++	_, err = writer.ExecContext(t.Context(), `
++		CREATE TABLE items (id TEXT PRIMARY KEY);
++		INSERT INTO items VALUES ('item1');
++	`)
++	require.NoError(t, err)
++	require.NoError(t, writer.Close())
++
++	// Syntax error or missing table should be returned directly.
++	err = WithSQLiteReadOnly(t.Context(), dbPath, sqliteReadOptions{busyTimeoutMS: 100}, func(db *sql.DB) error {
++		var x string
++		return db.QueryRowContext(t.Context(), "SELECT nonexistent_column FROM items").Scan(&x)
++	})
++	require.Error(t, err)
++	assert.NotContains(t, err.Error(), "locked")
++}
+diff --git a/internal/parser/types.go b/internal/parser/types.go
+index e10f7468..6431836b 100644
+--- a/internal/parser/types.go
++++ b/internal/parser/types.go
+@@ -382,6 +382,12 @@ var Registry = []AgentDef{
+ 		DefaultDirs: cursorIDEDefaultDirs(),
+ 		IDPrefix:    "cursor-ide:",
+ 		FileBased:   true,
++		Usage: UsageCapabilities{
++			// composerData exposes contextTokensUsed at the session level;
++			// per-message counts are inferred by proportional distribution,
++			// not provided by the wire format.
++			NoPerMessageTokenData: true,
++		},
+ 		// state.vscdb is VS Code's shared global-state database: besides
+ 		// Cursor's own chat data, its ItemTable co-locates Cursor's live
+ 		// auth tokens (observed keys cursorAuth/accessToken and
+@@ -415,6 +421,7 @@ var Registry = []AgentDef{
+ 		DefaultDirs:       []string{".junie/sessions"},
+ 		IDPrefix:          "junie:",
+ 		FileBased:         true,
++		Usage:             UsageCapabilities{NoPerMessageTokenData: true},
+ 	},
+ 	{
+ 		Type:        AgentZencoder,
+diff --git a/internal/parser/warp.go b/internal/parser/warp.go
+index 4ded12ea..4321bf50 100644
+--- a/internal/parser/warp.go
++++ b/internal/parser/warp.go
+@@ -44,12 +44,23 @@ func ListWarpSessionMeta(
+ func ForEachWarpSessionMeta(
+ 	ctx context.Context, dbPath string, stableSnapshot bool, yield func(WarpSessionMeta) error,
+ ) error {
+-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
++	if _, err := os.Stat(dbPath); os.IsNotExist(err) || errors.Is(err, os.ErrPermission) {
+ 		return nil
+ 	}
++	f, err := os.Open(dbPath)
++	if err != nil {
++		if errors.Is(err, os.ErrPermission) {
++			return nil
++		}
++		return err
++	}
++	_ = f.Close()
+ 
+ 	db, err := openWarpDB(dbPath, stableSnapshot)
+ 	if err != nil {
++		if errors.Is(err, os.ErrPermission) {
++			return nil
++		}
+ 		return err
+ 	}
+ 	defer db.Close()
+@@ -533,11 +544,13 @@ func parseWarpTimestamp(s string) time.Time {
+ }
+ 
+ // warpDBPath returns the path to warp.sqlite inside the
+-// given directory, or "" if it doesn't exist.
++// given directory, or "" if it doesn't exist or is not readable.
+ func warpDBPath(dir string) string {
+ 	candidate := filepath.Join(dir, WarpDBFilename)
+-	if _, err := os.Stat(candidate); err == nil {
+-		return candidate
++	f, err := os.Open(candidate)
++	if err != nil {
++		return ""
+ 	}
+-	return ""
++	_ = f.Close()
++	return candidate
+ }

@@ -1,0 +1,132 @@
+# --- managed by sync.sh: developer_instructions ---
+developer_instructions = """
+# JetProfile — Codex agent rules
+
+Shared project context lives in `AGENTS.md`. This file is injected as `developer_instructions` in `.codex/config.toml` (Codex-only).
+
+## idea MCP — mandatory for project files
+MCP server id: `idea` in `.codex/config.toml` (native IntelliJ integration).
+At runtime, tools are exposed as `mcp__idea__{tool}` (for example `mcp__idea__apply_patch`).
+**NEVER use these tools:** `Edit`, `Write`. **ALWAYS use idea MCP equivalents instead.**
+**Exception:** paths outside the project (e.g. `~/.codex/`) — use standard tools; MCP only works with project-relative paths.
+**NEVER use `mcp__idea__execute_terminal_command`.** Use shell for git, build, and test.
+
+### Tool mapping
+
+| Instead of | Use idea MCP |
+|------------|--------------|
+| `Edit`, `Write`, `apply_patch`, `create_new_file` | `mcp__idea__apply_patch`, `mcp__idea__create_new_file` |
+
+### Tooling rules
+
+- Shell is allowed for git, build, and test. Prefer `mcp__idea__git_status` when available.
+- When multiple projects are open in IntelliJ, pass `projectPath` to idea MCP calls.
+
+### Key tools
+
+| Tool | Purpose |
+|------|---------|
+| `mcp__idea__build_project` | Compile; return errors |
+| `mcp__idea__get_file_problems` | IDEA inspections for one file |
+| `mcp__idea__lint_files` | Inspections for multiple files |
+| `mcp__idea__rename_refactoring` | Safe symbol rename |
+| `mcp__idea__reformat_file` | Apply IDE formatter |
+| `mcp__idea__git_status` | Git status |
+| `mcp__idea__get_run_configurations` | List run configs |
+| `mcp__idea__execute_run_configuration` | Run a config |
+
+Also available: `mcp__idea__read_file` (jar/jrt/decompiled sources), project module/dependency tools, inspection KTS tools.
+
+Note: several search/read tools are listed in `disabled_tools` under `[mcp_servers.idea]`
+
+### Verify after writing code
+
+Use `mcp__idea__get_file_problems` with `errorsOnly=false`. Fix warnings related to your changes; ignore unrelated ones. Run relevant tests before declaring done.
+
+## Code discovery (Codex)
+
+Aligns with `AGENTS.md`; prefer idea MCP and mcp-steroid when reachable.
+
+| Question | Tool |
+|----------|------|
+| *Where does this live?* — concept/behavior, location unknown | `jbcontext search` |
+
+Load-bearing audits — "is this the only caller?" — must use PSI when mcp-steroid is reachable. Grep cannot prove absence across 79 modules.
+
+
+"""
+# --- managed by sync.sh: developer_instructions ---
+
+[mcp_servers.chrome-devtools]
+enabled = false
+
+[mcp_servers.google-docs]
+enabled = false
+
+[mcp_servers.idea]
+enabled = true
+disabled_tools = [
+    "create_ij_module",
+    "configure_python_interpreter",
+    "get_python_environment",
+    "create_notebook",
+    "read_notebook",
+    "read_notebook_cell",
+    "edit_notebook",
+    "run_notebook_cell",
+    "execute_code_on_kernel",
+    "get_notebook_state",
+    "wait_cell_execution",
+    "interrupt_notebook",
+    "kill_notebook",
+    "create_database_connection",
+    "edit_database_connection",
+    "introspect_schema",
+    "fetch_query_result",
+    "read_file",
+    "search_file",
+    "search_text",
+    "search_regex",
+    "search_symbol",
+    "get_symbol_info",
+    "analyze_calls",
+    "execute_tool",
+    "list_directory_tree",
+    "git_status",
+    #"",
+    #"",
+    #"",
+    #"",
+    #"",
+    #"",
+    #"",
+]
+
+
+[mcp_servers.miro]
+enabled = false
+
+[mcp_servers.youtrack]
+enabled = false
+
+[mcp_servers.youtrack_local]
+enabled = false
+
+[mcp_servers.slack]
+enabled = false
+
+[features]
+hooks = true # todo: read https://learn.chatgpt.com/docs/hooks ???
+
+#[[hooks.SessionStart]]
+#matcher = ""
+#[[hooks.SessionStart.hooks]]
+#type = "command"
+#command = "bash .claude/hooks/mcp-steroid-probe.sh"
+#timeout = 5
+
+[mcp_servers.mcp-steroid]
+enabled = true
+
+show_raw_agent_reasoning = true
+model_reasoning_summary = "detailed"

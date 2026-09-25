@@ -1,0 +1,3 @@
+SDKROOT=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk \
+npm_config_cache=/private/tmp/agentsview-npm-cache-20260926 \
+make build

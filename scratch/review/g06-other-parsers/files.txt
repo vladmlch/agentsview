@@ -1,0 +1,14 @@
+internal/parser/claude.go
+internal/parser/claude_provider.go
+internal/parser/claude_provider_test.go
+internal/parser/cursor_ide.go
+internal/parser/cursor_ide_provider.go
+internal/parser/cursor_ide_test.go
+internal/parser/opencode.go
+internal/parser/opencode_provider.go
+internal/parser/opencode_test.go
+internal/parser/windsurf_provider.go
+internal/parser/windsurf_provider_test.go
+internal/parser/zed.go
+internal/parser/zed_provider.go
+internal/parser/zed_test.go

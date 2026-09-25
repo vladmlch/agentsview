@@ -1,0 +1,5 @@
+internal/parser/devin.go
+internal/parser/devin_provider.go
+internal/parser/devin_provider_test.go
+internal/parser/devin_subagent.go
+internal/parser/devin_test.go

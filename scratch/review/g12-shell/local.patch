@@ -1,0 +1,2978 @@
+diff --git a/frontend/e2e/appearance-a11y.spec.ts b/frontend/e2e/appearance-a11y.spec.ts
+index 3adac7bc..3a16efd2 100644
+--- a/frontend/e2e/appearance-a11y.spec.ts
++++ b/frontend/e2e/appearance-a11y.spec.ts
+@@ -256,6 +256,9 @@ test.describe("Appearance accessibility", () => {
+     await page.addInitScript(() => {
+       localStorage.setItem("theme", "dark");
+       localStorage.setItem("agentsview-high-contrast", "true");
++      // Focused mode renders flat message rows with role icons; normal mode
++      // folds assistant work into turn headers without them.
++      localStorage.setItem("agentsview-transcript-mode", "focused");
+     });
+     const sp = new SessionsPage(page);
+     await sp.goto();
+diff --git a/frontend/e2e/go-to-session.spec.ts b/frontend/e2e/go-to-session.spec.ts
+index 726620c6..a1295ffb 100644
+--- a/frontend/e2e/go-to-session.spec.ts
++++ b/frontend/e2e/go-to-session.spec.ts
+@@ -9,9 +9,7 @@ type RenderLintModule = {
+ 
+ const require = createRequire(import.meta.url);
+ const renderLintPath = process.env.PR_RENDER_LINT_PATH;
+-const renderLint = renderLintPath
+-  ? (require(renderLintPath) as RenderLintModule)
+-  : undefined;
++const renderLint = renderLintPath ? (require(renderLintPath) as RenderLintModule) : undefined;
+ const renderProofDir = process.env.PR_RENDER_PROOF_DIR;
+ const renderArtifactDir = process.env.PR_RENDER_ARTIFACT_DIR;
+ 
+@@ -62,6 +60,8 @@ function message(id: string, content: string) {
+     model: "",
+     context_tokens: 0,
+     output_tokens: 0,
++    has_context_tokens: false,
++    has_output_tokens: false,
+     is_system: false,
+   };
+ }
+@@ -151,7 +151,9 @@ test.describe("go to session", () => {
+       });
+     });
+ 
+-    const modifier = await page.evaluate(() => (/Mac/.test(navigator.platform) ? "Meta" : "Control"));
++    const modifier = await page.evaluate(() =>
++      /Mac/.test(navigator.platform) ? "Meta" : "Control",
++    );
+     await page.setViewportSize({ width: 1280, height: 900 });
+     await page.keyboard.press(`${modifier}+g`);
+     const dialog = page.getByRole("dialog", { name: "Go to session" });
+@@ -181,8 +183,10 @@ test.describe("go to session", () => {
+       expect(field!.x + field!.width).toBeLessThanOrEqual(width + 1);
+       await page.screenshot({ path: testInfo.outputPath(`go-to-session-error-${width}.png`) });
+       if (renderLint) {
+-        const lint = await page.evaluate((snippet) => (0, eval)(snippet),
+-          renderLint.renderLintSnippet(".kit-modal-panel"));
++        const lint = await page.evaluate(
++          (snippet) => (0, eval)(snippet),
++          renderLint.renderLintSnippet(".kit-modal-panel"),
++        );
+         console.log(`render-lint width=${width}px violations=${JSON.stringify(lint)}`);
+         if (renderProofDir) {
+           mkdirSync(renderProofDir, { recursive: true });
+@@ -198,17 +202,16 @@ test.describe("go to session", () => {
+         await page.screenshot({
+           path: join(
+             renderArtifactDir,
+-            width === 1280
+-              ? "agentsview-1768-2-after.png"
+-              : `agentsview-1768-2-${width}.png`,
++            width === 1280 ? "agentsview-1768-2-after.png" : `agentsview-1768-2-${width}.png`,
+           ),
+         });
+       }
+     }
+ 
+     const observed = await page.evaluate(
+-      () => (window as Window & { __goToSessionShortcutObserved?: boolean[] })
+-        .__goToSessionShortcutObserved,
++      () =>
++        (window as Window & { __goToSessionShortcutObserved?: boolean[] })
++          .__goToSessionShortcutObserved,
+     );
+     expect(observed?.[0]).toBe(true);
+     await input.press("Escape");
+@@ -220,13 +223,17 @@ test.describe("go to session", () => {
+     await input.fill(TARGET_UUID);
+     await input.press("Enter");
+ 
+-    await expect(page).toHaveURL(new RegExp(`${TARGET_PATH.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\?desktop=1$`));
++    await expect(page).toHaveURL(
++      new RegExp(`${TARGET_PATH.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\?desktop=1$`),
++    );
+     await expect(page.getByText("Off-list hydrated content hydrated")).toBeVisible();
+     expect(await page.evaluate(() => window.history.length)).toBe(beforeTarget + 1);
+     expect(await page.evaluate(() => window.location.search)).toBe("?desktop=1");
+     expect(await page.evaluate(() => window.location.pathname)).toBe(TARGET_PATH);
+     expect(listResponses.length).toBeGreaterThan(0);
+-    expect(listResponses.every(({ ids }) => ids.every((id) => !id.includes(TARGET_UUID)))).toBe(true);
++    expect(listResponses.every(({ ids }) => ids.every((id) => !id.includes(TARGET_UUID)))).toBe(
++      true,
++    );
+ 
+     await page.keyboard.press(`${modifier}+f`);
+     const findInput = page.locator(".kit-find-bar__input");
+@@ -248,7 +255,9 @@ test.describe("go to session", () => {
+     await input.fill(OPAQUE_ID);
+     await input.press("Enter");
+ 
+-    await expect(page).toHaveURL(new RegExp(`${OPAQUE_PATH.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\?desktop=1$`));
++    await expect(page).toHaveURL(
++      new RegExp(`${OPAQUE_PATH.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\?desktop=1$`),
++    );
+     await expect(page.getByText("Opaque session ID content")).toBeVisible();
+ 
+     await page.keyboard.press(`${modifier}+g`);
+@@ -256,7 +265,9 @@ test.describe("go to session", () => {
+     await input.fill(MISSING_UUID);
+     await input.press("Enter");
+ 
+-    await expect(page).toHaveURL(new RegExp(`${MISSING_PATH.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\?desktop=1$`));
++    await expect(page).toHaveURL(
++      new RegExp(`${MISSING_PATH.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\?desktop=1$`),
++    );
+     await expect(page.getByText("Session not found")).toBeVisible();
+     await expect(page.getByText("Off-list hydrated content hydrated")).toHaveCount(0);
+   });
+diff --git a/frontend/e2e/navigation.spec.ts b/frontend/e2e/navigation.spec.ts
+index 19c500ed..77c629eb 100644
+--- a/frontend/e2e/navigation.spec.ts
++++ b/frontend/e2e/navigation.spec.ts
+@@ -1,5 +1,6 @@
+ import { test, expect } from "@playwright/test";
+ import { SessionsPage } from "./pages/sessions-page";
++import { waitForRowHitTarget } from "./helpers/virtual-list-helpers";
+ 
+ test.describe("Navigation", () => {
+   let sp: SessionsPage;
+@@ -131,7 +132,8 @@ test.describe("Navigation", () => {
+     await session.click();
+     await expect(session).toHaveClass(/active/);
+     await expect(sp.scroller).toHaveAttribute("data-messages-session-id", sessionId);
+-    await expect(sp.messageRows).toHaveCount(6);
++    // Three prompts plus a turn-header/final-output pair per collapsed turn.
++    await expect(sp.messageRows).toHaveCount(7);
+ 
+     const users = sp.messageRows.filter({
+       has: page.locator(".message.is-user"),
+@@ -139,11 +141,14 @@ test.describe("Navigation", () => {
+     await users.first().click();
+     await expect(users.first()).toHaveClass(/selected/);
+ 
+-    const assistants = sp.messageRows.filter({
+-      has: page.locator(".message:not(.is-user)"),
+-    });
++    // Plain j moves by message ordinal: it expands the owning assistant
++    // turn and lands on the event row that renders the next stop — the
++    // turn's final output is a static preview, so the selected row is a
++    // turn-event, not a flat message row.
+     await page.keyboard.press("j");
+-    await expect(assistants.first()).toHaveClass(/selected/);
++    const assistantSelection = page.locator(".virtual-row.selected");
++    await expect(assistantSelection).toHaveCount(1);
++    await expect(assistantSelection.locator(".turn-event")).toHaveCount(1);
+     await users.first().click();
+ 
+     await page.keyboard.press("Shift+J");
+@@ -151,11 +156,15 @@ test.describe("Navigation", () => {
+     await page.keyboard.press("Shift+K");
+     await expect(users.first()).toHaveClass(/selected/);
+ 
++    await waitForRowHitTarget(users.nth(1));
+     await users.nth(1).click();
+     await sp.toggleSortOrder();
+     await expect(users.nth(1)).toHaveClass(/selected/);
+     await page.keyboard.press("Shift+J");
+     await expect(users.nth(2)).toHaveClass(/selected/);
++    // Rows re-measure after the sort toggle and reveal scroll;
++    // wait for them to stop overlapping before clicking.
++    await waitForRowHitTarget(users.nth(1));
+     await users.nth(1).click();
+     await page.keyboard.press("Shift+K");
+     await expect(users.nth(0)).toHaveClass(/selected/);
+diff --git a/frontend/e2e/session-list.spec.ts b/frontend/e2e/session-list.spec.ts
+index dc3d863e..a1b5d6eb 100644
+--- a/frontend/e2e/session-list.spec.ts
++++ b/frontend/e2e/session-list.spec.ts
+@@ -2,7 +2,11 @@ import { createRequire } from "node:module";
+ import { test, expect } from "@playwright/test";
+ import { SessionsPage } from "./pages/sessions-page";
+ import { clickNavTab } from "./helpers/nav";
+-import { createMockSessions, handleSessionsRoute, sessionsRoutePattern } from "./helpers/mock-sessions";
++import {
++  createMockSessions,
++  handleSessionsRoute,
++  sessionsRoutePattern,
++} from "./helpers/mock-sessions";
+ 
+ type RenderLintModule = {
+   renderLintSnippet: (scopeSelector: string, options?: Record<string, unknown>) => string;
+@@ -10,9 +14,7 @@ type RenderLintModule = {
+ 
+ const require = createRequire(import.meta.url);
+ const renderLintPath = process.env.PR_RENDER_LINT_PATH;
+-const renderLint = renderLintPath
+-  ? (require(renderLintPath) as RenderLintModule)
+-  : undefined;
++const renderLint = renderLintPath ? (require(renderLintPath) as RenderLintModule) : undefined;
+ 
+ // Test-fixture assumptions: project-alpha has 2 sessions,
+ // project-beta has 3, project-duration has 1 (the duration UX
+@@ -47,7 +49,10 @@ test("session previews hide a leading system-reminder envelope", async ({ page }
+     first_message:
+       '<system-reminder data-role="user-context">ctx</system-reminder>\nrefactor the auth guard',
+   };
+-  await page.route(sessionsRoutePattern, handleSessionsRoute([{ sessions: [session], project: null }]));
++  await page.route(
++    sessionsRoutePattern,
++    handleSessionsRoute([{ sessions: [session], project: null }]),
++  );
+   await page.route("**/api/v1/projects*", (route) =>
+     route.fulfill({ json: { projects: [{ name: "project-preview", session_count: 1 }] } }),
+   );
+@@ -128,7 +133,9 @@ test.describe("Session list", () => {
+ 
+     await sp.messageRows.first().click();
+     await page.keyboard.press("ArrowDown");
+-    await expect(sp.messageRows.nth(1)).toHaveClass(/selected/);
++    // j/k stops at content rows only: the prompt's next ordinal is rendered
++    // by the collapsed turn's final-output row, past its header.
++    await expect(sp.messageRows.nth(2)).toHaveClass(/selected/);
+   });
+ 
+   const filterCases = [
+diff --git a/frontend/messages/az.json b/frontend/messages/az.json
+index c61cdb78..75b29cb0 100644
+--- a/frontend/messages/az.json
++++ b/frontend/messages/az.json
+@@ -66,6 +66,8 @@
+   "header_transcript_filter_label": "Blok növlərini süz",
+   "header_transcript_visibility": "Blokların görünməsi",
+   "header_transcript_show_all": "Hamısını göstər",
++  "transcript_expand_all": "Hamısını aç",
++  "transcript_collapse_all": "Hamısını yığ",
+   "header_transcript_blocks_user": "İstifadəçi mesajları",
+   "header_transcript_blocks_assistant": "Köməkçi mətni",
+   "header_transcript_blocks_thinking": "Düşünmə blokları",
+@@ -374,6 +376,8 @@
+   "tool_block_status_label": "Vəziyyət:",
+   "tool_block_source_label": "Mənbə:",
+   "tool_block_agent_label": "Agent:",
++  "tool_block_subagent_label": "Alt agent:",
++  "tool_block_subagent_result_label": "Alt agentin nəticəsi:",
+   "tool_block_show_less": "Daha az göstər",
+   "tool_block_show_all_lines": [
+     {
+@@ -400,6 +404,7 @@
+     }
+   ],
+   "sidebar_loading": "Yüklənir",
++  "sidebar_load_more": "Daha çox yüklə",
+   "sidebar_multi_select": "Çoxlu seçim",
+   "sidebar_exit_multi_select": "Çoxlu seçimdən çıx",
+   "sidebar_select_all_visible": "Bütün görünənləri seç",
+@@ -2381,6 +2386,30 @@
+   ],
+   "settings_image_cleanup_compact_note": "Məlumat yüklərinin silinməsi saxlanılmış sətirləri yenidən yazır. Arxiv faylının ölçüsü agentsview db compact əmrini icra edənədək dəyişmir.",
+   "appearance_render_unknown_xml_blocks": "Naməlum XML bloklarını əvvəlcədən formatlanmış mətn kimi göstər",
++  "appearance_auto_collapse_assistant_turns": "Köməkçi növbələrini susmaya görə yığ",
++  "message_content_show_full_prompt": "Tam sorğunu göstər",
++  "message_content_show_less": "Daha az göstər",
++  "assistant_turn_event_message": "Mesaj",
++  "assistant_turn_message_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} mesaj",
++        "countPlural=other": "{countLabel} mesaj"
++      }
++    }
++  ],
++  "assistant_turn_tool_call_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} alət çağırışı",
++        "countPlural=other": "{countLabel} alət çağırışı"
++      }
++    }
++  ],
+   "go_to_session_title": "Sessiyaya keç",
+   "go_to_session_input_label": "Sessiya ID-si və ya UUID",
+   "go_to_session_placeholder": "Sessiya ID-sini və ya UUID-ni yapışdır",
+diff --git a/frontend/messages/en.json b/frontend/messages/en.json
+index 2b69da85..2b83d1c0 100644
+--- a/frontend/messages/en.json
++++ b/frontend/messages/en.json
+@@ -64,6 +64,8 @@
+   "header_transcript_filter_label": "Filter block types",
+   "header_transcript_visibility": "Block Visibility",
+   "header_transcript_show_all": "Show all",
++  "transcript_expand_all": "Expand all",
++  "transcript_collapse_all": "Collapse all",
+   "header_transcript_blocks_user": "User messages",
+   "header_transcript_blocks_assistant": "Assistant text",
+   "header_transcript_blocks_thinking": "Thinking blocks",
+@@ -372,6 +374,8 @@
+   "tool_block_status_label": "status:",
+   "tool_block_source_label": "source:",
+   "tool_block_agent_label": "agent:",
++  "tool_block_subagent_label": "Subagent:",
++  "tool_block_subagent_result_label": "Subagent result:",
+   "tool_block_show_less": "show less",
+   "tool_block_show_all_lines": [
+     {
+@@ -398,6 +402,7 @@
+     }
+   ],
+   "sidebar_loading": "loading",
++  "sidebar_load_more": "Load more",
+   "sidebar_multi_select": "Multi-select",
+   "sidebar_exit_multi_select": "Exit multi-select",
+   "sidebar_select_all_visible": "Select all visible",
+@@ -2379,6 +2384,30 @@
+   ],
+   "settings_image_cleanup_compact_note": "Removing payloads rewrites the stored rows. The archive file keeps its size until you run agentsview db compact.",
+   "appearance_render_unknown_xml_blocks": "Render unknown XML blocks as preformatted text",
++  "appearance_auto_collapse_assistant_turns": "Collapse assistant turns by default",
++  "message_content_show_full_prompt": "Show full prompt",
++  "message_content_show_less": "Show less",
++  "assistant_turn_event_message": "Message",
++  "assistant_turn_message_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} message",
++        "countPlural=other": "{countLabel} messages"
++      }
++    }
++  ],
++  "assistant_turn_tool_call_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} tool call",
++        "countPlural=other": "{countLabel} tool calls"
++      }
++    }
++  ],
+   "go_to_session_title": "Go to session",
+   "go_to_session_input_label": "Session ID or UUID",
+   "go_to_session_placeholder": "Paste a session ID or UUID",
+diff --git a/frontend/messages/es.json b/frontend/messages/es.json
+index 63a900f6..df67a920 100644
+--- a/frontend/messages/es.json
++++ b/frontend/messages/es.json
+@@ -66,6 +66,8 @@
+   "header_transcript_filter_label": "Filtrar tipos de bloque",
+   "header_transcript_visibility": "Visibilidad de bloques",
+   "header_transcript_show_all": "Mostrar todo",
++  "transcript_expand_all": "Expandir todo",
++  "transcript_collapse_all": "Contraer todo",
+   "header_transcript_blocks_user": "Mensajes del usuario",
+   "header_transcript_blocks_assistant": "Texto del asistente",
+   "header_transcript_blocks_thinking": "Bloques de razonamiento",
+@@ -374,6 +376,8 @@
+   "tool_block_status_label": "estado:",
+   "tool_block_source_label": "origen:",
+   "tool_block_agent_label": "agente:",
++  "tool_block_subagent_label": "Subagente:",
++  "tool_block_subagent_result_label": "Resultado del subagente:",
+   "tool_block_show_less": "mostrar menos",
+   "tool_block_show_all_lines": [
+     {
+@@ -400,6 +404,7 @@
+     }
+   ],
+   "sidebar_loading": "cargando",
++  "sidebar_load_more": "Cargar más",
+   "sidebar_multi_select": "Selección múltiple",
+   "sidebar_exit_multi_select": "Salir de la selección múltiple",
+   "sidebar_select_all_visible": "Seleccionar todas las visibles",
+@@ -2381,6 +2386,30 @@
+   ],
+   "settings_image_cleanup_compact_note": "Quitar las cargas útiles reescribe las filas almacenadas. El archivo de almacenamiento conserva su tamaño hasta que ejecutes agentsview db compact.",
+   "appearance_render_unknown_xml_blocks": "Mostrar los bloques XML desconocidos como texto preformateado",
++  "appearance_auto_collapse_assistant_turns": "Contraer los turnos del asistente de forma predeterminada",
++  "message_content_show_full_prompt": "Mostrar el prompt completo",
++  "message_content_show_less": "Mostrar menos",
++  "assistant_turn_event_message": "Mensaje",
++  "assistant_turn_message_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} mensaje",
++        "countPlural=other": "{countLabel} mensajes"
++      }
++    }
++  ],
++  "assistant_turn_tool_call_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} llamada a herramienta",
++        "countPlural=other": "{countLabel} llamadas a herramienta"
++      }
++    }
++  ],
+   "go_to_session_title": "Ir a sesión",
+   "go_to_session_input_label": "ID o UUID de sesión",
+   "go_to_session_placeholder": "Pega un ID o UUID de sesión",
+diff --git a/frontend/messages/fr.json b/frontend/messages/fr.json
+index ebbb8241..f4a43d3f 100644
+--- a/frontend/messages/fr.json
++++ b/frontend/messages/fr.json
+@@ -64,6 +64,8 @@
+   "header_transcript_filter_label": "Filtrer les types de blocs",
+   "header_transcript_visibility": "Visibilité des blocs",
+   "header_transcript_show_all": "Tout afficher",
++  "transcript_expand_all": "Tout développer",
++  "transcript_collapse_all": "Tout réduire",
+   "header_transcript_blocks_user": "Messages utilisateur",
+   "header_transcript_blocks_assistant": "Texte de l'assistant",
+   "header_transcript_blocks_thinking": "Blocs de réflexion",
+@@ -372,6 +374,8 @@
+   "tool_block_status_label": "état :",
+   "tool_block_source_label": "source :",
+   "tool_block_agent_label": "agent :",
++  "tool_block_subagent_label": "Sous-agent :",
++  "tool_block_subagent_result_label": "Résultat du sous-agent :",
+   "tool_block_show_less": "afficher moins",
+   "tool_block_show_all_lines": [
+     {
+@@ -398,6 +402,7 @@
+     }
+   ],
+   "sidebar_loading": "chargement",
++  "sidebar_load_more": "Charger plus",
+   "sidebar_multi_select": "Sélection multiple",
+   "sidebar_exit_multi_select": "Quitter la sélection multiple",
+   "sidebar_select_all_visible": "Sélectionner les sessions visibles",
+@@ -2378,6 +2383,30 @@
+   ],
+   "settings_image_cleanup_compact_note": "La suppression des charges réécrit les lignes stockées. La taille du fichier d'archive reste inchangée jusqu'à ce que vous exécutiez agentsview db compact.",
+   "appearance_render_unknown_xml_blocks": "Afficher les blocs XML inconnus en texte préformaté",
++  "appearance_auto_collapse_assistant_turns": "Réduire les tours de l'assistant par défaut",
++  "message_content_show_full_prompt": "Afficher le prompt complet",
++  "message_content_show_less": "Afficher moins",
++  "assistant_turn_event_message": "Message",
++  "assistant_turn_message_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} message",
++        "countPlural=other": "{countLabel} messages"
++      }
++    }
++  ],
++  "assistant_turn_tool_call_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} appel d'outil",
++        "countPlural=other": "{countLabel} appels d'outil"
++      }
++    }
++  ],
+   "go_to_session_title": "Accéder à une session",
+   "go_to_session_input_label": "ID ou UUID de session",
+   "go_to_session_placeholder": "Collez un ID ou UUID de session",
+diff --git a/frontend/messages/ja.json b/frontend/messages/ja.json
+index 52ab45aa..e6217117 100644
+--- a/frontend/messages/ja.json
++++ b/frontend/messages/ja.json
+@@ -64,6 +64,8 @@
+   "header_transcript_filter_label": "フィルターブロックタイプ",
+   "header_transcript_visibility": "ブロックの可視性",
+   "header_transcript_show_all": "すべて表示",
++  "transcript_expand_all": "すべて展開",
++  "transcript_collapse_all": "すべて折りたたむ",
+   "header_transcript_blocks_user": "ユーザーメッセージ",
+   "header_transcript_blocks_assistant": "アシスタントテキスト",
+   "header_transcript_blocks_thinking": "思考ブロック",
+@@ -372,6 +374,8 @@
+   "tool_block_status_label": "状態：",
+   "tool_block_source_label": "ソース：",
+   "tool_block_agent_label": "エージェント：",
++  "tool_block_subagent_label": "サブエージェント：",
++  "tool_block_subagent_result_label": "サブエージェントの結果：",
+   "tool_block_show_less": "あまり見せない",
+   "tool_block_show_all_lines": [
+     {
+@@ -398,6 +402,7 @@
+     }
+   ],
+   "sidebar_loading": "読み込み中",
++  "sidebar_load_more": "さらに読み込む",
+   "sidebar_multi_select": "複数選択",
+   "sidebar_exit_multi_select": "複数選択を終了する",
+   "sidebar_select_all_visible": "表示されているものをすべて選択します",
+@@ -2367,6 +2372,30 @@
+   ],
+   "settings_image_cleanup_compact_note": "ペイロードの削除は保存済み行を書き換えます。agentsview db compact を実行するまでアーカイブファイルのサイズは変わりません。",
+   "appearance_render_unknown_xml_blocks": "不明なXMLブロックを整形済みテキストとして表示",
++  "appearance_auto_collapse_assistant_turns": "アシスタントのターンを既定で折りたたむ",
++  "message_content_show_full_prompt": "プロンプト全体を表示",
++  "message_content_show_less": "折りたたむ",
++  "assistant_turn_event_message": "メッセージ",
++  "assistant_turn_message_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} 件のメッセージ",
++        "countPlural=other": "{countLabel} 件のメッセージ"
++      }
++    }
++  ],
++  "assistant_turn_tool_call_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=one": "{countLabel} 個のツール呼び出し",
++        "countPlural=other": "{countLabel} 個のツール呼び出し"
++      }
++    }
++  ],
+   "go_to_session_title": "セッションへ移動",
+   "go_to_session_input_label": "セッションIDまたはUUID",
+   "go_to_session_placeholder": "セッションIDまたはUUIDを貼り付け",
+diff --git a/frontend/messages/ko.json b/frontend/messages/ko.json
+index 0ab7a38f..a94ec7ed 100644
+--- a/frontend/messages/ko.json
++++ b/frontend/messages/ko.json
+@@ -64,6 +64,8 @@
+   "header_transcript_filter_label": "블록 유형 필터",
+   "header_transcript_visibility": "블록 표시 여부",
+   "header_transcript_show_all": "모두 표시",
++  "transcript_expand_all": "모두 펼치기",
++  "transcript_collapse_all": "모두 접기",
+   "header_transcript_blocks_user": "사용자 메시지",
+   "header_transcript_blocks_assistant": "어시스턴트 텍스트",
+   "header_transcript_blocks_thinking": "사고 블록",
+@@ -361,6 +363,8 @@
+   "tool_block_status_label": "상태:",
+   "tool_block_source_label": "출처:",
+   "tool_block_agent_label": "에이전트:",
++  "tool_block_subagent_label": "서브에이전트:",
++  "tool_block_subagent_result_label": "서브에이전트 결과:",
+   "tool_block_show_less": "간략히 보기",
+   "tool_block_show_all_lines": [
+     {
+@@ -385,6 +389,7 @@
+     }
+   ],
+   "sidebar_loading": "불러오는 중",
++  "sidebar_load_more": "더 보기",
+   "sidebar_multi_select": "다중 선택",
+   "sidebar_exit_multi_select": "다중 선택 종료",
+   "sidebar_select_all_visible": "표시된 항목 모두 선택",
+@@ -2296,6 +2301,28 @@
+   ],
+   "settings_image_cleanup_compact_note": "페이로드를 제거하면 저장된 행이 다시 작성됩니다. agentsview db compact를 실행할 때까지 아카이브 파일 크기는 유지됩니다.",
+   "appearance_render_unknown_xml_blocks": "알 수 없는 XML 블록을 미리 서식이 지정된 텍스트로 표시",
++  "appearance_auto_collapse_assistant_turns": "어시스턴트 턴을 기본으로 접기",
++  "message_content_show_full_prompt": "전체 프롬프트 보기",
++  "message_content_show_less": "간략히 보기",
++  "assistant_turn_event_message": "메시지",
++  "assistant_turn_message_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=other": "메시지 {countLabel}개"
++      }
++    }
++  ],
++  "assistant_turn_tool_call_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=other": "도구 호출 {countLabel}회"
++      }
++    }
++  ],
+   "go_to_session_title": "세션으로 이동",
+   "go_to_session_input_label": "세션 ID 또는 UUID",
+   "go_to_session_placeholder": "세션 ID 또는 UUID 붙여넣기",
+diff --git a/frontend/messages/zh-CN.json b/frontend/messages/zh-CN.json
+index 5e2e7fe1..d060bb85 100644
+--- a/frontend/messages/zh-CN.json
++++ b/frontend/messages/zh-CN.json
+@@ -64,6 +64,8 @@
+   "header_transcript_filter_label": "筛选 block 类型",
+   "header_transcript_visibility": "Block 可见性",
+   "header_transcript_show_all": "全部显示",
++  "transcript_expand_all": "全部展开",
++  "transcript_collapse_all": "全部折叠",
+   "header_transcript_blocks_user": "用户消息",
+   "header_transcript_blocks_assistant": "助手文本",
+   "header_transcript_blocks_thinking": "思考块",
+@@ -361,6 +363,8 @@
+   "tool_block_status_label": "状态：",
+   "tool_block_source_label": "来源：",
+   "tool_block_agent_label": "agent：",
++  "tool_block_subagent_label": "子代理：",
++  "tool_block_subagent_result_label": "子代理结果：",
+   "tool_block_show_less": "收起",
+   "tool_block_show_all_lines": [
+     {
+@@ -385,6 +389,7 @@
+     }
+   ],
+   "sidebar_loading": "加载中",
++  "sidebar_load_more": "加载更多",
+   "sidebar_multi_select": "多选",
+   "sidebar_exit_multi_select": "退出多选",
+   "sidebar_select_all_visible": "选择所有可见会话",
+@@ -2296,6 +2301,28 @@
+   ],
+   "settings_image_cleanup_compact_note": "删除载荷会重写存储的行。在运行 agentsview db compact 之前，存档文件大小保持不变。",
+   "appearance_render_unknown_xml_blocks": "将未知 XML 块渲染为预格式化文本",
++  "appearance_auto_collapse_assistant_turns": "默认折叠助手回合",
++  "message_content_show_full_prompt": "显示完整提示",
++  "message_content_show_less": "收起",
++  "assistant_turn_event_message": "消息",
++  "assistant_turn_message_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=other": "{countLabel} 条消息"
++      }
++    }
++  ],
++  "assistant_turn_tool_call_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=other": "{countLabel} 次 tool call"
++      }
++    }
++  ],
+   "go_to_session_title": "跳转到会话",
+   "go_to_session_input_label": "会话 ID 或 UUID",
+   "go_to_session_placeholder": "粘贴会话 ID 或 UUID",
+diff --git a/frontend/messages/zh-TW.json b/frontend/messages/zh-TW.json
+index 9c745323..f2b2d285 100644
+--- a/frontend/messages/zh-TW.json
++++ b/frontend/messages/zh-TW.json
+@@ -64,6 +64,8 @@
+   "header_transcript_filter_label": "篩選 block 類型",
+   "header_transcript_visibility": "Block 可見性",
+   "header_transcript_show_all": "全部顯示",
++  "transcript_expand_all": "全部展開",
++  "transcript_collapse_all": "全部摺疊",
+   "header_transcript_blocks_user": "使用者訊息",
+   "header_transcript_blocks_assistant": "助手文本",
+   "header_transcript_blocks_thinking": "思考區塊",
+@@ -361,6 +363,8 @@
+   "tool_block_status_label": "狀態：",
+   "tool_block_source_label": "來源：",
+   "tool_block_agent_label": "agent：",
++  "tool_block_subagent_label": "子代理：",
++  "tool_block_subagent_result_label": "子代理結果：",
+   "tool_block_show_less": "收起",
+   "tool_block_show_all_lines": [
+     {
+@@ -385,6 +389,7 @@
+     }
+   ],
+   "sidebar_loading": "載入中",
++  "sidebar_load_more": "載入更多",
+   "sidebar_multi_select": "多選",
+   "sidebar_exit_multi_select": "退出多選",
+   "sidebar_select_all_visible": "選擇所有可見對話",
+@@ -2296,6 +2301,28 @@
+   ],
+   "settings_image_cleanup_compact_note": "刪除有效載荷會改寫儲存的資料列。在執行 agentsview db compact 之前，封存檔大小保持不變。",
+   "appearance_render_unknown_xml_blocks": "將未知 XML 區塊以預格式化文字呈現",
++  "appearance_auto_collapse_assistant_turns": "預設摺疊助手回合",
++  "message_content_show_full_prompt": "顯示完整提示",
++  "message_content_show_less": "收起",
++  "assistant_turn_event_message": "訊息",
++  "assistant_turn_message_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=other": "{countLabel} 則訊息"
++      }
++    }
++  ],
++  "assistant_turn_tool_call_count": [
++    {
++      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
++      "selectors": ["countPlural"],
++      "match": {
++        "countPlural=other": "{countLabel} 次 tool call"
++      }
++    }
++  ],
+   "go_to_session_title": "跳轉至對話",
+   "go_to_session_input_label": "對話 ID 或 UUID",
+   "go_to_session_placeholder": "貼上對話 ID 或 UUID",
+diff --git a/frontend/src/App.svelte b/frontend/src/App.svelte
+index 96aa2975..76a80737 100644
+--- a/frontend/src/App.svelte
++++ b/frontend/src/App.svelte
+@@ -73,6 +73,7 @@
+   import { messages } from "./lib/stores/messages.svelte.js";
+   import { sync } from "./lib/stores/sync.svelte.js";
+   import { ui } from "./lib/stores/ui.svelte.js";
++  import { inSessionSearch } from "./lib/stores/inSessionSearch.svelte.js";
+   import { router } from "./lib/stores/router.svelte.js";
+   import { starred } from "./lib/stores/starred.svelte.js";
+   import { pins } from "./lib/stores/pins.svelte.js";
+@@ -122,6 +123,7 @@
+         scrollToOrdinal: (o: number) => void;
+         getDisplayItems: () => DisplayItem[];
+         getNormalDisplayItems: () => DisplayItem[];
++        getNavigableOrdinals: () => number[];
+       }
+     | undefined = $state(undefined);
+ 
+@@ -278,43 +280,54 @@
+     });
+   });
+ 
++  // One j/k step crosses one source message ordinal. Turn headers are
++  // never stops: the list comes from the transcript rows that render
++  // content, already in display order for the active sort direction.
+   function navigateMessage(delta: number) {
+-    const items = messageListRef?.getDisplayItems();
+-    if (!items || items.length === 0) return;
+-
+-    const sorted = ui.sortNewestFirst
+-      ? [...items].reverse()
+-      : items;
++    const ordinals = messageListRef?.getNavigableOrdinals();
++    if (!ordinals || ordinals.length === 0) return;
+ 
+     const selected = ui.selectedOrdinal;
+     if (selected === null) {
+-      const first = sorted[0]!;
+-      navigateToMessageOrdinal(first.ordinals[0]!);
++      navigateToMessageOrdinal(ordinals[0]!);
+       return;
+     }
+ 
+-    const curIdx = sorted.findIndex((item) =>
+-      item.ordinals.includes(selected),
+-    );
+-    const nextIdx = Math.max(
+-      0,
+-      Math.min(sorted.length - 1, curIdx + delta),
+-    );
+-    if (nextIdx === curIdx) return;
++    const curIdx = ordinals.indexOf(selected);
++    if (curIdx >= 0) {
++      const nextIdx = Math.max(
++        0,
++        Math.min(ordinals.length - 1, curIdx + delta),
++      );
++      if (nextIdx === curIdx) return;
++      navigateToMessageOrdinal(ordinals[nextIdx]!);
++      return;
++    }
+ 
+-    const next = sorted[nextIdx]!;
+-    navigateToMessageOrdinal(next.ordinals[0]!);
++    // The selection isn't a navigable stop (e.g. a folded turn member's
++    // ordinal recorded by a header click). Anchor the step where it would
++    // sort in display order — ordinals run newest-first when sorted that
++    // way — so j moves to the next stop after it and k to the one before.
++    const insertionIdx = ordinals.findIndex((ordinal) =>
++      ui.sortNewestFirst ? ordinal < selected : ordinal > selected,
++    );
++    const slot = insertionIdx < 0 ? ordinals.length : insertionIdx;
++    const nextIdx = delta > 0 ? slot : slot - 1;
++    if (nextIdx < 0 || nextIdx >= ordinals.length) return;
++    navigateToMessageOrdinal(ordinals[nextIdx]!);
+   }
+ 
+   function navigateUserPrompt(delta: number) {
+     const items = messageListRef?.getDisplayItems();
+     if (!items || items.length === 0) return;
+ 
++    // Prompt rows an active search reveals are navigable too, so the jump
++    // target check uses effective visibility rather than the saved filter.
+     const ordinal = findUserPromptOrdinal(
+       items,
+       ui.selectedOrdinal,
+       ui.sortNewestFirst ? -delta : delta,
+-      ui.isBlockVisible("user"),
++      inSessionSearch.isBlockEffectivelyVisible("user"),
+     );
+     if (ordinal !== undefined) navigateToMessageOrdinal(ordinal);
+   }
+diff --git a/frontend/src/App.test.ts b/frontend/src/App.test.ts
+index ae65d929..8dcd162d 100644
+--- a/frontend/src/App.test.ts
++++ b/frontend/src/App.test.ts
+@@ -1,9 +1,10 @@
+ // @vitest-environment jsdom
+-import { afterEach, describe, expect, it, vi } from "vite-plus/test";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+ import { mount, tick, unmount } from "svelte";
+ import { analytics } from "./lib/stores/analytics.svelte.js";
+ import { analyticsPageDates } from "./lib/stores/analyticsPageDates.js";
+ import { insights } from "./lib/stores/insights.svelte.js";
++import { inSessionSearch } from "./lib/stores/inSessionSearch.svelte.js";
+ import { messages } from "./lib/stores/messages.svelte.js";
+ import { pins } from "./lib/stores/pins.svelte.js";
+ import { router } from "./lib/stores/router.svelte.js";
+@@ -13,6 +14,7 @@ import { createSessionsStore, sessions } from "./lib/stores/sessions.svelte.js";
+ import { settings } from "./lib/stores/settings.svelte.js";
+ import { starred } from "./lib/stores/starred.svelte.js";
+ import { sync } from "./lib/stores/sync.svelte.js";
++import { turnCollapse } from "./lib/stores/turn-collapse.svelte.js";
+ import { ui } from "./lib/stores/ui.svelte.js";
+ import { usage } from "./lib/stores/usage.svelte.js";
+ import { yokedDates } from "./lib/stores/yokedDates.svelte.js";
+@@ -1371,6 +1373,168 @@ describe("App root Sessions landing", () => {
+   });
+ });
+ 
++function navMessage(
++  ordinal: number,
++  role: Message["role"],
++  content: string,
++  overrides: Partial<Message> = {},
++): Message {
++  return {
++    id: 5000 + ordinal,
++    session_id: "s1",
++    ordinal,
++    role,
++    content,
++    content_length: content.length,
++    timestamp: `2026-01-01T00:00:${String(ordinal).padStart(2, "0")}Z`,
++    has_thinking: false,
++    thinking_text: "",
++    has_tool_use: false,
++    model: "",
++    context_tokens: 0,
++    output_tokens: 0,
++    has_context_tokens: false,
++    has_output_tokens: false,
++    is_system: false,
++    is_sidechain: false,
++    ...overrides,
++  } as Message;
++}
++
++describe("App transcript keyboard navigation", () => {
++  beforeEach(() => {
++    stubAppDependencies();
++    vi.spyOn(sessions, "navigateToSession").mockResolvedValue();
++    router.route = "sessions";
++    router.sessionId = "s1";
++    sessions.activeSessionId = "s1";
++    messages.sessionId = "s1";
++    messages.loading = false;
++    messages.hasOlder = false;
++    messages.messages = [
++      navMessage(0, "user", "first ask"),
++      navMessage(1, "assistant", "[Thinking]\nplan\n[/Thinking]\nworking on it", {
++        has_thinking: true,
++      }),
++      navMessage(2, "assistant", "final answer"),
++      navMessage(3, "user", "second ask"),
++      // A hidden system user row between the second prompt and its
++      // answer must never be a prompt-jump target.
++      navMessage(4, "user", "system notice", { is_system: true }),
++      navMessage(5, "assistant", "second answer"),
++    ];
++    ui.setTranscriptMode("normal");
++    ui.setAutoCollapseAssistantTurns(true);
++    ui.showAllBlocks();
++    ui.sortNewestFirst = false;
++    ui.followLatest = false;
++    ui.selectedOrdinal = null;
++    turnCollapse.activateSession(null);
++    inSessionSearch.close();
++  });
++
++  afterEach(() => {
++    inSessionSearch.close();
++    turnCollapse.activateSession(null);
++    messages.clear();
++    ui.setTranscriptMode("normal");
++    ui.setAutoCollapseAssistantTurns(true);
++    ui.showAllBlocks();
++    ui.sortNewestFirst = false;
++    ui.selectedOrdinal = null;
++  });
++
++  function key(k: string, shiftKey = false) {
++    document.dispatchEvent(new KeyboardEvent("keydown", { key: k, shiftKey }));
++  }
++
++  it("steps j/k one source message ordinal at a time and expands the owning turn", async () => {
++    component = mount(App, { target: document.body });
++    await flushEffects();
++
++    key("j");
++    await flushEffects();
++    expect(ui.selectedOrdinal).toBe(0);
++
++    // The folded member (ordinal 1) is not a stop: j lands on the turn's
++    // final-output ordinal and expands its owning turn on the way.
++    key("j");
++    await flushEffects();
++    expect(ui.selectedOrdinal).toBe(2);
++    expect(turnCollapse.isTurnExpanded("s1:turn:5001", false)).toBe(true);
++
++    // Expanded member events join the navigable ordinals: k reaches the
++    // previously folded message.
++    key("k");
++    await flushEffects();
++    expect(ui.selectedOrdinal).toBe(1);
++
++    key("j");
++    key("j");
++    await flushEffects();
++    expect(ui.selectedOrdinal).toBe(3);
++
++    key("j");
++    await flushEffects();
++    expect(ui.selectedOrdinal).toBe(5);
++    expect(turnCollapse.isTurnExpanded("s1:turn:5005", false)).toBe(true);
++
++    // Clamped at the last navigable ordinal.
++    key("j");
++    await flushEffects();
++    expect(ui.selectedOrdinal).toBe(5);
++  });
++
++  it("anchors j/k where a folded-member selection would sort", async () => {
++    component = mount(App, { target: document.body });
++    await flushEffects();
++
++    // Selecting a folded member (e.g. via a collapsed turn header's
++    // ordinals) is not a navigable stop: j moves to the stop after it,
++    // k to the stop before it — never a jump to the first row.
++    ui.selectedOrdinal = 1;
++    key("j");
++    await flushEffects();
++    expect(ui.selectedOrdinal).toBe(2);
++
++    ui.selectedOrdinal = 1;
++    key("k");
++    await flushEffects();
++    expect(ui.selectedOrdinal).toBe(0);
++
++    // A selection beyond every navigable stop moves back to the last
++    // one on k and stays put on j.
++    ui.selectedOrdinal = 99;
++    key("k");
++    await flushEffects();
++    expect(ui.selectedOrdinal).toBe(5);
++
++    ui.selectedOrdinal = 99;
++    key("j");
++    await flushEffects();
++    expect(ui.selectedOrdinal).toBe(99);
++  });
++
++  it("keeps Shift+J/K prompt jumps on real user messages", async () => {
++    component = mount(App, { target: document.body });
++    await flushEffects();
++
++    ui.selectedOrdinal = 5;
++    key("K", true);
++    await flushEffects();
++    // The hidden system-user row at ordinal 4 is never a jump target.
++    expect(ui.selectedOrdinal).toBe(3);
++
++    key("K", true);
++    await flushEffects();
++    expect(ui.selectedOrdinal).toBe(0);
++
++    key("J", true);
++    await flushEffects();
++    expect(ui.selectedOrdinal).toBe(3);
++  });
++});
++
+ function message(ordinal: number, role: Message["role"], isSystem = false) {
+   return {
+     kind: "message" as const,
+diff --git a/frontend/src/lib/components/layout/AppHeader.svelte b/frontend/src/lib/components/layout/AppHeader.svelte
+index 851f2896..5c464438 100644
+--- a/frontend/src/lib/components/layout/AppHeader.svelte
++++ b/frontend/src/lib/components/layout/AppHeader.svelte
+@@ -38,6 +38,13 @@
+     type BlockType,
+   } from "../../stores/ui.svelte.js";
+   import { sessions } from "../../stores/sessions.svelte.js";
++  import { inSessionSearch, toggleBlockFilter } from "../../stores/inSessionSearch.svelte.js";
++  import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
++  import { collectSearchBlocks } from "../../search/block-text.js";
++  import { isTurnEventVisible } from "../../utils/turn-visibility.js";
++  import { enrichSegments, parseContent } from "../../utils/content-parser.js";
++  import type { TurnEvent } from "../../utils/assistant-turns.js";
++  import type { DbToolCall } from "../../api/generated/index.js";
+   import { sync } from "../../stores/sync.svelte.js";
+   import { router, type Route } from "../../stores/router.svelte.js";
+   import {
+@@ -190,6 +197,180 @@
+     sessions.activeSession?.file_path ?? "",
+   );
+ 
++  /** Event kinds that own an `isEventExpanded` disclosure. Rollups and
++   *  system rows do not; the rollup's member disclosures still count. */
++  const DISCLOSURE_EVENT_KINDS = new Set<TurnEvent["kind"]>([
++    "message",
++    "thinking",
++    "skill",
++    "tool",
++  ]);
++
++  /** Result statuses that default a tool output drawer open. */
++  const TOOL_ERROR_STATUSES = new Set(["error", "errored", "failed"]);
++  const toolErrorResult = (call: DbToolCall | undefined): boolean =>
++    (call?.result_events ?? []).some((event) =>
++      TOOL_ERROR_STATUSES.has(event.status),
++    );
++
++  /** Mirror ToolBlock: `collapseKey` tops an `isEventExpanded`
++   *  disclosure, the `:output` drawer renders for result_content, and
++   *  `:history` renders for result_events. Checking all three keys keeps
++   *  the label honest after a single manual fold. */
++  function toolBlockExpanded(
++    key: string,
++    call: DbToolCall | undefined,
++    defaultExpanded: boolean,
++  ): boolean {
++    if (!turnCollapse.isEventExpanded(key, defaultExpanded)) return false;
++    if (
++      call?.result_content &&
++      !turnCollapse.isToolSectionExpanded(`${key}:output`, toolErrorResult(call))
++    ) {
++      return false;
++    }
++    if (
++      (call?.result_events?.length ?? 0) > 0 &&
++      !turnCollapse.isToolSectionExpanded(`${key}:history`, false)
++    ) {
++      return false;
++    }
++    return true;
++  }
++
++  /** The disclosures nested inside one `tool` event beyond its own
++   *  event key: solo call sections, parallel members, or legacy
++   *  `:seg${i}` blocks — matching the ToolBlock tree the row mounts. */
++  function toolEventNestedExpanded(
++    event: TurnEvent,
++    defaultExpanded: boolean,
++  ): boolean {
++    const calls = event.toolCalls ?? [];
++    if (calls.length === 1) {
++      // The solo ToolBlock shares the event's collapse key; only its
++      // sections add keys.
++      return toolBlockExpanded(event.key, calls[0], defaultExpanded);
++    }
++    if (calls.length > 1) {
++      return calls.every((call, index) =>
++        toolBlockExpanded(`${event.key}:${index}`, call, defaultExpanded),
++      );
++    }
++    // Same filter the row applies for its `:seg${i}` member keys.
++    return (event.segments ?? [])
++      .filter((segment) => segment.type === "tool")
++      .every((segment, index) =>
++        toolBlockExpanded(`${event.key}:seg${index}`, segment.toolCall, defaultExpanded),
++      );
++  }
++
++  /** A tool rollup mounts a ToolCallGroup whose member keys derive as
++   *  `${event.key}:${message.id}` plus the call/segment index — the same
++   *  shape the component builds. */
++  function rollupMembersExpanded(
++    event: TurnEvent,
++    defaultExpanded: boolean,
++  ): boolean {
++    for (const message of event.toolMessages ?? []) {
++      const scope = `${event.key}:${message.id}`;
++      if (inSessionSearch.isBlockEffectivelyVisible("thinking")) {
++        for (const block of collectSearchBlocks(message)) {
++          if (block.kind !== "thinking") continue;
++          // ToolCallGroup reuses the block key's trailing segment index.
++          const key = `${scope}:thinking:${block.key.split(":").pop()}`;
++          if (!turnCollapse.isEventExpanded(key, defaultExpanded)) {
++            return false;
++          }
++        }
++      }
++      const calls = message.tool_calls ?? [];
++      if (calls.length === 1) {
++        if (!toolBlockExpanded(`${scope}:0`, calls[0], defaultExpanded)) {
++          return false;
++        }
++      } else if (calls.length > 1) {
++        for (const [index, call] of calls.entries()) {
++          if (!toolBlockExpanded(`${scope}:${index}`, call, defaultExpanded)) {
++            return false;
++          }
++        }
++      } else {
++        const toolSegments = enrichSegments(
++          parseContent(
++            message.content,
++            message.has_tool_use,
++            message.id,
++            message.content_length,
++          ),
++          message.tool_calls,
++        ).filter((segment) => segment.type === "tool");
++        for (const [index, segment] of toolSegments.entries()) {
++          if (
++            !toolBlockExpanded(`${scope}:seg${index}`, segment.toolCall, defaultExpanded)
++          ) {
++            return false;
++          }
++        }
++      }
++    }
++    return true;
++  }
++
++  /** True when every assistant turn that renders rows — and every
++   *  expandable disclosure inside it, down to tool output/history
++   *  drawers and rollup members — currently resolves expanded. Reads the
++   *  shared in-session scope the find index already projects; only
++   *  evaluated while the normal-mode toggle renders. */
++  const allTurnRowsExpanded = $derived.by(() => {
++    const defaultExpanded = !ui.autoCollapseAssistantTurns;
++    const effectivelyVisible = (type: BlockType) =>
++      inSessionSearch.isBlockEffectivelyVisible(type);
++    let eligible = false;
++    for (const node of inSessionSearch.scope?.items ?? []) {
++      if (node.kind !== "assistant-turn") continue;
++      const visible = node.events.filter((event) =>
++        isTurnEventVisible(event, effectivelyVisible),
++      );
++      if (visible.length === 0) continue;
++      eligible = true;
++      if (!turnCollapse.isTurnExpanded(node.key, defaultExpanded)) {
++        return false;
++      }
++      for (const event of visible) {
++        if (event.kind === "tool-rollup") {
++          if (!rollupMembersExpanded(event, defaultExpanded)) return false;
++          continue;
++        }
++        if (!DISCLOSURE_EVENT_KINDS.has(event.kind)) continue;
++        if (!turnCollapse.isEventExpanded(event.key, defaultExpanded)) {
++          return false;
++        }
++        if (
++          event.kind === "tool" &&
++          !toolEventNestedExpanded(event, defaultExpanded)
++        ) {
++          return false;
++        }
++      }
++    }
++    return eligible;
++  });
++
++  /** Manual filter change while search is open suppresses the temporary
++   *  reveal; the note is a no-op when the find view is closed. The toggle
++   *  flips the *effective* state the checkbox displays. */
++  function handleBlockToggle(type: BlockType) {
++    toggleBlockFilter(type);
++  }
++
++  /** Show every block type and lift any search-time suppressions. */
++  function handleShowAllBlocks() {
++    for (const type of ALL_BLOCK_TYPES) {
++      inSessionSearch.noteManualBlockFilterChange(type, true);
++    }
++    ui.showAllBlocks();
++  }
++
+   // Close block filter dropdown on outside click
+   $effect(() => {
+     if (!showBlockFilter) return;
+@@ -392,6 +573,29 @@
+ 
+         <span class="strip-divider"></span>
+ 
++        {#if ui.transcriptMode === "normal"}
++          <button
++            class="pill pill-bulk"
++            onclick={() =>
++              allTurnRowsExpanded
++                ? turnCollapse.collapseAll()
++                : turnCollapse.expandAll()
++            }
++            title={allTurnRowsExpanded
++              ? m.transcript_collapse_all()
++              : m.transcript_expand_all()}
++            aria-label={allTurnRowsExpanded
++              ? m.transcript_collapse_all()
++              : m.transcript_expand_all()}
++          >
++            <span class="pill-label"
++              >{allTurnRowsExpanded
++                ? m.transcript_collapse_all()
++                : m.transcript_expand_all()}</span
++            >
++          </button>
++        {/if}
++
+         <div class="filter-wrap">
+           <button
+             class="pill pill-icon"
+@@ -411,11 +615,11 @@
+             <div class="block-filter-dropdown kit-popover-card" bind:this={filterDropRef}>
+               <div class="block-filter-title">{m.header_transcript_visibility()}</div>
+               {#each ALL_BLOCK_TYPES as bt}
+-                {@const visible = ui.isBlockVisible(bt)}
++                {@const visible = inSessionSearch.isBlockEffectivelyVisible(bt)}
+                 <button
+                   class="block-filter-item"
+                   class:active={visible}
+-                  onclick={() => ui.toggleBlock(bt)}
++                  onclick={() => handleBlockToggle(bt)}
+                 >
+                   <span
+                     class="block-filter-dot"
+@@ -432,7 +636,7 @@
+               {#if ui.hasBlockFilters}
+                 <button
+                   class="block-filter-reset"
+-                  onclick={() => ui.showAllBlocks()}
++                  onclick={handleShowAllBlocks}
+                 >
+                   {m.header_transcript_show_all()}
+                 </button>
+@@ -1167,6 +1371,12 @@
+       font-size: 0;
+     }
+ 
++    /* The expand/collapse toggle has no compact letter form; drop it
++       with the other nonessential controls. */
++    .pill-bulk {
++      display: none;
++    }
++
+     /* Show first letter only via data attrs */
+     .pill:nth-child(1) .pill-label::after {
+       content: "N";
+diff --git a/frontend/src/lib/components/layout/AppHeader.test.ts b/frontend/src/lib/components/layout/AppHeader.test.ts
+index 5cf3387e..7ed9898a 100644
+--- a/frontend/src/lib/components/layout/AppHeader.test.ts
++++ b/frontend/src/lib/components/layout/AppHeader.test.ts
+@@ -20,12 +20,18 @@ vi.mock("../../utils/clipboard.js", () => ({
+ }));
+ 
+ import { sessions } from "../../stores/sessions.svelte.js";
++import { messages } from "../../stores/messages.svelte.js";
+ import { sync } from "../../stores/sync.svelte.js";
+ import { settings } from "../../stores/settings.svelte.js";
++import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
++import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
+ import { ui } from "../../stores/ui.svelte.js";
+ import { router } from "../../stores/router.svelte.js";
+ import { setLocale } from "../../i18n/index.js";
++import { projectSessionScope } from "../../search/session-scope.js";
++import type { AssistantTurnItem } from "../../utils/assistant-turns.js";
+ import type { Session } from "../../api/types.js";
++import type { DbMessage as Message } from "../../api/generated/index.js";
+ 
+ // @ts-ignore
+ import AppHeader from "./AppHeader.svelte";
+@@ -335,3 +341,226 @@ describe("AppHeader export actions", () => {
+     expect(document.body.textContent).toContain("活动");
+   });
+ });
++
++function headerMessage(
++  ordinal: number,
++  role: Message["role"],
++  content: string,
++  overrides: Partial<Message> = {},
++): Message {
++  return {
++    id: 2000 + ordinal,
++    session_id: "sess-123",
++    ordinal,
++    role,
++    content,
++    content_length: content.length,
++    timestamp: `2026-06-13T12:00:${String(ordinal).padStart(2, "0")}Z`,
++    has_thinking: false,
++    thinking_text: "",
++    has_tool_use: false,
++    model: "",
++    context_tokens: 0,
++    output_tokens: 0,
++    has_context_tokens: false,
++    has_output_tokens: false,
++    is_system: false,
++    is_sidechain: false,
++    ...overrides,
++  } as Message;
++}
++
++describe("AppHeader transcript controls", () => {
++  let component: ReturnType<typeof mount> | undefined;
++
++  beforeEach(() => {
++    vi.clearAllMocks();
++    sessions.activeSessionId = "sess-123";
++    sessions.sessions = [testSession()];
++    sync.serverVersion = null;
++    settings.loaded = true;
++    settings.readOnly = false;
++    settings.error = null;
++    ui.isMobileViewport = false;
++    ui.sidebarOpen = true;
++    ui.followLatest = false;
++    router.route = "sessions";
++    setLocale("en");
++
++    messages.clear();
++    messages.sessionId = "sess-123";
++    messages.loading = false;
++    messages.hasOlder = false;
++    messages.messages = [
++      headerMessage(0, "user", "ask"),
++      headerMessage(1, "assistant", "working"),
++      headerMessage(2, "assistant", "done"),
++    ];
++    ui.setTranscriptMode("normal");
++    ui.setAutoCollapseAssistantTurns(true);
++    ui.showAllBlocks();
++    ui.sortNewestFirst = false;
++    inSessionSearch.close();
++    inSessionSearch.clearQuery();
++    turnCollapse.activateSession("sess-123");
++  });
++
++  afterEach(() => {
++    if (component) {
++      unmount(component);
++      component = undefined;
++    }
++    document.body.innerHTML = "";
++    inSessionSearch.close();
++    inSessionSearch.clearQuery();
++    turnCollapse.activateSession(null);
++    messages.clear();
++    ui.setTranscriptMode("normal");
++    ui.setAutoCollapseAssistantTurns(true);
++    ui.showAllBlocks();
++    ui.isMobileViewport = false;
++    ui.sidebarOpen = true;
++    router.route = "sessions";
++    settings.loaded = false;
++  });
++
++  function bulkButton() {
++    return document.querySelector<HTMLButtonElement>(".pill-bulk");
++  }
++
++  it("toggles session-wide expand/collapse and labels it from row state", async () => {
++    component = mount(AppHeader, { target: document.body });
++    await tick();
++
++    // Collapsed-by-default turns make the toggle offer expansion.
++    expect(bulkButton()).not.toBeNull();
++    expect(bulkButton()!.getAttribute("aria-label")).toBe("Expand all");
++
++    bulkButton()!.click();
++    await tick();
++    expect(turnCollapse.bulkBaseline).toBe("expand");
++    expect(bulkButton()!.getAttribute("aria-label")).toBe("Collapse all");
++
++    // A single manually collapsed event flips the label back — the label
++    // is derived from every row's effective expansion, not the baseline.
++    turnCollapse.setEventExpanded("sess-123:2001:message:0", false);
++    await tick();
++    expect(bulkButton()!.getAttribute("aria-label")).toBe("Expand all");
++
++    bulkButton()!.click();
++    await tick();
++    expect(turnCollapse.bulkBaseline).toBe("expand");
++    expect(bulkButton()!.getAttribute("aria-label")).toBe("Collapse all");
++
++    bulkButton()!.click();
++    await tick();
++    expect(turnCollapse.bulkBaseline).toBe("collapse");
++    expect(bulkButton()!.getAttribute("aria-label")).toBe("Expand all");
++  });
++
++  it("flips the bulk label when a nested tool output drawer folds", async () => {
++    messages.messages = [
++      headerMessage(0, "user", "ask"),
++      headerMessage(1, "assistant", "working", {
++        has_tool_use: true,
++        tool_calls: [
++          {
++            category: "",
++            tool_name: "Read",
++            tool_use_id: "t1",
++            result_content: "done",
++          },
++        ],
++      }),
++      headerMessage(2, "assistant", "done"),
++    ];
++    component = mount(AppHeader, { target: document.body });
++    await tick();
++
++    bulkButton()!.click();
++    await tick();
++    expect(bulkButton()!.getAttribute("aria-label")).toBe("Collapse all");
++
++    // Folding one tool block's output drawer — a nested disclosure the
++    // label used to ignore — must bring "Expand all" back.
++    const scope = projectSessionScope({
++      messages: messages.messages,
++      sessionId: "sess-123",
++    });
++    const turn = scope.items.find(
++      (item): item is AssistantTurnItem => item.kind === "assistant-turn",
++    )!;
++    const toolEvent = turn.events.find((event) => event.kind === "tool")!;
++    turnCollapse.setToolSectionExpanded(`${toolEvent.key}:output`, false);
++    await tick();
++    expect(bulkButton()!.getAttribute("aria-label")).toBe("Expand all");
++  });
++
++  it("hides the bulk toggle in focused mode", async () => {
++    ui.setTranscriptMode("focused");
++    component = mount(AppHeader, { target: document.body });
++    await tick();
++
++    expect(bulkButton()).toBeNull();
++    const focusedPill = document.querySelector<HTMLButtonElement>(
++      'button[aria-label="Focused transcript mode"]',
++    );
++    expect(focusedPill?.classList.contains("active")).toBe(true);
++  });
++
++  it("checks search-revealed block types and reports manual hides", async () => {
++    messages.messages = [
++      headerMessage(0, "user", "ask"),
++      headerMessage(1, "assistant", "[Thinking]\nneedle\n[/Thinking]\nworking", {
++        has_thinking: true,
++      }),
++      headerMessage(2, "assistant", "done"),
++    ];
++    ui.setBlockVisible("thinking", false);
++    // Flush between the saved-filter change and opening search, the way a
++    // real hide-then-open sequence would land in separate tasks.
++    await tick();
++    inSessionSearch.isOpen = true;
++    inSessionSearch.query = "needle";
++    inSessionSearch.debouncedQuery = "needle";
++
++    component = mount(AppHeader, { target: document.body });
++    await tick();
++
++    // The hidden type that owns a match is temporarily revealed, and the
++    // checkbox displays the effective state.
++    expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(true);
++
++    const funnel = document.querySelector<HTMLButtonElement>(
++      'button[aria-label="Filter block types"]',
++    );
++    expect(funnel).not.toBeNull();
++    funnel!.click();
++    await tick();
++
++    const items = () =>
++      Array.from(document.querySelectorAll<HTMLButtonElement>(".block-filter-item"));
++    const thinkingItem = items().find((button) => button.textContent?.includes("Thinking"));
++    expect(thinkingItem).toBeDefined();
++    expect(thinkingItem!.classList.contains("active")).toBe(true);
++
++    // Hiding the revealed type suppresses its temporary reveal without
++    // changing the saved filter semantics elsewhere.
++    thinkingItem!.click();
++    await tick();
++    expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(false);
++    expect(ui.isBlockVisible("thinking")).toBe(false);
++    expect(thinkingItem!.classList.contains("active")).toBe(false);
++
++    // Show all restores every type and lifts the suppression.
++    const showAll = document.querySelector<HTMLButtonElement>(".block-filter-reset");
++    expect(showAll).not.toBeNull();
++    showAll!.click();
++    await tick();
++    expect(ui.hasBlockFilters).toBe(false);
++    expect(inSessionSearch.isBlockEffectivelyVisible("thinking")).toBe(true);
++    for (const item of items()) {
++      expect(item.classList.contains("active")).toBe(true);
++    }
++  });
++});
+diff --git a/frontend/src/lib/components/settings/AppearanceSettings.svelte b/frontend/src/lib/components/settings/AppearanceSettings.svelte
+index 490abb6b..18abd186 100644
+--- a/frontend/src/lib/components/settings/AppearanceSettings.svelte
++++ b/frontend/src/lib/components/settings/AppearanceSettings.svelte
+@@ -1,6 +1,7 @@
+ <script lang="ts">
+   import { Button, Checkbox, SegmentedControl, Typeahead } from "@kenn-io/kit-ui";
+   import { m } from "../../i18n/index.js";
++  import { inSessionSearch, toggleBlockFilter } from "../../stores/inSessionSearch.svelte.js";
+   import { settings } from "../../stores/settings.svelte.js";
+   import {
+     ui,
+@@ -48,6 +49,13 @@
+       label: `${step}%`,
+     })),
+   );
++
++  /** Same protocol as the header's block filter: while the find view is
++   *  open, record the manual choice first so a temporary reveal is
++   *  suppressed, then save the persistent visibility choice. */
++  function handleBlockToggle(type: BlockType) {
++    toggleBlockFilter(type);
++  }
+ </script>
+ 
+ <div class="appearance-settings">
+@@ -112,13 +120,22 @@
+     />
+   </div>
+ 
++  <div class="setting-row">
++    <Checkbox
++      checked={ui.autoCollapseAssistantTurns}
++      onchange={(checked) => ui.setAutoCollapseAssistantTurns(checked)}
++      ariaLabel={m.appearance_auto_collapse_assistant_turns()}
++      label={m.appearance_auto_collapse_assistant_turns()}
++    />
++  </div>
++
+   <div class="setting-row column">
+     <span class="setting-label">{m.appearance_block_visibility()}</span>
+     <div class="block-toggles">
+       {#each ALL_BLOCK_TYPES as bt}
+         <Checkbox
+-          checked={ui.isBlockVisible(bt)}
+-          onchange={() => ui.toggleBlock(bt)}
++          checked={inSessionSearch.isBlockEffectivelyVisible(bt)}
++          onchange={() => handleBlockToggle(bt)}
+           label={BLOCK_LABELS[bt]}
+         />
+       {/each}
+diff --git a/frontend/src/lib/components/settings/AppearanceSettings.test.ts b/frontend/src/lib/components/settings/AppearanceSettings.test.ts
+index 498c8e1f..c5200d18 100644
+--- a/frontend/src/lib/components/settings/AppearanceSettings.test.ts
++++ b/frontend/src/lib/components/settings/AppearanceSettings.test.ts
+@@ -1,10 +1,17 @@
+ import { cleanup, fireEvent, render, waitFor } from "@testing-library/svelte";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
++import { tick } from "svelte";
+ 
+ import AppearanceSettings from "./AppearanceSettings.svelte";
++import MessageContent from "../content/MessageContent.svelte";
+ import { SettingsService } from "../../api/generated/index";
++import type { DbMessage as Message } from "../../api/generated/index.js";
++import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
++import { messages } from "../../stores/messages.svelte.js";
++import { sessions } from "../../stores/sessions.svelte.js";
+ import { settings } from "../../stores/settings.svelte.js";
+ import { sync } from "../../stores/sync.svelte.js";
++import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
+ import { ui } from "../../stores/ui.svelte.js";
+ 
+ vi.mock("../../api/generated/index", async (importOriginal) => {
+@@ -21,6 +28,34 @@ const settingsService = SettingsService as unknown as {
+   putApiV1Settings: ReturnType<typeof vi.fn>;
+ };
+ const originalIsDesktop = sync.isDesktop;
++const AUTO_COLLAPSE_TURNS_KEY = "agentsview-auto-collapse-turns";
++
++function searchMessage(
++  ordinal: number,
++  role: Message["role"],
++  content: string,
++  overrides: Partial<Message> = {},
++): Message {
++  return {
++    id: 9000 + ordinal,
++    session_id: "appearance-search",
++    ordinal,
++    role,
++    content,
++    content_length: content.length,
++    timestamp: `2026-06-13T12:00:${String(ordinal).padStart(2, "0")}Z`,
++    has_thinking: false,
++    thinking_text: "",
++    has_tool_use: false,
++    model: "",
++    context_tokens: 0,
++    output_tokens: 0,
++    has_context_tokens: false,
++    has_output_tokens: false,
++    is_system: false,
++    ...overrides,
++  } as Message;
++}
+ 
+ describe("AppearanceSettings", () => {
+   beforeEach(() => {
+@@ -44,12 +79,26 @@ describe("AppearanceSettings", () => {
+       writable: true,
+       configurable: true,
+     });
++    inSessionSearch.close();
++    inSessionSearch.clearQuery();
++    messages.clear();
++    sessions.activeSessionId = null;
++    ui.showAllBlocks();
++    ui.setAutoCollapseAssistantTurns(true);
++    turnCollapse.activateSession(null);
+   });
+ 
+   afterEach(() => {
+     ui.setZoomLevel(100);
+     ui.renderUnknownXmlBlocksAsPreformatted = false;
+     if (ui.highContrast) ui.toggleHighContrast();
++    inSessionSearch.close();
++    inSessionSearch.clearQuery();
++    messages.clear();
++    sessions.activeSessionId = null;
++    ui.showAllBlocks();
++    ui.setAutoCollapseAssistantTurns(true);
++    turnCollapse.activateSession(null);
+     settings.chartPalette = "agentsview";
+     settings.readOnly = false;
+     settings.loaded = false;
+@@ -203,4 +252,78 @@ describe("AppearanceSettings", () => {
+     expect((getByRole("radio", { name: "Agentsview" }) as HTMLButtonElement).disabled).toBe(true);
+     expect((getByRole("radio", { name: "Matplotlib" }) as HTMLButtonElement).disabled).toBe(true);
+   });
++
++  it("persists the assistant-turn collapse preference locally", async () => {
++    const { getByRole } = render(AppearanceSettings);
++    const checkbox = getByRole("checkbox", {
++      name: "Collapse assistant turns by default",
++    }) as HTMLInputElement;
++
++    expect(checkbox.checked).toBe(true);
++    expect(ui.autoCollapseAssistantTurns).toBe(true);
++
++    await fireEvent.click(checkbox);
++
++    expect(checkbox.checked).toBe(false);
++    expect(ui.autoCollapseAssistantTurns).toBe(false);
++    await waitFor(() => expect(localStorage.getItem(AUTO_COLLAPSE_TURNS_KEY)).toBe("false"));
++
++    await fireEvent.click(checkbox);
++    expect(ui.autoCollapseAssistantTurns).toBe(true);
++    await waitFor(() => expect(localStorage.getItem(AUTO_COLLAPSE_TURNS_KEY)).toBe("true"));
++
++    // The preference is browser-local; it never posts to server settings.
++    expect(settingsService.putApiV1Settings).not.toHaveBeenCalled();
++  });
++
++  it("suppresses a search-revealed block type when its filter hides during search", async () => {
++    const thinkingMessage = searchMessage(
++      1,
++      "assistant",
++      "[Thinking]\nneedle\n[/Thinking]\nworking",
++      { has_thinking: true },
++    );
++    messages.sessionId = "appearance-search";
++    messages.hasOlder = false;
++    messages.loading = false;
++    messages.messages = [
++      searchMessage(0, "user", "ask"),
++      thinkingMessage,
++      searchMessage(2, "assistant", "done"),
++    ];
++    ui.setBlockVisible("thinking", false);
++    await tick();
++    inSessionSearch.isOpen = true;
++    inSessionSearch.query = "needle";
++    inSessionSearch.debouncedQuery = "needle";
++
++    const { getByRole } = render(AppearanceSettings);
++    render(MessageContent, { props: { message: thinkingMessage } });
++    await waitFor(() => expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(true));
++
++    // The hidden type is temporarily revealed: content mounts and the
++    // checkbox reports effective visibility rather than the saved filter.
++    expect(document.querySelector(".thinking-block")).not.toBeNull();
++    const thinkingBox = getByRole("checkbox", {
++      name: "Thinking blocks",
++    }) as HTMLInputElement;
++    expect(thinkingBox.checked).toBe(true);
++
++    await fireEvent.click(thinkingBox);
++
++    // The manual hide suppresses the temporary reveal immediately while the
++    // saved filter was already hidden and stays hidden.
++    await waitFor(() => expect(document.querySelector(".thinking-block")).toBeNull());
++    expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(false);
++    expect(inSessionSearch.isBlockEffectivelyVisible("thinking")).toBe(false);
++    expect(ui.isBlockVisible("thinking")).toBe(false);
++    expect(thinkingBox.checked).toBe(false);
++
++    // Closing the find view keeps the saved (hidden) choice, not the reveal.
++    inSessionSearch.close();
++    await tick();
++    expect(inSessionSearch.isBlockEffectivelyVisible("thinking")).toBe(false);
++    expect(ui.isBlockVisible("thinking")).toBe(false);
++    expect(thinkingBox.checked).toBe(false);
++  });
+ });
+diff --git a/frontend/src/lib/components/sidebar/SessionList.svelte b/frontend/src/lib/components/sidebar/SessionList.svelte
+index 85d24624..7f1af953 100644
+--- a/frontend/src/lib/components/sidebar/SessionList.svelte
++++ b/frontend/src/lib/components/sidebar/SessionList.svelte
+@@ -1,7 +1,8 @@
+ <script lang="ts">
+   import { onDestroy, onMount } from "svelte";
++  import { Button, Spinner } from "@kenn-io/kit-ui";
+   import { m } from "../../i18n/index.js";
+-  import { sessions } from "../../stores/sessions.svelte.js";
++  import { buildSessionGroups, sessions, type SessionGroup } from "../../stores/sessions.svelte.js";
+   import { ui } from "../../stores/ui.svelte.js";
+   import { starred } from "../../stores/starred.svelte.js";
+   import SessionItem from "./SessionItem.svelte";
+@@ -73,6 +74,60 @@
+     }
+   });
+ 
++  $effect(() => {
++    if (groupMode === "agent") {
++      void sessions.loadAgents();
++    } else if (groupMode === "project") {
++      void sessions.loadProjects();
++    }
++  });
++
++  let groupMetadata = $derived.by(() => {
++    if (starred.filterOnly) return undefined;
++    if (groupMode === "agent") {
++      return sessions.agents.map((a) => ({
++        key: a.name,
++        totalCount: a.session_count,
++      }));
++    }
++    if (groupMode === "project") {
++      return sessions.projects.map((p) => ({
++        key: p.name,
++        totalCount: p.session_count,
++      }));
++    }
++    return undefined;
++  });
++
++  let perGroupSessions = $derived.by(() => {
++    if (groupMode === "none") return undefined;
++    const map = new Map<
++      string,
++      { groups: SessionGroup[]; totalCount?: number; hasMore?: boolean }
++    >();
++    for (const [key, state] of sessions.groupSessionsCache.entries()) {
++      let sess = state.sessions;
++      if (starred.filterOnly) {
++        sess = sess.filter((s) => starred.isStarred(s.id));
++      }
++      const grps = buildSessionGroups(sess);
++      map.set(key, {
++        groups: grps,
++        totalCount: state.total,
++        hasMore: Boolean(state.nextCursor),
++      });
++    }
++    return map;
++  });
++
++  let groupLoading = $derived.by(() => {
++    const loading = new Set<string>();
++    for (const [key, state] of sessions.groupSessionsCache.entries()) {
++      if (state.loading) loading.add(key);
++    }
++    return loading;
++  });
++
+   let groups = $derived.by(() => {
+     const all = sessions.groupedSessions;
+     if (!starred.filterOnly) return all;
+@@ -103,7 +158,7 @@
+ 
+   // Build grouped structure when groupMode is not "none".
+   let groupSections = $derived.by(() =>
+-    buildGroupSections(groups, groupMode),
++    buildGroupSections(groups, groupMode, groupMetadata, perGroupSessions),
+   );
+ 
+   // Derive effective collapsed set synchronously so the first
+@@ -119,9 +174,26 @@
+     return all;
+   });
+ 
++  // Ensure any expanded group has its sessions loaded.
++  $effect(() => {
++    if (groupMode === "none" || collapseAll) return;
++    for (const section of groupSections) {
++      if (!collapsed.has(section.label) && !sessions.groupSessionsCache.has(section.label)) {
++        void sessions.loadGroupSessions(groupMode, section.label);
++      }
++    }
++  });
++
+   // Build flat display items for virtual scrolling.
+   let displayItems = $derived.by(() =>
+-    buildDisplayItems(groups, groupSections, groupMode, collapsed, expandedGroups),
++    buildDisplayItems(
++      groups,
++      groupSections,
++      groupMode,
++      collapsed,
++      expandedGroups,
++      groupLoading,
++    ),
+   );
+ 
+   // When include_children is enabled the API total includes
+@@ -172,6 +244,7 @@
+   }
+ 
+   function toggleGroup(label: string) {
++    const isExpanding = collapseAll || !manualExpanded.has(label);
+     if (collapseAll) {
+       collapseAll = false;
+       manualExpanded = new Set([label]);
+@@ -184,6 +257,9 @@
+       }
+       manualExpanded = next;
+     }
++    if (isExpanding && groupMode !== "none") {
++      void sessions.loadGroupSessions(groupMode, label);
++    }
+   }
+ 
+   function toggleChainExpand(groupKey: string) {
+@@ -317,6 +393,25 @@
+     }
+   });
+ 
++  const lastAutoLoadedCursor = new Map<string, string>();
++  $effect(() => {
++    if (groupMode === "none") return;
++    for (const item of visibleItems) {
++      if (item.type === "group-load-more") {
++        const state = sessions.getGroupState(item.label);
++        if (
++          state &&
++          state.nextCursor &&
++          !state.loading &&
++          lastAutoLoadedCursor.get(item.label) !== state.nextCursor
++        ) {
++          lastAutoLoadedCursor.set(item.label, state.nextCursor);
++          void sessions.loadMoreGroupSessions(groupMode, item.label);
++        }
++      }
++    }
++  });
++
+   // Clamp stale scrollTop when count shrinks.
+   $effect(() => {
+     if (!containerRef) return;
+@@ -426,6 +521,14 @@
+       // updates, and prevRevealedId is still unset so the
+       // second pass will proceed to scroll.
+       if (groupMode !== "none") {
++        const activeLabel =
++          groupMode === "agent"
++            ? sessions.activeSession?.agent
++            : sessions.activeSession?.project;
++        if (activeLabel && collapsed.has(activeLabel)) {
++          toggleGroup(activeLabel);
++          return;
++        }
+         for (const section of groupSections) {
+           const owns = section.groups.some((g) =>
+             g.sessions.some((s) => s.id === activeId),
+@@ -695,6 +798,33 @@
+               selected={primary ? sessions.selectedIds.has(primary.id) : false}
+             />
+           {/if}
++        {:else if item.type === "group-loading"}
++          <div class="group-loading-row">
++            <Spinner size={12} label={m.sidebar_loading()} />
++            <span class="group-loading-text">{m.sidebar_loading()}</span>
++          </div>
++        {:else if item.type === "group-load-more"}
++          {@const isGroupLoading = sessions.isGroupLoading(item.label)}
++          <div class="group-load-more-row">
++            <Button
++              size="sm"
++              surface="soft"
++              tone="neutral"
++              disabled={isGroupLoading}
++              onclick={() => {
++                if (groupMode !== "none") {
++                  void sessions.loadMoreGroupSessions(groupMode, item.label);
++                }
++              }}
++            >
++              {#if isGroupLoading}
++                <Spinner size={11} label={m.sidebar_loading()} />
++                <span>{m.sidebar_loading()}</span>
++              {:else}
++                <span>{m.sidebar_load_more()}{item.count > 0 ? ` (${formatNumber(item.count)})` : ""}</span>
++              {/if}
++            </Button>
++          </div>
+         {/if}
+       </div>
+     {/each}
+@@ -1025,4 +1155,17 @@
+     color: var(--text-primary);
+   }
+ 
++  .group-loading-row,
++  .group-load-more-row {
++    display: flex;
++    align-items: center;
++    padding-left: 24px;
++    height: 100%;
++    gap: 8px;
++  }
++
++  .group-loading-text {
++    font-size: 11px;
++    color: var(--text-muted);
++  }
+ </style>
+diff --git a/frontend/src/lib/components/sidebar/session-list-utils.test.ts b/frontend/src/lib/components/sidebar/session-list-utils.test.ts
+index 8f0478e5..65428ed0 100644
+--- a/frontend/src/lib/components/sidebar/session-list-utils.test.ts
++++ b/frontend/src/lib/components/sidebar/session-list-utils.test.ts
+@@ -942,4 +942,130 @@ describe("selectPrimaryId", () => {
+     });
+     expect(selectPrimaryId([a, b], "key")).toBe("b");
+   });
++
++  it("prefers session with user messages over newer zero-user-message continuation", () => {
++    const parent = makeSession({
++      id: "parent",
++      user_message_count: 11,
++      ended_at: "2025-01-01T00:00:00Z",
++    });
++    const continuation = makeSession({
++      id: "continuation",
++      user_message_count: 0,
++      relationship_type: "continuation",
++      ended_at: "2025-01-02T00:00:00Z",
++    });
++    expect(selectPrimaryId([parent, continuation], "parent")).toBe("parent");
++  });
++});
++
++// ---------------------------------------------------------------------------
++// buildGroupSections — with metadata & on-demand loading
++// ---------------------------------------------------------------------------
++
++describe("buildGroupSections (metadata and perGroupSessions)", () => {
++  it("uses metadata to establish groups and total counts even when groups array is empty", () => {
++    const metadata = [
++      { key: "cursor-ide", totalCount: 1245 },
++      { key: "claude", totalCount: 50 },
++    ];
++    const result = buildGroupSections([], "agent", metadata);
++
++    expect(result).toHaveLength(2);
++    expect(result[0]!.label).toBe("cursor-ide");
++    expect(result[0]!.totalCount).toBe(1245);
++    expect(result[0]!.hasMore).toBe(true);
++    expect(result[1]!.label).toBe("claude");
++    expect(result[1]!.totalCount).toBe(50);
++  });
++
++  it("sorts by totalCount descending from metadata", () => {
++    const metadata = [
++      { key: "small", totalCount: 5 },
++      { key: "large", totalCount: 1000 },
++      { key: "medium", totalCount: 50 },
++    ];
++    const result = buildGroupSections([], "agent", metadata);
++
++    expect(result.map((s) => s.label)).toEqual(["large", "medium", "small"]);
++  });
++
++  it("incorporates perGroupSessions when loaded on demand", () => {
++    const metadata = [
++      { key: "cursor-ide", totalCount: 1245 },
++      { key: "claude", totalCount: 50 },
++    ];
++    const loadedGroup = makeGroup("cursor-ide", 2);
++    const perGroupSessions = new Map([
++      [
++        "cursor-ide",
++        {
++          groups: [loadedGroup],
++          totalCount: 1245,
++          hasMore: true,
++        },
++      ],
++    ]);
++
++    const result = buildGroupSections([], "agent", metadata, perGroupSessions);
++
++    const cursorSection = result.find((s) => s.label === "cursor-ide")!;
++    expect(cursorSection.groups).toHaveLength(1);
++    expect(cursorSection.totalCount).toBe(1245);
++    expect(cursorSection.hasMore).toBe(true);
++
++    const claudeSection = result.find((s) => s.label === "claude")!;
++    expect(claudeSection.groups).toHaveLength(0);
++    expect(claudeSection.totalCount).toBe(50);
++  });
++});
++
++// ---------------------------------------------------------------------------
++// buildDisplayItems — group-loading and group-load-more
++// ---------------------------------------------------------------------------
++
++describe("buildDisplayItems (group-loading and group-load-more)", () => {
++  it("emits group-loading item when expanded group has 0 sessions and is loading", () => {
++    const sections = [
++      {
++        label: "cursor-ide",
++        groups: [],
++        totalCount: 1245,
++        hasMore: true,
++      },
++    ];
++    const collapsed = new Set<string>();
++    const groupLoading = new Set(["cursor-ide"]);
++
++    const items = buildDisplayItems([], sections, "agent", collapsed, new Set(), groupLoading);
++
++    expect(items).toHaveLength(2);
++    expect(items[0]!.type).toBe("header");
++    expect(items[1]!.type).toBe("group-loading");
++    expect(items[1]!.label).toBe("cursor-ide");
++    expect(items[1]!.top).toBe(HEADER_HEIGHT);
++  });
++
++  it("emits group-load-more item when group has more sessions to load", () => {
++    const group = makeGroup("cursor-ide", 1);
++    const sections = [
++      {
++        label: "cursor-ide",
++        groups: [group],
++        totalCount: 1245,
++        hasMore: true,
++      },
++    ];
++    const collapsed = new Set<string>();
++
++    const items = buildDisplayItems([], sections, "agent", collapsed, new Set());
++
++    expect(items).toHaveLength(3);
++    expect(items[0]!.type).toBe("header");
++    expect(items[1]!.type).toBe("session");
++    expect(items[2]!.type).toBe("group-load-more");
++    expect(items[2]!.label).toBe("cursor-ide");
++    expect(items[2]!.count).toBe(1244);
++    expect(items[2]!.top).toBe(HEADER_HEIGHT + ITEM_HEIGHT);
++  });
+ });
+diff --git a/frontend/src/lib/components/sidebar/session-list-utils.ts b/frontend/src/lib/components/sidebar/session-list-utils.ts
+index 79851d65..d1b4cf0f 100644
+--- a/frontend/src/lib/components/sidebar/session-list-utils.ts
++++ b/frontend/src/lib/components/sidebar/session-list-utils.ts
+@@ -14,6 +14,13 @@ export type GroupMode = "none" | "agent" | "project";
+ export interface GroupSection {
+   label: string;
+   groups: SessionGroup[];
++  totalCount?: number;
++  hasMore?: boolean;
++}
++
++export interface GroupMetadataItem {
++  key: string;
++  totalCount: number;
+ }
+ 
+ /** @deprecated Use GroupSection */
+@@ -21,7 +28,7 @@ export type AgentSection = GroupSection;
+ 
+ export interface DisplayItem {
+   id: string;
+-  type: "header" | "session" | "team-group" | "subagent-group";
++  type: "header" | "session" | "team-group" | "subagent-group" | "group-loading" | "group-load-more";
+   label: string;
+   count: number;
+   group?: SessionGroup;
+@@ -57,38 +64,19 @@ export function getInitialGroupMode(): GroupMode {
+   return "none";
+ }
+ 
+-/**
+- * Select the best primary session from a list using the same
+- * recency rule as buildSessionGroups: for groups with subagents
+- * prefer the root session (matching the group key), otherwise
+- * pick the most recently active session.
+- */
+-export function selectPrimaryId(sessions: SessionGroupInput[], groupKey: string): string {
+-  if (sessions.length === 0) return groupKey;
+-  const hasSubagents = sessions.some((s) => s.relationship_type === "subagent");
+-  if (hasSubagents) {
+-    const root = sessions.find((s) => s.id === groupKey);
+-    return root ? root.id : sessions[0]!.id;
+-  }
+-  let best = sessions[0]!;
+-  let bestKey = best.ended_at ?? best.started_at ?? best.created_at;
+-  for (let i = 1; i < sessions.length; i++) {
+-    const s = sessions[i]!;
+-    const k = s.ended_at ?? s.started_at ?? s.created_at;
+-    if (k > bestKey) {
+-      bestKey = k;
+-      best = s;
+-    }
+-  }
+-  return best.id;
+-}
++export { selectPrimaryId } from "../../stores/sessions.svelte.js";
+ 
+ /**
+  * Build grouped sections from flat session groups.
+  * Groups by agent name or project depending on mode.
+  * Returns empty array when mode is "none".
+  */
+-export function buildGroupSections(groups: SessionGroup[], mode: GroupMode): GroupSection[] {
++export function buildGroupSections(
++  groups: SessionGroup[],
++  mode: GroupMode,
++  metadata?: GroupMetadataItem[],
++  perGroupSessions?: Map<string, { groups: SessionGroup[]; totalCount?: number; hasMore?: boolean }>,
++): GroupSection[] {
+   if (mode === "none") return [];
+   const map = new Map<string, SessionGroup[]>();
+   for (const g of groups) {
+@@ -102,10 +90,49 @@ export function buildGroupSections(groups: SessionGroup[], mode: GroupMode): Gro
+     }
+     list.push(g);
+   }
+-  // Sort by count descending (most sessions first).
+-  return Array.from(map.entries())
+-    .sort((a, b) => b[1].length - a[1].length)
+-    .map(([label, groups]) => ({ label, groups }));
++
++  if (!metadata || metadata.length === 0) {
++    // Sort by count descending (most sessions first).
++    return Array.from(map.entries())
++      .sort((a, b) => b[1].length - a[1].length)
++      .map(([label, groups]) => ({ label, groups, totalCount: groups.length }));
++  }
++
++  const seen = new Set<string>();
++  const sections: GroupSection[] = [];
++
++  for (const meta of metadata) {
++    const label = meta.key;
++    seen.add(label);
++    const perGroup = perGroupSessions?.get(label);
++    const sectionGroups = perGroup?.groups ?? map.get(label) ?? [];
++    const totalCount = perGroup?.totalCount ?? meta.totalCount;
++    const hasMore = perGroup?.hasMore ?? (totalCount > sectionGroups.length);
++
++    sections.push({
++      label,
++      groups: sectionGroups,
++      totalCount,
++      hasMore,
++    });
++  }
++
++  for (const [label, sectionGroups] of map.entries()) {
++    if (!seen.has(label)) {
++      sections.push({
++        label,
++        groups: sectionGroups,
++        totalCount: sectionGroups.length,
++        hasMore: false,
++      });
++    }
++  }
++
++  return sections.sort((a, b) => {
++    const diff = (b.totalCount ?? b.groups.length) - (a.totalCount ?? a.groups.length);
++    if (diff !== 0) return diff;
++    return a.label.localeCompare(b.label);
++  });
+ }
+ 
+ /** Check if a session is a teammate (received a <teammate-message>). */
+@@ -334,6 +361,7 @@ export function buildDisplayItems(
+   mode: GroupMode,
+   collapsed: Set<string>,
+   expandedGroups: Set<string>,
++  groupLoading?: Set<string>,
+ ): DisplayItem[] {
+   const y = { value: 0 };
+ 
+@@ -347,11 +375,12 @@ export function buildDisplayItems(
+ 
+   const items: DisplayItem[] = [];
+   for (const section of sections) {
++    const count = section.totalCount ?? section.groups.length;
+     items.push({
+       id: `header:${section.label}`,
+       type: "header",
+       label: section.label,
+-      count: section.groups.length,
++      count,
+       sectionGroups: section.groups,
+       height: HEADER_HEIGHT,
+       top: y.value,
+@@ -359,8 +388,32 @@ export function buildDisplayItems(
+     y.value += HEADER_HEIGHT;
+ 
+     if (!collapsed.has(section.label)) {
+-      for (const g of section.groups) {
+-        emitGroupItems(g, section.label, expandedGroups, items, y);
++      const isLoading = groupLoading?.has(section.label);
++      if (section.groups.length === 0 && isLoading) {
++        items.push({
++          id: `loading:${section.label}`,
++          type: "group-loading",
++          label: section.label,
++          count: 0,
++          height: ITEM_HEIGHT,
++          top: y.value,
++        });
++        y.value += ITEM_HEIGHT;
++      } else {
++        for (const g of section.groups) {
++          emitGroupItems(g, section.label, expandedGroups, items, y);
++        }
++        if (section.hasMore) {
++          items.push({
++            id: `more:${section.label}`,
++            type: "group-load-more",
++            label: section.label,
++            count: Math.max(0, (section.totalCount ?? 0) - section.groups.length),
++            height: ITEM_HEIGHT,
++            top: y.value,
++          });
++          y.value += ITEM_HEIGHT;
++        }
+       }
+     }
+   }
+diff --git a/frontend/src/lib/stores/sessions.svelte.ts b/frontend/src/lib/stores/sessions.svelte.ts
+index d9a342e0..78a97855 100644
+--- a/frontend/src/lib/stores/sessions.svelte.ts
++++ b/frontend/src/lib/stores/sessions.svelte.ts
+@@ -77,6 +77,13 @@ export interface RecentlyDeletedSessions {
+   timer: ReturnType<typeof setTimeout>;
+ }
+ 
++export interface GroupSessionsState {
++  sessions: Session[];
++  nextCursor: string | null;
++  total: number;
++  loading: boolean;
++}
++
+ export interface Filters {
+   project: string;
+   machine: string;
+@@ -337,7 +344,16 @@ class SessionsStore {
+   private safetyNetTimer: ReturnType<typeof setInterval> | null = null;
+ 
+   get activeSession(): Session | undefined {
+-    const session = this.sessions.find((s) => s.id === this.activeSessionId);
++    let session = this.sessions.find((s) => s.id === this.activeSessionId);
++    if (!session && this.activeSessionId) {
++      for (const groupState of this.groupSessionsCache.values()) {
++        const found = groupState.sessions.find((s) => s.id === this.activeSessionId);
++        if (found) {
++          session = found;
++          break;
++        }
++      }
++    }
+     return session?.is_index_only ? undefined : session;
+   }
+ 
+@@ -528,6 +544,7 @@ class SessionsStore {
+       if (this.loadVersion !== version) return;
+ 
+       this.sidebarIndexVersion = indexVersion;
++      this.clearGroupSessionsCache();
+       this.hydratedSessionsByVersion.set(indexVersion, new Map());
+       this.sidebarHydrationEpochByVersion.set(indexVersion, 0);
+       this.pruneSidebarHydrationVersions(indexVersion);
+@@ -660,15 +677,34 @@ class SessionsStore {
+ 
+   private mergeHydratedSession(hydrated: Session) {
+     const idx = this.sessions.findIndex((s) => s.id === hydrated.id);
+-    if (idx < 0) return;
+-    const current = this.sessions[idx]!;
+-    this.sessions[idx] = {
+-      ...current,
+-      ...hydrated,
+-      display_name: hydrated.display_name ?? current.display_name,
+-      is_teammate: hydrated.is_teammate ?? current.is_teammate,
+-      is_index_only: false,
+-    };
++    if (idx >= 0) {
++      const current = this.sessions[idx]!;
++      this.sessions[idx] = {
++        ...current,
++        ...hydrated,
++        display_name: hydrated.display_name ?? current.display_name,
++        is_teammate: hydrated.is_teammate ?? current.is_teammate,
++        is_index_only: false,
++      };
++    }
++    for (const [key, groupState] of this.groupSessionsCache.entries()) {
++      const gIdx = groupState.sessions.findIndex((s) => s.id === hydrated.id);
++      if (gIdx >= 0) {
++        const current = groupState.sessions[gIdx]!;
++        const updated = [...groupState.sessions];
++        updated[gIdx] = {
++          ...current,
++          ...hydrated,
++          display_name: hydrated.display_name ?? current.display_name,
++          is_teammate: hydrated.is_teammate ?? current.is_teammate,
++          is_index_only: false,
++        };
++        this.groupSessionsCache.set(key, {
++          ...groupState,
++          sessions: updated,
++        });
++      }
++    }
+   }
+ 
+   private invalidateHydratedSessionDetails() {
+@@ -758,6 +794,143 @@ class SessionsStore {
+     }
+   }
+ 
++  groupSessionsCache: Map<string, GroupSessionsState> = $state(new Map());
++  private groupSessionsInflight: Map<string, Promise<void>> = new Map();
++  private groupSessionsVersion = 0;
++
++  getGroupSessions(key: string): Session[] {
++    return this.groupSessionsCache.get(key)?.sessions ?? [];
++  }
++
++  getGroupState(key: string): GroupSessionsState | undefined {
++    return this.groupSessionsCache.get(key);
++  }
++
++  isGroupLoading(key: string): boolean {
++    return this.groupSessionsCache.get(key)?.loading ?? false;
++  }
++
++  clearGroupSessionsCache() {
++    this.groupSessionsVersion++;
++    this.groupSessionsInflight.clear();
++    this.groupSessionsCache = new Map();
++  }
++
++  async loadGroupSessions(mode: "agent" | "project", key: string, force = false): Promise<void> {
++    const existing = this.groupSessionsCache.get(key);
++    if (!force && existing && (existing.sessions.length > 0 || !existing.nextCursor)) {
++      return;
++    }
++    const inflight = this.groupSessionsInflight.get(key);
++    if (inflight) return inflight;
++
++    const version = this.groupSessionsVersion;
++    const promise = (async () => {
++      this.groupSessionsCache.set(key, {
++        sessions: existing?.sessions ?? [],
++        nextCursor: existing?.nextCursor ?? null,
++        total: existing?.total ?? 0,
++        loading: true,
++      });
++
++      try {
++        const signal = this.routeSignal();
++        const params: SidebarIndexParams = {
++          ...this.apiParams,
++          agent: mode === "agent" ? key : this.apiParams.agent,
++          project: mode === "project" ? key : this.apiParams.project,
++          limit: 100,
++        };
++        const index = await SessionsService.getApiV1SessionsSidebarIndex(params, { signal });
++        if (version !== this.groupSessionsVersion) return;
++
++        const existingById = new Map((existing?.sessions ?? []).map((s) => [s.id, s]));
++        const mapped = index.sessions.map((row) => sidebarIndexRowToSession(row, existingById.get(row.id)));
++
++        this.groupSessionsCache.set(key, {
++          sessions: mapped,
++          nextCursor: index.next_cursor ?? null,
++          total: index.total,
++          loading: false,
++        });
++      } catch (err) {
++        if (!isAbortError(err) && version === this.groupSessionsVersion) {
++          this.groupSessionsCache.set(key, {
++            sessions: existing?.sessions ?? [],
++            nextCursor: existing?.nextCursor ?? null,
++            total: existing?.total ?? 0,
++            loading: false,
++          });
++        }
++      } finally {
++        this.groupSessionsInflight.delete(key);
++      }
++    })();
++
++    this.groupSessionsInflight.set(key, promise);
++    return promise;
++  }
++
++  async loadMoreGroupSessions(mode: "agent" | "project", key: string): Promise<void> {
++    const existing = this.groupSessionsCache.get(key);
++    if (!existing || !existing.nextCursor || existing.loading) return;
++
++    const inflight = this.groupSessionsInflight.get(key);
++    if (inflight) return inflight;
++
++    const version = this.groupSessionsVersion;
++    const promise = (async () => {
++      this.groupSessionsCache.set(key, {
++        ...existing,
++        loading: true,
++      });
++
++      try {
++        const signal = this.routeSignal();
++        const params: SidebarIndexParams = {
++          ...this.apiParams,
++          agent: mode === "agent" ? key : this.apiParams.agent,
++          project: mode === "project" ? key : this.apiParams.project,
++          cursor: existing.nextCursor!,
++          limit: 100,
++        };
++        const index = await SessionsService.getApiV1SessionsSidebarIndex(params, { signal });
++        if (version !== this.groupSessionsVersion) return;
++
++        const existingById = new Map(existing.sessions.map((s) => [s.id, s]));
++        const nextMapped = index.sessions.map((row) => sidebarIndexRowToSession(row, existingById.get(row.id)));
++
++        const seen = new Set(existing.sessions.map((s) => s.id));
++        const merged = [...existing.sessions];
++        for (const s of nextMapped) {
++          if (!seen.has(s.id)) {
++            seen.add(s.id);
++            merged.push(s);
++          }
++        }
++
++        this.groupSessionsCache.set(key, {
++          sessions: merged,
++          nextCursor: index.next_cursor ?? null,
++          total: index.total,
++          loading: false,
++        });
++      } catch (err) {
++        if (!isAbortError(err) && version === this.groupSessionsVersion) {
++          this.groupSessionsCache.set(key, {
++            ...existing,
++            loading: false,
++          });
++        }
++      } finally {
++        this.groupSessionsInflight.delete(key);
++      }
++    })();
++
++    this.groupSessionsInflight.set(key, promise);
++    return promise;
++  }
++
+   async loadProjects() {
+     if (this.projectsLoaded) return;
+     if (this.projectsPromise) return this.projectsPromise;
+@@ -1367,6 +1540,7 @@ class SessionsStore {
+   }
+ 
+   invalidateFilterCaches() {
++    this.clearGroupSessionsCache();
+     this.invalidateProjectCache();
+     this.agentsVersion++;
+     this.agentsLoaded = false;
+@@ -1438,6 +1612,22 @@ class SessionsStore {
+       }
+       this.sessions[idx] = merged;
+     }
++    for (const [key, groupState] of this.groupSessionsCache.entries()) {
++      const gIdx = groupState.sessions.findIndex((s) => s.id === id);
++      if (gIdx !== -1) {
++        const current = groupState.sessions[gIdx]!;
++        const merged = { ...current, ...updated };
++        if (displayName === null && updated.display_name === undefined) {
++          merged.display_name = undefined;
++        }
++        const updatedSessions = [...groupState.sessions];
++        updatedSessions[gIdx] = merged;
++        this.groupSessionsCache.set(key, {
++          ...groupState,
++          sessions: updatedSessions,
++        });
++      }
++    }
+   }
+ 
+   async assignSessionProject(id: string, project: string) {
+@@ -1811,6 +2001,51 @@ function findPublicRoots(id: string, byId: Map<string, SessionGroupInput>): stri
+   return [...roots].sort();
+ }
+ 
++/**
++ * Select the best primary session from a list.
++ *
++ * For groups with subagents, prefer the root session (matching the group key).
++ * Otherwise (e.g. continuation chains), prefer sessions with user messages so that
++ * automated or background continuation stubs (such as task notifications) never
++ * displace the interactive conversation. Among equal candidate tiers, pick the
++ * most recently active session.
++ */
++export function selectPrimaryId(sessions: SessionGroupInput[], groupKey: string): string {
++  if (sessions.length === 0) return groupKey;
++  const hasSubagents = sessions.some((s) => s.relationship_type === "subagent");
++  if (hasSubagents) {
++    const root = sessions.find((s) => s.id === groupKey);
++    return root ? root.id : sessions[0]!.id;
++  }
++  const userCandidates = sessions.filter(
++    (s) => !s.is_automated && (s.user_message_count ?? 0) > 0,
++  );
++  const nonZeroCandidates = sessions.filter(
++    (s) => (s.user_message_count ?? 0) > 0,
++  );
++  const nonAutomatedCandidates = sessions.filter((s) => !s.is_automated);
++  const pool =
++    userCandidates.length > 0
++      ? userCandidates
++      : nonZeroCandidates.length > 0
++        ? nonZeroCandidates
++        : nonAutomatedCandidates.length > 0
++          ? nonAutomatedCandidates
++          : sessions;
++
++  let best = pool[0]!;
++  let bestKey = recencyKey(best);
++  for (let i = 1; i < pool.length; i++) {
++    const s = pool[i]!;
++    const k = recencyKey(s);
++    if (k > bestKey) {
++      bestKey = k;
++      best = s;
++    }
++  }
++  return best.id;
++}
++
+ export function buildSessionGroups(sessions: SessionGroupInput[]): SessionGroup[] {
+   const byId = new Map<string, SessionGroupInput>();
+   for (const s of sessions) {
+@@ -1966,25 +2201,7 @@ export function buildSessionGroups(sessions: SessionGroupInput[]): SessionGroup[
+     }
+     group.firstMessage = group.sessions[0]?.first_message ?? null;
+ 
+-    // For groups containing subagent children, the root session
+-    // should always be the main entry (not the most recent child).
+-    const hasSubagents = group.sessions.some((s) => s.relationship_type === "subagent");
+-    if (hasSubagents) {
+-      const rootIdx = group.sessions.findIndex((s) => s.id === group.key);
+-      group.primarySessionId = rootIdx >= 0 ? group.sessions[rootIdx]!.id : group.sessions[0]!.id;
+-    } else {
+-      // For continuation chains, use the most recently active session.
+-      let bestIdx = 0;
+-      let bestKey = recencyKey(group.sessions[0]!);
+-      for (let i = 1; i < group.sessions.length; i++) {
+-        const k = recencyKey(group.sessions[i]!);
+-        if (k > bestKey) {
+-          bestKey = k;
+-          bestIdx = i;
+-        }
+-      }
+-      group.primarySessionId = group.sessions[bestIdx]!.id;
+-    }
++    group.primarySessionId = selectPrimaryId(group.sessions, group.key);
+   }
+ 
+   const ordered = insertionOrder.filter((k) => !keysToRemove.has(k)).map((k) => groupMap.get(k)!);
+diff --git a/frontend/src/lib/stores/sessions.test.ts b/frontend/src/lib/stores/sessions.test.ts
+index b187b551..337c2696 100644
+--- a/frontend/src/lib/stores/sessions.test.ts
++++ b/frontend/src/lib/stores/sessions.test.ts
+@@ -3305,6 +3305,89 @@ describe("buildSessionGroups", () => {
+     expect(groups[0]!.primarySessionId).toBe("s2");
+   });
+ 
++  it("prefers session with user messages over newer zero-user-message continuation", () => {
++    const sessions = [
++      makeSession({
++        id: "s1",
++        project: "proj",
++        message_count: 52,
++        user_message_count: 11,
++        started_at: "2024-01-01T00:00:00Z",
++        ended_at: "2024-01-01T01:00:00Z",
++      }),
++      makeSession({
++        id: "s2",
++        project: "proj",
++        parent_session_id: "s1",
++        relationship_type: "continuation",
++        message_count: 3,
++        user_message_count: 0,
++        started_at: "2024-01-01T00:00:00Z",
++        ended_at: "2024-01-01T02:00:00Z",
++      }),
++    ];
++
++    const groups = buildSessionGroups(sessions);
++    expect(groups).toHaveLength(1);
++    expect(groups[0]!.primarySessionId).toBe("s1");
++  });
++
++  it("selects newer continuation when both have user messages", () => {
++    const sessions = [
++      makeSession({
++        id: "s1",
++        project: "proj",
++        message_count: 10,
++        user_message_count: 5,
++        started_at: "2024-01-01T00:00:00Z",
++        ended_at: "2024-01-01T01:00:00Z",
++      }),
++      makeSession({
++        id: "s2",
++        project: "proj",
++        parent_session_id: "s1",
++        relationship_type: "continuation",
++        message_count: 6,
++        user_message_count: 2,
++        started_at: "2024-01-01T01:30:00Z",
++        ended_at: "2024-01-01T02:00:00Z",
++      }),
++    ];
++
++    const groups = buildSessionGroups(sessions);
++    expect(groups).toHaveLength(1);
++    expect(groups[0]!.primarySessionId).toBe("s2");
++  });
++
++  it("prefers non-automated session over automated continuation when both have zero user messages", () => {
++    const sessions = [
++      makeSession({
++        id: "s1",
++        project: "proj",
++        message_count: 2,
++        user_message_count: 0,
++        is_automated: false,
++        started_at: "2024-01-01T00:00:00Z",
++        ended_at: "2024-01-01T01:00:00Z",
++      }),
++      makeSession({
++        id: "s2",
++        project: "proj",
++        parent_session_id: "s1",
++        relationship_type: "continuation",
++        message_count: 2,
++        user_message_count: 0,
++        is_automated: true,
++        started_at: "2024-01-01T01:30:00Z",
++        ended_at: "2024-01-01T02:00:00Z",
++      }),
++    ];
++
++    const groups = buildSessionGroups(sessions);
++    expect(groups).toHaveLength(1);
++    expect(groups[0]!.primarySessionId).toBe("s1");
++  });
++
+   it("sorts sessions within group by startedAt asc", () => {
+     const sessions = [
+       makeSession({
+@@ -3657,3 +3740,77 @@ describe("SessionsStore live refresh", () => {
+     vi.useRealTimers();
+   });
+ });
++
++describe("SessionsStore on-demand group loading", () => {
++  it("loadGroupSessions fetches with agent param and limit 100", async () => {
++    const sessions = createSessionsStore();
++    vi.mocked(api.getSidebarSessionIndex).mockResolvedValueOnce({
++      sessions: [makeSkinnyRow({ id: "cursor-1", agent: "cursor-ide" })],
++      total: 1245,
++      next_cursor: "cursor-token-1",
++    });
++
++    await sessions.loadGroupSessions("agent", "cursor-ide");
++
++    expect(api.getSidebarSessionIndex).toHaveBeenCalledWith(
++      expect.objectContaining({
++        agent: "cursor-ide",
++        limit: 100,
++      }),
++    );
++    const state = sessions.getGroupState("cursor-ide");
++    expect(state).toBeDefined();
++    expect(state!.sessions).toHaveLength(1);
++    expect(state!.sessions[0]!.id).toBe("cursor-1");
++    expect(state!.total).toBe(1245);
++    expect(state!.nextCursor).toBe("cursor-token-1");
++    expect(state!.loading).toBe(false);
++  });
++
++  it("loadMoreGroupSessions fetches next page using next_cursor", async () => {
++    const sessions = createSessionsStore();
++    vi.mocked(api.getSidebarSessionIndex)
++      .mockResolvedValueOnce({
++        sessions: [makeSkinnyRow({ id: "cursor-1", agent: "cursor-ide" })],
++        total: 1245,
++        next_cursor: "cursor-token-1",
++      })
++      .mockResolvedValueOnce({
++        sessions: [makeSkinnyRow({ id: "cursor-2", agent: "cursor-ide" })],
++        total: 1245,
++        next_cursor: null,
++      });
++
++    await sessions.loadGroupSessions("agent", "cursor-ide");
++    await sessions.loadMoreGroupSessions("agent", "cursor-ide");
++
++    expect(api.getSidebarSessionIndex).toHaveBeenLastCalledWith(
++      expect.objectContaining({
++        agent: "cursor-ide",
++        cursor: "cursor-token-1",
++        limit: 100,
++      }),
++    );
++    const state = sessions.getGroupState("cursor-ide");
++    expect(state!.sessions).toHaveLength(2);
++    expect(state!.sessions.map((s) => s.id)).toEqual(["cursor-1", "cursor-2"]);
++    expect(state!.nextCursor).toBeNull();
++  });
++
++  it("clearGroupSessionsCache resets the cache", async () => {
++    const sessions = createSessionsStore();
++    vi.mocked(api.getSidebarSessionIndex).mockResolvedValueOnce({
++      sessions: [makeSkinnyRow({ id: "cursor-1", agent: "cursor-ide" })],
++      total: 1245,
++      next_cursor: null,
++    });
++
++    await sessions.loadGroupSessions("agent", "cursor-ide");
++    expect(sessions.getGroupSessions("cursor-ide")).toHaveLength(1);
++
++    sessions.clearGroupSessionsCache();
++    expect(sessions.getGroupSessions("cursor-ide")).toHaveLength(0);
++    expect(sessions.getGroupState("cursor-ide")).toBeUndefined();
++  });
++});
++
+diff --git a/frontend/src/lib/stores/ui.svelte.ts b/frontend/src/lib/stores/ui.svelte.ts
+index cdf6d264..41a03252 100644
+--- a/frontend/src/lib/stores/ui.svelte.ts
++++ b/frontend/src/lib/stores/ui.svelte.ts
+@@ -53,6 +53,7 @@ const VITALS_KEY = "agentsview-session-vitals";
+ const VITALS_CALLS_EXPANDED_KEY = "agentsview-session-vitals-calls-expanded";
+ const SIGNAL_PANEL_KEY = "agentsview-signal-panel";
+ const FOLLOW_LATEST_KEY = "agentsview-follow-latest";
++const AUTO_COLLAPSE_TURNS_KEY = "agentsview-auto-collapse-turns";
+ 
+ /** Resolves the visible block types from a stored filter payload. */
+ export function parseBlockFilters(raw: string | null): Set<BlockType> {
+@@ -281,8 +282,17 @@ class UIStore {
+   signalPanelOpen: boolean = $state(readStoredBool(SIGNAL_PANEL_KEY, false));
+   followLatest: boolean = $state(readStoredBool(FOLLOW_LATEST_KEY, false));
+   followLatestRequest: number = $state(0);
+-
+-  /** Set of block types currently visible. */
++  /** Default expansion for assistant turn headers and their child event
++   *  rows: `true` means they render collapsed by default. Manual and bulk
++   *  expansion choices live in the session-scoped turn-collapse store and
++   *  are not affected by this preference. */
++  autoCollapseAssistantTurns: boolean = $state(readStoredBool(AUTO_COLLAPSE_TURNS_KEY, true));
++
++  /**
++   * Set of block types currently visible. Writers MUST reassign this Set
++   * rather than mutate it in place — the in-session search diff effect
++   * snapshots the previous reference to detect manual filter changes.
++   */
+   visibleBlocks: Set<BlockType> = $state(readBlockFilters());
+ 
+   constructor() {
+@@ -404,6 +414,14 @@ class UIStore {
+         }
+       });
+ 
++      $effect(() => {
++        try {
++          localStorage?.setItem(AUTO_COLLAPSE_TURNS_KEY, String(this.autoCollapseAssistantTurns));
++        } catch {
++          // ignore
++        }
++      });
++
+       $effect(() => {
+         if (this.activeModal !== "publish") {
+           this.publishTarget = null;
+@@ -566,6 +584,10 @@ class UIStore {
+     this.setFollowLatest(!this.followLatest);
+   }
+ 
++  setAutoCollapseAssistantTurns(enabled: boolean) {
++    this.autoCollapseAssistantTurns = enabled;
++  }
++
+   zoomIn() {
+     const idx = ZOOM_STEPS.indexOf(this.zoomLevel);
+     if (idx < ZOOM_STEPS.length - 1) {
+diff --git a/frontend/src/lib/stores/ui.test.ts b/frontend/src/lib/stores/ui.test.ts
+index 8bcf710a..5521e1ae 100644
+--- a/frontend/src/lib/stores/ui.test.ts
++++ b/frontend/src/lib/stores/ui.test.ts
+@@ -23,6 +23,7 @@ describe("UIStore", () => {
+     ui.pendingScrollOrdinal = null;
+     ui.followLatest = false;
+     ui.followLatestRequest = 0;
++    ui.setAutoCollapseAssistantTurns(true);
+   });
+ 
+   describe("activeModal", () => {
+@@ -584,6 +585,120 @@ describe("UIStore", () => {
+     });
+   });
+ 
++  describe("auto-collapse assistant turns preference", () => {
++    it("defaults to enabled", async () => {
++      const original = globalThis.localStorage;
++      Object.defineProperty(globalThis, "localStorage", {
++        value: {
++          getItem: vi.fn(() => null),
++          setItem: vi.fn(),
++        },
++        writable: true,
++        configurable: true,
++      });
++
++      try {
++        // @ts-expect-error -- query string busts module cache
++        const mod = await import("./ui.svelte.js?autoCollapseDefault");
++        expect(mod.ui.autoCollapseAssistantTurns).toBe(true);
++      } finally {
++        Object.defineProperty(globalThis, "localStorage", {
++          value: original,
++          writable: true,
++          configurable: true,
++        });
++      }
++    });
++
++    it("restores a disabled preference", async () => {
++      const original = globalThis.localStorage;
++      Object.defineProperty(globalThis, "localStorage", {
++        value: {
++          getItem: vi.fn((key: string) =>
++            key === "agentsview-auto-collapse-turns" ? "false" : null,
++          ),
++          setItem: vi.fn(),
++        },
++        writable: true,
++        configurable: true,
++      });
++
++      try {
++        // @ts-expect-error -- query string busts module cache
++        const mod = await import("./ui.svelte.js?autoCollapseDisabled");
++        expect(mod.ui.autoCollapseAssistantTurns).toBe(false);
++      } finally {
++        Object.defineProperty(globalThis, "localStorage", {
++          value: original,
++          writable: true,
++          configurable: true,
++        });
++      }
++    });
++
++    it("persists changes under agentsview-auto-collapse-turns", async () => {
++      const original = globalThis.localStorage;
++      const setItem = vi.fn();
++      Object.defineProperty(globalThis, "localStorage", {
++        value: { getItem: vi.fn(() => null), setItem },
++        writable: true,
++        configurable: true,
++      });
++
++      try {
++        // @ts-expect-error -- query string busts module cache
++        const mod = await import("./ui.svelte.js?autoCollapsePersist");
++        setItem.mockClear();
++
++        mod.ui.setAutoCollapseAssistantTurns(false);
++        await tick();
++
++        expect(mod.ui.autoCollapseAssistantTurns).toBe(false);
++        expect(setItem).toHaveBeenCalledWith("agentsview-auto-collapse-turns", "false");
++      } finally {
++        Object.defineProperty(globalThis, "localStorage", {
++          value: original,
++          writable: true,
++          configurable: true,
++        });
++      }
++    });
++
++    it("can be set back to enabled on the shared store", () => {
++      ui.setAutoCollapseAssistantTurns(false);
++      expect(ui.autoCollapseAssistantTurns).toBe(false);
++
++      ui.setAutoCollapseAssistantTurns(true);
++      expect(ui.autoCollapseAssistantTurns).toBe(true);
++    });
++
++    it("falls back to enabled when the stored value is invalid", async () => {
++      const original = globalThis.localStorage;
++      Object.defineProperty(globalThis, "localStorage", {
++        value: {
++          getItem: vi.fn((key: string) =>
++            key === "agentsview-auto-collapse-turns" ? "yes" : null,
++          ),
++          setItem: vi.fn(),
++        },
++        writable: true,
++        configurable: true,
++      });
++
++      try {
++        // @ts-expect-error -- query string busts module cache
++        const mod = await import("./ui.svelte.js?autoCollapseInvalid");
++        expect(mod.ui.autoCollapseAssistantTurns).toBe(true);
++      } finally {
++        Object.defineProperty(globalThis, "localStorage", {
++          value: original,
++          writable: true,
++          configurable: true,
++        });
++      }
++    });
++  });
++
+   describe("postMessage theme control", () => {
+     it("should change theme on valid theme:set message", () => {
+       ui.theme = "light";

@@ -1,0 +1,1796 @@
+diff --git a/internal/parser/claude.go b/internal/parser/claude.go
+index e12fae6f..5eaa1ca1 100644
+--- a/internal/parser/claude.go
++++ b/internal/parser/claude.go
+@@ -155,7 +155,8 @@ func claudeParseFile(
+ 		parentSessionID = lineage.parentSessionID
+ 	}
+ 
+-	lr := newLineReaderContext(ctx, f, maxLineSize)
++	tee := newCodexHashAnchorTee(io.LimitReader(f, info.Size()))
++	lr := newLineReaderContext(ctx, tee, maxLineSize)
+ 	defer releaseLineReader(lr)
+ 	lastLineFailed := false
+ 	for {
+@@ -403,6 +404,19 @@ func claudeParseFile(
+ 		}
+ 	}
+ 
++	if err := lr.Err(); err != nil {
++		return nil, nil, fmt.Errorf("reading claude %s: %w", path, err)
++	}
++	if tee.total < info.Size() {
++		if _, err := io.Copy(io.Discard, tee); err != nil {
++			return nil, nil, fmt.Errorf("reading remainder of %s: %w", path, err)
++		}
++	}
++	fullHash, err := tee.HashDigest()
++	if err != nil {
++		return nil, nil, err
++	}
++
+ 	// Detect truncation: last line is non-empty, invalid JSON,
+ 	// AND the file did not end with a newline. A newline-
+ 	// terminated invalid line is just a complete malformed
+@@ -421,10 +435,16 @@ func claudeParseFile(
+ 		return nil, nil, err
+ 	}
+ 
++	inode, device := sourceFileIdentityForFile(f, info)
++	changeTime, _ := codexIndexChangeTimeForFile(f, info)
+ 	fileInfo := FileInfo{
+-		Path:  path,
+-		Size:  info.Size(),
+-		Mtime: info.ModTime().UnixNano(),
++		Path:       path,
++		Size:       info.Size(),
++		Mtime:      info.ModTime().UnixNano(),
++		Inode:      int64(inode),
++		Device:     int64(device),
++		ChangeTime: changeTime,
++		Hash:       fullHash,
+ 	}
+ 	if opts.compatibleTitleEvents {
+ 		displayName = firstNonEmptyJSONLString(
+@@ -532,6 +552,21 @@ func claudeParseFile(
+ 	if err := ctx.Err(); err != nil {
+ 		return nil, nil, err
+ 	}
++	var lastEntryUUID string
++	for i := len(entries) - 1; i >= 0; i-- {
++		if entries[i].uuid != "" {
++			lastEntryUUID = entries[i].uuid
++			break
++		}
++	}
++	if !opts.uploadIdentity && lineage == nil && !lastLineFailed && len(kept) == 1 && lastEntryUUID != "" {
++		hashState, stateErr := tee.HashState()
++		if stateErr == nil {
++			kept[0].Checkpoint = []byte(lastEntryUUID)
++			kept[0].CheckpointHashState = hashState
++			kept[0].CheckpointAnchorDigest = tee.AnchorDigest()
++		}
++	}
+ 	return kept, excluded, nil
+ }
+ 
+diff --git a/internal/parser/claude_provider.go b/internal/parser/claude_provider.go
+index 5bf50e25..b8ef67da 100644
+--- a/internal/parser/claude_provider.go
++++ b/internal/parser/claude_provider.go
+@@ -364,12 +364,16 @@ func (p *claudeProvider) ParseIncremental(
+ 		return IncrementalOutcome{ForceReplace: true},
+ 			IncrementalNeedsFullParse, nil
+ 	}
++	lastUUID := req.LastEntryUUID
++	if lastUUID == "" && len(req.Seed) > 0 {
++		lastUUID = string(req.Seed)
++	}
+ 	newMsgs, links, endedAt, consumed, err := claudeParseSessionFrom(
+ 		path,
+ 		req.Offset,
+ 		claudeIncrementalScan{
+ 			startOrdinal:  req.StartOrdinal,
+-			lastEntryUUID: req.LastEntryUUID,
++			lastEntryUUID: lastUUID,
+ 			stored: claudeStoredIdentity{
+ 				agentLabel:  req.StoredAgentLabel,
+ 				entrypoint:  req.StoredEntrypoint,
+@@ -394,20 +398,37 @@ func (p *claudeProvider) ParseIncremental(
+ 	}
+ 	if len(newMsgs) == 0 {
+ 		if consumed > 0 {
++			var nextCursor []byte
++			if lastUUID != "" {
++				nextCursor = []byte(lastUUID)
++			}
+ 			return IncrementalOutcome{
+ 				SessionID:     req.SessionID,
+ 				SubagentLinks: links,
++				NextCursor:    nextCursor,
+ 				EndedAt:       endedAt,
+ 				ConsumedBytes: consumed,
+ 			}, IncrementalApplied, nil
+ 		}
+ 		return IncrementalOutcome{}, IncrementalNoNewData, nil
+ 	}
++	nextUUID := lastUUID
++	for i := len(newMsgs) - 1; i >= 0; i-- {
++		if newMsgs[i].SourceUUID != "" {
++			nextUUID = strings.TrimSuffix(newMsgs[i].SourceUUID, ":ide-context")
++			break
++		}
++	}
++	var nextCursor []byte
++	if nextUUID != "" {
++		nextCursor = []byte(nextUUID)
++	}
+ 	totalOut, peakCtx, hasTotalOut, hasPeakCtx := claudeProviderTokenTotals(newMsgs)
+ 	return IncrementalOutcome{
+ 		SessionID:            req.SessionID,
+ 		Messages:             newMsgs,
+ 		SubagentLinks:        links,
++		NextCursor:           nextCursor,
+ 		EndedAt:              endedAt,
+ 		ConsumedBytes:        consumed,
+ 		MessageCount:         len(newMsgs),
+diff --git a/internal/parser/claude_provider_test.go b/internal/parser/claude_provider_test.go
+index fb37f126..545d0963 100644
+--- a/internal/parser/claude_provider_test.go
++++ b/internal/parser/claude_provider_test.go
+@@ -997,3 +997,57 @@ func claudeProviderFixture(firstMessage string) string {
+ 		testjsonl.ClaudeAssistantJSON("Done.", tsEarlyS1),
+ 	)
+ }
++
++func TestClaudeProvider_ParseCarriesSinglePassCheckpoint(t *testing.T) {
++	root := t.TempDir()
++	sourcePath := filepath.Join(root, "-Users-dev-code-demo", "cp-test.jsonl")
++	u1 := "uuid-1"
++	u2 := "uuid-2"
++	u3 := "uuid-3"
++	initial := testjsonl.JoinJSONL(
++		testjsonl.ClaudeEntryJSON("user", "first question", tsEarly, u1, ""),
++		testjsonl.ClaudeEntryJSON("assistant", "first answer", tsEarlyS1, u2, u1),
++	)
++	writeSourceFile(t, sourcePath, initial)
++
++	provider, ok := NewProvider(AgentClaude, ProviderConfig{
++		Roots:   []string{root},
++		Machine: "devbox",
++	})
++	require.True(t, ok)
++	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
++		RawSessionID: "cp-test",
++	})
++	require.NoError(t, err)
++	require.True(t, ok)
++
++	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
++	require.NoError(t, err)
++	require.Len(t, outcome.Results, 1)
++	res := outcome.Results[0].Result
++
++	assert.Equal(t, []byte(u2), res.Checkpoint)
++	assert.NotEmpty(t, res.CheckpointHashState)
++	assert.NotEmpty(t, res.CheckpointAnchorDigest)
++	assert.NotEmpty(t, res.Session.File.Hash)
++
++	// Incremental parse advances the cursor
++	appended := testjsonl.JoinJSONL(
++		testjsonl.ClaudeEntryJSON("user", "second question", tsEarlyS5, u3, u2),
++	)
++	writeSourceFile(t, sourcePath, initial+"\n"+appended)
++
++	incOutcome, status, err := provider.ParseIncremental(t.Context(), IncrementalRequest{
++		Source:        source,
++		SessionID:     "cp-test",
++		Offset:        int64(len(initial) + 1), // including newline
++		StartOrdinal:  2,
++		Seed:          res.Checkpoint,
++		LastEntryUUID: u2,
++		Fingerprint:   SourceFingerprint{Key: sourcePath, Size: int64(len(initial) + 1 + len(appended))},
++	})
++	require.NoError(t, err)
++	assert.Equal(t, IncrementalApplied, status)
++	assert.Equal(t, []byte(u3), incOutcome.NextCursor)
++	assert.Len(t, incOutcome.Messages, 1)
++}
+diff --git a/internal/parser/cursor_ide.go b/internal/parser/cursor_ide.go
+index a87f5492..c29e36d7 100644
+--- a/internal/parser/cursor_ide.go
++++ b/internal/parser/cursor_ide.go
+@@ -9,6 +9,7 @@ import (
+ 	"fmt"
+ 	"hash/fnv"
+ 	"os"
++	"sort"
+ 	"strconv"
+ 	"strings"
+ 	"sync/atomic"
+@@ -77,6 +78,10 @@ func openCursorIDEDB(dbPath string) (*sql.DB, error) {
+ 	return db, nil
+ }
+ 
++func withCursorIDEDB(ctx context.Context, dbPath string, fn func(conn *sql.DB) error) error {
++	return WithSQLiteReadOnly(ctx, dbPath, sqliteReadOptions{busyTimeoutMS: 3000}, fn)
++}
++
+ // cursorIDEQuerier is the shared read surface of *sql.DB and *sql.Tx: the
+ // composer readers accept it so one snapshot transaction can serve the
+ // composer document, its bubbles, and the content digest together.
+@@ -108,17 +113,23 @@ func CursorIDEComposerExists(ctx context.Context, dbPath, composerID string) boo
+ 	if dbPath == "" || composerID == "" || !IsValidSessionID(composerID) {
+ 		return false
+ 	}
+-	conn, err := openCursorIDEDB(dbPath)
+-	if err != nil {
+-		return false
+-	}
+-	defer conn.Close()
+-	var one int
+-	err = conn.QueryRowContext(ctx,
+-		`SELECT 1 FROM cursorDiskKV WHERE key = ? LIMIT 1`,
+-		cursorIDEComposerKeyPrefix+composerID,
+-	).Scan(&one)
+-	return err == nil
++	var found bool
++	err := withCursorIDEDB(ctx, dbPath, func(conn *sql.DB) error {
++		var one int
++		err := conn.QueryRowContext(ctx,
++			`SELECT 1 FROM cursorDiskKV WHERE key = ? LIMIT 1`,
++			cursorIDEComposerKeyPrefix+composerID,
++		).Scan(&one)
++		if err == nil {
++			found = true
++			return nil
++		}
++		if errors.Is(err, sql.ErrNoRows) {
++			return nil
++		}
++		return err
++	})
++	return err == nil && found
+ }
+ 
+ // cursorIDEComposerHeader is one entry of fullConversationHeadersOnly: the
+@@ -155,6 +166,7 @@ type cursorIDEComposerDoc struct {
+ 	LastUpdatedAt       int64                        `json:"lastUpdatedAt"`
+ 	WorkspaceIdentifier cursorIDEWorkspaceIdentifier `json:"workspaceIdentifier"`
+ 	TrackedGitRepos     []cursorIDEGitRepo           `json:"trackedGitRepos"`
++	ContextTokensUsed   int64                        `json:"contextTokensUsed"`
+ }
+ 
+ // cursorIDEComposerMeta is a per-composer descriptor for the engine's
+@@ -600,6 +612,14 @@ func parseCursorIDEComposer(
+ 		return nil, nil
+ 	}
+ 
++	if doc.ContextTokensUsed > 0 {
++		allocated := distributeCursorIDETokens(doc.ContextTokensUsed, messages)
++		for i := range messages {
++			messages[i].ContextTokens = int(allocated[i])
++			messages[i].HasContextTokens = true
++		}
++	}
++
+ 	var firstMessage string
+ 	userCount := 0
+ 	for _, m := range messages {
+@@ -647,19 +667,21 @@ func parseCursorIDEComposer(
+ 	}
+ 	cwd := cursorIDECwd(doc)
+ 	sess := ParsedSession{
+-		ID:               cursorIDEIDPrefix + composerID,
+-		Agent:            AgentCursorIDE,
+-		Machine:          machine,
+-		Project:          ExtractProjectFromCwd(cwd),
+-		Cwd:              cwd,
+-		GitBranch:        cursorIDELatestBranch(doc.TrackedGitRepos),
+-		SessionName:      doc.Name,
+-		FirstMessage:     firstMessage,
+-		StartedAt:        startedAt,
+-		EndedAt:          endedAt,
+-		MessageCount:     len(messages),
+-		UserMessageCount: userCount,
+-		IsTruncated:      truncated,
++		ID:                   cursorIDEIDPrefix + composerID,
++		Agent:                AgentCursorIDE,
++		Machine:              machine,
++		Project:              ExtractProjectFromCwd(cwd),
++		Cwd:                  cwd,
++		GitBranch:            cursorIDELatestBranch(doc.TrackedGitRepos),
++		SessionName:          doc.Name,
++		FirstMessage:         firstMessage,
++		StartedAt:            startedAt,
++		EndedAt:              endedAt,
++		MessageCount:         len(messages),
++		UserMessageCount:     userCount,
++		IsTruncated:          truncated,
++		HasPeakContextTokens: doc.ContextTokensUsed > 0,
++		PeakContextTokens:    int(doc.ContextTokensUsed),
+ 		File: FileInfo{
+ 			Path:  VirtualSourcePath(dbPath, composerID),
+ 			Size:  dbInfo.Size(),
+@@ -671,6 +693,58 @@ func parseCursorIDEComposer(
+ 	return &ParseResult{Session: sess, Messages: messages}, nil
+ }
+ 
++// distributeCursorIDETokens apportions a session-level context-token total
++// across messages using the largest-remainder (Hamilton) method. Each
++// message first receives floor(total * contentLength / totalContentLength);
++// the remaining tokens are handed out one at a time to the messages with the
++// largest fractional remainders, ties broken by original message index.
++// The returned slice always sums exactly to total.
++func distributeCursorIDETokens(total int64, messages []ParsedMessage) []int64 {
++	n := len(messages)
++	out := make([]int64, n)
++	if total <= 0 || n == 0 {
++		return out
++	}
++
++	var totalLen int64
++	for _, m := range messages {
++		totalLen += int64(m.ContentLength)
++	}
++	if totalLen == 0 {
++		// Without any text length to apportion against, keep the whole total
++		// with the first message so the allocation still sums correctly.
++		out[0] = total
++		return out
++	}
++
++	type remainder struct {
++		rem int64
++		idx int
++	}
++	remainders := make([]remainder, n)
++	var allocated int64
++	for i, m := range messages {
++		prod := total * int64(m.ContentLength)
++		floor := prod / totalLen
++		out[i] = floor
++		allocated += floor
++		remainders[i] = remainder{rem: prod % totalLen, idx: i}
++	}
++
++	sort.Slice(remainders, func(a, b int) bool {
++		if remainders[a].rem == remainders[b].rem {
++			return remainders[a].idx < remainders[b].idx
++		}
++		return remainders[a].rem > remainders[b].rem
++	})
++
++	left := total - allocated
++	for i := int64(0); i < left; i++ {
++		out[remainders[i].idx]++
++	}
++	return out
++}
++
+ // cursorIDETime converts an epoch-milliseconds stamp (composerData
+ // createdAt/lastUpdatedAt) to UTC. Zero stays zero. Bubble timestamps use a
+ // different encoding (ISO-8601 strings) and go through parseTimestamp
+diff --git a/internal/parser/cursor_ide_provider.go b/internal/parser/cursor_ide_provider.go
+index be45fd19..c3fef58d 100644
+--- a/internal/parser/cursor_ide_provider.go
++++ b/internal/parser/cursor_ide_provider.go
+@@ -2,6 +2,7 @@ package parser
+ 
+ import (
+ 	"context"
++	"database/sql"
+ 	"errors"
+ 	"fmt"
+ 	"hash/fnv"
+@@ -130,12 +131,13 @@ func cursorIDEFingerprintSource(
+ 		}, nil
+ 	}
+ 
+-	conn, err := openCursorIDEDB(src.Container)
+-	if err != nil {
+-		return SourceFingerprint{}, err
+-	}
+-	defer conn.Close()
+-	meta, ok, err := loadCursorIDEComposerMeta(ctx, conn, src.MemberID)
++	var meta cursorIDEComposerMeta
++	var ok bool
++	err = withCursorIDEDB(ctx, src.Container, func(conn *sql.DB) error {
++		var loadErr error
++		meta, ok, loadErr = loadCursorIDEComposerMeta(ctx, conn, src.MemberID)
++		return loadErr
++	})
+ 	if err != nil {
+ 		return SourceFingerprint{}, err
+ 	}
+@@ -234,15 +236,16 @@ func cursorIDEBatchMemberPresent(ctx context.Context,
+ ) map[string]bool {
+ 	present := make(map[string]bool, len(members))
+ 	existing := make(map[string]struct{})
+-	conn, err := openCursorIDEDB(container.Container)
+-	if err == nil {
+-		defer conn.Close()
++	err := withCursorIDEDB(ctx, container.Container, func(conn *sql.DB) error {
+ 		ids, listErr := listCursorIDEComposerIDs(ctx, conn)
+-		err = listErr
++		if listErr != nil {
++			return listErr
++		}
+ 		for _, id := range ids {
+ 			existing[id] = struct{}{}
+ 		}
+-	}
++		return nil
++	})
+ 	for _, member := range members {
+ 		if err != nil {
+ 			present[member.Path] = true
+@@ -286,14 +289,18 @@ func cursorIDEParseMember(
+ 	if !IsValidSessionID(src.MemberID) {
+ 		return nil, nil
+ 	}
+-	conn, err := openCursorIDEDB(src.Container)
++	var res *ParseResult
++	err = withCursorIDEDB(ctx, src.Container, func(conn *sql.DB) error {
++		var parseErr error
++		res, parseErr = parseCursorIDEComposer(
++			ctx, conn, src.Container, src.MemberID, req.Machine, dbInfo,
++		)
++		return parseErr
++	})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	defer conn.Close()
+-	return parseCursorIDEComposer(
+-		ctx, conn, src.Container, src.MemberID, req.Machine, dbInfo,
+-	)
++	return res, nil
+ }
+ 
+ // cursorIDEParseContainerEach yields each composer as it is parsed, so the
+@@ -309,33 +316,30 @@ func cursorIDEParseContainerEach(
+ 		}
+ 		return err
+ 	}
+-	conn, err := openCursorIDEDB(src.Container)
+-	if err != nil {
+-		return err
+-	}
+-	defer conn.Close()
+-	ids, err := listCursorIDEComposerIDs(ctx, conn)
+-	if err != nil {
+-		return err
+-	}
+-	for _, id := range ids {
+-		if err := ctx.Err(); err != nil {
+-			return err
+-		}
+-		result, err := parseCursorIDEComposer(
+-			ctx, conn, src.Container, id, req.Machine, dbInfo,
+-		)
++	return withCursorIDEDB(ctx, src.Container, func(conn *sql.DB) error {
++		ids, err := listCursorIDEComposerIDs(ctx, conn)
+ 		if err != nil {
+ 			return err
+ 		}
+-		if result == nil {
+-			continue
+-		}
+-		if err := yield(*result); err != nil {
+-			return err
++		for _, id := range ids {
++			if err := ctx.Err(); err != nil {
++				return err
++			}
++			result, err := parseCursorIDEComposer(
++				ctx, conn, src.Container, id, req.Machine, dbInfo,
++			)
++			if err != nil {
++				return err
++			}
++			if result == nil {
++				continue
++			}
++			if err := yield(*result); err != nil {
++				return err
++			}
+ 		}
+-	}
+-	return nil
++		return nil
++	})
+ }
+ 
+ // parseCursorIDEVirtualPath splits a Cursor IDE virtual source path into its
+diff --git a/internal/parser/cursor_ide_test.go b/internal/parser/cursor_ide_test.go
+index bdce6806..7fc246ae 100644
+--- a/internal/parser/cursor_ide_test.go
++++ b/internal/parser/cursor_ide_test.go
+@@ -31,14 +31,15 @@ type cursorIDETestBubble struct {
+ // cursorIDETestComposer is one synthetic composerData document plus its
+ // bubbles, keyed under the same composer ID.
+ type cursorIDETestComposer struct {
+-	id        string
+-	name      string
+-	createdAt int64
+-	updatedAt int64
+-	cwd       string
+-	repoPath  string
+-	branch    string
+-	bubbles   []cursorIDETestBubble
++	id                string
++	name              string
++	createdAt         int64
++	updatedAt         int64
++	cwd               string
++	repoPath          string
++	branch            string
++	contextTokensUsed int64
++	bubbles           []cursorIDETestBubble
+ 	// omitBubbleIDs skips writing these bubble IDs to cursorDiskKV even
+ 	// though they are still listed in fullConversationHeadersOnly, so the
+ 	// parser must tolerate a header pointing at a row Cursor never wrote or
+@@ -67,10 +68,11 @@ func createCursorIDEDB(t *testing.T, composers []cursorIDETestComposer) string {
+ 			})
+ 		}
+ 		doc := cursorIDEComposerDoc{
+-			Headers:       headers,
+-			Name:          c.name,
+-			CreatedAt:     c.createdAt,
+-			LastUpdatedAt: c.updatedAt,
++			Headers:           headers,
++			Name:              c.name,
++			CreatedAt:         c.createdAt,
++			LastUpdatedAt:     c.updatedAt,
++			ContextTokensUsed: c.contextTokensUsed,
+ 		}
+ 		doc.WorkspaceIdentifier.URI.FSPath = c.cwd
+ 		if c.repoPath != "" {
+@@ -1283,3 +1285,186 @@ func TestCursorIDEClassifyPathIgnoresEmptyWALEvents(t *testing.T) {
+ 	require.True(t, ok)
+ 	assert.Equal(t, dbPath, match.Container)
+ }
++
++func TestCursorIDE_FallbackOnBusy(t *testing.T) {
++	composerID := "locked-composer-0000"
++	dbPath := createCursorIDEDB(t, []cursorIDETestComposer{{
++		id:        composerID,
++		name:      "locked session",
++		createdAt: 1718954851522,
++		bubbles: []cursorIDETestBubble{
++			{id: "b1", bubbleType: cursorIDEBubbleTypeUser, text: "hello", createdAt: "2026-06-21T07:27:31.522Z"},
++		},
++	}})
++
++	writer, err := sql.Open("sqlite3", dbPath)
++	require.NoError(t, err)
++	defer writer.Close()
++	writer.SetMaxOpenConns(1)
++
++	_, err = writer.ExecContext(t.Context(), "PRAGMA journal_mode=WAL")
++	require.NoError(t, err)
++	_, err = writer.ExecContext(t.Context(), "PRAGMA locking_mode=EXCLUSIVE")
++	require.NoError(t, err)
++
++	tx, err := writer.BeginTx(t.Context(), nil)
++	require.NoError(t, err)
++	defer func() { _ = tx.Rollback() }()
++
++	_, err = tx.ExecContext(t.Context(), "INSERT INTO cursorDiskKV VALUES ('dummy', 'dummy')")
++	require.NoError(t, err)
++
++	exists := CursorIDEComposerExists(t.Context(), dbPath, composerID)
++	assert.True(t, exists, "CursorIDEComposerExists must succeed via scratch fallback when locked")
++
++	provider, ok := NewProvider(AgentCursorIDE, ProviderConfig{
++		Roots: []string{filepath.Dir(dbPath)},
++	})
++	require.True(t, ok)
++
++	sources, err := provider.Discover(t.Context())
++	require.NoError(t, err)
++	require.Len(t, sources, 1)
++
++	fingerprint, err := provider.Fingerprint(t.Context(), sources[0])
++	require.NoError(t, err)
++
++	outcome, err := provider.Parse(t.Context(), ParseRequest{
++		Source: sources[0], Machine: "devbox", Fingerprint: fingerprint,
++	})
++	require.NoError(t, err, "provider.Parse must succeed via scratch fallback when locked")
++	require.Len(t, outcome.Results, 1)
++	assert.Equal(t, cursorIDEIDPrefix+composerID, outcome.Results[0].Result.Session.ID)
++}
++
++func TestDistributeCursorIDETokens(t *testing.T) {
++	tests := []struct {
++		name     string
++		total    int64
++		lengths  []int
++		expected []int64
++	}{
++		{
++			name:     "zero total leaves allocations zero",
++			total:    0,
++			lengths:  []int{10, 20},
++			expected: []int64{0, 0},
++		},
++		{
++			name:     "exact proportional split with no remainder",
++			total:    100,
++			lengths:  []int{25, 75},
++			expected: []int64{25, 75},
++		},
++		{
++			name:     "remainder awarded to larger fractional share",
++			total:    10,
++			lengths:  []int{1, 2},
++			expected: []int64{3, 7},
++		},
++		{
++			name:     "equal remainders tie-break by original index",
++			total:    10,
++			lengths:  []int{1, 1, 1},
++			expected: []int64{4, 3, 3},
++		},
++		{
++			name:     "single message receives the entire total",
++			total:    50,
++			lengths:  []int{42},
++			expected: []int64{50},
++		},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			messages := make([]ParsedMessage, len(tc.lengths))
++			for i, length := range tc.lengths {
++				messages[i].ContentLength = length
++			}
++			got := distributeCursorIDETokens(tc.total, messages)
++			assert.Equal(t, tc.expected, got)
++
++			var sum int64
++			for _, v := range got {
++				sum += v
++			}
++			assert.Equal(t, tc.total, sum, "allocated tokens must sum exactly to the requested total")
++		})
++	}
++}
++
++func TestParseCursorIDEComposer_ContextTokensUsedDistributed(t *testing.T) {
++	dbPath := createCursorIDEDB(t, []cursorIDETestComposer{{
++		id:                "tokens-0000-0000-0000-000000000000",
++		name:              "Token thread",
++		createdAt:         1782026756842,
++		updatedAt:         1782026791522,
++		contextTokensUsed: 100,
++		bubbles: []cursorIDETestBubble{
++			{
++				id: "u1", bubbleType: cursorIDEBubbleTypeUser,
++				text: "12345", createdAt: "2026-06-21T07:27:29.606Z",
++			},
++			{
++				id: "a1", bubbleType: cursorIDEBubbleTypeAssistant,
++				text: "123456789012345", createdAt: "2026-06-21T07:27:31.522Z",
++			},
++		},
++	}})
++	conn, err := openCursorIDEDB(dbPath)
++	require.NoError(t, err)
++	defer conn.Close()
++	info, err := os.Stat(dbPath)
++	require.NoError(t, err)
++
++	result, err := parseCursorIDEComposer(
++		t.Context(), conn, dbPath,
++		"tokens-0000-0000-0000-000000000000", "devbox", info,
++	)
++	require.NoError(t, err)
++	require.NotNil(t, result)
++	require.Len(t, result.Messages, 2)
++
++	var sum int
++	for _, m := range result.Messages {
++		assert.True(t, m.HasContextTokens,
++			"every message must carry inferred context-token presence")
++		sum += m.ContextTokens
++	}
++	assert.Equal(t, 100, sum,
++		"per-message context tokens must sum to the composer-level total")
++	assert.True(t, result.Session.HasPeakContextTokens)
++	assert.Equal(t, 100, result.Session.PeakContextTokens)
++}
++
++func TestParseCursorIDEComposer_ZeroContextTokensUsedLeavesTokensUnset(t *testing.T) {
++	dbPath := createCursorIDEDB(t, []cursorIDETestComposer{{
++		id:                "no-tokens-0000-0000-0000-000000000000",
++		name:              "No token thread",
++		createdAt:         1782026756842,
++		updatedAt:         1782026791522,
++		contextTokensUsed: 0,
++		bubbles: []cursorIDETestBubble{
++			{
++				id: "u1", bubbleType: cursorIDEBubbleTypeUser,
++				text: "hello", createdAt: "2026-06-21T07:27:29.606Z",
++			},
++		},
++	}})
++	conn, err := openCursorIDEDB(dbPath)
++	require.NoError(t, err)
++	defer conn.Close()
++	info, err := os.Stat(dbPath)
++	require.NoError(t, err)
++
++	result, err := parseCursorIDEComposer(
++		t.Context(), conn, dbPath,
++		"no-tokens-0000-0000-0000-000000000000", "devbox", info,
++	)
++	require.NoError(t, err)
++	require.NotNil(t, result)
++	require.Len(t, result.Messages, 1)
++	assert.False(t, result.Messages[0].HasContextTokens)
++	assert.Zero(t, result.Messages[0].ContextTokens)
++	assert.False(t, result.Session.HasPeakContextTokens)
++}
+diff --git a/internal/parser/opencode.go b/internal/parser/opencode.go
+index ef7cc982..11bcd9bb 100644
+--- a/internal/parser/opencode.go
++++ b/internal/parser/opencode.go
+@@ -67,25 +67,31 @@ func OpenCodeSQLiteSessionExists(ctx context.Context, dbPath, sessionID string)
+ 	if err != nil || info.IsDir() {
+ 		return false
+ 	}
+-	db, err := openOpenCodeDB(dbPath)
+-	if err != nil {
+-		return false
+-	}
+-	defer db.Close()
+-	table, err := openCodeSessionTableCached(ctx, db, dbPath, sessionID)
+-	if err != nil {
+-		return false
+-	}
+-	from, err := openCodeSessionFromCached(ctx, db, dbPath, table)
+-	if err != nil {
+-		return false
+-	}
+-	var found int
+-	err = db.QueryRowContext(ctx,
+-		"SELECT 1 FROM "+from+" WHERE id = ? LIMIT 1",
+-		sessionID,
+-	).Scan(&found)
+-	return err == nil
++	var found bool
++	err = withOpenCodeDB(ctx, dbPath, func(db *sql.DB) error {
++		table, err := openCodeSessionTableCached(ctx, db, dbPath, sessionID)
++		if err != nil {
++			return err
++		}
++		from, err := openCodeSessionFromCached(ctx, db, dbPath, table)
++		if err != nil {
++			return err
++		}
++		var one int
++		err = db.QueryRowContext(ctx,
++			"SELECT 1 FROM "+from+" WHERE id = ? LIMIT 1",
++			sessionID,
++		).Scan(&one)
++		if err == nil {
++			found = true
++			return nil
++		}
++		if errors.Is(err, sql.ErrNoRows) {
++			return nil
++		}
++		return err
++	})
++	return err == nil && found
+ }
+ 
+ // ListOpenCodeSessionMeta returns lightweight metadata for
+@@ -177,67 +183,63 @@ func ForEachOpenCodeSessionWatermarkMeta(
+ 		return nil
+ 	}
+ 
+-	db, err := openOpenCodeDB(dbPath)
+-	if err != nil {
+-		return err
+-	}
+-	defer db.Close()
+-
+-	composite, err := openCodeCompositeMtimeSupportedCached(ctx, db, dbPath)
+-	if err != nil {
+-		return err
+-	}
+-	// Ordered by id so the virtual paths ("<db>#<id>") stream in ascending
+-	// byte order: the changed-path merge walks a paged stored-freshness
+-	// cursor in step with this stream, and both sides must share one order.
+-	tables, idle, migration, err := openCodeSessionTablesCached(ctx, db, dbPath)
+-	if err != nil {
+-		return err
+-	}
+-	var queries []string
+-	for _, table := range tables {
+-		from := openCodeSessionFrom(table, idle, migration)
+-		query := "SELECT s.id, s.time_updated FROM " + from + " s"
+-		if composite {
+-			query = "SELECT s.id, " + openCodeSessionRowWatermarkExpr +
+-				" FROM " + from + " s" + openCodeSessionCompositeMtimeJoins
++	return withOpenCodeDB(ctx, dbPath, func(db *sql.DB) error {
++		composite, err := openCodeCompositeMtimeSupportedCached(ctx, db, dbPath)
++		if err != nil {
++			return err
+ 		}
+-
+-		if table == "session" && len(tables) == 2 {
+-			query += " WHERE NOT EXISTS (SELECT 1 FROM session_v2 WHERE id = s.id)"
++		// Ordered by id so the virtual paths ("<db>#<id>") stream in ascending
++		// byte order: the changed-path merge walks a paged stored-freshness
++		// cursor in step with this stream, and both sides must share one order.
++		tables, idle, migration, err := openCodeSessionTablesCached(ctx, db, dbPath)
++		if err != nil {
++			return err
+ 		}
+-		queries = append(queries, query)
+-	}
+-	query := strings.Join(queries, " UNION ALL ") + " ORDER BY 1"
++		var queries []string
++		for _, table := range tables {
++			from := openCodeSessionFrom(table, idle, migration)
++			query := "SELECT s.id, s.time_updated FROM " + from + " s"
++			if composite {
++				query = "SELECT s.id, " + openCodeSessionRowWatermarkExpr +
++					" FROM " + from + " s" + openCodeSessionCompositeMtimeJoins
++			}
+ 
+-	rows, err := db.QueryContext(ctx, query)
+-	if err != nil {
+-		return fmt.Errorf(
+-			"listing opencode session watermarks: %w", err,
+-		)
+-	}
+-	defer rows.Close()
++			if table == "session" && len(tables) == 2 {
++				query += " WHERE NOT EXISTS (SELECT 1 FROM session_v2 WHERE id = s.id)"
++			}
++			queries = append(queries, query)
++		}
++		query := strings.Join(queries, " UNION ALL ") + " ORDER BY 1"
+ 
+-	for rows.Next() {
+-		var id string
+-		var watermark int64
+-		if err := rows.Scan(&id, &watermark); err != nil {
++		rows, err := db.QueryContext(ctx, query)
++		if err != nil {
+ 			return fmt.Errorf(
+-				"scanning opencode session watermark: %w", err,
++				"listing opencode session watermarks: %w", err,
+ 			)
+ 		}
+-		observeStreamingDiscoveryBuffer(ctx, 1)
+-		if err := yield(OpenCodeSessionMeta{
+-			SessionID:      id,
+-			VirtualPath:    dbPath + "#" + id,
+-			FileMtime:      watermark * 1_000_000,
+-			CompositeMtime: composite,
+-			WatermarkOnly:  composite,
+-		}); err != nil {
+-			return err
++		defer rows.Close()
++
++		for rows.Next() {
++			var id string
++			var watermark int64
++			if err := rows.Scan(&id, &watermark); err != nil {
++				return fmt.Errorf(
++					"scanning opencode session watermark: %w", err,
++				)
++			}
++			observeStreamingDiscoveryBuffer(ctx, 1)
++			if err := yield(OpenCodeSessionMeta{
++				SessionID:      id,
++				VirtualPath:    dbPath + "#" + id,
++				FileMtime:      watermark * 1_000_000,
++				CompositeMtime: composite,
++				WatermarkOnly:  composite,
++			}); err != nil {
++				return err
++			}
+ 		}
+-	}
+-	return rows.Err()
++		return rows.Err()
++	})
+ }
+ 
+ // ForEachOpenCodeSessionMeta streams lightweight session rows directly from
+@@ -252,80 +254,76 @@ func ForEachOpenCodeSessionMeta(
+ 		return nil
+ 	}
+ 
+-	db, err := openOpenCodeDB(dbPath)
+-	if err != nil {
+-		return err
+-	}
+-	defer db.Close()
+-
+-	composite, err := openCodeCompositeMtimeSupportedCached(ctx, db, dbPath)
+-	if err != nil {
+-		return err
+-	}
+-	tables, idle, migration, err := openCodeSessionTablesCached(ctx, db, dbPath)
+-	if err != nil {
+-		return err
+-	}
+-	var queries []string
+-	for _, table := range tables {
+-		from := openCodeSessionFrom(table, idle, migration)
+-		query := "SELECT s.id, s.time_updated, s.time_updated, 0, 0, 0, '', '', 0, 0, '' " +
+-			"FROM " + from + " s"
+-		if composite {
+-			openCodeContainerChildScans.Add(1)
+-			v2, err := openCodeProjectionFormatCached(ctx, db, dbPath)
+-			if err != nil {
+-				return err
+-			}
+-			columns, joins := openCodeV2AggregateSQL(v2, false)
+-			watermark, counts, baseJoins := openCodeCompositeMtimeExpr, openCodeCompositeCountsExpr, openCodeCompositeMtimeJoins
+-			if table == "session_v2" {
+-				watermark, counts, baseJoins = openCodeSessionRowWatermarkExpr, openCodeV2BaseCountsExpr, openCodeSessionCompositeMtimeJoins
+-			}
+-			query = "SELECT s.id, " + watermark + ", " + counts + columns +
+-				" FROM " + from + " s" + baseJoins + joins
++	return withOpenCodeDB(ctx, dbPath, func(db *sql.DB) error {
++		composite, err := openCodeCompositeMtimeSupportedCached(ctx, db, dbPath)
++		if err != nil {
++			return err
+ 		}
+-
+-		if table == "session" && len(tables) == 2 {
+-			query += " WHERE NOT EXISTS (SELECT 1 FROM session_v2 WHERE id = s.id)"
++		tables, idle, migration, err := openCodeSessionTablesCached(ctx, db, dbPath)
++		if err != nil {
++			return err
+ 		}
+-		queries = append(queries, query)
+-	}
+-	query := strings.Join(queries, " UNION ALL ") + " ORDER BY 1"
++		var queries []string
++		for _, table := range tables {
++			from := openCodeSessionFrom(table, idle, migration)
++			query := "SELECT s.id, s.time_updated, s.time_updated, 0, 0, 0, '', '', 0, 0, '' " +
++				"FROM " + from + " s"
++			if composite {
++				openCodeContainerChildScans.Add(1)
++				v2, err := openCodeProjectionFormatCached(ctx, db, dbPath)
++				if err != nil {
++					return err
++				}
++				columns, joins := openCodeV2AggregateSQL(v2, false)
++				watermark, counts, baseJoins := openCodeCompositeMtimeExpr, openCodeCompositeCountsExpr, openCodeCompositeMtimeJoins
++				if table == "session_v2" {
++					watermark, counts, baseJoins = openCodeSessionRowWatermarkExpr, openCodeV2BaseCountsExpr, openCodeSessionCompositeMtimeJoins
++				}
++				query = "SELECT s.id, " + watermark + ", " + counts + columns +
++					" FROM " + from + " s" + baseJoins + joins
++			}
+ 
+-	rows, err := db.QueryContext(ctx, query)
+-	if err != nil {
+-		return fmt.Errorf(
+-			"listing opencode sessions: %w", err,
+-		)
+-	}
+-	defer rows.Close()
++			if table == "session" && len(tables) == 2 {
++				query += " WHERE NOT EXISTS (SELECT 1 FROM session_v2 WHERE id = s.id)"
++			}
++			queries = append(queries, query)
++		}
++		query := strings.Join(queries, " UNION ALL ") + " ORDER BY 1"
+ 
+-	for rows.Next() {
+-		var id string
+-		var agg openCodeChildAggregate
+-		if err := rows.Scan(
+-			&id, &agg.watermark, &agg.sessionTime, &agg.projectTime,
+-			&agg.messages, &agg.parts,
+-			&agg.messageIdent, &agg.partIdent,
+-			&agg.projectionTime, &agg.projections, &agg.projectionIdent,
+-		); err != nil {
++		rows, err := db.QueryContext(ctx, query)
++		if err != nil {
+ 			return fmt.Errorf(
+-				"scanning opencode session meta: %w", err,
++				"listing opencode sessions: %w", err,
+ 			)
+ 		}
+-		observeStreamingDiscoveryBuffer(ctx, 1)
+-		if err := yield(OpenCodeSessionMeta{
+-			SessionID:      id,
+-			VirtualPath:    dbPath + "#" + id,
+-			FileMtime:      max(agg.watermark, agg.projectionTime) * 1_000_000,
+-			CompositeMtime: composite,
+-			ChildDigest:    agg.digest(composite),
+-		}); err != nil {
+-			return err
++		defer rows.Close()
++
++		for rows.Next() {
++			var id string
++			var agg openCodeChildAggregate
++			if err := rows.Scan(
++				&id, &agg.watermark, &agg.sessionTime, &agg.projectTime,
++				&agg.messages, &agg.parts,
++				&agg.messageIdent, &agg.partIdent,
++				&agg.projectionTime, &agg.projections, &agg.projectionIdent,
++			); err != nil {
++				return fmt.Errorf(
++					"scanning opencode session meta: %w", err,
++				)
++			}
++			observeStreamingDiscoveryBuffer(ctx, 1)
++			if err := yield(OpenCodeSessionMeta{
++				SessionID:      id,
++				VirtualPath:    dbPath + "#" + id,
++				FileMtime:      max(agg.watermark, agg.projectionTime) * 1_000_000,
++				CompositeMtime: composite,
++				ChildDigest:    agg.digest(composite),
++			}); err != nil {
++				return err
++			}
+ 		}
+-	}
+-	return rows.Err()
++		return rows.Err()
++	})
+ }
+ 
+ // openCodeSessionCompositeMtime returns one session's composite change signal
+@@ -542,57 +540,60 @@ func parseOpenCodeDBSessionContext(
+ 		)
+ 	}
+ 
+-	db, err := openOpenCodeDB(dbPath)
+-	if err != nil {
+-		return nil, nil, err
+-	}
+-	defer db.Close()
++	var parsedSess *ParsedSession
++	var parsedMsgs []ParsedMessage
++	err := withOpenCodeDB(ctx, dbPath, func(db *sql.DB) error {
++		projects, err := loadOpenCodeProjectsCached(ctx, db, dbPath)
++		if err != nil {
++			return fmt.Errorf(
++				"loading opencode projects: %w", err,
++			)
++		}
+ 
+-	projects, err := loadOpenCodeProjectsCached(ctx, db, dbPath)
+-	if err != nil {
+-		return nil, nil, fmt.Errorf(
+-			"loading opencode projects: %w", err,
+-		)
+-	}
++		table, err := openCodeSessionTableCached(ctx, db, dbPath, sessionID)
++		if err != nil {
++			return err
++		}
++		hasDirectory, err := openCodeSessionHasDirectoryCached(ctx, db, dbPath, table)
++		if err != nil {
++			return fmt.Errorf("probing opencode session schema: %w", err)
++		}
++		from, err := openCodeSessionFromCached(ctx, db, dbPath, table)
++		if err != nil {
++			return err
++		}
++		s, err := loadOneOpenCodeSession(ctx, db, from, sessionID, hasDirectory)
++		if err != nil {
++			return fmt.Errorf(
++				"loading opencode session %s: %w",
++				sessionID, err,
++			)
++		}
+ 
+-	table, err := openCodeSessionTableCached(ctx, db, dbPath, sessionID)
+-	if err != nil {
+-		return nil, nil, err
+-	}
+-	hasDirectory, err := openCodeSessionHasDirectoryCached(ctx, db, dbPath, table)
+-	if err != nil {
+-		return nil, nil, fmt.Errorf("probing opencode session schema: %w", err)
+-	}
+-	from, err := openCodeSessionFromCached(ctx, db, dbPath, table)
++		projectWorktree := strings.TrimSpace(projects[s.projectID])
++		cwd := resolveOpenCodeWorktree(s.directory, projectWorktree)
++		if cwd == "" &&
++			(strings.TrimSpace(s.directory) == "" ||
++				strings.TrimSpace(s.directory) == string(filepath.Separator) ||
++				strings.TrimSpace(s.directory) == "/") &&
++			(strings.TrimSpace(projectWorktree) == string(filepath.Separator) ||
++				strings.TrimSpace(projectWorktree) == "/") {
++			// SQLite's global project uses / as its declared worktree. Preserve
++			// that source value; file-backed metadata applies the stricter policy.
++			cwd = "/"
++		}
++		if !openCodeUsableWorktree(projectWorktree) {
++			projectWorktree = cwd
++		}
++		parsedSess, parsedMsgs, err = buildOpenCodeSessionContext(
++			ctx, db, s, cwd, projectWorktree, dbPath, machine,
++		)
++		return err
++	})
+ 	if err != nil {
+ 		return nil, nil, err
+ 	}
+-	s, err := loadOneOpenCodeSession(ctx, db, from, sessionID, hasDirectory)
+-	if err != nil {
+-		return nil, nil, fmt.Errorf(
+-			"loading opencode session %s: %w",
+-			sessionID, err,
+-		)
+-	}
+-
+-	projectWorktree := strings.TrimSpace(projects[s.projectID])
+-	cwd := resolveOpenCodeWorktree(s.directory, projectWorktree)
+-	if cwd == "" &&
+-		(strings.TrimSpace(s.directory) == "" ||
+-			strings.TrimSpace(s.directory) == string(filepath.Separator) ||
+-			strings.TrimSpace(s.directory) == "/") &&
+-		(strings.TrimSpace(projectWorktree) == string(filepath.Separator) ||
+-			strings.TrimSpace(projectWorktree) == "/") {
+-		// SQLite's global project uses / as its declared worktree. Preserve
+-		// that source value; file-backed metadata applies the stricter policy.
+-		cwd = "/"
+-	}
+-	if !openCodeUsableWorktree(projectWorktree) {
+-		projectWorktree = cwd
+-	}
+-	return buildOpenCodeSessionContext(
+-		ctx, db, s, cwd, projectWorktree, dbPath, machine,
+-	)
++	return parsedSess, parsedMsgs, nil
+ }
+ 
+ // resolveOpenCodeWorktree picks the session working directory used for
+@@ -734,6 +735,10 @@ func openOpenCodeDB(dbPath string) (*sql.DB, error) {
+ 	return db, nil
+ }
+ 
++func withOpenCodeDB(ctx context.Context, dbPath string, fn func(db *sql.DB) error) error {
++	return WithSQLiteReadOnly(ctx, dbPath, sqliteReadOptions{busyTimeoutMS: 3000}, fn)
++}
++
+ // openCodeProject is a row from the opencode project table.
+ type openCodeProject struct {
+ 	id       string
+@@ -2269,15 +2274,16 @@ func openCodeSQLiteSessionMtimeComposite(ctx context.Context,
+ 		)
+ 	}
+ 
+-	db, err := openOpenCodeDB(dbPath)
+-	if err != nil {
+-		return 0, "", false, err
+-	}
+-	defer db.Close()
+-
+-	timeUpdated, digest, composite, err := openCodeSessionCompositeMtime(ctx,
+-		db, dbPath, sessionID,
+-	)
++	var timeUpdated int64
++	var digest string
++	var composite bool
++	err := withOpenCodeDB(ctx, dbPath, func(db *sql.DB) error {
++		var mtimeErr error
++		timeUpdated, digest, composite, mtimeErr = openCodeSessionCompositeMtime(ctx,
++			db, dbPath, sessionID,
++		)
++		return mtimeErr
++	})
+ 	if err != nil {
+ 		return 0, "", false, err
+ 	}
+@@ -2299,13 +2305,12 @@ func openCodeSQLiteSessionMtime(ctx context.Context,
+ 		)
+ 	}
+ 
+-	db, err := openOpenCodeDB(dbPath)
+-	if err != nil {
+-		return 0, err
+-	}
+-	defer db.Close()
+-
+-	timeUpdated, _, err := openCodeSessionWatermark(ctx, db, dbPath, sessionID)
++	var timeUpdated int64
++	err := withOpenCodeDB(ctx, dbPath, func(db *sql.DB) error {
++		var watermarkErr error
++		timeUpdated, _, watermarkErr = openCodeSessionWatermark(ctx, db, dbPath, sessionID)
++		return watermarkErr
++	})
+ 	if err != nil {
+ 		return 0, err
+ 	}
+diff --git a/internal/parser/opencode_provider.go b/internal/parser/opencode_provider.go
+index 1b2bc37b..62c0c4ba 100644
+--- a/internal/parser/opencode_provider.go
++++ b/internal/parser/opencode_provider.go
+@@ -950,41 +950,42 @@ func openCodeSQLiteSessionWatermarkOnly(
+ 	if err := ctx.Err(); err != nil {
+ 		return 0, false, false, err
+ 	}
+-	db, err := openOpenCodeDB(dbPath)
+-	if err != nil {
+-		return 0, false, false, err
+-	}
+-	defer db.Close()
+-	composite, err = openCodeCompositeMtimeSupportedCached(ctx, db, dbPath)
+-	if err != nil {
+-		return 0, false, false, err
+-	}
+-	table, err := openCodeSessionTableCached(ctx, db, dbPath, sessionID)
+-	if err != nil {
+-		return 0, false, false, err
+-	}
+-	from, err := openCodeSessionFromCached(ctx, db, dbPath, table)
+-	if err != nil {
+-		return 0, false, false, err
+-	}
+-
+-	query := "SELECT s.time_updated FROM " + from + " s WHERE s.id = ?"
+-	if composite {
+-		query = "SELECT " + openCodeSessionRowWatermarkExpr +
+-			" FROM " + from + " s" + openCodeSessionCompositeMtimeJoins +
+-			" WHERE s.id = ?"
+-	}
+-	err = db.QueryRowContext(ctx, query, sessionID).Scan(&watermark)
+-	if errors.Is(err, sql.ErrNoRows) {
+-		return 0, composite, false, nil
+-	}
+-	if err != nil {
+-		return 0, composite, false, fmt.Errorf(
+-			"loading opencode session watermark %s#%s: %w",
+-			dbPath, sessionID, err,
+-		)
+-	}
+-	return watermark, composite, true, nil
++	err = withOpenCodeDB(ctx, dbPath, func(db *sql.DB) error {
++		var qErr error
++		composite, qErr = openCodeCompositeMtimeSupportedCached(ctx, db, dbPath)
++		if qErr != nil {
++			return qErr
++		}
++		table, qErr := openCodeSessionTableCached(ctx, db, dbPath, sessionID)
++		if qErr != nil {
++			return qErr
++		}
++		from, qErr := openCodeSessionFromCached(ctx, db, dbPath, table)
++		if qErr != nil {
++			return qErr
++		}
++
++		query := "SELECT s.time_updated FROM " + from + " s WHERE s.id = ?"
++		if composite {
++			query = "SELECT " + openCodeSessionRowWatermarkExpr +
++				" FROM " + from + " s" + openCodeSessionCompositeMtimeJoins +
++				" WHERE s.id = ?"
++		}
++		rowErr := db.QueryRowContext(ctx, query, sessionID).Scan(&watermark)
++		if errors.Is(rowErr, sql.ErrNoRows) {
++			found = false
++			return nil
++		}
++		if rowErr != nil {
++			return fmt.Errorf(
++				"loading opencode session watermark %s#%s: %w",
++				dbPath, sessionID, rowErr,
++			)
++		}
++		found = true
++		return nil
++	})
++	return watermark, composite, found, err
+ }
+ 
+ var errOpenCodeCanonicalSourceFound = errors.New("opencode canonical source found")
+diff --git a/internal/parser/opencode_test.go b/internal/parser/opencode_test.go
+index 8ad8ca5c..512f2e4d 100644
+--- a/internal/parser/opencode_test.go
++++ b/internal/parser/opencode_test.go
+@@ -2668,3 +2668,42 @@ func TestOpenCodeStorageFingerprintMissingDetectsContentRewrite(
+ 	assert.True(t, OpenCodeStorageFingerprintMissing(stored, current),
+ 		"expected content rewrite to invalidate fingerprint")
+ }
++
++func TestOpenCode_FallbackOnBusy(t *testing.T) {
++	dbPath, seeder, writer := newTestDB(t)
++
++	seeder.AddProject("proj-1", "/work/proj")
++	seeder.AddSession("sess-1", "proj-1", "", "Locked Session", 1000, 2000)
++	seeder.AddMessage("msg-1", "sess-1", 1001, 1001, `{"role":"user","content":"hello"}`)
++	seeder.AddPart("part-1", "msg-1", "sess-1", 1001, 1001, `{"type":"text","text":"hello world"}`)
++
++	writer.SetMaxOpenConns(1)
++	_, err := writer.ExecContext(t.Context(), "PRAGMA journal_mode=WAL")
++	require.NoError(t, err)
++	_, err = writer.ExecContext(t.Context(), "PRAGMA locking_mode=EXCLUSIVE")
++	require.NoError(t, err)
++
++	tx, err := writer.BeginTx(t.Context(), nil)
++	require.NoError(t, err)
++	defer func() { _ = tx.Rollback() }()
++
++	_, err = tx.ExecContext(t.Context(), "INSERT INTO project (id, worktree) VALUES ('dummy', '/tmp')")
++	require.NoError(t, err)
++
++	exists := OpenCodeSQLiteSessionExists(t.Context(), dbPath, "sess-1")
++	assert.True(t, exists, "OpenCodeSQLiteSessionExists must succeed via scratch fallback when locked")
++
++	var metas []OpenCodeSessionMeta
++	err = ForEachOpenCodeSessionMeta(t.Context(), dbPath, func(m OpenCodeSessionMeta) error {
++		metas = append(metas, m)
++		return nil
++	})
++	require.NoError(t, err, "ForEachOpenCodeSessionMeta must succeed via scratch fallback when locked")
++	require.Len(t, metas, 1)
++
++	sess, msgs, err := parseOpenCodeDBSessionContext(t.Context(), dbPath, "sess-1", "test-machine")
++	require.NoError(t, err, "parseOpenCodeDBSessionContext must succeed via scratch fallback when locked")
++	require.NotNil(t, sess)
++	assert.Equal(t, "opencode:sess-1", sess.ID)
++	require.Len(t, msgs, 1)
++}
+diff --git a/internal/parser/windsurf_provider.go b/internal/parser/windsurf_provider.go
+index f3cb64ae..643e3ba0 100644
+--- a/internal/parser/windsurf_provider.go
++++ b/internal/parser/windsurf_provider.go
+@@ -730,30 +730,31 @@ func readWindsurfChatValues(ctx context.Context, dbPath string) ([]windsurfChatV
+ 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+ 		return nil, nil
+ 	}
+-	db, err := openWindsurfDB(dbPath)
++	var values []windsurfChatValue
++	err := withWindsurfDB(ctx, dbPath, func(db *sql.DB) error {
++		values = make([]windsurfChatValue, 0, len(windsurfChatDataKeys))
++		for _, key := range windsurfChatDataKeys {
++			var value string
++			err := db.QueryRowContext(ctx,
++				`SELECT value FROM ItemTable WHERE key = ?`,
++				key,
++			).Scan(&value)
++			if err == sql.ErrNoRows {
++				continue
++			}
++			if err != nil {
++				return fmt.Errorf("read windsurf chat data: %w", err)
++			}
++			values = append(values, windsurfChatValue{
++				Key:   key,
++				Value: value,
++			})
++		}
++		return nil
++	})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	defer db.Close()
+-
+-	values := make([]windsurfChatValue, 0, len(windsurfChatDataKeys))
+-	for _, key := range windsurfChatDataKeys {
+-		var value string
+-		err := db.QueryRowContext(ctx,
+-			`SELECT value FROM ItemTable WHERE key = ?`,
+-			key,
+-		).Scan(&value)
+-		if err == sql.ErrNoRows {
+-			continue
+-		}
+-		if err != nil {
+-			return nil, fmt.Errorf("read windsurf chat data: %w", err)
+-		}
+-		values = append(values, windsurfChatValue{
+-			Key:   key,
+-			Value: value,
+-		})
+-	}
+ 	return values, nil
+ }
+ 
+@@ -764,33 +765,30 @@ func forEachWindsurfSessionRecord(
+ 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+ 		return nil
+ 	}
+-	db, err := openWindsurfDB(dbPath)
+-	if err != nil {
+-		return err
+-	}
+-	defer db.Close()
+-	for _, key := range windsurfChatDataKeys {
+-		if err := ctx.Err(); err != nil {
+-			return err
+-		}
+-		var exists int
+-		err := db.QueryRowContext(ctx,
+-			`SELECT 1 FROM ItemTable WHERE key = ?`, key,
+-		).Scan(&exists)
+-		if err == sql.ErrNoRows {
+-			continue
+-		}
+-		if err != nil {
+-			return fmt.Errorf("read windsurf chat data: %w", err)
+-		}
+-		reader := &windsurfSQLiteValueReader{ctx: ctx, db: db, key: key}
+-		if err := forEachWindsurfRecordFromReader(
+-			ctx, reader, windsurfFallbackSessionID(dbPath), yield,
+-		); err != nil {
+-			return err
++	return withWindsurfDB(ctx, dbPath, func(db *sql.DB) error {
++		for _, key := range windsurfChatDataKeys {
++			if err := ctx.Err(); err != nil {
++				return err
++			}
++			var exists int
++			err := db.QueryRowContext(ctx,
++				`SELECT 1 FROM ItemTable WHERE key = ?`, key,
++			).Scan(&exists)
++			if err == sql.ErrNoRows {
++				continue
++			}
++			if err != nil {
++				return fmt.Errorf("read windsurf chat data: %w", err)
++			}
++			reader := &windsurfSQLiteValueReader{ctx: ctx, db: db, key: key}
++			if err := forEachWindsurfRecordFromReader(
++				ctx, reader, windsurfFallbackSessionID(dbPath), yield,
++			); err != nil {
++				return err
++			}
+ 		}
+-	}
+-	return nil
++		return nil
++	})
+ }
+ 
+ const windsurfSQLiteReadChunk = 64 * 1024
+@@ -1049,6 +1047,10 @@ func openWindsurfDB(dbPath string) (*sql.DB, error) {
+ 	return db, nil
+ }
+ 
++func withWindsurfDB(ctx context.Context, dbPath string, fn func(db *sql.DB) error) error {
++	return WithSQLiteReadOnly(ctx, dbPath, sqliteReadOptions{busyTimeoutMS: 3000}, fn)
++}
++
+ func windsurfRecordsFromValue(
+ 	data []byte,
+ 	fallbackSessionID string,
+diff --git a/internal/parser/windsurf_provider_test.go b/internal/parser/windsurf_provider_test.go
+index ae933000..82d944b5 100644
+--- a/internal/parser/windsurf_provider_test.go
++++ b/internal/parser/windsurf_provider_test.go
+@@ -561,3 +561,46 @@ func windsurfVSCodeSessionJSON(sessionID, user, assistant string) string {
+ 		}]
+ 	}`
+ }
++
++func TestWindsurf_FallbackOnBusy(t *testing.T) {
++	root, dbPath := windsurfProviderFixture(t, windsurfVSCodeSessionJSON(
++		"windsurf-locked-1",
++		"How do I add support?",
++		"Use the existing parser.",
++	))
++
++	writer, err := sql.Open("sqlite3", dbPath)
++	require.NoError(t, err)
++	defer writer.Close()
++	writer.SetMaxOpenConns(1)
++
++	_, err = writer.ExecContext(t.Context(), "PRAGMA journal_mode=WAL")
++	require.NoError(t, err)
++	_, err = writer.ExecContext(t.Context(), "PRAGMA locking_mode=EXCLUSIVE")
++	require.NoError(t, err)
++
++	tx, err := writer.BeginTx(t.Context(), nil)
++	require.NoError(t, err)
++	defer func() { _ = tx.Rollback() }()
++
++	_, err = tx.ExecContext(t.Context(), "INSERT INTO ItemTable VALUES ('dummy', 'dummy')")
++	require.NoError(t, err)
++
++	provider := newTestWindsurfProvider(root)
++
++	sources, err := provider.Discover(t.Context())
++	require.NoError(t, err, "Discover must succeed via scratch fallback when locked")
++	require.Len(t, sources, 1)
++
++	fp, err := provider.Fingerprint(t.Context(), sources[0])
++	require.NoError(t, err, "Fingerprint must succeed via scratch fallback when locked")
++
++	out, err := provider.Parse(t.Context(), ParseRequest{
++		Source:      sources[0],
++		Fingerprint: fp,
++		Machine:     "machine-a",
++	})
++	require.NoError(t, err, "Parse must succeed via scratch fallback when locked")
++	require.Len(t, out.Results, 1)
++	assert.Equal(t, "windsurf:windsurf-locked-1", out.Results[0].Result.Session.ID)
++}
+diff --git a/internal/parser/zed.go b/internal/parser/zed.go
+index 25cd5d2b..61d70fc7 100644
+--- a/internal/parser/zed.go
++++ b/internal/parser/zed.go
+@@ -28,18 +28,24 @@ func ZedSQLiteSessionExists(ctx context.Context, dbPath, sessionID string) bool
+ 	if !IsRegularFile(dbPath) {
+ 		return false
+ 	}
+-	db, err := openZedDB(dbPath)
+-	if err != nil {
+-		return false
+-	}
+-	defer db.Close()
+-	shape, err := inspectZedSchema(ctx, db)
+-	if err != nil {
+-		return false
+-	}
+-	var found int
+-	err = db.QueryRowContext(ctx, fmt.Sprintf(`SELECT 1 FROM threads WHERE id = ? %s LIMIT 1`, shape.parentFilter()), sessionID).Scan(&found)
+-	return err == nil
++	var found bool
++	err := withZedDB(ctx, dbPath, func(db *sql.DB) error {
++		shape, err := inspectZedSchema(ctx, db)
++		if err != nil {
++			return err
++		}
++		var one int
++		err = db.QueryRowContext(ctx, fmt.Sprintf(`SELECT 1 FROM threads WHERE id = ? %s LIMIT 1`, shape.parentFilter()), sessionID).Scan(&one)
++		if err == nil {
++			found = true
++			return nil
++		}
++		if errors.Is(err, sql.ErrNoRows) {
++			return nil
++		}
++		return err
++	})
++	return err == nil && found
+ }
+ 
+ // ZedSQLiteSourceMtime resolves the per-thread updated_at timestamp
+@@ -53,17 +59,14 @@ func ZedSQLiteSourceMtimeContext(ctx context.Context, path string) (int64, error
+ 	if !ok {
+ 		return 0, fmt.Errorf("not a zed sqlite virtual path: %s", path)
+ 	}
+-	db, err := openZedDB(dbPath)
+-	if err != nil {
+-		return 0, err
+-	}
+-	defer db.Close()
+-	shape, err := inspectZedSchema(ctx, db)
+-	if err != nil {
+-		return 0, err
+-	}
+ 	var updatedAt string
+-	err = db.QueryRowContext(ctx, fmt.Sprintf(`SELECT COALESCE(updated_at, '') FROM threads WHERE id = ? %s LIMIT 1`, shape.parentFilter()), sessionID).Scan(&updatedAt)
++	err := withZedDB(ctx, dbPath, func(db *sql.DB) error {
++		shape, err := inspectZedSchema(ctx, db)
++		if err != nil {
++			return err
++		}
++		return db.QueryRowContext(ctx, fmt.Sprintf(`SELECT COALESCE(updated_at, '') FROM threads WHERE id = ? %s LIMIT 1`, shape.parentFilter()), sessionID).Scan(&updatedAt)
++	})
+ 	if err != nil {
+ 		return 0, fmt.Errorf("loading zed thread mtime %s: %w", sessionID, err)
+ 	}
+@@ -273,6 +276,10 @@ func openZedDB(dbPath string) (*sql.DB, error) {
+ 	return db, nil
+ }
+ 
++func withZedDB(ctx context.Context, dbPath string, fn func(db *sql.DB) error) error {
++	return WithSQLiteReadOnly(ctx, dbPath, sqliteReadOptions{busyTimeoutMS: 3000}, fn)
++}
++
+ type zedThreadRow struct {
+ 	id          string
+ 	summary     string
+diff --git a/internal/parser/zed_provider.go b/internal/parser/zed_provider.go
+index 5cb9a94e..4bc7029e 100644
+--- a/internal/parser/zed_provider.go
++++ b/internal/parser/zed_provider.go
+@@ -44,18 +44,15 @@ func zedDiscoverEach(
+ 		return nil
+ 	}
+ 	dbPath := containers[0]
+-	conn, err := OpenZedDB(dbPath)
+-	if err != nil {
+-		return err
+-	}
+-	defer conn.Close()
+-	shape, err := inspectZedSchema(ctx, conn)
+-	if err != nil {
+-		return wrapZedListingError(err)
+-	}
+-	return forEachZedThreadMeta(ctx, conn, dbPath, shape, func(meta ZedThreadMeta) error {
+-		return yield(multiSessionMatch{
+-			Path: meta.VirtualPath, Container: dbPath, MemberID: meta.RawID,
++	return withZedDB(ctx, dbPath, func(conn *sql.DB) error {
++		shape, err := inspectZedSchema(ctx, conn)
++		if err != nil {
++			return wrapZedListingError(err)
++		}
++		return forEachZedThreadMeta(ctx, conn, dbPath, shape, func(meta ZedThreadMeta) error {
++			return yield(multiSessionMatch{
++				Path: meta.VirtualPath, Container: dbPath, MemberID: meta.RawID,
++			})
+ 		})
+ 	})
+ }
+@@ -179,18 +176,22 @@ func zedParseMember(
+ 	if !IsValidSessionID(src.MemberID) {
+ 		return nil, fmt.Errorf("invalid Zed session ID: %s", src.MemberID)
+ 	}
+-	conn, err := OpenZedDB(src.Container)
++	var res *ParseResult
++	err = withZedDB(ctx, src.Container, func(conn *sql.DB) error {
++		shape, err := inspectZedSchema(ctx, conn)
++		if err != nil {
++			return wrapZedLoadingError(src.MemberID, err)
++		}
++		var parseErr error
++		res, parseErr = parseZedThreadFromDBWithSchema(
++			ctx, conn, src.Container, src.MemberID, req.Machine, dbInfo, shape,
++		)
++		return parseErr
++	})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	defer conn.Close()
+-	shape, err := inspectZedSchema(ctx, conn)
+-	if err != nil {
+-		return nil, wrapZedLoadingError(src.MemberID, err)
+-	}
+-	return parseZedThreadFromDBWithSchema(
+-		ctx, conn, src.Container, src.MemberID, req.Machine, dbInfo, shape,
+-	)
++	return res, nil
+ }
+ 
+ func zedParseContainer(
+@@ -203,43 +204,41 @@ func zedParseContainer(
+ 		}
+ 		return nil, fmt.Errorf("stat %s: %w", src.Container, err)
+ 	}
+-	conn, err := OpenZedDB(src.Container)
+-	if err != nil {
+-		return nil, err
+-	}
+-	defer conn.Close()
+-	shape, err := inspectZedSchema(ctx, conn)
+-	if err != nil {
+-		return nil, wrapZedListingError(err)
+-	}
+-	var metas []ZedThreadMeta
+-	err = forEachZedThreadMeta(ctx, conn, src.Container, shape, func(meta ZedThreadMeta) error {
+-		metas = append(metas, meta)
+-		return nil
+-	})
+-	if err != nil {
+-		return nil, err
+-	}
+-	// Zed has no per-thread content digest; stamp the physical DB hash on every
+-	// fanned-out thread row, mirroring the legacy fan-out. Computed here rather
+-	// than via the base's hash stamping because the value is the DB's own hash,
+-	// not the request fingerprint.
+-	dbHash, _ := hashJSONLSourceFile(src.Container)
+-	results := make([]ParseResult, 0, len(metas))
+-	for _, meta := range metas {
+-		result, err := parseZedThreadFromDBWithSchema(
+-			ctx, conn, src.Container, meta.RawID, req.Machine, dbInfo, shape,
+-		)
++	var results []ParseResult
++	err = withZedDB(ctx, src.Container, func(conn *sql.DB) error {
++		shape, err := inspectZedSchema(ctx, conn)
+ 		if err != nil {
+-			return nil, err
++			return wrapZedListingError(err)
+ 		}
+-		if result == nil {
+-			continue
++		var metas []ZedThreadMeta
++		err = forEachZedThreadMeta(ctx, conn, src.Container, shape, func(meta ZedThreadMeta) error {
++			metas = append(metas, meta)
++			return nil
++		})
++		if err != nil {
++			return err
+ 		}
+-		if dbHash != "" {
+-			result.Session.File.Hash = dbHash
++		dbHash, _ := hashJSONLSourceFile(src.Container)
++		results = make([]ParseResult, 0, len(metas))
++		for _, meta := range metas {
++			result, err := parseZedThreadFromDBWithSchema(
++				ctx, conn, src.Container, meta.RawID, req.Machine, dbInfo, shape,
++			)
++			if err != nil {
++				return err
++			}
++			if result == nil {
++				continue
++			}
++			if dbHash != "" {
++				result.Session.File.Hash = dbHash
++			}
++			results = append(results, *result)
+ 		}
+-		results = append(results, *result)
++		return nil
++	})
++	if err != nil {
++		return nil, err
+ 	}
+ 	return results, nil
+ }
+diff --git a/internal/parser/zed_test.go b/internal/parser/zed_test.go
+index 22010f56..5537c449 100644
+--- a/internal/parser/zed_test.go
++++ b/internal/parser/zed_test.go
+@@ -383,3 +383,55 @@ func nullString(s string) any {
+ 	}
+ 	return s
+ }
++
++func TestZed_FallbackOnBusy(t *testing.T) {
++	rootDir := t.TempDir()
++	dbPath := filepath.Join(rootDir, "threads", "threads.db")
++	require.NoError(t, os.MkdirAll(filepath.Dir(dbPath), 0o755))
++	createZedThreadsDBAt(t, dbPath, []zedTestThread{{
++		id:        "thread-1",
++		summary:   "Locked Thread",
++		updatedAt: "2026-06-21T07:27:31.522Z",
++		dataType:  "json",
++		data:      []byte(`{"messages":[{"role":"user","text":"hello"}]}`),
++	}})
++
++	writer, err := sql.Open("sqlite3", dbPath)
++	require.NoError(t, err)
++	defer writer.Close()
++	writer.SetMaxOpenConns(1)
++
++	_, err = writer.ExecContext(t.Context(), "PRAGMA journal_mode=WAL")
++	require.NoError(t, err)
++	_, err = writer.ExecContext(t.Context(), "PRAGMA locking_mode=EXCLUSIVE")
++	require.NoError(t, err)
++
++	tx, err := writer.BeginTx(t.Context(), nil)
++	require.NoError(t, err)
++	defer func() { _ = tx.Rollback() }()
++
++	_, err = tx.ExecContext(t.Context(), "INSERT INTO threads (id, summary, updated_at, data_type, data) VALUES ('dummy', 'dummy', '', 'json', X'')")
++	require.NoError(t, err)
++
++	exists := ZedSQLiteSessionExists(t.Context(), dbPath, "thread-1")
++	assert.True(t, exists, "ZedSQLiteSessionExists must succeed via scratch fallback when locked")
++
++	provider, ok := NewProvider(AgentZed, ProviderConfig{
++		Roots: []string{rootDir},
++	})
++	require.True(t, ok)
++
++	sources, err := provider.Discover(t.Context())
++	require.NoError(t, err)
++	require.Len(t, sources, 1)
++
++	fingerprint, err := provider.Fingerprint(t.Context(), sources[0])
++	require.NoError(t, err)
++
++	outcome, err := provider.Parse(t.Context(), ParseRequest{
++		Source: sources[0], Machine: "devbox", Fingerprint: fingerprint,
++	})
++	require.NoError(t, err, "provider.Parse must succeed via scratch fallback when locked")
++	require.Len(t, outcome.Results, 1)
++	assert.Equal(t, "zed:thread-1", outcome.Results[0].Result.Session.ID)
++}

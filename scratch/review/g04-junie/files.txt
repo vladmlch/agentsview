@@ -1,0 +1,6 @@
+internal/parser/junie.go
+internal/parser/junie_provider.go
+internal/parser/junie_provider_test.go
+internal/parser/junie_subagent.go
+internal/parser/junie_test.go
+internal/sync/junie_integration_test.go

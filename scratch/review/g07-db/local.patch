@@ -1,0 +1,2365 @@
+diff --git a/internal/db/archive_content_test.go b/internal/db/archive_content_test.go
+index 8182e8bc..9d58cdb2 100644
+--- a/internal/db/archive_content_test.go
++++ b/internal/db/archive_content_test.go
+@@ -891,9 +891,7 @@ func TestCopyOrphanedDataProjectsArchiveContent(t *testing.T) {
+ 		assert.Empty(t, call.InputJSON)
+ 		assert.Empty(t, call.ResultContent)
+ 		assert.Equal(t, 9, call.ResultContentLength)
+-		require.Len(t, call.ResultEvents, 1)
+-		assert.Empty(t, call.ResultEvents[0].Content)
+-		assert.Equal(t, "ok", call.ResultEvents[0].Status)
++		require.Empty(t, call.ResultEvents)
+ 		require.Len(t, messages[2].ToolCalls, 1)
+ 		assert.Equal(t, "child", messages[2].ToolCalls[0].SubagentSessionID)
+ 		assert.Empty(t, messages[2].ToolCalls[0].InputJSON)
+@@ -1328,15 +1326,16 @@ func TestArchiveProjectionOfLateToolResults(t *testing.T) {
+ 			}
+ 			require.Len(t, msgs[0].ToolCalls, 1)
+ 			call := msgs[0].ToolCalls[0]
+-			require.Len(t, call.ResultEvents, 1)
+-			assert.Equal(t, "ok", call.ResultEvents[0].Status)
+-			assert.Equal(t, 11, call.ResultEvents[0].ContentLength)
+ 			if policy.OmitsToolContent() {
+ 				assert.Empty(t, call.ResultContent)
++				require.Len(t, call.ResultEvents, 1)
++				assert.Equal(t, "ok", call.ResultEvents[0].Status)
++				assert.Equal(t, 11, call.ResultEvents[0].ContentLength)
+ 				assert.Empty(t, call.ResultEvents[0].Content)
+ 			} else {
+ 				assert.Equal(t, "tool output", call.ResultContent)
+-				assert.Equal(t, "tool output", call.ResultEvents[0].Content)
++				assert.Equal(t, 11, call.ResultContentLength)
++				require.Empty(t, call.ResultEvents)
+ 			}
+ 		})
+ 	}
+diff --git a/internal/db/artifact_import_test.go b/internal/db/artifact_import_test.go
+index 29aa58e8..1ab2caef 100644
+--- a/internal/db/artifact_import_test.go
++++ b/internal/db/artifact_import_test.go
+@@ -629,8 +629,7 @@ func TestApplyArtifactImportedSessionProjectsToolResultImages(t *testing.T) {
+ 	require.Len(t, messages, 1)
+ 	call := messages[0].ToolCalls[0]
+ 	assertOffloadedImage(t, call.ResultContent, database.AssetsDir())
+-	require.Len(t, call.ResultEvents, 1)
+-	assertOffloadedImage(t, call.ResultEvents[0].Content, database.AssetsDir())
++	require.Empty(t, call.ResultEvents)
+ }
+ 
+ func TestArtifactImportedManifestHashesChunksWithinSQLiteVariableLimit(
+diff --git a/internal/db/db.go b/internal/db/db.go
+index 3794f119..27e94ba5 100644
+--- a/internal/db/db.go
++++ b/internal/db/db.go
+@@ -560,7 +560,49 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
+ // (125: Gemini and Cursor files that share a session ID remain separate
+ // conversations. Re-parse unchanged sources, including cached remote mirrors,
+ // to recover conversations previously collapsed into one archived session.)
+-const dataVersion = 125
++// (126: Devin message_nodes thinking is read from the observed
++// {thinking, signature, signature_type} object instead of a plain string
++// that Devin never writes. Re-parse Devin sessions to restore dropped
++// thinking text on assistant messages.)
++// (127: Devin continued sessions recover the pre-compaction history from
++// message_nodes sibling branches, and continuation-summary nodes are marked
++// as compact boundaries. Re-parse Devin sessions to restore messages the
++// main chain does not reach.)
++// (128: Devin message_nodes are preferred over possibly stale transcript
++// exports, and Devin subagent calls/results are normalized from both formats.
++// Re-parse Devin sessions to restore current messages and tool details.)
++// (129: Devin message_nodes subagent trees are stored as parent-linked child
++// sessions. Re-parse Devin sessions to materialize their transcript-backed
++// subagents from the source database.)
++// (130: duplicate Devin subagent roots sharing a prompt message_id are
++// coalesced onto the most complete transcript tree.)
++// (131: the Antigravity IDE parser now reads
++// brain/<parent>/.system_generated/subagents/<child>.json descriptors and
++// invoke_subagent result steps to link spawned subagent sessions to their
++// parent. Re-parse Antigravity sessions so stored rows gain
++// parent_session_id, relationship_type, subagent session names, and
++// tool-call spawn edges.)
++// (132: the Devin CLI parser now recursively unwinds prior compaction eras
++// via metadata.summarized_from across disconnected message_nodes root trees,
++// restoring pre-compaction history in multi-generation compacted sessions.)
++// (133: Codex rollout continuation segments with history_mode: "paginated"
++// are now stitched across history_base ancestor chains into a single session,
++// restoring the initial prompt and complete conversation history.)
++// (134: inverted tool result storage: single-event results are stored directly
++// in tool_calls.result_content with 0 rows in tool_result_events, eliminating
++// duplicate output/history drawers across all providers.)
++// (135: JetBrains Junie CLI session indexing. Re-parse Junie sessions to store
++// events.jsonl block-update streams and synthesize subagent child sessions.)
++// (136: the Antigravity IDE and CLI providers now catalog-price reasoning
++// tokens from gemini-2.5-pro / gemini-2.5-flash / gemini-3-flash thinking
++// blocks when cost is not recorded by the provider.)
++// (137: the Cursor IDE parser now distributes composerData.contextTokensUsed
++// across the session's parsed messages proportional to content length,
++// setting per-message ContextTokens and session PeakContextTokens.)
++// (138: the Antigravity parser unwraps <USER_REQUEST> envelopes and strips
++// runtime prompt-injection metadata (<ADDITIONAL_METADATA>,
++// <USER_SETTINGS_CHANGE>) from user messages.)
++const dataVersion = 138
+ 
+ const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
+ 
+@@ -616,34 +658,12 @@ const ClassifierHashKey = "is_automated_classifier_hash"
+ //go:embed schema.sql
+ var schemaSQL string
+ 
+-// messagesADTriggerDDL is the AFTER DELETE trigger that mirrors row
+-// removals into the FTS5 shadow tables. ReplaceSessionMessages drops
+-// this trigger inside its transaction (replacing N per-row FTS deletes
+-// with a single bulk INSERT...SELECT) and then re-runs this DDL to
+-// restore it before commit. Keeping the statement in one place keeps
+-// the two installation sites byte-identical.
+-const messagesADTriggerDDL = `
+-CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+-    INSERT INTO messages_fts(messages_fts, rowid, content)
+-        VALUES('delete', old.id, old.content);
+-END;
+-`
+-
+ const cjkFTSRuntimeMatchesSQL = `EXISTS (
+     SELECT 1 FROM main.stats
+     WHERE key = '` + cjkFTSFingerprintStatsKey + `'
+       AND CAST(value AS TEXT) = agentsview_cjk_fts_fingerprint()
+ )`
+ 
+-const messagesCJKADTriggerDDL = `
+-CREATE TEMP TRIGGER IF NOT EXISTS messages_cjk_ad
+-AFTER DELETE ON main.messages
+-WHEN ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
+-    INSERT INTO messages_cjk_fts(messages_cjk_fts, rowid, content)
+-        VALUES('delete', old.id, old.content);
+-END;
+-`
+-
+ const schemaFTS = `
+ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+     content,
+@@ -651,15 +671,121 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+     content_rowid='id',
+     tokenize='porter unicode61'
+ );
+-
+-CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+-    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
++CREATE VIRTUAL TABLE IF NOT EXISTS tool_content_fts USING fts5(
++    content,
++    content='tool_content',
++    content_rowid='id',
++    tokenize='porter unicode61'
++);
++CREATE TRIGGER IF NOT EXISTS tool_content_fts_ai AFTER INSERT ON tool_content BEGIN
++    INSERT INTO tool_content_fts(rowid, content) VALUES(new.id, new.content);
++END;
++CREATE TRIGGER IF NOT EXISTS tool_content_fts_ad AFTER DELETE ON tool_content BEGIN
++    INSERT INTO tool_content_fts(tool_content_fts, rowid, content)
++        VALUES('delete', old.id, old.content);
+ END;
+-` + messagesADTriggerDDL + `
+-CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+-    INSERT INTO messages_fts(messages_fts, rowid, content)
++CREATE TRIGGER IF NOT EXISTS tool_content_fts_au AFTER UPDATE ON tool_content BEGIN
++    INSERT INTO tool_content_fts(tool_content_fts, rowid, content)
+         VALUES('delete', old.id, old.content);
+-    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
++    INSERT INTO tool_content_fts(rowid, content) VALUES(new.id, new.content);
++END;
++`
++
++const toolContentTriggersDropsSQL = `
++DROP TRIGGER IF EXISTS tool_calls_fts_ai;
++DROP TRIGGER IF EXISTS tool_calls_fts_ad;
++DROP TRIGGER IF EXISTS tool_calls_fts_au;
++DROP TRIGGER IF EXISTS tool_result_events_fts_ai;
++DROP TRIGGER IF EXISTS tool_result_events_fts_ad;
++DROP TRIGGER IF EXISTS tool_result_events_fts_au;
++`
++
++const toolContentTriggersCreatesSQL = `
++CREATE TRIGGER IF NOT EXISTS tool_calls_fts_ai AFTER INSERT ON tool_calls BEGIN
++    INSERT INTO tool_content(source_kind, source_id, session_id, message_id,
++        ordinal, location, tool_name, tool_use_id, content, file_path,
++        exit_code, is_error)
++    SELECT 'call', new.id, new.session_id, new.message_id, m.ordinal,
++        'tool_input', new.tool_name, COALESCE(new.tool_use_id,''),
++        COALESCE(new.input_json,''), COALESCE(new.file_path,''), NULL, 0
++    FROM messages m WHERE m.id = new.message_id AND COALESCE(new.input_json,'') <> '';
++    INSERT INTO tool_content(source_kind, source_id, session_id, message_id,
++        ordinal, location, tool_name, tool_use_id, content, file_path,
++        exit_code, is_error)
++    SELECT 'call', new.id, new.session_id, new.message_id, m.ordinal,
++        'tool_result', new.tool_name, COALESCE(new.tool_use_id,''),
++        COALESCE(new.result_content,''), COALESCE(new.file_path,''),
++        CASE WHEN json_valid(new.result_content) THEN CAST(COALESCE(
++            json_extract(new.result_content,'$.exit_code'),
++            json_extract(new.result_content,'$.exitCode')) AS INTEGER) END,
++        CASE WHEN json_valid(new.result_content) AND
++                       COALESCE(json_extract(new.result_content,'$.is_error'),0)
++             THEN 1 ELSE 0 END
++    FROM messages m WHERE m.id = new.message_id AND COALESCE(new.result_content,'') <> '';
++END;
++CREATE TRIGGER IF NOT EXISTS tool_calls_fts_ad AFTER DELETE ON tool_calls BEGIN
++    DELETE FROM tool_content WHERE source_kind='call' AND source_id=old.id;
++END;
++CREATE TRIGGER IF NOT EXISTS tool_calls_fts_au AFTER UPDATE ON tool_calls BEGIN
++    DELETE FROM tool_content WHERE source_kind='call' AND source_id=old.id;
++    INSERT INTO tool_content(source_kind, source_id, session_id, message_id,
++        ordinal, location, tool_name, tool_use_id, content, file_path,
++        exit_code, is_error)
++    SELECT 'call', new.id, new.session_id, new.message_id, m.ordinal,
++        'tool_input', new.tool_name, COALESCE(new.tool_use_id,''),
++        COALESCE(new.input_json,''), COALESCE(new.file_path,''), NULL, 0
++    FROM messages m WHERE m.id = new.message_id AND COALESCE(new.input_json,'') <> '';
++    INSERT INTO tool_content(source_kind, source_id, session_id, message_id,
++        ordinal, location, tool_name, tool_use_id, content, file_path,
++        exit_code, is_error)
++    SELECT 'call', new.id, new.session_id, new.message_id, m.ordinal,
++        'tool_result', new.tool_name, COALESCE(new.tool_use_id,''),
++        COALESCE(new.result_content,''), COALESCE(new.file_path,''),
++        CASE WHEN json_valid(new.result_content) THEN CAST(COALESCE(
++            json_extract(new.result_content,'$.exit_code'),
++            json_extract(new.result_content,'$.exitCode')) AS INTEGER) END,
++        CASE WHEN json_valid(new.result_content) AND
++                       COALESCE(json_extract(new.result_content,'$.is_error'),0)
++             THEN 1 ELSE 0 END
++    FROM messages m WHERE m.id = new.message_id AND COALESCE(new.result_content,'') <> '';
++END;
++CREATE TRIGGER IF NOT EXISTS tool_result_events_fts_ai AFTER INSERT ON tool_result_events BEGIN
++    INSERT INTO tool_content(source_kind, source_id, session_id, ordinal,
++        location, tool_name, tool_use_id, content, file_path, exit_code, is_error)
++    VALUES ('event', new.id, new.session_id, new.tool_call_message_ordinal,
++        'tool_result', COALESCE((SELECT tool_name FROM tool_calls
++          WHERE session_id=new.session_id AND
++            ((new.tool_use_id <> '' AND tool_use_id=new.tool_use_id) OR
++             (COALESCE(new.tool_use_id,'')='' AND call_index=new.call_index))
++          ORDER BY id LIMIT 1),''), COALESCE(new.tool_use_id,''), new.content,
++        '', CASE WHEN json_valid(new.content) THEN CAST(COALESCE(
++            json_extract(new.content,'$.exit_code'),
++            json_extract(new.content,'$.exitCode')) AS INTEGER) END,
++        CASE WHEN lower(new.status) IN ('error','failed','failure') OR
++                       (json_valid(new.content) AND COALESCE(
++                           json_extract(new.content,'$.is_error'),0))
++             THEN 1 ELSE 0 END);
++END;
++CREATE TRIGGER IF NOT EXISTS tool_result_events_fts_ad AFTER DELETE ON tool_result_events BEGIN
++    DELETE FROM tool_content WHERE source_kind='event' AND source_id=old.id;
++END;
++CREATE TRIGGER IF NOT EXISTS tool_result_events_fts_au AFTER UPDATE ON tool_result_events BEGIN
++    DELETE FROM tool_content WHERE source_kind='event' AND source_id=old.id;
++    INSERT INTO tool_content(source_kind, source_id, session_id, ordinal,
++        location, tool_name, tool_use_id, content, file_path, exit_code, is_error)
++    VALUES ('event', new.id, new.session_id, new.tool_call_message_ordinal,
++        'tool_result', COALESCE((SELECT tool_name FROM tool_calls
++          WHERE session_id=new.session_id AND
++            ((new.tool_use_id <> '' AND tool_use_id=new.tool_use_id) OR
++             (COALESCE(new.tool_use_id,'')='' AND call_index=new.call_index))
++          ORDER BY id LIMIT 1),''), COALESCE(new.tool_use_id,''), new.content,
++        '', CASE WHEN json_valid(new.content) THEN CAST(COALESCE(
++            json_extract(new.content,'$.exit_code'),
++            json_extract(new.content,'$.exitCode')) AS INTEGER) END,
++        CASE WHEN lower(new.status) IN ('error','failed','failure') OR
++                       (json_valid(new.content) AND COALESCE(
++                           json_extract(new.content,'$.is_error'),0))
++             THEN 1 ELSE 0 END);
+ END;
+ `
+ 
+@@ -673,19 +799,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_cjk_fts USING fts5(
+ `
+ 
+ const schemaCJKFTSTriggers = `
+-CREATE TEMP TRIGGER IF NOT EXISTS messages_cjk_ai
+-AFTER INSERT ON main.messages
+-WHEN ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
+-    INSERT INTO messages_cjk_fts(rowid, content) VALUES (new.id, new.content);
+-END;
+-` + messagesCJKADTriggerDDL + `
+-CREATE TEMP TRIGGER IF NOT EXISTS messages_cjk_au
+-AFTER UPDATE ON main.messages
+-WHEN ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
+-    INSERT INTO messages_cjk_fts(messages_cjk_fts, rowid, content)
+-        VALUES('delete', old.id, old.content);
+-    INSERT INTO messages_cjk_fts(rowid, content) VALUES (new.id, new.content);
+-END;
+ 
+ -- The persistent BEFORE triggers mark a session pending without consulting
+ -- the extension, because a build without the sidecar cannot evaluate the
+@@ -2936,6 +3049,9 @@ func (db *DB) migrateColumns(ctx context.Context, progress OpenProgressFunc) err
+ 	if _, err := w.ExecContext(ctx, artifactSessionQueueTriggerDropsSQL); err != nil {
+ 		return fmt.Errorf("dropping artifact session queue triggers: %w", err)
+ 	}
++	if _, err := w.ExecContext(ctx, toolContentTriggersDropsSQL); err != nil {
++		return fmt.Errorf("dropping tool content triggers: %w", err)
++	}
+ 	if err := ctx.Err(); err != nil {
+ 		return err
+ 	}
+@@ -2945,6 +3061,9 @@ func (db *DB) migrateColumns(ctx context.Context, progress OpenProgressFunc) err
+ 	if _, err := w.ExecContext(ctx, artifactSessionQueueTriggerCreatesSQL); err != nil {
+ 		return fmt.Errorf("installing artifact session queue triggers: %w", err)
+ 	}
++	if _, err := w.ExecContext(ctx, toolContentTriggersCreatesSQL); err != nil {
++		return fmt.Errorf("installing tool content triggers: %w", err)
++	}
+ 	if err := ctx.Err(); err != nil {
+ 		return err
+ 	}
+@@ -2974,6 +3093,12 @@ func (db *DB) migrateColumns(ctx context.Context, progress OpenProgressFunc) err
+ 	if err := ctx.Err(); err != nil {
+ 		return err
+ 	}
++	if err := db.backfillToolContentFTSLocked(ctx, w); err != nil {
++		return err
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
+ 	if err := scopeLegacyDevinSourceUUIDsLocked(ctx, w); err != nil {
+ 		return err
+ 	}
+@@ -3675,6 +3800,14 @@ func (db *DB) createPartialIndexesLocked(ctx context.Context, w *writerHandle) e
+ 		WHERE file_path IS NOT NULL AND deleted_at IS NULL`); err != nil {
+ 		return fmt.Errorf("creating active session source index: %w", err)
+ 	}
++	// The UNIQUE(session_id, ordinal) constraint on messages already
++	// maintains an identical implicit index, so the explicit named index
++	// is redundant and wastes space and write cost.
++	if _, err := w.Exec(ctx,
++		`DROP INDEX IF EXISTS idx_messages_session_ordinal`,
++	); err != nil {
++		return fmt.Errorf("dropping redundant messages session ordinal index: %w", err)
++	}
+ 	if _, err := w.Exec(ctx,
+ 		`DROP INDEX IF EXISTS idx_artifact_checkpoint_stage_pending`,
+ 	); err != nil {
+@@ -3942,6 +4075,56 @@ func (db *DB) markToolCallFieldBackfillDoneLocked(ctx context.Context,
+ 	return nil
+ }
+ 
++func (db *DB) backfillToolContentFTSLocked(ctx context.Context, w *writerHandle) error {
++	var fts5Available bool
++	if err := w.QueryRowContext(ctx,
++		`SELECT EXISTS(SELECT 1 FROM pragma_module_list WHERE name = 'fts5')`,
++	).Scan(&fts5Available); err != nil || !fts5Available {
++		return nil
++	}
++	var count int
++	if err := w.QueryRowContext(ctx,
++		"SELECT count(*) FROM sqlite_master WHERE type='table' AND name='tool_content'",
++	).Scan(&count); err != nil || count == 0 {
++		return nil
++	}
++	var tcCount int
++	if err := w.QueryRowContext(ctx, "SELECT count(*) FROM tool_content").Scan(&tcCount); err != nil {
++		return nil
++	}
++	if tcCount > 0 {
++		return nil
++	}
++	if _, err := w.ExecContext(ctx, `
++		INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
++			message_id, ordinal, location, tool_name, tool_use_id, content, file_path)
++		SELECT 'call', tc.id, tc.session_id, tc.message_id, m.ordinal,
++			'tool_input', tc.tool_name, COALESCE(tc.tool_use_id,''),
++			COALESCE(tc.input_json,''), COALESCE(tc.file_path,'')
++		FROM tool_calls tc JOIN messages m ON m.id=tc.message_id
++		WHERE COALESCE(tc.input_json,'') <> '';
++		INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
++			message_id, ordinal, location, tool_name, tool_use_id, content, file_path)
++		SELECT 'call', tc.id, tc.session_id, tc.message_id, m.ordinal,
++			'tool_result', tc.tool_name, COALESCE(tc.tool_use_id,''),
++			COALESCE(tc.result_content,''), COALESCE(tc.file_path,'')
++		FROM tool_calls tc JOIN messages m ON m.id=tc.message_id
++		WHERE COALESCE(tc.result_content,'') <> '';
++		INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
++			ordinal, location, tool_name, tool_use_id, content, is_error)
++		SELECT 'event', tre.id, tre.session_id, tre.tool_call_message_ordinal,
++			'tool_result', COALESCE((SELECT tc.tool_name FROM tool_calls tc
++			 WHERE tc.session_id=tre.session_id AND tc.tool_use_id=tre.tool_use_id
++			 AND COALESCE(tre.tool_use_id,'')<>'' ORDER BY tc.id LIMIT 1),''),
++			COALESCE(tre.tool_use_id,''), tre.content,
++			CASE WHEN lower(tre.status) IN ('error','failed','failure') THEN 1 ELSE 0 END
++		FROM tool_result_events tre;
++		INSERT INTO tool_content_fts(tool_content_fts) VALUES('rebuild')`); err != nil {
++		return fmt.Errorf("backfilling tool content FTS: %w", err)
++	}
++	return nil
++}
++
+ // ForceBackfillIsAutomated reclassifies is_automated across
+ // every session, ignoring any cached classifier hash. ResyncAll
+ // calls this after CopyOrphanedDataFrom because orphan-copied
+@@ -4706,7 +4889,7 @@ func (db *DB) RebuildBulkImportIndexes(ctx context.Context) error {
+ 
+ // checkFTSModuleLoads fails when messages_fts is in the schema but this
+ // executable's SQLite cannot load its virtual table module. Writes to
+-// messages fire triggers into messages_fts, so such an archive is
++// messages synchronize messages_fts, so such an archive is
+ // read-only for this build no matter how the open succeeds.
+ func (db *DB) checkFTSModuleLoads(
+ 	ctx context.Context, w *writerHandle,
+@@ -4873,6 +5056,14 @@ func (db *DB) init(ctx context.Context, progress OpenProgressFunc) error {
+ 		}
+ 	}
+ 
++	// Drop legacy row-level FTS triggers if present from earlier schema versions
++	// to avoid per-row trigger overhead during message writes.
++	for _, tr := range []string{"messages_ai", "messages_au", "messages_ad"} {
++		if _, err := w.ExecContext(ctx, "DROP TRIGGER IF EXISTS "+tr); err != nil {
++			return fmt.Errorf("dropping legacy trigger %s: %w", tr, err)
++		}
++	}
++
+ 	if err := ensureCJKFTS(ctx, w, false); err != nil {
+ 		return fmt.Errorf("initializing CJK FTS: %w", err)
+ 	}
+diff --git a/internal/db/db_test.go b/internal/db/db_test.go
+index 643695af..0f9da463 100644
+--- a/internal/db/db_test.go
++++ b/internal/db/db_test.go
+@@ -816,6 +816,12 @@ func TestMigration_ResultContentColumn(t *testing.T) {
+ 	conn, err := sql.Open("sqlite3", path)
+ 	requireNoError(t, err, "raw open")
+ 	_, err = conn.ExecContext(t.Context(), `
++		DROP TRIGGER IF EXISTS tool_result_events_fts_ai;
++		DROP TRIGGER IF EXISTS tool_result_events_fts_ad;
++		DROP TRIGGER IF EXISTS tool_result_events_fts_au;
++		DROP TRIGGER IF EXISTS tool_calls_fts_ai;
++		DROP TRIGGER IF EXISTS tool_calls_fts_ad;
++		DROP TRIGGER IF EXISTS tool_calls_fts_au;
+ 		CREATE TABLE tool_calls_old AS
+ 			SELECT id, message_id, session_id, tool_name,
+ 			       category, tool_use_id, input_json,
+@@ -1041,6 +1047,36 @@ func TestCurrentDataVersionDevinMessageNodeTokenUsage(t *testing.T) {
+ 		"Devin message_nodes token usage requires re-parsing fallback sessions")
+ }
+ 
++func TestCurrentDataVersionDevinMessageNodeThinking(t *testing.T) {
++	assert.GreaterOrEqual(t, CurrentDataVersion(), 123,
++		"Devin message_nodes thinking objects require re-parsing to restore dropped thinking text")
++}
++
++func TestCurrentDataVersionDevinMultiGenerationCompaction(t *testing.T) {
++	assert.GreaterOrEqual(t, CurrentDataVersion(), 129,
++		"Devin multi-generation compaction context recovery requires re-parsing sessions to unwind disconnected root trees")
++}
++
++func TestCurrentDataVersionCodexContinuationHistory(t *testing.T) {
++	assert.GreaterOrEqual(t, CurrentDataVersion(), 130,
++		"Codex continuation history stitching requires re-parsing paginated rollouts to recover full history")
++}
++
++func TestCurrentDataVersionJunieSessionIndexing(t *testing.T) {
++	assert.GreaterOrEqual(t, CurrentDataVersion(), 132,
++		"Junie session indexing requires re-parsing to ingest events.jsonl block-update streams")
++}
++
++func TestCurrentDataVersionAntigravityThinkingPricing(t *testing.T) {
++	assert.GreaterOrEqual(t, CurrentDataVersion(), 133,
++		"Antigravity thinking pricing requires re-pricing sessions with reasoning tokens")
++}
++
++func TestCurrentDataVersionCursorContextTokens(t *testing.T) {
++	assert.GreaterOrEqual(t, CurrentDataVersion(), 134,
++		"Cursor context tokens distribution requires re-parsing sessions to populate per-message context tokens")
++}
++
+ func TestCurrentDataVersionPositAssistantProviderIdentity(t *testing.T) {
+ 	assert.GreaterOrEqual(t, CurrentDataVersion(), 95,
+ 		"Posit Assistant provider identity requires re-parsing usage rows")
+@@ -4208,7 +4244,7 @@ func TestWriteSessionIncrementalToolCallResultUpdate(t *testing.T) {
+ 		WHERE session_id = ? AND tool_use_id = ?`,
+ 		"s1", "call_cmd",
+ 	).Scan(&result, &resultLen))
+-	assert.Empty(t, result, "the sole event already stores the summary")
++	assert.Equal(t, "command finished", result, "single event summary stored directly in tool_calls")
+ 	loaded, err := d.GetAllMessages(t.Context(), "s1")
+ 	require.NoError(t, err)
+ 	require.Len(t, loaded, 1)
+@@ -4216,18 +4252,14 @@ func TestWriteSessionIncrementalToolCallResultUpdate(t *testing.T) {
+ 	assert.Equal(t, "command finished", loaded[0].ToolCalls[0].ResultContent)
+ 	assert.Equal(t, len("command finished"), resultLen)
+ 
+-	var source, content, timestamp string
+-	var eventIndex, eventCount int
++	var eventCount int
+ 	require.NoError(t, d.Reader().QueryRow(t.Context(), `
+-		SELECT source, content, COALESCE(timestamp, ''), event_index
++		SELECT COUNT(*)
+ 		FROM tool_result_events
+ 		WHERE session_id = ? AND tool_use_id = ?`,
+ 		"s1", "call_cmd",
+-	).Scan(&source, &content, &timestamp, &eventIndex))
+-	assert.Equal(t, "function_call_output", source)
+-	assert.Equal(t, "command finished", content)
+-	assert.Equal(t, "2026-08-02T09:00:00Z", timestamp)
+-	assert.Zero(t, eventIndex)
++	).Scan(&eventCount))
++	assert.Zero(t, eventCount, "single event matching summary has 0 tool_result_events rows")
+ 
+ 	_, werr = d.WriteSessionIncremental(t.Context(), "s1", nil, update)
+ 	require.NoError(t, werr,
+@@ -4237,7 +4269,7 @@ func TestWriteSessionIncrementalToolCallResultUpdate(t *testing.T) {
+ 		WHERE session_id = ? AND tool_use_id = ?`,
+ 		"s1", "call_cmd",
+ 	).Scan(&eventCount))
+-	assert.Equal(t, 1, eventCount)
++	assert.Zero(t, eventCount, "replayed single event still has 0 tool_result_events rows")
+ 
+ 	sess, err := d.GetSession(t.Context(), "s1")
+ 	require.NoError(t, err)
+@@ -4300,7 +4332,7 @@ func TestWriteSessionIncrementalTargetsDuplicateCallIDOccurrence(t *testing.T) {
+ 		SELECT COUNT(*) FROM tool_result_events
+ 		WHERE session_id = ? AND tool_call_message_ordinal = ?
+ 		  AND call_index = ?`, "s1", 1, 0).Scan(&eventCount))
+-	assert.Equal(t, 1, eventCount)
++	assert.Zero(t, eventCount)
+ 
+ 	write(ToolCallPosition{MessageOrdinal: 0, CallIndex: 0}, "first")
+ 	var stateOccurrences int
+@@ -6371,6 +6403,9 @@ func TestCopyOrphanedDataFrom_LegacyNoIsSystem(t *testing.T) {
+ 	// SQLite doesn't support DROP COLUMN before 3.35;
+ 	// recreate the table without is_system.
+ 	_, err = raw.ExecContext(t.Context(), `
++		DROP TRIGGER IF EXISTS tool_calls_fts_ai;
++		DROP TRIGGER IF EXISTS tool_calls_fts_ad;
++		DROP TRIGGER IF EXISTS tool_calls_fts_au;
+ 		CREATE TABLE messages_new (
+ 			id INTEGER PRIMARY KEY AUTOINCREMENT,
+ 			session_id TEXT NOT NULL,
+diff --git a/internal/db/legacy_schema_test.go b/internal/db/legacy_schema_test.go
+index 00fd622a..2cc31bf0 100644
+--- a/internal/db/legacy_schema_test.go
++++ b/internal/db/legacy_schema_test.go
+@@ -389,6 +389,68 @@ func requireLegacyRepairIndexes(t *testing.T, d *DB) {
+ 	}
+ }
+ 
++// TestMessagesSessionOrdinalRedundantIndexDropped verifies that the
++// explicit idx_messages_session_ordinal index is removed from both fresh
++// and upgraded archives while the UNIQUE(session_id, ordinal) constraint
++// and its implicit index remain.
++func TestMessagesSessionOrdinalRedundantIndexDropped(t *testing.T) {
++	assertNoRedundantIndex := func(t *testing.T, d *DB) {
++		t.Helper()
++		var explicitCount int
++		err := d.getReader().QueryRow(t.Context(), `
++			SELECT count(*) FROM sqlite_master
++			WHERE type = 'index' AND name = 'idx_messages_session_ordinal'
++		`).Scan(&explicitCount)
++		require.NoError(t, err)
++		assert.Equal(t, 0, explicitCount,
++			"explicit idx_messages_session_ordinal must be absent")
++
++		requireIndexColumns(t, d, "sqlite_autoindex_messages_1", []string{
++			"session_id", "ordinal",
++		})
++	}
++
++	t.Run("fresh database", func(t *testing.T) {
++		d := testDB(t)
++		assertNoRedundantIndex(t, d)
++	})
++
++	t.Run("legacy database with explicit index", func(t *testing.T) {
++		path := filepath.Join(t.TempDir(), "legacy.db")
++		conn, err := sql.Open("sqlite3", makeDSN(path, false))
++		require.NoError(t, err)
++		conn.SetMaxOpenConns(1)
++
++		_, err = conn.ExecContext(t.Context(), preParentLegacySchema+`
++			CREATE INDEX idx_messages_session_ordinal
++			    ON messages(session_id, ordinal);
++			INSERT INTO sessions (
++			    id, project, machine, agent
++			) VALUES ('legacy-session', 'project-a', 'local', 'claude');
++			INSERT INTO messages (
++			    id, session_id, ordinal, role, content
++			) VALUES (1, 'legacy-session', 0, 'user', 'archived');
++		`)
++		require.NoError(t, err)
++		require.NoError(t, conn.Close())
++
++		d, err := Open(t.Context(), path)
++		require.NoError(t, err)
++		defer d.Close()
++
++		assertNoRedundantIndex(t, d)
++
++		// The UNIQUE(session_id, ordinal) constraint must still enforce
++		// uniqueness after the redundant explicit index is dropped.
++		_, err = d.getWriter().ExecContext(t.Context(), `
++			INSERT INTO messages (session_id, ordinal, role, content)
++			VALUES ('legacy-session', 0, 'assistant', 'duplicate')
++		`)
++		require.Error(t, err)
++		assert.ErrorContains(t, err, "UNIQUE constraint failed")
++	})
++}
++
+ func TestToolResultMetadataMigrationPreservesArchivedEvents(t *testing.T) {
+ 	path := filepath.Join(t.TempDir(), "legacy.db")
+ 	conn, err := sql.Open("sqlite3", makeDSN(path, false))
+diff --git a/internal/db/messages.go b/internal/db/messages.go
+index 1464c054..506b89d1 100644
+--- a/internal/db/messages.go
++++ b/internal/db/messages.go
+@@ -1,6 +1,7 @@
+ package db
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"crypto/sha256"
+ 	"database/sql"
+@@ -1135,8 +1136,8 @@ func embeddableUnitsQuery(since, sessionID string, includeAutomated bool) string
+ // predicate on the joined sessions row so SQLite can drive the scan from
+ // sessions, which is orders of magnitude smaller than messages. With the
+ // predicate on the join, the planner had no indexed way to apply it and
+-// scanned every message row (content included) through
+-// idx_messages_session_ordinal before discarding almost all of them; an
++// scanned every message row (content included) through the unique
++// (session_id, ordinal) index before discarding almost all of them; an
+ // incremental refresh touching eight sessions still read the whole corpus.
+ // The IN form makes the candidate session list the outer loop and looks its
+ // messages up with SEARCH ... (session_id=?) on that same index, which also
+@@ -1241,6 +1242,23 @@ func insertMessagesTx(
+ 			)
+ 		}
+ 	}
++	if len(ids) > 0 {
++		active, err := activeFTSTablesTx(tx)
++		if err != nil {
++			return nil, err
++		}
++		minID := ids[0]
++		maxID := ids[len(ids)-1]
++		for _, table := range active {
++			if _, err := tx.Exec(
++				`INSERT INTO `+table+`(rowid, content)
++				 SELECT id, content FROM messages WHERE id BETWEEN ? AND ?`,
++				minID, maxID,
++			); err != nil {
++				return nil, fmt.Errorf("bulk-indexing %s entries id=%d..%d: %w", table, minID, maxID, err)
++			}
++		}
++	}
+ 	return ids, nil
+ }
+ 
+@@ -2266,48 +2284,44 @@ func sessionHasCurrentCJKFTSTx(
+ 	return storedFingerprint == simpleFTSRuntimeConfig.fingerprint, nil
+ }
+ 
++// activeFTSTablesTx returns the names of active FTS tables (standard and CJK)
++// that need to be synchronized when messages are modified.
++func activeFTSTablesTx(tx transactionQueries) ([]string, error) {
++	var active []string
++	hasFTS, err := sessionHasFTSTableTx(tx, "messages_fts")
++	if err != nil {
++		return nil, err
++	}
++	if hasFTS {
++		active = append(active, "messages_fts")
++	}
++	hasCJK, err := sessionHasCurrentCJKFTSTx(tx)
++	if err != nil {
++		return nil, err
++	}
++	if hasCJK {
++		active = append(active, "messages_cjk_fts")
++	}
++	return active, nil
++}
++
+ func deleteSessionMessageRowsTx(
+ 	tx transactionQueries, sessionID string,
+ ) error {
+-	tables := []struct {
+-		name       string
+-		deleteName string
+-		deleteDDL  string
+-	}{
+-		{"messages_fts", "messages_ad", messagesADTriggerDDL},
+-		{"messages_cjk_fts", "messages_cjk_ad", messagesCJKADTriggerDDL},
+-	}
+-	active := tables[:0]
+-	for _, table := range tables {
+-		var exists bool
+-		var err error
+-		if table.name == "messages_cjk_fts" {
+-			exists, err = sessionHasCurrentCJKFTSTx(tx)
+-		} else {
+-			exists, err = sessionHasFTSTableTx(tx, table.name)
+-		}
+-		if err != nil {
+-			return err
+-		}
+-		if exists {
+-			active = append(active, table)
+-		}
++	active, err := activeFTSTablesTx(tx)
++	if err != nil {
++		return err
+ 	}
+ 
+ 	for _, table := range active {
+-		// Bulk-delete the FTS entries first so the later row delete
+-		// does not re-tokenize large message blobs through delete triggers.
++		// Bulk-delete the FTS entries first so the FTS index is kept
++		// synchronized without per-row delete triggers.
+ 		if _, err := tx.Exec(
+-			`INSERT INTO `+table.name+`(`+table.name+`, rowid, content)
++			`INSERT INTO `+table+`(`+table+`, rowid, content)
+ 			 SELECT 'delete', id, content FROM messages WHERE session_id = ?`,
+ 			sessionID,
+ 		); err != nil {
+-			return fmt.Errorf("bulk-deleting %s entries: %w", table.name, err)
+-		}
+-		if _, err := tx.Exec(
+-			"DROP TRIGGER IF EXISTS " + table.deleteName,
+-		); err != nil {
+-			return fmt.Errorf("dropping %s trigger: %w", table.deleteName, err)
++			return fmt.Errorf("bulk-deleting %s entries: %w", table, err)
+ 		}
+ 	}
+ 	if _, err := tx.Exec(
+@@ -2315,11 +2329,6 @@ func deleteSessionMessageRowsTx(
+ 	); err != nil {
+ 		return fmt.Errorf("deleting old messages: %w", err)
+ 	}
+-	for _, table := range active {
+-		if _, err := tx.Exec(table.deleteDDL); err != nil {
+-			return fmt.Errorf("restoring %s trigger: %w", table.deleteName, err)
+-		}
+-	}
+ 	return nil
+ }
+ 
+@@ -3602,6 +3611,8 @@ func soleToolResultEventTx(ctx context.Context,
+ 	imagePolicy config.ToolResultImages,
+ ) ([]ToolResultEvent, error) {
+ 	var count int
++	var subagent, agentID, status, timestamp string
++	var digest []byte
+ 	var content sql.NullString
+ 	if err := tx.QueryRowContext(ctx,
+ 		`SELECT COUNT(*) FROM (
+@@ -3622,11 +3633,17 @@ func soleToolResultEventTx(ctx context.Context,
+ 		return nil, nil
+ 	}
+ 	if err := tx.QueryRowContext(ctx,
+-		`SELECT content FROM tool_result_events
++		`SELECT COALESCE(subagent_session_id, ''),
++		        COALESCE(agent_id, ''),
++		        COALESCE(status, ''),
++		        COALESCE(timestamp, ''),
++		        raw_content_digest,
++		        content
++		 FROM tool_result_events
+ 		 WHERE session_id = ? AND tool_call_message_ordinal = ?
+ 		   AND call_index = ? AND COALESCE(content, '') <> ''`,
+ 		sessionID, messageOrdinal, callIndex,
+-	).Scan(&content); err != nil {
++	).Scan(&subagent, &agentID, &status, &timestamp, &digest, &content); err != nil {
+ 		return nil, fmt.Errorf(
+ 			"reading sole tool result event for %s/%d/%d: %w",
+ 			sessionID, messageOrdinal, callIndex, err,
+@@ -3637,7 +3654,14 @@ func soleToolResultEventTx(ctx context.Context,
+ 		stored, _ = StripToolResultImages(stored)
+ 	}
+ 	// Offload dedup must compare stored bytes because readers hydrate the original event.
+-	return []ToolResultEvent{{Content: stored}}, nil
++	return []ToolResultEvent{{
++		Content:           stored,
++		SubagentSessionID: subagent,
++		AgentID:           agentID,
++		Status:            status,
++		Timestamp:         timestamp,
++		RawContentDigest:  digest,
++	}}, nil
+ }
+ 
+ func applyToolCallSubagentLinkTx(ctx context.Context,
+@@ -3721,15 +3745,25 @@ func applyToolCallSubagentLinkTx(ctx context.Context,
+ 			resultContent, resultContentLen,
+ 		)
+ 		// A linked result carries no events of its own, but the call it
+-		// targets may already have one stored. Re-storing a summary the
+-		// event repeats would undo the dedup on every incremental pass.
++		// targets may already have one stored. If the linked result repeats
++		// that single stored event, delete the redundant event row so the
++		// call conforms to the single-event storage model.
+ 		sole, err := soleToolResultEventTx(ctx,
+ 			tx, sessionID, messageOrdinal, callIndex, imagePolicy,
+ 		)
+ 		if err != nil {
+ 			return false, err
+ 		}
+-		resultContent = DedupToolCallResultSummary(resultContent, sole)
++		if ResultContentDuplicatesSingleEvent(resultContent, sole) {
++			if _, err := tx.ExecContext(ctx,
++				`DELETE FROM tool_result_events
++				 WHERE session_id = ? AND tool_call_message_ordinal = ?
++				   AND call_index = ?`,
++				sessionID, messageOrdinal, callIndex,
++			); err != nil {
++				return false, fmt.Errorf("deleting redundant single event: %w", err)
++			}
++		}
+ 	}
+ 	if currentSubagent == storedSubagent &&
+ 		currentResultContentLen == resultContentLen &&
+@@ -3758,9 +3792,12 @@ func applyToolCallResultUpdateTx(ctx context.Context,
+ 
+ 	position := update.Position
+ 	var toolCallID int64
+-	var category string
++	var category, currentResultContent string
++	var currentResultContentLen int
+ 	if err := tx.QueryRowContext(ctx,
+-		`SELECT tc.id, tc.category
++		`SELECT tc.id, tc.category,
++		        COALESCE(tc.result_content, ''),
++		        COALESCE(tc.result_content_length, 0)
+ 		 FROM tool_calls tc
+ 		 JOIN messages m ON m.id = tc.message_id
+ 		 WHERE tc.session_id = ? AND m.session_id = tc.session_id AND m.ordinal = ?
+@@ -3768,7 +3805,7 @@ func applyToolCallResultUpdateTx(ctx context.Context,
+ 		   AND COALESCE(tc.tool_use_id, '') = ?`,
+ 		sessionID, position.MessageOrdinal, position.CallIndex,
+ 		update.ToolUseID,
+-	).Scan(&toolCallID, &category); err != nil {
++	).Scan(&toolCallID, &category, &currentResultContent, &currentResultContentLen); err != nil {
+ 		if errors.Is(err, sql.ErrNoRows) {
+ 			return false, nil, nil
+ 		}
+@@ -3802,16 +3839,16 @@ func applyToolCallResultUpdateTx(ctx context.Context,
+ 			return false, nil, err
+ 		}
+ 	}
+-	var nextEventIndex int
++
++	var eventCount int
+ 	if err := tx.QueryRowContext(ctx,
+-		`SELECT COALESCE(MAX(event_index), -1) + 1
+-		 FROM tool_result_events
++		`SELECT COUNT(*) FROM tool_result_events
+ 		 WHERE session_id = ? AND tool_call_message_ordinal = ?
+ 		   AND call_index = ?`,
+ 		sessionID, position.MessageOrdinal, position.CallIndex,
+-	).Scan(&nextEventIndex); err != nil {
++	).Scan(&eventCount); err != nil {
+ 		return false, nil, fmt.Errorf(
+-			"reading next event index for %s/%s: %w",
++			"counting tool result events for %s/%s: %w",
+ 			sessionID, update.ToolUseID, err,
+ 		)
+ 	}
+@@ -3848,6 +3885,67 @@ func applyToolCallResultUpdateTx(ctx context.Context,
+ 		incoming = toolCall.ResultEvents
+ 	}
+ 
++	if eventCount == 0 && (currentResultContent != "" || currentResultContentLen > 0) {
++		if !blocked && len(incoming) == 1 {
++			candidate := incoming[0]
++			if candidate.ContentLength == currentResultContentLen &&
++				candidate.Content == currentResultContent &&
++				candidate.AgentID == "" && candidate.SubagentSessionID == "" {
++				storedDigest := sha256.Sum256([]byte(currentResultContent))
++				if bytes.Equal(candidate.RawContentDigest, storedDigest[:]) ||
++					strings.Contains(currentResultContent, "asset://") {
++					return false, nil, nil
++				}
++			}
++		}
++		var agentID string
++		_ = tx.QueryRowContext(ctx,
++			`SELECT agent_id FROM tool_call_occurrence_agent_state
++			 WHERE session_id = ? AND message_ordinal = ? AND call_index = ?
++			 LIMIT 1`,
++			sessionID, position.MessageOrdinal, position.CallIndex,
++		).Scan(&agentID)
++		ev0Event := ToolResultEvent{
++			ToolUseID:     update.ToolUseID,
++			AgentID:       agentID,
++			Source:        "function_call_output",
++			Status:        "completed",
++			Content:       currentResultContent,
++			ContentLength: currentResultContentLen,
++			EventIndex:    0,
++		}
++		if blocked {
++			ev0Event.Content = ""
++		}
++		PrepareToolResultEvent(&ev0Event)
++		ev0Row := toolResultEventRow{
++			SessionID:      sessionID,
++			MessageOrdinal: position.MessageOrdinal,
++			CallIndex:      position.CallIndex,
++			Event:          ev0Event,
++		}
++		if err := insertToolResultEventsTx(tx, []toolResultEventRow{ev0Row}); err != nil {
++			return false, nil, err
++		}
++		if err := upsertToolCallAgentStateRows(tx, []toolResultEventRow{ev0Row}); err != nil {
++			return false, nil, err
++		}
++	}
++
++	var nextEventIndex int
++	if err := tx.QueryRowContext(ctx,
++		`SELECT COALESCE(MAX(event_index), -1) + 1
++		 FROM tool_result_events
++		 WHERE session_id = ? AND tool_call_message_ordinal = ?
++		   AND call_index = ?`,
++		sessionID, position.MessageOrdinal, position.CallIndex,
++	).Scan(&nextEventIndex); err != nil {
++		return false, nil, fmt.Errorf(
++			"reading next event index for %s/%s: %w",
++			sessionID, update.ToolUseID, err,
++		)
++	}
++
+ 	insertRows := make([]toolResultEventRow, 0, len(incoming))
+ 	var inserted []ToolResultEvent
+ 	var metadataChanged bool
+@@ -3908,6 +4006,16 @@ func applyToolCallResultUpdateTx(ctx context.Context,
+ 		})
+ 	}
+ 	if len(insertRows) == 0 {
++		if eventCount == 0 {
++			if _, err := tx.ExecContext(ctx,
++				`DELETE FROM tool_result_events
++				 WHERE session_id = ? AND tool_call_message_ordinal = ?
++				   AND call_index = ?`,
++				sessionID, position.MessageOrdinal, position.CallIndex,
++			); err != nil {
++				return false, nil, err
++			}
++		}
+ 		return metadataChanged, nil, nil
+ 	}
+ 	if err := insertToolResultEventsTx(tx, insertRows); err != nil {
+@@ -3941,15 +4049,26 @@ func applyToolCallResultUpdateTx(ctx context.Context,
+ 				resultLength = len(summary)
+ 			}
+ 		}
++		storedSummary = summary
++	}
+ 
+-		sole, err := soleToolResultEventTx(ctx,
+-			tx, sessionID, position.MessageOrdinal, position.CallIndex,
+-			imagePolicy,
+-		)
+-		if err != nil {
+-			return false, nil, err
++	sole, err := soleToolResultEventTx(ctx,
++		tx, sessionID, position.MessageOrdinal, position.CallIndex,
++		imagePolicy,
++	)
++	if err != nil {
++		return false, nil, err
++	}
++	if ResultContentDuplicatesSingleEvent(storedSummary, sole) {
++		if _, err := tx.ExecContext(ctx,
++			`DELETE FROM tool_result_events
++			 WHERE session_id = ? AND tool_call_message_ordinal = ?
++			   AND call_index = ?`,
++			sessionID, position.MessageOrdinal, position.CallIndex,
++		); err != nil {
++			return false, nil, fmt.Errorf("deleting redundant single event: %w", err)
+ 		}
+-		storedSummary = DedupToolCallResultSummary(summary, sole)
++		inserted = nil
+ 	}
+ 	if _, err := tx.ExecContext(ctx,
+ 		`UPDATE tool_calls
+@@ -4184,6 +4303,9 @@ func resolveToolResultEvents(msgs []Message) []toolResultEventRow {
+ 	var rows []toolResultEventRow
+ 	for _, m := range msgs {
+ 		for callIndex, tc := range m.ToolCalls {
++			if !ShouldPersistToolResultEvents(tc.ResultContent, tc.ResultEvents) {
++				continue
++			}
+ 			for eventIndex, ev := range tc.ResultEvents {
+ 				ev.EventIndex = eventIndex
+ 				ev.ContentLength = ResolveResultContentLength(
+diff --git a/internal/db/messages_diff.go b/internal/db/messages_diff.go
+index 1dfa2274..6c73abc3 100644
+--- a/internal/db/messages_diff.go
++++ b/internal/db/messages_diff.go
+@@ -343,6 +343,22 @@ func applySessionMessageDiffTx(ctx context.Context,
+ 	tx *sql.Tx, sessionID string, plan messageDiffPlan,
+ ) error {
+ 	if len(plan.updates) > 0 {
++		active, err := activeFTSTablesTx(tx)
++		if err != nil {
++			return err
++		}
++		for _, u := range plan.updates {
++			for _, table := range active {
++				if _, err := tx.ExecContext(ctx,
++					`INSERT INTO `+table+`(`+table+`, rowid, content)
++					 SELECT 'delete', id, content FROM messages WHERE id = ?`,
++					u.id,
++				); err != nil {
++					return fmt.Errorf("deleting %s entry for updated message %d: %w", table, u.id, err)
++				}
++			}
++		}
++
+ 		updateSQL := "UPDATE messages SET " +
+ 			messageUpdateSetClause + " WHERE id = ?"
+ 		ids := make([]int64, 0, len(plan.updates))
+@@ -360,6 +376,17 @@ func applySessionMessageDiffTx(ctx context.Context,
+ 			ordinals = append(ordinals, u.msg.Ordinal)
+ 			msgs = append(msgs, u.msg)
+ 		}
++		for _, u := range plan.updates {
++			for _, table := range active {
++				if _, err := tx.ExecContext(ctx,
++					`INSERT INTO `+table+`(rowid, content)
++					 SELECT id, content FROM messages WHERE id = ?`,
++					u.id,
++				); err != nil {
++					return fmt.Errorf("indexing %s entry for updated message %d: %w", table, u.id, err)
++				}
++			}
++		}
+ 		if err := deleteToolRowsForMessagesTx(ctx,
+ 			tx, sessionID, ids, ordinals,
+ 		); err != nil {
+diff --git a/internal/db/messages_fts_batch_test.go b/internal/db/messages_fts_batch_test.go
+new file mode 100644
+index 00000000..154bf74d
+--- /dev/null
++++ b/internal/db/messages_fts_batch_test.go
+@@ -0,0 +1,150 @@
++package db
++
++import (
++	"database/sql"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestNoRowLevelFTSMessageTriggers(t *testing.T) {
++	t.Parallel()
++	d := testDB(t)
++	requireFTS(t, d)
++
++	// Verify that row-level triggers on messages (which cause write amplification)
++	// are not present.
++	var count int
++	err := d.getReader().QueryRow(t.Context(), `
++		SELECT count(*) FROM sqlite_master
++		WHERE type = 'trigger' AND name IN ('messages_ai', 'messages_au', 'messages_ad')
++	`).Scan(&count)
++	require.NoError(t, err)
++	assert.Equal(t, 0, count, "messages table should not have row-level FTS triggers")
++}
++
++func TestBatchFTSIndexing_Operations(t *testing.T) {
++	t.Parallel()
++	d := testDB(t)
++	requireFTS(t, d)
++
++	const (
++		session1 = "session-fts-1"
++		token1   = "uniqueftsalpha"
++		session2 = "session-fts-2"
++		token2   = "uniqueftsbeta"
++	)
++
++	// 1. Fresh write via WriteSessionBatch
++	insertSession(t, d, session1, "proj")
++	res, err := d.WriteSessionBatch([]SessionBatchWrite{{
++		Session: Session{
++			ID:               session1,
++			Project:          "proj",
++			MessageCount:     2,
++			UserMessageCount: 1,
++		},
++		Messages: []Message{
++			userMsg(session1, 0, "first message "+token1),
++			asstMsg(session1, 1, "reply to alpha"),
++		},
++		DataVersion:     CurrentDataVersion(),
++		ReplaceMessages: true,
++	}})
++	require.NoError(t, err)
++	assert.Equal(t, 2, res.WrittenMessages)
++
++	// Verify token1 is indexed
++	var matchCount int
++	err = d.getReader().QueryRow(t.Context(), `
++		SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?
++	`, token1).Scan(&matchCount)
++	require.NoError(t, err)
++	assert.Equal(t, 1, matchCount, "token1 should be indexed by WriteSessionBatch")
++
++	// 2. Incremental append via InsertMessages
++	err = d.InsertMessages(t.Context(), []Message{
++		userMsg(session1, 2, "second message with "+token2),
++	})
++	require.NoError(t, err)
++
++	// Verify token2 is indexed and token1 is still there
++	err = d.getReader().QueryRow(t.Context(), `
++		SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?
++	`, token2).Scan(&matchCount)
++	require.NoError(t, err)
++	assert.Equal(t, 1, matchCount, "token2 should be indexed by InsertMessages")
++
++	err = d.getReader().QueryRow(t.Context(), `
++		SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?
++	`, token1).Scan(&matchCount)
++	require.NoError(t, err)
++	assert.Equal(t, 1, matchCount, "token1 should still be indexed")
++
++	// 3. ReplaceSessionMessages replacing all messages of session1 with new token
++	const token3 = "uniqueftsgamma"
++	err = d.ReplaceSessionMessages(t.Context(), session1, []Message{
++		userMsg(session1, 0, "replaced message "+token3),
++	})
++	require.NoError(t, err)
++
++	// Old tokens should be gone (no leak)
++	assertNoFTSLeak(t, d, token1)
++	assertNoFTSLeak(t, d, token2)
++
++	// token3 should be indexed
++	err = d.getReader().QueryRow(t.Context(), `
++		SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?
++	`, token3).Scan(&matchCount)
++	require.NoError(t, err)
++	assert.Equal(t, 1, matchCount, "token3 should be indexed by ReplaceSessionMessages")
++
++	// 4. DeleteSession should clean up FTS entries
++	err = d.DeleteSession(t.Context(), session1)
++	require.NoError(t, err)
++	assertNoFTSLeak(t, d, token3)
++
++	var totalFTS int
++	err = d.getReader().QueryRow(t.Context(), `SELECT count(*) FROM messages_fts`).Scan(&totalFTS)
++	require.NoError(t, err)
++	assert.Equal(t, 0, totalFTS, "messages_fts should be empty after deleting session")
++}
++
++func TestLegacyTriggersDroppedOnOpen(t *testing.T) {
++	t.Parallel()
++	d := testDB(t)
++	requireFTS(t, d)
++
++	// Artificially install legacy triggers
++	require.NoError(t, d.Update(t.Context(), func(tx *sql.Tx) error {
++		_, err := tx.ExecContext(t.Context(), `
++			CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
++				SELECT 1;
++			END;
++			CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
++				SELECT 1;
++			END;
++			CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
++				SELECT 1;
++			END;
++		`)
++		return err
++	}))
++
++	// Close and re-open to trigger ensureFTS cleanup
++	path := d.path
++	require.NoError(t, d.Close())
++
++	d2, err := Open(t.Context(), path)
++	require.NoError(t, err)
++	defer func() { _ = d2.Close() }()
++
++	var count int
++	err = d2.getReader().QueryRow(t.Context(), `
++		SELECT count(*) FROM sqlite_master
++		WHERE type = 'trigger' AND name IN ('messages_ai', 'messages_au', 'messages_ad')
++	`).Scan(&count)
++	require.NoError(t, err)
++	assert.Equal(t, 0, count, "legacy triggers should be dropped on open")
++}
+diff --git a/internal/db/messages_test.go b/internal/db/messages_test.go
+index 6bccf190..0714dc4d 100644
+--- a/internal/db/messages_test.go
++++ b/internal/db/messages_test.go
+@@ -109,7 +109,6 @@ func buildLargeSessionFixtureTemplate(
+ 		largeSessionMessages(largeSessionFixtureID, largeSessionFixtureToken)...)
+ 	if withFKPoison {
+ 		seedCrossSessionFKGrowth(t, d, largeSessionNeighborPrefix)
+-		poisonMessagesDeleteTrigger(t, d)
+ 	}
+ 	ctx, cancel := context.WithTimeout(t.Context(), largeSessionPerfCeiling)
+ 	defer cancel()
+@@ -188,19 +187,16 @@ func poisonMessagesDeleteTrigger(t *testing.T, d *DB) {
+ 	}), "poison messages_ad trigger")
+ }
+ 
+-func requireMessagesDeleteTriggerRestored(t *testing.T, d *DB) {
++func requireNoFTSMessageTriggers(t *testing.T, d *DB) {
+ 	t.Helper()
+ 
+-	var triggerSQL string
++	var count int
+ 	err := d.getReader().QueryRow(t.Context(),
+-		`SELECT sql FROM sqlite_master
+-		 WHERE type = 'trigger' AND name = 'messages_ad'`,
+-	).Scan(&triggerSQL)
+-	require.NoError(t, err, "read messages_ad trigger")
+-	assert.NotContains(t, triggerSQL, "poison messages_ad fired",
+-		"messages_ad trigger was not restored")
+-	assert.Contains(t, triggerSQL, "INSERT INTO messages_fts",
+-		"messages_ad trigger no longer matches the canonical FTS delete path")
++		`SELECT count(*) FROM sqlite_master
++		 WHERE type = 'trigger' AND name IN ('messages_ai', 'messages_au', 'messages_ad')`,
++	).Scan(&count)
++	require.NoError(t, err, "read FTS triggers")
++	assert.Zero(t, count, "messages table should have no row-level FTS triggers")
+ }
+ 
+ func requireMessagesDeleteTriggerPoisoned(t *testing.T, d *DB) {
+@@ -582,7 +578,7 @@ func TestWriteSessionBatch_ReplaceMessagesLargeSession(t *testing.T) {
+ 	require.NoError(t, err, "GetAllMessages after batch replace")
+ 	require.Len(t, got, len(repl), "after batch replace")
+ 	assertNoFTSLeak(t, d, largeSessionFixtureToken)
+-	requireMessagesDeleteTriggerRestored(t, d)
++	requireNoFTSMessageTriggers(t, d)
+ 
+ 	var neighborToolCalls int
+ 	err = d.getReader().QueryRow(t.Context(),
+diff --git a/internal/db/messages_units_scope_test.go b/internal/db/messages_units_scope_test.go
+index 55af98c7..c24d331a 100644
+--- a/internal/db/messages_units_scope_test.go
++++ b/internal/db/messages_units_scope_test.go
+@@ -222,10 +222,10 @@ func explainQueryPlan(t *testing.T, d *DB, query string, args ...any) []string {
+ // TestEmbeddableUnitsQueryPlanDrivesFromSessionsWhenSinceIsSet is the
+ // regression guard for the after-sync refresh reading the entire message
+ // corpus (including content) on every run. With a watermark the planner must
+-// look messages up per candidate session through
+-// idx_messages_session_ordinal; a plan that scans messages means the
+-// watermark stopped narrowing the scan. Without a watermark the full scan is
+-// the intended shape and must stay.
++// look messages up per candidate session through the unique (session_id,
++// ordinal) index; a plan that scans messages means the watermark stopped
++// narrowing the scan. Without a watermark the full scan is the intended shape
++// and must stay.
+ func TestEmbeddableUnitsQueryPlanDrivesFromSessionsWhenSinceIsSet(t *testing.T) {
+ 	d := testDB(t)
+ 	seedEmbeddableScopeCorpus(t, d)
+@@ -259,8 +259,11 @@ func TestEmbeddableUnitsQueryPlanDrivesFromSessionsWhenSinceIsSet(t *testing.T)
+ 				if strings.HasPrefix(line, "SCAN m") {
+ 					scansMessages = true
+ 				}
+-				if strings.HasPrefix(line,
+-					"SEARCH m USING INDEX idx_messages_session_ordinal (session_id=") {
++				// The planner may use either the explicit index name on older
++				// archives or the implicit autoindex created by the
++				// UNIQUE(session_id, ordinal) constraint on current ones.
++				if strings.HasPrefix(line, "SEARCH m USING INDEX") &&
++					strings.Contains(line, "(session_id=") {
+ 					searchesMessages = true
+ 				}
+ 			}
+diff --git a/internal/db/migrate_images_test.go b/internal/db/migrate_images_test.go
+index 193da3c1..95c40a1e 100644
+--- a/internal/db/migrate_images_test.go
++++ b/internal/db/migrate_images_test.go
+@@ -100,7 +100,7 @@ func TestMigrateLeavesBlockInlineWhenPutFails(t *testing.T) {
+ 
+ 	var beforeContent string
+ 	require.NoError(t, d.getReader().QueryRow(t.Context(),
+-		"SELECT content FROM tool_result_events WHERE session_id = ?", "fail-put",
++		"SELECT result_content FROM tool_calls WHERE session_id = ?", "fail-put",
+ 	).Scan(&beforeContent))
+ 	assert.Contains(t, beforeContent, "input_image")
+ 
+@@ -109,7 +109,7 @@ func TestMigrateLeavesBlockInlineWhenPutFails(t *testing.T) {
+ 
+ 	var afterContent string
+ 	require.NoError(t, d.getReader().QueryRow(t.Context(),
+-		"SELECT content FROM tool_result_events WHERE session_id = ?", "fail-put",
++		"SELECT result_content FROM tool_calls WHERE session_id = ?", "fail-put",
+ 	).Scan(&afterContent))
+ 	// Boundary: 0 rows carrying image_ref after failure.
+ 	assert.Equal(t, beforeContent, afterContent)
+@@ -132,7 +132,7 @@ func TestMigratePartialFailurePreservesReport(t *testing.T) {
+ 	// Snapshot second session content before migration.
+ 	var secondBefore string
+ 	require.NoError(t, d.getReader().QueryRow(t.Context(),
+-		"SELECT content FROM tool_result_events WHERE session_id = ?", "pf-second",
++		"SELECT result_content FROM tool_calls WHERE session_id = ?", "pf-second",
+ 	).Scan(&secondBefore))
+ 
+ 	calls := 0
+@@ -160,7 +160,7 @@ func TestMigratePartialFailurePreservesReport(t *testing.T) {
+ 	// First session's row is migrated.
+ 	var firstAfter string
+ 	require.NoError(t, d.getReader().QueryRow(t.Context(),
+-		"SELECT content FROM tool_result_events WHERE session_id = ?", "pf-first",
++		"SELECT result_content FROM tool_calls WHERE session_id = ?", "pf-first",
+ 	).Scan(&firstAfter))
+ 	assert.Contains(t, firstAfter, "image_ref")
+ 	assert.Contains(t, firstAfter, "asset://")
+@@ -168,7 +168,7 @@ func TestMigratePartialFailurePreservesReport(t *testing.T) {
+ 	// Second session's row is unchanged.
+ 	var secondAfter string
+ 	require.NoError(t, d.getReader().QueryRow(t.Context(),
+-		"SELECT content FROM tool_result_events WHERE session_id = ?", "pf-second",
++		"SELECT result_content FROM tool_calls WHERE session_id = ?", "pf-second",
+ 	).Scan(&secondAfter))
+ 	assert.Equal(t, secondBefore, secondAfter)
+ 	assert.NotContains(t, secondAfter, "image_ref")
+@@ -207,13 +207,13 @@ func TestMigrateCancellationPreservesReport(t *testing.T) {
+ 
+ 	var firstContent string
+ 	require.NoError(t, d.getReader().QueryRow(context.WithoutCancel(ctx),
+-		"SELECT content FROM tool_result_events WHERE session_id = ?", "cancel-first",
++		"SELECT result_content FROM tool_calls WHERE session_id = ?", "cancel-first",
+ 	).Scan(&firstContent))
+ 	assert.Contains(t, firstContent, "image_ref")
+ 
+ 	var secondContent string
+ 	require.NoError(t, d.getReader().QueryRow(context.WithoutCancel(ctx),
+-		"SELECT content FROM tool_result_events WHERE session_id = ?", "cancel-second",
++		"SELECT result_content FROM tool_calls WHERE session_id = ?", "cancel-second",
+ 	).Scan(&secondContent))
+ 	assert.Contains(t, secondContent, "input_image")
+ }
+@@ -289,7 +289,7 @@ func TestMigratedReferenceMatchesStoredFile(t *testing.T) {
+ 
+ 			var storedContent string
+ 			require.NoError(t, d.getReader().QueryRow(t.Context(),
+-				"SELECT content FROM tool_result_events WHERE session_id = ?", "ref-match",
++				"SELECT result_content FROM tool_calls WHERE session_id = ?", "ref-match",
+ 			).Scan(&storedContent))
+ 			assert.NotContains(t, storedContent, "input_image")
+ 			assert.Contains(t, storedContent, `"text":"before"`)
+@@ -326,21 +326,16 @@ func TestMigratedReferenceMatchesStoredFile(t *testing.T) {
+ 			assert.Equal(t, storedContent, call.ResultContent)
+ 			assert.NotContains(t, call.ResultContent, "input_image")
+ 
+-			var summaryLength, eventLength int
++			var summaryLength int
+ 			require.NoError(t, d.getReader().QueryRow(t.Context(), `
+-				SELECT tc.result_content_length, ev.content_length
++				SELECT tc.result_content_length
+ 				FROM tool_calls tc
+-				JOIN messages m ON m.id = tc.message_id
+-				JOIN tool_result_events ev
+-				  ON ev.session_id = tc.session_id
+-				 AND ev.tool_call_message_ordinal = m.ordinal
+-				 AND ev.call_index = tc.call_index
+ 				WHERE tc.session_id = ? AND tc.tool_use_id = ?`,
+ 				"ref-match", "call-1",
+-			).Scan(&summaryLength, &eventLength))
+-			assert.Equal(t, len(storedContent), eventLength)
+-			assert.Equal(t, eventLength, summaryLength)
+-			assert.Equal(t, eventLength, call.ResultContentLength)
++			).Scan(&summaryLength))
++			assert.Equal(t, len(storedContent), summaryLength)
++			assert.Equal(t, summaryLength, call.ResultContentLength)
++			assert.Empty(t, call.ResultEvents)
+ 		})
+ 	}
+ }
+@@ -699,7 +694,7 @@ func TestMigrateDeduplicatesAcrossSessions(t *testing.T) {
+ 	for _, id := range []string{"dedup-a", "dedup-b"} {
+ 		var content string
+ 		require.NoError(t, d.getReader().QueryRow(t.Context(),
+-			"SELECT content FROM tool_result_events WHERE session_id = ?", id,
++			"SELECT result_content FROM tool_calls WHERE session_id = ?", id,
+ 		).Scan(&content))
+ 		var blocks []json.RawMessage
+ 		require.NoError(t, json.Unmarshal([]byte(content), &blocks))
+@@ -970,9 +965,29 @@ func TestMigrateDeduplicatedSummaryKeepsCollapse(t *testing.T) {
+ 	d := testDB(t)
+ 	assetsDir := t.TempDir()
+ 	put := realPut(assetsDir)
+-	seedArtifactOrigin(t, d)
+ 	insertSession(t, d, "dedup-collapse", "project")
+-	insertMessages(t, d, testTimedImageMessage("dedup-collapse"))
++	content := testInlineImageContent()
++	require.NoError(t, d.InsertMessages(t.Context(), []Message{{
++		SessionID: "dedup-collapse",
++		Ordinal:   0,
++		Role:      "assistant",
++		Content:   "answer",
++		ToolCalls: []ToolCall{{
++			ToolName:            "Read",
++			Category:            "Read",
++			ToolUseID:           "call-1",
++			ResultContent:       "",
++			ResultContentLength: len(content),
++		}},
++	}}))
++	_, err := d.getWriter().Exec(t.Context(), `
++		INSERT INTO tool_result_events (
++			session_id, tool_call_message_ordinal, call_index,
++			tool_use_id, source, status, content, content_length, event_index
++		) VALUES ('dedup-collapse', 0, 0, 'call-1', 'tool', 'completed', ?, ?, 0)`,
++		content, len(content),
++	)
++	require.NoError(t, err)
+ 	clearArtifactExportQueue(t, d)
+ 
+ 	// Verify the dedup invariant: result_content is empty, result_content_length
+diff --git a/internal/db/query_dialect.go b/internal/db/query_dialect.go
+index 4fc0199f..379ba13f 100644
+--- a/internal/db/query_dialect.go
++++ b/internal/db/query_dialect.go
+@@ -539,6 +539,7 @@ func BuildSessionBaseFilterSQL(
+ 	preds := []string{
+ 		"message_count > 0",
+ 		"deleted_at IS NULL",
++		"source_missing_at IS NULL",
+ 	}
+ 	if f.IncludeEmpty {
+ 		preds = preds[1:]
+@@ -626,6 +627,7 @@ func buildSessionFilterWithBuilder(
+ 	basePreds := []string{
+ 		q("message_count") + " > 0",
+ 		q("deleted_at") + " IS NULL",
++		q("source_missing_at") + " IS NULL",
+ 	}
+ 	if f.IncludeEmpty {
+ 		basePreds = basePreds[1:]
+@@ -682,6 +684,7 @@ func buildSessionFilterWithBuilder(
+ 		"SELECT s.id FROM sessions s" +
+ 		" JOIN tree t ON " + b.dialect.ParentRelation("s", "t") +
+ 		" WHERE s.message_count > 0 AND s.deleted_at IS NULL" +
++		" AND s.source_missing_at IS NULL" +
+ 		childAutomationWhere +
+ 		") SELECT id FROM tree"
+ 
+diff --git a/internal/db/query_dialect_clickhouse_test.go b/internal/db/query_dialect_clickhouse_test.go
+index c7b9cc44..405f62f0 100644
+--- a/internal/db/query_dialect_clickhouse_test.go
++++ b/internal/db/query_dialect_clickhouse_test.go
+@@ -14,8 +14,8 @@ func TestBuildSessionFilterSQLHooksKeepRowStoreDialectsUnchanged(t *testing.T) {
+ 	filter := SessionFilter{
+ 		Starred: true, IncludeChildren: true, IncludeOrphans: true, Project: "p",
+ 	}
+-	const sqliteWant = "message_count > 0 AND deleted_at IS NULL AND id IN (WITH RECURSIVE tree(id) AS (SELECT root_session.id FROM sessions root_session WHERE root_session.message_count > 0 AND root_session.deleted_at IS NULL AND root_session.project = ? AND EXISTS (SELECT 1 FROM starred_sessions ss WHERE ss.session_id = root_session.id) AND (NOT (root_session.relationship_type IN ('subagent', 'fork', 'continuation')) OR (root_session.relationship_type IN ('subagent', 'fork', 'continuation') AND NOT EXISTS ( SELECT 1 FROM sessions parent WHERE parent.id = root_session.parent_session_id ))) UNION SELECT s.id FROM sessions s JOIN tree t ON s.parent_session_id = t.id WHERE s.message_count > 0 AND s.deleted_at IS NULL) SELECT id FROM tree)"
+-	const postgresWant = "message_count > 0 AND deleted_at IS NULL AND id IN (WITH RECURSIVE tree(id) AS (SELECT root_session.id FROM sessions root_session WHERE root_session.message_count > 0 AND root_session.deleted_at IS NULL AND root_session.project = $1 AND EXISTS (SELECT 1 FROM starred_sessions ss WHERE ss.session_id = root_session.id) AND (NOT (root_session.relationship_type IN ('subagent', 'fork', 'continuation')) OR (root_session.relationship_type IN ('subagent', 'fork', 'continuation') AND NOT EXISTS ( SELECT 1 FROM sessions parent WHERE parent.id = root_session.parent_session_id ))) UNION SELECT s.id FROM sessions s JOIN tree t ON s.parent_session_id = t.id WHERE s.message_count > 0 AND s.deleted_at IS NULL) SELECT id FROM tree)"
++	const sqliteWant = "message_count > 0 AND deleted_at IS NULL AND source_missing_at IS NULL AND id IN (WITH RECURSIVE tree(id) AS (SELECT root_session.id FROM sessions root_session WHERE root_session.message_count > 0 AND root_session.deleted_at IS NULL AND root_session.project = ? AND EXISTS (SELECT 1 FROM starred_sessions ss WHERE ss.session_id = root_session.id) AND (NOT (root_session.relationship_type IN ('subagent', 'fork', 'continuation')) OR (root_session.relationship_type IN ('subagent', 'fork', 'continuation') AND NOT EXISTS ( SELECT 1 FROM sessions parent WHERE parent.id = root_session.parent_session_id ))) UNION SELECT s.id FROM sessions s JOIN tree t ON s.parent_session_id = t.id WHERE s.message_count > 0 AND s.deleted_at IS NULL AND s.source_missing_at IS NULL) SELECT id FROM tree)"
++	const postgresWant = "message_count > 0 AND deleted_at IS NULL AND source_missing_at IS NULL AND id IN (WITH RECURSIVE tree(id) AS (SELECT root_session.id FROM sessions root_session WHERE root_session.message_count > 0 AND root_session.deleted_at IS NULL AND root_session.project = $1 AND EXISTS (SELECT 1 FROM starred_sessions ss WHERE ss.session_id = root_session.id) AND (NOT (root_session.relationship_type IN ('subagent', 'fork', 'continuation')) OR (root_session.relationship_type IN ('subagent', 'fork', 'continuation') AND NOT EXISTS ( SELECT 1 FROM sessions parent WHERE parent.id = root_session.parent_session_id ))) UNION SELECT s.id FROM sessions s JOIN tree t ON s.parent_session_id = t.id WHERE s.message_count > 0 AND s.deleted_at IS NULL AND s.source_missing_at IS NULL) SELECT id FROM tree)"
+ 
+ 	tests := []struct {
+ 		name    string
+diff --git a/internal/db/schema.sql b/internal/db/schema.sql
+index b83a0847..fd3f2456 100644
+--- a/internal/db/schema.sql
++++ b/internal/db/schema.sql
+@@ -232,8 +232,9 @@ CREATE INDEX IF NOT EXISTS idx_sessions_project
+     ON sessions(project);
+ CREATE INDEX IF NOT EXISTS idx_sessions_machine
+     ON sessions(machine);
+-CREATE INDEX IF NOT EXISTS idx_messages_session_ordinal
+-    ON messages(session_id, ordinal);
++-- The UNIQUE(session_id, ordinal) constraint on messages already
++-- maintains an identical implicit index, so no explicit named index is
++-- needed here.
+ CREATE INDEX IF NOT EXISTS idx_messages_velocity
+     ON messages(session_id, ordinal, role, timestamp, content_length);
+ CREATE INDEX IF NOT EXISTS idx_messages_session_role
+@@ -393,6 +394,31 @@ CREATE INDEX IF NOT EXISTS idx_tool_result_events_summary
+                           (summary_participates IS NULL OR raw_content_digest IS NULL),
+                           summary_participates, event_index);
+ 
++-- Stable projection backing tool_content_fts. A single row namespace bridges
++-- both source tables without changing their archive identities.
++CREATE TABLE IF NOT EXISTS tool_content (
++    id INTEGER PRIMARY KEY,
++    source_kind TEXT NOT NULL,
++    source_id INTEGER NOT NULL,
++    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
++    message_id INTEGER,
++    ordinal INTEGER NOT NULL,
++    location TEXT NOT NULL,
++    tool_name TEXT NOT NULL DEFAULT '',
++    tool_use_id TEXT NOT NULL DEFAULT '',
++    content TEXT NOT NULL DEFAULT '',
++    file_path TEXT NOT NULL DEFAULT '',
++    exit_code INTEGER,
++    is_error INTEGER NOT NULL DEFAULT 0,
++    UNIQUE(source_kind, source_id, location)
++);
++CREATE INDEX IF NOT EXISTS idx_tool_content_session
++    ON tool_content(session_id, ordinal);
++CREATE INDEX IF NOT EXISTS idx_tool_content_source
++    ON tool_content(source_kind, source_id);
++CREATE INDEX IF NOT EXISTS idx_tool_content_filters
++    ON tool_content(location, exit_code, is_error, tool_name);
++
+ -- Insights table for AI-generated activity insights
+ CREATE TABLE IF NOT EXISTS insights (
+     id          INTEGER PRIMARY KEY,
+diff --git a/internal/db/search_content.go b/internal/db/search_content.go
+index ed554434..9bd158ba 100644
+--- a/internal/db/search_content.go
++++ b/internal/db/search_content.go
+@@ -780,46 +780,130 @@ func literalPrefix(pattern string) string {
+ // failed to load), so both modes report the same capability gate.
+ var errFTSUnavailable = errors.New("search: full-text search is unavailable")
+ 
+-// searchContentFTS uses messages_fts for fast tokenized matching over
+-// message content only. The caller (service/CLI) guarantees Sources is
+-// messages-only for fts mode.
+-func (db *DB) searchContentFTS(
+-	ctx context.Context, f ContentSearchFilter,
+-) (ContentSearchPage, error) {
+-	// Guard FTS availability up front: a missing messages_fts table would
+-	// otherwise raise a generic SQLITE_ERROR that classifyFTSError would misread
+-	// as invalid user input (400). With FTS present, the only SQLITE_ERROR the
+-	// MATCH query can raise comes from a malformed pattern.
++type toolFTSFilters struct {
++	toolOnly, hasError bool
++	exitCode           *int
++	mcp, file, text    string
++}
++
++func parseToolFTSFilters(pattern string) (toolFTSFilters, error) {
++	var out toolFTSFilters
++	var text []string
++	for _, part := range strings.Fields(pattern) {
++		switch {
++		case part == "scope:tool":
++			out.toolOnly = true
++		case strings.HasPrefix(part, "exit:"):
++			value, err := strconv.Atoi(strings.TrimPrefix(part, "exit:"))
++			if err != nil || (value != 0 && value != 1) {
++				return out, searchInputErrorf("search: exit must be 0 or 1")
++			}
++			out.exitCode = &value
++		case part == "has_error:true":
++			out.hasError = true
++		case strings.HasPrefix(part, "mcp:"):
++			out.mcp = strings.TrimPrefix(part, "mcp:")
++		case strings.HasPrefix(part, "file:"):
++			out.file = strings.TrimPrefix(part, "file:")
++		default:
++			text = append(text, part)
++		}
++	}
++	out.text = strings.Join(text, " ")
++	return out, nil
++}
++
++// searchContentFTS unions the message and tool indexes. Tool qualifiers are
++// removed before MATCH parsing and applied to projection metadata.
++func (db *DB) searchContentFTS(ctx context.Context, f ContentSearchFilter) (ContentSearchPage, error) {
+ 	if !db.HasFTS(ctx) {
+ 		return ContentSearchPage{}, errFTSUnavailable
+ 	}
+-	ftsQuery, err := db.prepareMessageFTSQuery(ctx, f.Pattern)
++	filters, err := parseToolFTSFilters(f.Pattern)
+ 	if err != nil {
+ 		return ContentSearchPage{}, err
+ 	}
++	var prepared messageFTSQuery
++	if filters.text != "" {
++		prepared, err = db.prepareMessageFTSQuery(ctx, filters.text)
++		if err != nil {
++			return ContentSearchPage{}, err
++		}
++	}
+ 	scope, scopeArgs := sessionScopeSubquery(f)
+-	sysPred := "1=1"
+-	if f.ExcludeSystem {
+-		sysPred = "m.is_system = 0 AND " + SystemPrefixSQL("m.content", "m.role")
++	toolFiltered := filters.exitCode != nil || filters.hasError || filters.mcp != "" || filters.file != ""
++	var branches []string
++	var args []any
++	if !filters.toolOnly && !toolFiltered && hasSource(f, "messages") && filters.text != "" {
++		sysPred := "1=1"
++		if f.ExcludeSystem {
++			sysPred = "m.is_system = 0 AND " + SystemPrefixSQL("m.content", "m.role")
++		}
++		branch := fmt.Sprintf(`SELECT m.session_id AS session_id,s.project AS project,s.agent AS agent,
++			COALESCE(s.transcript_revision,'') AS transcript_revision,'message' AS location,m.role AS role,'' AS tool_name,m.ordinal AS ordinal,
++			COALESCE(m.timestamp,'') AS ts,m.content AS snippet,0 AS src,m.id AS row_id
++			FROM %s JOIN messages m ON m.id=%s.rowid
++			JOIN sessions s ON s.id=m.session_id
++			WHERE %s MATCH ? AND %s AND m.%s`, prepared.table, prepared.table,
++			prepared.table, sysPred, scope)
++		branches = append(branches, branch)
++		args = append(args, prepared.match)
++		args = append(args, scopeArgs...)
+ 	}
+-	// Select the full content (not FTS snippet()) so the snippet is built in Go
+-	// and secret redaction sees whole secrets rather than a pre-truncated window.
+-	query := fmt.Sprintf(`
+-		SELECT m.session_id, s.project, s.agent,
+-			COALESCE(s.transcript_revision,''), 'message', m.role, '',
+-			m.ordinal, COALESCE(m.timestamp,'') AS ts, m.content AS snippet
+-		FROM messages_fts
+-		JOIN messages m ON m.id = messages_fts.rowid
+-		JOIN sessions s ON s.id = m.session_id
+-		WHERE messages_fts MATCH ? AND %s AND m.%s
+-		ORDER BY rank ASC, m.ordinal ASC, m.id ASC
+-		LIMIT ? OFFSET ?`, sysPred, scope)
+-	query = strings.ReplaceAll(query, "messages_fts", ftsQuery.table)
+-	args := []any{ftsQuery.match}
+-	args = append(args, scopeArgs...)
++	wantTools := filters.toolOnly || toolFiltered || hasSource(f, "tool_input") || hasSource(f, "tool_result")
++	if wantTools {
++		predicates := []string{"tc." + scope}
++		toolArgs := append([]any(nil), scopeArgs...)
++		if filters.text != "" {
++			predicates = append([]string{"tool_content_fts MATCH ?"}, predicates...)
++			toolArgs = append([]any{prepared.match}, toolArgs...)
++		}
++		if !hasSource(f, "tool_input") || (filters.toolOnly && len(f.Sources) == 0) {
++			if hasSource(f, "tool_result") || filters.toolOnly || toolFiltered {
++				predicates = append(predicates, "tc.location='tool_result'")
++			}
++		} else if !hasSource(f, "tool_result") {
++			predicates = append(predicates, "tc.location='tool_input'")
++		}
++		if filters.exitCode != nil {
++			predicates = append(predicates, "tc.exit_code=?")
++			toolArgs = append(toolArgs, *filters.exitCode)
++		}
++		if filters.hasError {
++			predicates = append(predicates, "tc.is_error=1")
++		}
++		if filters.mcp != "" {
++			predicates = append(predicates, "(lower(tc.tool_name) LIKE lower(?) ESCAPE '\\' OR lower(tc.tool_name) LIKE lower(?) ESCAPE '\\')")
++			m := escapeLike(filters.mcp)
++			toolArgs = append(toolArgs, "%mcp%"+m+"%", "%"+strings.ReplaceAll(m, ".", "%")+"%")
++		}
++		if filters.file != "" {
++			predicates = append(predicates, "(tc.file_path LIKE ? ESCAPE '\\' OR tc.content LIKE ? ESCAPE '\\')")
++			like := "%" + escapeLike(filters.file) + "%"
++			toolArgs = append(toolArgs, like, like)
++		}
++		predicates = append(predicates, `(tc.source_kind<>'call' OR tc.location<>'tool_result' OR tc.tool_use_id='' OR NOT EXISTS
++			(SELECT 1 FROM tool_content ev WHERE ev.source_kind='event' AND ev.session_id=tc.session_id AND ev.tool_use_id=tc.tool_use_id))`)
++		branch := `SELECT tc.session_id AS session_id,s.project AS project,s.agent AS agent,COALESCE(s.transcript_revision,'') AS transcript_revision,
++			tc.location AS location,'assistant' AS role,tc.tool_name AS tool_name,tc.ordinal AS ordinal,COALESCE(m.timestamp,'') AS ts,
++			tc.content AS snippet,1 AS src,tc.id AS row_id FROM tool_content_fts
++			JOIN tool_content tc ON tc.id=tool_content_fts.rowid
++			LEFT JOIN messages m ON m.id=tc.message_id JOIN sessions s ON s.id=tc.session_id
++			WHERE ` + strings.Join(predicates, " AND ")
++		branches = append(branches, branch)
++		args = append(args, toolArgs...)
++	}
++	if len(branches) == 0 {
++		return ContentSearchPage{}, nil
++	}
++	query := `SELECT session_id,project,agent,transcript_revision,location,role,tool_name,ordinal,ts,snippet
++		FROM (` + strings.Join(branches, " UNION ALL ") + `)
++		ORDER BY session_id,ordinal,src,row_id LIMIT ? OFFSET ?`
+ 	args = append(args, f.Limit+1, f.Cursor)
+ 	page, err := db.scanContentMatches(ctx, query, args, f.Limit, f.Cursor, func(body string) string {
+-		return f.ftsSnippet(body, ftsQuery.snippetTerm)
++		copy := f
++		copy.Pattern = filters.text
++		return copy.ftsSnippet(body, prepared.snippetTerm)
+ 	})
+ 	if err != nil {
+ 		return ContentSearchPage{}, classifyFTSError(err)
+diff --git a/internal/db/session_export_test.go b/internal/db/session_export_test.go
+index 376862a2..16966277 100644
+--- a/internal/db/session_export_test.go
++++ b/internal/db/session_export_test.go
+@@ -731,7 +731,6 @@ func TestAllSessionExportMaterializesActivitySort(t *testing.T) {
+ 		"child-subagent",
+ 		"imported-migrated",
+ 		"child-fork",
+-		"source-missing",
+ 		"child-continuation",
+ 	}
+ 	var tableSQL, indexSQL string
+@@ -840,7 +839,6 @@ func TestAllSessionExportMaterializesActivitySort(t *testing.T) {
+ 		"2026-05-01T13:00:00Z",
+ 		"2026-05-01T12:30:00Z",
+ 		"2026-05-01T12:00:00Z",
+-		"2026-05-01T11:30:00Z",
+ 		"2026-05-01T11:00:00Z",
+ 	}, gotActivities)
+ 	assert.Equal(t, []int{len(expectedIDs)}, slices.Compact(populationCounts))
+diff --git a/internal/db/sessions.go b/internal/db/sessions.go
+index 99777c96..aae71023 100644
+--- a/internal/db/sessions.go
++++ b/internal/db/sessions.go
+@@ -995,6 +995,7 @@ func (db *DB) getSidebarSessionIndexPage(
+ 			JOIN tree t ON s.parent_session_id = t.id
+ 			WHERE s.message_count > 0
+ 			  AND s.deleted_at IS NULL
++			  AND s.source_missing_at IS NULL
+ 			  ` + childAutomationWhere + `
+ 		)
+ 		` + sidebarStarredRootCTE(f.Starred) + `,
+@@ -1077,6 +1078,7 @@ func (db *DB) getSidebarSessionIndexPage(
+ 			JOIN tree t ON s.parent_session_id = t.id
+ 			WHERE s.message_count > 0
+ 			  AND s.deleted_at IS NULL
++			  AND s.source_missing_at IS NULL
+ 			  ` + childAutomationWhere + `
+ 		),
+ 		ranked_tree(id, ord) AS (
+@@ -1742,6 +1744,7 @@ func (db *DB) GetChildSessions(
+ 	query := "SELECT " + sessionBaseCols +
+ 		" FROM sessions WHERE parent_session_id = ?" +
+ 		" AND deleted_at IS NULL" +
++		" AND source_missing_at IS NULL" +
+ 		" ORDER BY started_at"
+ 	rows, err := db.getReader().QueryContext(ctx, query, parentID)
+ 	if err != nil {
+@@ -3103,6 +3106,7 @@ func updateSessionIncrementalTx(ctx context.Context,
+ 			has_total_output_tokens = ?,
+ 			has_peak_context_tokens = ?,
+ 			termination_status = ?,
++			data_version = ?,
+ 			-- Mark the row as last written by the incremental-append path.
+ 			-- The full-replace writer (upsertSessionArgs) resets this to
+ 			-- false; parse-diff reads it to classify benign
+@@ -3115,7 +3119,7 @@ func updateSessionIncrementalTx(ctx context.Context,
+ 		update.NextOrdinal, lastEntryUUID,
+ 		update.TotalOutputTokens, update.PeakContextTokens,
+ 		update.HasTotalOutputTokens, update.HasPeakContextTokens,
+-		update.TerminationStatus, id,
++		update.TerminationStatus, CurrentDataVersion(), id,
+ 	)
+ 	if err != nil {
+ 		return fmt.Errorf(
+@@ -3223,6 +3227,7 @@ func replaceSessionIncrementalTx(ctx context.Context,
+ 			next_ordinal = ?,
+ 			last_entry_uuid = ?,
+ 			termination_status = ?,
++			data_version = ?,
+ 			last_write_incremental = 1
+ 		WHERE id = ?`,
+ 		update.EndedAt,
+@@ -3233,7 +3238,8 @@ func replaceSessionIncrementalTx(ctx context.Context,
+ 		recomputePeak, id, added.peakContext,
+ 		recomputePeak, id, added.hasContext,
+ 		update.FileSize, update.FileMtime, update.FileHash,
+-		update.NextOrdinal, lastEntryUUID, update.TerminationStatus, id,
++		update.NextOrdinal, lastEntryUUID, update.TerminationStatus,
++		CurrentDataVersion(), id,
+ 	)
+ 	if err != nil {
+ 		return fmt.Errorf(
+diff --git a/internal/db/sessions_test.go b/internal/db/sessions_test.go
+index a579325b..027dec1c 100644
+--- a/internal/db/sessions_test.go
++++ b/internal/db/sessions_test.go
+@@ -30,7 +30,7 @@ func TestDeleteSession_LargeSessionFTSDelete(t *testing.T) {
+ 
+ 	requireSessionGone(t, d, largeSessionFixtureID)
+ 	assertNoFTSLeak(t, d, largeSessionFixtureToken)
+-	requireMessagesDeleteTriggerRestored(t, d)
++	requireNoFTSMessageTriggers(t, d)
+ 
+ 	var neighborPins int
+ 	err := d.getReader().QueryRow(t.Context(),
+diff --git a/internal/db/staged_content.go b/internal/db/staged_content.go
+index 96d8b3ac..a4ed9799 100644
+--- a/internal/db/staged_content.go
++++ b/internal/db/staged_content.go
+@@ -18,9 +18,9 @@ import (
+ // memory, so neither the event contents nor the summaries ever live as one
+ // full in-memory session slice.
+ type StagedToolResults interface {
+-	// ResolveSummary returns the stored result summary and its length for
+-	// one tool call. A summary identical to its sole event is omitted,
+-	// while its length and the content-failure verdict retain the full text.
++	// ResolveSummary returns the result summary and its length for one tool
++	// call. Single-event results return the full summary to be stored
++	// directly in tool_calls.result_content.
+ 	ResolveSummary(
+ 		ctx context.Context, toolUseID string,
+ 	) (string, int, error)
+diff --git a/internal/db/strip_images.go b/internal/db/strip_images.go
+index ec8716d6..65e0d890 100644
+--- a/internal/db/strip_images.go
++++ b/internal/db/strip_images.go
+@@ -231,16 +231,6 @@ func (db *DB) rewriteStoredToolResultRows(
+ 		return false, fmt.Errorf("iterating tool result events: %w", err)
+ 	}
+ 	eventRows.Close()
+-	for i := range calls {
+-		if calls[i].content == "" {
+-			continue
+-		}
+-		sole, ok := soleProjectedToolResultContent(eventContents[calls[i].key])
+-		if ok && calls[i].content == sole {
+-			calls[i].length = len(calls[i].content)
+-			calls[i].content = ""
+-		}
+-	}
+ 	callIndexes := make(map[int64]int, len(calls))
+ 	for i := range calls {
+ 		callIndexes[calls[i].id] = i
+diff --git a/internal/db/strip_images_test.go b/internal/db/strip_images_test.go
+index 87cd24aa..be31e404 100644
+--- a/internal/db/strip_images_test.go
++++ b/internal/db/strip_images_test.go
+@@ -155,7 +155,28 @@ func TestStripToolImagesRejectsInvalidBefore(t *testing.T) {
+ func TestStripToolImagesUpdatesDeduplicatedCallLength(t *testing.T) {
+ 	d := testDB(t)
+ 	insertSession(t, d, "deduped", "project")
+-	insertMessages(t, d, testTimedImageMessage("deduped"))
++	content := testInlineImageContent()
++	require.NoError(t, d.InsertMessages(t.Context(), []Message{{
++		SessionID: "deduped",
++		Ordinal:   0,
++		Role:      "assistant",
++		Content:   "answer",
++		ToolCalls: []ToolCall{{
++			ToolName:            "Read",
++			Category:            "Read",
++			ToolUseID:           "call-1",
++			ResultContent:       "",
++			ResultContentLength: len(content),
++		}},
++	}}))
++	_, err := d.getWriter().Exec(t.Context(), `
++		INSERT INTO tool_result_events (
++			session_id, tool_call_message_ordinal, call_index,
++			tool_use_id, source, status, content, content_length, event_index
++		) VALUES ('deduped', 0, 0, 'call-1', 'tool', 'completed', ?, ?, 0)`,
++		content, len(content),
++	)
++	require.NoError(t, err)
+ 
+ 	var storedCall string
+ 	var beforeLength int
+@@ -167,7 +188,7 @@ func TestStripToolImagesUpdatesDeduplicatedCallLength(t *testing.T) {
+ 	assert.Empty(t, storedCall)
+ 	assert.Positive(t, beforeLength)
+ 
+-	_, err := d.StripToolImages(t.Context(), StripImagesFilter{})
++	_, err = d.StripToolImages(t.Context(), StripImagesFilter{})
+ 	require.NoError(t, err)
+ 
+ 	var callContent, eventContent string
+@@ -348,7 +369,7 @@ func TestStripToolImagesRollsBackWhenEventUpdateFails(t *testing.T) {
+ 	}, report)
+ 	var committedContent string
+ 	require.NoError(t, d.getReader().QueryRow(t.Context(), `
+-		SELECT content FROM tool_result_events WHERE session_id = 'committed'`,
++		SELECT result_content FROM tool_calls WHERE session_id = 'committed'`,
+ 	).Scan(&committedContent))
+ 	assert.Contains(t, committedContent, "agentsview_image")
+ 	assert.NotContains(t, committedContent, "input_image")
+@@ -426,7 +447,7 @@ func TestStripToolImagesRefreshesSecretFindings(t *testing.T) {
+ 	message := testImageMessage("secrets")
+ 	message.Content = "message key: " + key
+ 	content := `[{"type":"input_image","image_url":"data:image/png;base64,AAEC"},{"type":"text","text":"` + key + `"}]`
+-	message.ToolCalls[0].ResultContent = content
++	message.ToolCalls[0].ResultContent = "summary"
+ 	message.ToolCalls[0].ResultEvents[0].Content = content
+ 	insertMessages(t, d, message)
+ 	// Seed the existing event finding at its pre-strip offset. The rescan must
+@@ -477,7 +498,7 @@ func TestStripToolImagesRescansStoredEventCoordinates(t *testing.T) {
+ 			key := "AKIA" + "7QHWN2DKR4FYPLJA"
+ 			content := message.ToolCalls[0].ResultEvents[0].Content
+ 			content = strings.TrimSuffix(content, "]") + `,{"type":"text","text":"` + key + `"}]`
+-			message.ToolCalls[0].ResultContent = content
++			message.ToolCalls[0].ResultContent = "summary"
+ 			message.ToolCalls[0].ResultEvents[0].Content = content
+ 			insertMessages(t, d, message)
+ 			// Copied archives keep stored event IDs, including rows with no call.
+@@ -580,7 +601,7 @@ func TestStripPublicationSequence(t *testing.T) {
+ 	const wantStripped = `[{"type":"text","text":"before"},{"byte_size":3,"media_type":"image/png","sha256":"","text":"[Image: image/png, 3 bytes]","type":"agentsview_image","version":1},{"type":"text","text":"after"}]`
+ 	var eventContent string
+ 	require.NoError(t, d.getReader().QueryRow(t.Context(),
+-		"SELECT content FROM tool_result_events WHERE session_id = ?", "pub-unchanged",
++		"SELECT result_content FROM tool_calls WHERE session_id = ?", "pub-unchanged",
+ 	).Scan(&eventContent))
+ 	assert.Equal(t, wantStripped, eventContent, "post-strip content preserves text around the placeholder")
+ 
+diff --git a/internal/db/tool_result_dedup.go b/internal/db/tool_result_dedup.go
+index 2fa75183..ab722ac9 100644
+--- a/internal/db/tool_result_dedup.go
++++ b/internal/db/tool_result_dedup.go
+@@ -1,6 +1,11 @@
+ package db
+ 
+-import "fmt"
++import (
++	"bytes"
++	"crypto/sha256"
++	"fmt"
++	"strings"
++)
+ 
+ // Tool-result summaries used to be stored twice: once as
+ // tool_calls.result_content and once as the tool_result_events row the
+@@ -8,12 +13,15 @@ import "fmt"
+ // roughly 40% of the file, because the overwhelming majority of calls have a
+ // single result event and the summary is that event's content byte for byte.
+ //
+-// Such a summary is no longer stored at all. result_content_length still
+-// records the summary's size, so a cleared column with a non-zero length is
+-// the signal that the read side must re-derive the summary from the call's
+-// sole content-bearing event. A genuinely empty summary keeps length zero and
+-// is left alone, and a blocked category (whose event content is blanked as
+-// well) re-derives an empty string, which is exactly what it stores today.
++// In the current model, single-event results are stored directly in
++// tool_calls.result_content with 0 rows in tool_result_events when the event
++// content matches the tool call's result summary. Genuine multi-event calls
++// (events > 1 or event content differs from summary) persist rows in
++// tool_result_events.
++//
++// For legacy pre-v123 data where result_content was cleared and a single event
++// was stored in tool_result_events, RestoreToolCallResultContent and
++// ToolCallResultContentSQL retain backward compatibility.
+ 
+ // SoleToolResultContent ignores empty timing events when finding one payload.
+ func SoleToolResultContent(events []ToolResultEvent) (ToolResultEvent, bool) {
+@@ -32,23 +40,49 @@ func SoleToolResultContent(events []ToolResultEvent) (ToolResultEvent, bool) {
+ }
+ 
+ // ResultContentDuplicatesSingleEvent reports whether a summary repeats the
+-// content of the call's sole content-bearing event verbatim.
++// content of the call's only result event verbatim without dropping subagent,
++// multi-agent, or distinct raw provider identity.
+ func ResultContentDuplicatesSingleEvent(
+ 	summary string, events []ToolResultEvent,
+ ) bool {
+-	sole, ok := SoleToolResultContent(events)
+-	return summary != "" && ok && sole.Content == summary
++	if summary == "" || len(events) != 1 ||
++		events[0].Content != summary ||
++		events[0].SubagentSessionID != "" ||
++		events[0].AgentID != "" {
++		return false
++	}
++	if len(events[0].RawContentDigest) > 0 {
++		digest := sha256.Sum256([]byte(summary))
++		if !bytes.Equal(events[0].RawContentDigest, digest[:]) {
++			if !strings.Contains(summary, "agentsview_image") &&
++				!strings.Contains(summary, "asset://") {
++				return false
++			}
++		}
++	}
++	return true
++}
++
++// ShouldPersistToolResultEvents reports whether a call's result events must be
++// persisted to tool_result_events. Single-event results whose content matches
++// the call's result summary are stored directly on the tool call, leaving 0 rows
++// in tool_result_events. Only multi-event calls or single events whose content
++// diverges from the summary are persisted.
++func ShouldPersistToolResultEvents(
++	summary string, events []ToolResultEvent,
++) bool {
++	if ResultContentDuplicatesSingleEvent(summary, events) {
++		return false
++	}
++	return len(events) > 0
+ }
+ 
+ // DedupToolCallResultSummary returns the result summary to persist for a call
+-// with the given result events: empty when the events already carry the same
+-// bytes, and the summary itself otherwise.
++// with the given result events: in the current storage model, the summary is
++// always stored directly on the tool call.
+ func DedupToolCallResultSummary(
+ 	summary string, events []ToolResultEvent,
+ ) string {
+-	if ResultContentDuplicatesSingleEvent(summary, events) {
+-		return ""
+-	}
+ 	return summary
+ }
+ 
+diff --git a/internal/db/tool_result_dedup_test.go b/internal/db/tool_result_dedup_test.go
+index 67ce3a40..da809612 100644
+--- a/internal/db/tool_result_dedup_test.go
++++ b/internal/db/tool_result_dedup_test.go
+@@ -18,9 +18,10 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
+ 		wantStored    string
+ 		wantStoredLen int
+ 		wantLoaded    string
++		wantEvents    int
+ 	}{
+ 		{
+-			name: "single event summary is not stored",
++			name: "single event summary is stored directly",
+ 			call: ToolCall{
+ 				ToolName:            "Bash",
+ 				Category:            "Bash",
+@@ -35,12 +36,13 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
+ 					ContentLength: len("total 4\ndrwxr-xr-x"),
+ 				}},
+ 			},
+-			wantStored:    "",
++			wantStored:    "total 4\ndrwxr-xr-x",
+ 			wantStoredLen: len("total 4\ndrwxr-xr-x"),
+ 			wantLoaded:    "total 4\ndrwxr-xr-x",
++			wantEvents:    0,
+ 		},
+ 		{
+-			name: "timed event summary is not stored",
++			name: "timed event summary is stored with its events",
+ 			call: ToolCall{
+ 				ToolName: "Bash", Category: "Bash", ToolUseID: "call_timed",
+ 				ResultContent: "output", ResultContentLength: len("output"),
+@@ -49,7 +51,10 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
+ 					{ToolUseID: "call_timed", Source: "tool_execution", Status: "completed", Content: "output", ContentLength: len("output")},
+ 				},
+ 			},
+-			wantStored: "", wantStoredLen: len("output"), wantLoaded: "output",
++			wantStored:    "output",
++			wantStoredLen: len("output"),
++			wantLoaded:    "output",
++			wantEvents:    2,
+ 		},
+ 		{
+ 			name: "multi event summary is stored",
+@@ -83,6 +88,7 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
+ 			wantStored:    "agent-1:\nfirst\n\nagent-2:\nsecond",
+ 			wantStoredLen: len("agent-1:\nfirst\n\nagent-2:\nsecond"),
+ 			wantLoaded:    "agent-1:\nfirst\n\nagent-2:\nsecond",
++			wantEvents:    2,
+ 		},
+ 		{
+ 			name: "single event summary that differs is stored",
+@@ -104,6 +110,7 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
+ 			wantStored:    "agent-1:\nonly",
+ 			wantStoredLen: len("agent-1:\nonly"),
+ 			wantLoaded:    "agent-1:\nonly",
++			wantEvents:    1,
+ 		},
+ 		{
+ 			name: "blocked category keeps its blanked shape",
+@@ -124,6 +131,7 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
+ 			wantStored:    "",
+ 			wantStoredLen: 4096,
+ 			wantLoaded:    "",
++			wantEvents:    1,
+ 		},
+ 		{
+ 			name: "empty summary over a blank event stays empty",
+@@ -144,6 +152,7 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
+ 			wantStored:    "",
+ 			wantStoredLen: 0,
+ 			wantLoaded:    "",
++			wantEvents:    1,
+ 		},
+ 	}
+ 
+@@ -185,7 +194,7 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
+ 				msgs[0].ToolCalls[0].ResultContent,
+ 				"loaded ToolCall.ResultContent")
+ 			assert.Len(t, msgs[0].ToolCalls[0].ResultEvents,
+-				len(call.ResultEvents), "result events survive")
++				tt.wantEvents, "result events count")
+ 			tx, err := d.getWriter().Begin(t.Context())
+ 			require.NoError(t, err)
+ 			defer func() { require.NoError(t, tx.Rollback()) }()
+@@ -376,7 +385,7 @@ func TestSubagentLinkKeepsDedupedSummary(t *testing.T) {
+ 	}
+ 
+ 	content, length := stored()
+-	require.Empty(t, content, "insert must dedup the single-event summary")
++	require.Equal(t, "agent finished", content, "insert must store the single-event summary directly")
+ 	require.Equal(t, len("agent finished"), length)
+ 
+ 	link := func(result string) {
+@@ -397,7 +406,7 @@ func TestSubagentLinkKeepsDedupedSummary(t *testing.T) {
+ 
+ 	link("agent finished")
+ 	content, length = stored()
+-	assert.Empty(t, content, "link repeating the event must stay deduped")
++	assert.Equal(t, "agent finished", content, "link repeating the event stays stored directly")
+ 	assert.Equal(t, len("agent finished"), length)
+ 
+ 	msgs, err := d.GetMessages(t.Context(), "s-link", 0, 10, true)
+@@ -406,6 +415,7 @@ func TestSubagentLinkKeepsDedupedSummary(t *testing.T) {
+ 	require.Len(t, msgs[0].ToolCalls, 1)
+ 	assert.Equal(t, "agent finished", msgs[0].ToolCalls[0].ResultContent)
+ 	assert.Equal(t, "agent-child", msgs[0].ToolCalls[0].SubagentSessionID)
++	assert.Empty(t, msgs[0].ToolCalls[0].ResultEvents, "no redundant single event stored")
+ 
+ 	link("agent finished with a longer final report")
+ 	content, length = stored()
+@@ -463,7 +473,7 @@ func TestOmittedResultContentLengthRoundTrips(t *testing.T) {
+ 			Content: "running", HasToolUse: true,
+ 			ToolCalls: []ToolCall{call("call_nolen")},
+ 		}}))
+-		got := loaded(t, d, "s-nolen", 1)
++		got := loaded(t, d, "s-nolen", 0)
+ 		assert.Equal(t, summary, got.ResultContent)
+ 		assert.Equal(t, len(summary), got.ResultContentLength)
+ 	})
+@@ -484,7 +494,7 @@ func TestOmittedResultContentLengthRoundTrips(t *testing.T) {
+ 			ReplaceMessages: true,
+ 		}})
+ 		require.NoError(t, err)
+-		got := loaded(t, d, "s-batch-nolen", 1)
++		got := loaded(t, d, "s-batch-nolen", 0)
+ 		assert.Equal(t, summary, got.ResultContent)
+ 		assert.Equal(t, len(summary), got.ResultContentLength)
+ 	})
+@@ -500,7 +510,7 @@ func TestOmittedResultContentLengthRoundTrips(t *testing.T) {
+ 			Content: "running", HasToolUse: true,
+ 			ToolCalls: []ToolCall{wrong},
+ 		}}))
+-		got := loaded(t, d, "s-wrong", 1)
++		got := loaded(t, d, "s-wrong", 0)
+ 		assert.Equal(t, summary, got.ResultContent)
+ 		assert.Equal(t, len(summary), got.ResultContentLength)
+ 	})
+diff --git a/internal/db/tool_result_images_test.go b/internal/db/tool_result_images_test.go
+index 8c9f0fe8..e5028ab7 100644
+--- a/internal/db/tool_result_images_test.go
++++ b/internal/db/tool_result_images_test.go
+@@ -198,6 +198,12 @@ func TestIngestWithDropRemovesInlineImagesFromBothTables(t *testing.T) {
+ 	d.SetToolResultImages(config.ToolResultImagesDrop)
+ 	insertSession(t, d, "ingest", "project")
+ 	message := testImageMessage("ingest")
++	message.ToolCalls[0].ResultEvents = append(message.ToolCalls[0].ResultEvents, ToolResultEvent{
++		ToolUseID: "call-1",
++		Source:    "tool",
++		Status:    "completed",
++		Content:   message.ToolCalls[0].ResultContent,
++	})
+ 	original := message
+ 	insertMessages(t, d, message)
+ 	assert.Equal(t, original.ToolCalls[0].ResultContent, message.ToolCalls[0].ResultContent)
+@@ -304,16 +310,16 @@ func TestToolResultImagesDedupAndLengths(t *testing.T) {
+ 	insertSession(t, d, "lengths", "project")
+ 	require.NoError(t, d.InsertMessages(t.Context(), []Message{testImageMessage("lengths")}))
+ 
+-	var summaryLength, eventLength int
++	var summaryLength int
+ 	require.NoError(t, d.getReader().QueryRow(t.Context(),
+ 		"SELECT result_content_length FROM tool_calls WHERE session_id = ?", "lengths",
+ 	).Scan(&summaryLength))
++	var eventCount int
+ 	require.NoError(t, d.getReader().QueryRow(t.Context(),
+-		"SELECT content_length FROM tool_result_events WHERE session_id = ?", "lengths",
+-	).Scan(&eventLength))
++		"SELECT COUNT(*) FROM tool_result_events WHERE session_id = ?", "lengths",
++	).Scan(&eventCount))
+ 	assert.Positive(t, summaryLength)
+-	assert.Positive(t, eventLength)
+-	assert.Equal(t, eventLength, summaryLength)
++	assert.Zero(t, eventCount)
+ }
+ 
+ func TestDropImagesPreservesEmptySummaryMeaning(t *testing.T) {
+@@ -600,9 +606,7 @@ func TestToolResultImagesOffloadWriteRoutes(t *testing.T) {
+ 			require.Len(t, stored, 1)
+ 			call := stored[0].ToolCalls[0]
+ 			assertOffloadedImage(t, call.ResultContent, d.AssetsDir())
+-			require.Len(t, call.ResultEvents, 1)
+-			assertOffloadedImage(t, call.ResultEvents[0].Content, d.AssetsDir())
+-			assert.Equal(t, len(call.ResultEvents[0].Content), call.ResultEvents[0].ContentLength)
++			require.Empty(t, call.ResultEvents)
+ 			assert.Equal(t, testInlineImageContent(), messages[0].ToolCalls[0].ResultEvents[0].Content)
+ 		})
+ 	}
+@@ -716,11 +720,11 @@ func TestToolResultImagesOffloadPublishesBeforeInsert(t *testing.T) {
+ 		}, false)
+ 	}))
+ 	require.NoError(t, conn.Close())
+-	_, err = d.getWriter().Exec(t.Context(), `CREATE TEMP TRIGGER require_asset BEFORE INSERT ON tool_result_events WHEN NOT asset_published(NEW.content) BEGIN SELECT RAISE(ABORT, 'asset missing before insert'); END`)
++	_, err = d.getWriter().Exec(t.Context(), `CREATE TEMP TRIGGER require_asset BEFORE INSERT ON tool_calls WHEN NOT asset_published(NEW.result_content) BEGIN SELECT RAISE(ABORT, 'asset missing before insert'); END`)
+ 	require.NoError(t, err)
+ 	require.NoError(t, d.InsertMessages(t.Context(), []Message{testImageMessage("ordered")}))
+ 	var count int
+-	require.NoError(t, d.getReader().QueryRow(t.Context(), "SELECT COUNT(*) FROM tool_result_events WHERE session_id = 'ordered'").Scan(&count))
++	require.NoError(t, d.getReader().QueryRow(t.Context(), "SELECT COUNT(*) FROM tool_calls WHERE session_id = 'ordered'").Scan(&count))
+ 	assert.Equal(t, 1, count)
+ }
+ 
+@@ -738,8 +742,7 @@ func TestOffloadLinkedSummaryKeepsReferenceWithOlderInlineEvent(t *testing.T) {
+ 	require.Len(t, messages[0].ToolCalls, 1)
+ 	call := messages[0].ToolCalls[0]
+ 	assertOffloadedImage(t, call.ResultContent, d.AssetsDir())
+-	require.Len(t, call.ResultEvents, 1)
+-	assert.Equal(t, testInlineImageContent(), call.ResultEvents[0].Content)
++	require.Empty(t, call.ResultEvents)
+ 	assert.Equal(t, len(call.ResultContent), call.ResultContentLength)
+ }
+ 
+diff --git a/internal/db/tool_result_metadata_test.go b/internal/db/tool_result_metadata_test.go
+index 9a1b3116..fb9d5fad 100644
+--- a/internal/db/tool_result_metadata_test.go
++++ b/internal/db/tool_result_metadata_test.go
+@@ -189,8 +189,8 @@ func TestLateResultRequiresMetadataForArchivedEvents(t *testing.T) {
+ 		HasToolUse: true, ToolCalls: []ToolCall{{
+ 			SessionID: "s1",
+ 			ToolName:  "exec_command", Category: "Bash", ToolUseID: "call",
+-			ResultContent: "old",
+-			ResultEvents:  []ToolResultEvent{{ToolUseID: "call", Content: "old", ContentLength: 3}},
++			ResultContentLength: 3,
++			ResultEvents:        []ToolResultEvent{{ToolUseID: "call", Content: "old", ContentLength: 3}},
+ 		}},
+ 	})
+ 	missing, err := d.HasMissingToolResultMetadata(t.Context(), "s1", []ToolCallPosition{{}})
+diff --git a/internal/db/unit_range.go b/internal/db/unit_range.go
+index d816e433..64108c53 100644
+--- a/internal/db/unit_range.go
++++ b/internal/db/unit_range.go
+@@ -583,8 +583,9 @@ const unitExtentChunk = maxSQLVars / 6
+ //
+ // Orchestration is the shared ResolveRunExtents; one statement per
+ // unitExtentChunk distinct probes resolves every probe with correlated point
+-// lookups on idx_messages_session_ordinal (nearest stop row on each side,
+-// then the farthest same-sidechain member inside the stop-narrowed interval)
++// lookups on the unique (session_id, ordinal) index (nearest stop row on each
++// side, then the farthest same-sidechain member inside the stop-narrowed
++// interval)
+ // instead of transferring each interval's member rows to Go: an
+ // interval-span scan moves O(interval) rows per page across the driver
+ // boundary, the point lookups move exactly one result row per probe.
+@@ -600,11 +601,12 @@ func (db *DB) RunExtents(
+ // the inner subquery seeks the nearest STOP row between the anchor and the
+ // interval bound — an embeddable user row (the reducer closes every run
+ // there) or an opposite-sidechain embeddable assistant row (the flip rule);
+-// ORDER BY ordinal DESC/ASC LIMIT 1 walks idx_messages_session_ordinal from
+-// the anchor outward and stops at the first hit. The outer subquery then
+-// seeks the farthest same-sidechain member inside the stop-narrowed
+-// interval. Folding the user boundary into the stop set is what lets
+-// DeriveUnitRanges probe with sentinel (Lo, Hi) bounds instead of paying a
++// ORDER BY ordinal DESC/ASC LIMIT 1 walks the unique (session_id, ordinal)
++// index from the anchor outward and stops at the first hit. The outer
++// subquery then seeks the farthest same-sidechain member inside the
++// stop-narrowed interval. Folding the user boundary into the stop set is
++// what lets DeriveUnitRanges probe with sentinel (Lo, Hi) bounds instead of
++// paying a
+ // NearestUserBoundaries round trip first. The member predicate is role +
+ // is_system only: SystemPrefixSQL constrains user rows exclusively, so it is
+ // identically TRUE for assistant rows and deliberately omitted there.
+diff --git a/internal/duckdb/push.go b/internal/duckdb/push.go
+index b4d030ee..af29714c 100644
+--- a/internal/duckdb/push.go
++++ b/internal/duckdb/push.go
+@@ -1192,14 +1192,14 @@ func (s *Sync) upsertSession(
+ 			duplicate_prompt_count, no_code_context_count,
+ 			runaway_tool_loop_count, data_version,
+ 			cwd, git_branch, source_session_id, source_version, transcript_fidelity,
+-			parser_malformed_lines, is_truncated, deleted_at, deletion_cause, created_at,
++			parser_malformed_lines, is_truncated, deleted_at, deletion_cause, source_missing_at, created_at,
+ 			termination_status, secret_leak_count, secrets_rules_version,
+ 			agentsview_push_fingerprint, source_archive_id
+ 		) VALUES (
+ 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+ 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+ 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
++			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+ 		)`
+ 	query += `
+ 		ON CONFLICT(id) DO UPDATE SET
+@@ -1266,6 +1266,7 @@ func (s *Sync) upsertSession(
+ 			is_truncated = excluded.is_truncated,
+ 			deleted_at = excluded.deleted_at,
+ 			deletion_cause = excluded.deletion_cause,
++			source_missing_at = excluded.source_missing_at,
+ 			created_at = excluded.created_at,
+ 			termination_status = excluded.termination_status,
+ 			secret_leak_count = excluded.secret_leak_count,
+@@ -1320,6 +1321,7 @@ func sessionInsertArgs(
+ 		sess.Cwd, sess.GitBranch, sess.SourceSessionID,
+ 		sess.SourceVersion, sess.TranscriptFidelity, sess.ParserMalformedLines,
+ 		sess.IsTruncated, nilTime(sess.DeletedAt), nilString(sess.DeletionCause),
++		nilTime(sess.SourceMissingAt),
+ 		timeValue(sess.CreatedAt), nilString(sess.TerminationStatus),
+ 		sess.SecretLeakCount, sess.SecretsRulesVersion,
+ 		nilEmpty(fingerprint), archiveID,
+diff --git a/internal/duckdb/schema.go b/internal/duckdb/schema.go
+index 110c0222..0540accf 100644
+--- a/internal/duckdb/schema.go
++++ b/internal/duckdb/schema.go
+@@ -175,6 +175,7 @@ var mirrorTables = []tableSpec{
+ 			is_truncated BOOLEAN NOT NULL DEFAULT FALSE,
+ 			deleted_at TIMESTAMP,
+ 			deletion_cause TEXT,
++			source_missing_at TIMESTAMP,
+ 			created_at TIMESTAMP,
+ 			termination_status TEXT,
+ 			secret_leak_count INTEGER NOT NULL DEFAULT 0,
+@@ -247,6 +248,7 @@ var mirrorTables = []tableSpec{
+ 			{"is_truncated", "is_truncated BOOLEAN NOT NULL DEFAULT FALSE"},
+ 			{"deleted_at", "deleted_at TIMESTAMP"},
+ 			{"deletion_cause", "deletion_cause TEXT"},
++			{"source_missing_at", "source_missing_at TIMESTAMP"},
+ 			{"created_at", "created_at TIMESTAMP"},
+ 			{"termination_status", "termination_status TEXT"},
+ 			{"secret_leak_count", "secret_leak_count INTEGER NOT NULL DEFAULT 0"},
+diff --git a/internal/duckdb/store.go b/internal/duckdb/store.go
+index 6b3c9224..f33d58a4 100644
+--- a/internal/duckdb/store.go
++++ b/internal/duckdb/store.go
+@@ -310,7 +310,7 @@ const duckSessionCols = `id, project, project_assigned, machine, agent,
+ 	cwd, git_branch, source_session_id, source_version, transcript_fidelity,
+ 	parser_malformed_lines, is_truncated,
+ 	secret_leak_count, secrets_rules_version,
+-	deleted_at, deletion_cause, termination_status, transcript_revision`
++	deleted_at, deletion_cause, source_missing_at, termination_status, transcript_revision`
+ 
+ func scanSession(rs interface{ Scan(...any) error }) (db.Session, error) {
+ 	return scanSessionWithSource(rs, false)
+@@ -321,7 +321,7 @@ func scanSessionWithSource(
+ ) (db.Session, error) {
+ 	var s db.Session
+ 	var createdAt, localModifiedAt any
+-	var startedAt, endedAt, deletedAt any
++	var startedAt, endedAt, deletedAt, sourceMissingAt any
+ 	targets := []any{
+ 		&s.ID, &s.Project, &s.ProjectAssigned, &s.Machine, &s.Agent,
+ 		&s.AgentLabel, &s.Entrypoint, &s.SessionKind,
+@@ -350,7 +350,7 @@ func scanSessionWithSource(
+ 		&s.SourceSessionID, &s.SourceVersion, &s.TranscriptFidelity,
+ 		&s.ParserMalformedLines, &s.IsTruncated,
+ 		&s.SecretLeakCount, &s.SecretsRulesVersion,
+-		&deletedAt, &s.DeletionCause, &s.TerminationStatus, &s.TranscriptRevision,
++		&deletedAt, &s.DeletionCause, &sourceMissingAt, &s.TerminationStatus, &s.TranscriptRevision,
+ 	}
+ 	if includeSource {
+ 		targets = append(targets, &s.FilePath, &s.FileSize, &localModifiedAt)
+@@ -372,6 +372,9 @@ func scanSessionWithSource(
+ 	if v := formatDBTime(deletedAt); v != "" {
+ 		s.DeletedAt = &v
+ 	}
++	if v := formatDBTime(sourceMissingAt); v != "" {
++		s.SourceMissingAt = &v
++	}
+ 	return s, nil
+ }
+ 
+diff --git a/internal/duckdb/sync.go b/internal/duckdb/sync.go
+index c89dbed0..0c9efdcc 100644
+--- a/internal/duckdb/sync.go
++++ b/internal/duckdb/sync.go
+@@ -975,6 +975,7 @@ func duckSessionFingerprintFields(sess db.Session, machine string) []any {
+ 		sess.SourceVersion, sess.TranscriptFidelity, sess.ParserMalformedLines,
+ 		nilString(sess.TranscriptRevision),
+ 		sess.IsTruncated, nilTime(sess.DeletedAt), nilString(sess.DeletionCause),
++		nilTime(sess.SourceMissingAt),
+ 		timeValue(sess.CreatedAt), nilString(sess.TerminationStatus),
+ 		sess.SecretLeakCount, sess.SecretsRulesVersion,
+ 	}
+diff --git a/internal/ingest/signals.go b/internal/ingest/signals.go
+index a488ba22..00d6d5a2 100644
+--- a/internal/ingest/signals.go
++++ b/internal/ingest/signals.go
+@@ -267,7 +267,7 @@ func ScanSecretsFromMessages(
+ 			ci := callIndex
+ 			add(message.SessionID, "tool_input", message.Ordinal, &ci, nil,
+ 				call.InputJSON)
+-			if len(call.ResultEvents) > 0 {
++			if len(call.ResultEvents) > 0 && db.ShouldPersistToolResultEvents(call.ResultContent, call.ResultEvents) {
+ 				for eventIndex := range call.ResultEvents {
+ 					ei := eventIndex
+ 					add(message.SessionID, "tool_result_event", message.Ordinal,

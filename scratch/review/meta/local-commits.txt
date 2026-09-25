@@ -1,0 +1,129 @@
+deb0677c Merge remote-tracking branch 'origin/main'
+d899643d fix(parser): align Junie subagent sourceSessionId, project extraction, and prompt formatting
+8a4804aa feat(parser): read Junie summary and state sidecars, fold into freshness, and restore timestamp fallbacks
+6cdf2747 feat(parser): synthesize Junie BuiltInAgent streams into linked subagent sessions
+33d9ade7 feat(parser): classify Junie termination from cancel, failure, and task-state events
+1d48bd6e feat(parser): extract Junie tool calls from block-update events
+c750e665 feat(parser): route Junie a2ux events into per-agent streams with taskId-grouped assistant messages and thinking
+3f62f8b8 docs: plan Junie parser fidelity port from shelved implementation
+a720a48e fix(pricing): drop supplementals the pinned snapshot now prices
+94ce4c00 fix(frontend): prioritize sessions with user messages in continuation chains
+558ce709 fix(parser): exclude and purge Junie startup stub directories
+ad0249c5 feat(parser): clean Antigravity user prompt envelopes and metadata
+9be13c72 fix(db,sync): resolve rebase conflicts and align migrations and single-event result dedup
+a7e28cf7 feat(frontend): on-demand per-group sidebar loading with full session counts
+5bada53c gitignore
+01aaaeff fix(search): alias union columns in tool-content FTS search
+b58a4fd2 feat(parser): distribute cursor IDE contextTokensUsed across messages
+4a0b8c5c test(parser): cover codex fork/subagent replay gate edge cases
+dc69615f feat(search): index tool content with FTS5
+772766b5 refactor(db): drop redundant idx_messages_session_ordinal index
+52381435 fix(parser): harden codex, antigravity, junie, and devin ingestion edge cases
+c8976bba fix(parser): harden Antigravity SQLite lock retry and Junie cancellation/subagent linking
+de55cc14 docs(scratch): resolve tickets 07-10 on wayfinder map
+0859075c fix(parser): resolve watch, cache, and subagent discrepancies for Antigravity, Codex, and Junie
+616349ef fix(parser,pricing): remediate indexing, transcript, and pricing gaps for Antigravity, Codex, Junie, and Devin
+a47e291f docs(scratch): record 5-agent audit findings and graduate fix tickets
+da2761cd docs(scratch): chart wayfinder map for 5-agent indexing validation
+1548592c fix(parser): emit excluded session IDs for empty Junie sessions and ignore unreadable Warp DB
+1a4455a6 feat(parser,sync): enable resumable parser checkpoints and tail-append for Claude Code
+7c0eed56 docs(changelog): note Junie session provider
+e802a8ca feat(parser): add Junie (JetBrains) session provider
+95d09e06 feat(sync,parser): isolate SQLite third-party containers with scratch fallback and filter wal/shm events
+9ee5fe4d feat(db): batch FTS5 index updates during session writes
+fd2669d0 feat(db): store single-event tool results directly in tool calls without redundant events
+31f730a7 feat(parser): stitch Codex paginated rollout continuation history
+9f67ba8b fix(parser): suppress repetitive Devin boilerplate system prompts in continuation eras
+94c7d28e fix(parser): recursively unwind multi-generation Devin compaction eras
+ef8e381f feat(parser): link Antigravity IDE subagent sessions to parents
+08346b47 fix(frontend): address assistant turn review findings
+3d3d326c docs(frontend): mark assistant turn collapse plan complete
+646dae87 test(frontend): verify assistant turn collapse workflow
+2a0df8ab fix(frontend): address prompt disclosure review findings
+a12c2242 feat(frontend): add assistant turn settings
+fcb99fb3 fix(frontend): notify virtualizer subscribers when options change
+e0c30766 fix(frontend): address navigation and reveal review findings
+a0b7cfdb docs(frontend): update session scope items consumer note
+98c72d84 feat(frontend): reveal and navigate assistant turn events
+c0542cfb fix(db): hide source-missing child sessions from sidebar
+dd6191e3 fix(parser): dedupe Devin subagent transcript trees
+d9c471ac feat(parser): index Devin subagent transcripts
+efd72e04 feat(frontend): virtualize assistant turn rows
+878e6664 fix(frontend): address assistant turn rendering review findings
+0d55be94 feat(frontend): render collapsible assistant events
+2608fb40 fix(parser): prefer Devin message nodes and retain subagent calls
+0e3b122c fix(frontend): address turn collapse store review findings
+3e356e92 feat(frontend): add assistant turn expansion state
+f6fc3dc6 fix(frontend): address search scope review findings
+86fc2a52 feat(frontend): search through filtered transcript events
+4f9e911e refactor(frontend): tighten assistant turn projection
+f12bdc99 docs: mark assistant turn projection task complete
+f4702c33 feat(frontend): project assistant turn events
+eb953902 docs: plan assistant turn collapse implementation
+beeaddf3 docs: define collapse preview character counts
+7c70c5b3 docs: define newest-first turn ordering
+21ba0cf3 docs: specify assistant turn collapse design
+5c5b6a7a skills
+525fc633 fix(frontend): collapse XML skill injections by default
+d2bb42f3 fix(parser): recover pre-compaction history for continued Devin sessions
+e59daf74 fix(parser): read Devin message_nodes thinking from its object form
+7f119467 fix(frontend): prioritize sessions with user messages in continuation chains
+838be536 fix(parser): exclude and purge Junie startup stub directories
+af95671f feat(parser): clean Antigravity user prompt envelopes and metadata
+66fffef9 fix(db,sync): resolve rebase conflicts and align migrations and single-event result dedup
+e1371ee2 feat(frontend): on-demand per-group sidebar loading with full session counts
+8cf139a1 gitignore
+3f0b6a20 fix(search): alias union columns in tool-content FTS search
+0746f702 feat(parser): distribute cursor IDE contextTokensUsed across messages
+d9f72bf3 test(parser): cover codex fork/subagent replay gate edge cases
+f94db198 feat(search): index tool content with FTS5
+815410ff refactor(db): drop redundant idx_messages_session_ordinal index
+35705071 fix(parser): harden codex, antigravity, junie, and devin ingestion edge cases
+f59d7d78 fix(parser): harden Antigravity SQLite lock retry and Junie cancellation/subagent linking
+c9926f91 docs(scratch): resolve tickets 07-10 on wayfinder map
+9e2973d9 fix(parser): resolve watch, cache, and subagent discrepancies for Antigravity, Codex, and Junie
+fa5c6f14 fix(parser,pricing): remediate indexing, transcript, and pricing gaps for Antigravity, Codex, Junie, and Devin
+08166a4e docs(scratch): record 5-agent audit findings and graduate fix tickets
+2363e1c1 docs(scratch): chart wayfinder map for 5-agent indexing validation
+d7c92bcc fix(parser): emit excluded session IDs for empty Junie sessions and ignore unreadable Warp DB
+0fc4648c feat(parser,sync): enable resumable parser checkpoints and tail-append for Claude Code
+f26178ca docs(changelog): note Junie session provider
+9537480f feat(parser): add Junie (JetBrains) session provider
+421f7227 feat(sync,parser): isolate SQLite third-party containers with scratch fallback and filter wal/shm events
+813d6289 feat(db): batch FTS5 index updates during session writes
+7427b571 feat(db): store single-event tool results directly in tool calls without redundant events
+8ca2475e feat(parser): stitch Codex paginated rollout continuation history
+925ed978 fix(parser): suppress repetitive Devin boilerplate system prompts in continuation eras
+5d990136 fix(parser): recursively unwind multi-generation Devin compaction eras
+1bc82544 feat(parser): link Antigravity IDE subagent sessions to parents
+5de4e50a fix(frontend): address assistant turn review findings
+36c04a68 docs(frontend): mark assistant turn collapse plan complete
+0ef6d17d test(frontend): verify assistant turn collapse workflow
+f3812419 fix(frontend): address prompt disclosure review findings
+fe628e5e feat(frontend): add assistant turn settings
+2c62f34b fix(frontend): notify virtualizer subscribers when options change
+19a26208 fix(frontend): address navigation and reveal review findings
+daad08fc docs(frontend): update session scope items consumer note
+e87144e0 feat(frontend): reveal and navigate assistant turn events
+8932194c fix(db): hide source-missing child sessions from sidebar
+07e13c94 fix(parser): dedupe Devin subagent transcript trees
+88572563 feat(parser): index Devin subagent transcripts
+e4016bd5 feat(frontend): virtualize assistant turn rows
+4b5db892 fix(frontend): address assistant turn rendering review findings
+0718c4a1 feat(frontend): render collapsible assistant events
+8b3fbf03 fix(parser): prefer Devin message nodes and retain subagent calls
+8ddf169b fix(frontend): address turn collapse store review findings
+72433096 feat(frontend): add assistant turn expansion state
+cda7fed1 fix(frontend): address search scope review findings
+8de17e70 feat(frontend): search through filtered transcript events
+aa84286a refactor(frontend): tighten assistant turn projection
+5168af98 docs: mark assistant turn projection task complete
+b2002fea feat(frontend): project assistant turn events
+d9d30043 docs: plan assistant turn collapse implementation
+196faa36 docs: define collapse preview character counts
+b1eb8bbb docs: define newest-first turn ordering
+cf361c39 docs: specify assistant turn collapse design
+f20c89aa skills
+b33e731d fix(frontend): collapse XML skill injections by default
+3975629c fix(parser): recover pre-compaction history for continued Devin sessions
+611563be fix(parser): read Devin message_nodes thinking from its object form

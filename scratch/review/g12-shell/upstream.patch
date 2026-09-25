@@ -1,0 +1,96 @@
+diff --git a/frontend/messages/az.json b/frontend/messages/az.json
+index c61cdb78..cfcea42d 100644
+--- a/frontend/messages/az.json
++++ b/frontend/messages/az.json
+@@ -2184,6 +2184,7 @@
+   "system_boundary_interrupted": "Sorğu dayandırıldı",
+   "system_boundary_task_notification": "Tapşırıq bildirişi",
+   "system_boundary_stop_hook": "Dayandırma hadisəsi emalçısının rəyi",
++  "system_boundary_peer_message": "Başqa sessiyadan mesaj",
+   "system_boundary_title": "Sistem sərhədi: {subtype}",
+   "system_boundary_show_content": "Məzmunu göstər",
+   "trash_loading": "Zibil qutusu yüklənir...",
+diff --git a/frontend/messages/en.json b/frontend/messages/en.json
+index 2b69da85..50af3490 100644
+--- a/frontend/messages/en.json
++++ b/frontend/messages/en.json
+@@ -2182,6 +2182,7 @@
+   "system_boundary_interrupted": "Request interrupted",
+   "system_boundary_task_notification": "Task notification",
+   "system_boundary_stop_hook": "Stop hook feedback",
++  "system_boundary_peer_message": "Message from another session",
+   "system_boundary_title": "System boundary: {subtype}",
+   "system_boundary_show_content": "Show content",
+   "trash_loading": "Loading trash...",
+diff --git a/frontend/messages/es.json b/frontend/messages/es.json
+index 63a900f6..9761afc0 100644
+--- a/frontend/messages/es.json
++++ b/frontend/messages/es.json
+@@ -2184,6 +2184,7 @@
+   "system_boundary_interrupted": "Solicitud interrumpida",
+   "system_boundary_task_notification": "Notificación de tarea",
+   "system_boundary_stop_hook": "Respuesta del hook de detención",
++  "system_boundary_peer_message": "Mensaje de otra sesión",
+   "system_boundary_title": "Límite del sistema: {subtype}",
+   "system_boundary_show_content": "Mostrar contenido",
+   "trash_loading": "Cargando papelera...",
+diff --git a/frontend/messages/fr.json b/frontend/messages/fr.json
+index ebbb8241..4c43fae2 100644
+--- a/frontend/messages/fr.json
++++ b/frontend/messages/fr.json
+@@ -2181,6 +2181,7 @@
+   "system_boundary_interrupted": "Requête interrompue",
+   "system_boundary_task_notification": "Notification de tâche",
+   "system_boundary_stop_hook": "Retour du hook d'arrêt",
++  "system_boundary_peer_message": "Message d'une autre session",
+   "system_boundary_title": "Limite système : {subtype}",
+   "system_boundary_show_content": "Afficher le contenu",
+   "trash_loading": "Chargement de la corbeille...",
+diff --git a/frontend/messages/ja.json b/frontend/messages/ja.json
+index 52ab45aa..a8a979d3 100644
+--- a/frontend/messages/ja.json
++++ b/frontend/messages/ja.json
+@@ -2170,6 +2170,7 @@
+   "system_boundary_interrupted": "リクエストが中断されました",
+   "system_boundary_task_notification": "タスク通知",
+   "system_boundary_stop_hook": "フックフィードバックを停止する",
++  "system_boundary_peer_message": "別のセッションからのメッセージ",
+   "system_boundary_title": "システム境界: {subtype}",
+   "system_boundary_show_content": "コンテンツを表示",
+   "trash_loading": "ゴミ箱を読み込み中...",
+diff --git a/frontend/messages/ko.json b/frontend/messages/ko.json
+index 0ab7a38f..c983456c 100644
+--- a/frontend/messages/ko.json
++++ b/frontend/messages/ko.json
+@@ -2100,6 +2100,7 @@
+   "system_boundary_interrupted": "요청 중단됨",
+   "system_boundary_task_notification": "작업 알림",
+   "system_boundary_stop_hook": "중지 훅 피드백",
++  "system_boundary_peer_message": "다른 세션의 메시지",
+   "system_boundary_title": "시스템 경계: {subtype}",
+   "system_boundary_show_content": "내용 표시",
+   "trash_loading": "휴지통을 불러오는 중...",
+diff --git a/frontend/messages/zh-CN.json b/frontend/messages/zh-CN.json
+index 5e2e7fe1..b55cac95 100644
+--- a/frontend/messages/zh-CN.json
++++ b/frontend/messages/zh-CN.json
+@@ -2098,6 +2098,7 @@
+   "system_boundary_interrupted": "请求中断",
+   "system_boundary_task_notification": "任务通知",
+   "system_boundary_stop_hook": "停止钩子反馈",
++  "system_boundary_peer_message": "来自其他会话的消息",
+   "system_boundary_title": "系统边界：{subtype}",
+   "system_boundary_show_content": "显示内容",
+   "trash_loading": "正在加载回收站...",
+diff --git a/frontend/messages/zh-TW.json b/frontend/messages/zh-TW.json
+index 9c745323..971566a8 100644
+--- a/frontend/messages/zh-TW.json
++++ b/frontend/messages/zh-TW.json
+@@ -2098,6 +2098,7 @@
+   "system_boundary_interrupted": "請求中斷",
+   "system_boundary_task_notification": "任務通知",
+   "system_boundary_stop_hook": "停止 Hook 回饋",
++  "system_boundary_peer_message": "來自其他工作階段的訊息",
+   "system_boundary_title": "系統邊界：{subtype}",
+   "system_boundary_show_content": "顯示內容",
+   "trash_loading": "正在載入垃圾桶...",

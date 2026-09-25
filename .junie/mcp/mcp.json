@@ -1,0 +1,34 @@
+{
+    "mcpServers": {
+        "idea": {
+            "command": ""
+        },
+        "chrome-devtools": {
+            "command": "",
+            "enabled": false
+        },
+        "google-docs": {
+            "command": "",
+            "enabled": false
+        },
+        "miro": {
+            "command": "",
+            "enabled": false
+        },
+        "youtrack": {
+            "command": "",
+            "enabled": false
+        },
+        "youtrack_local": {
+            "command": "",
+            "enabled": false
+        },
+        "slack": {
+            "command": "",
+            "enabled": false
+        },
+        "mcp-steroid": {
+            "command": ""
+        }
+    }
+}

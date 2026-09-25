@@ -1,0 +1,1179 @@
+diff --git a/internal/sync/checkpoint.go b/internal/sync/checkpoint.go
+index b65594c3..d2b7f81a 100644
+--- a/internal/sync/checkpoint.go
++++ b/internal/sync/checkpoint.go
+@@ -369,6 +369,10 @@ func (e *Engine) buildCodexFullParseCheckpoint(
+ 	// stat: the cursor, hash state, and anchor describe the bytes the
+ 	// parser read, and pairing them with a fresher stat could bless a
+ 	// concurrent rewrite as the parsed content.
++	nextOrdinal := pw.sess.MessageCount
++	if len(pw.msgs) > 0 {
++		nextOrdinal = pw.msgs[len(pw.msgs)-1].Ordinal + 1
++	}
+ 	cp := &db.ParserCheckpoint{
+ 		SessionID:        pw.sess.ID,
+ 		Agent:            string(pw.sess.Agent),
+@@ -380,7 +384,7 @@ func (e *Engine) buildCodexFullParseCheckpoint(
+ 		Offset:           pw.sess.File.Size,
+ 		TailAnchorDigest: pw.checkpointAnchorDigest,
+ 		Hash:             hash,
+-		NextOrdinal:      pw.sess.MessageCount,
++		NextOrdinal:      nextOrdinal,
+ 		Version:          codexCheckpointVersion,
+ 	}
+ 	return cp, &db.ParserCheckpointBlobs{
+diff --git a/internal/sync/checkpoint_bootstrap_test.go b/internal/sync/checkpoint_bootstrap_test.go
+index 6f558294..47ee9299 100644
+--- a/internal/sync/checkpoint_bootstrap_test.go
++++ b/internal/sync/checkpoint_bootstrap_test.go
+@@ -123,6 +123,12 @@ func TestCodexCheckpointAdoptionIsLazyForUpgradedArchive(t *testing.T) {
+ 		for j := range expected[i].ToolCalls {
+ 			// Rendering is parser input to the write projection, not a stored field.
+ 			expected[i].ToolCalls[j].Rendering = ""
++			if db.ResultContentDuplicatesSingleEvent(
++				expected[i].ToolCalls[j].ResultContent,
++				expected[i].ToolCalls[j].ResultEvents,
++			) {
++				expected[i].ToolCalls[j].ResultEvents = nil
++			}
+ 		}
+ 	}
+ 	require.Equal(t, expected, stored)
+diff --git a/internal/sync/checkpoint_test.go b/internal/sync/checkpoint_test.go
+index 378a7482..96249407 100644
+--- a/internal/sync/checkpoint_test.go
++++ b/internal/sync/checkpoint_test.go
+@@ -105,7 +105,7 @@ func TestCodexCheckpointIncrementalResumeAdvancesCheckpoint(t *testing.T) {
+ 	require.Len(t, msgs, 2)
+ 	require.Len(t, msgs[1].ToolCalls, 1)
+ 	assert.Equal(t, "done", msgs[1].ToolCalls[0].ResultContent)
+-	require.Len(t, msgs[1].ToolCalls[0].ResultEvents, 1)
++	require.Empty(t, msgs[1].ToolCalls[0].ResultEvents)
+ 	assert.Equal(t, 100_000, msgs[1].ContextTokens)
+ 	assert.Equal(t, 250, msgs[1].OutputTokens)
+ 	assert.NotEmpty(t, msgs[1].TokenUsage,
+@@ -226,3 +226,82 @@ func TestCodexCheckpointInPlaceRewriteSameSizeSameMtimeIsRejected(t *testing.T)
+ 	assert.Equal(t, int64(len(initial)), cp.Offset,
+ 		"the rewritten bytes are the same length, so the checkpoint offset stays")
+ }
++
++func TestClaudeCheckpointFullParseAndIncrementalResume(t *testing.T) {
++	env := setupTestEnv(t)
++	ctx := t.Context()
++	claudeID := "claude-cp-session"
++	u1 := "uuid-c1"
++	u2 := "uuid-c2"
++	u3 := "uuid-c3"
++	initial := testjsonl.JoinJSONL(
++		testjsonl.ClaudeEntryJSON("user", "hello claude", "2024-01-01T10:00:00Z", u1, ""),
++		testjsonl.ClaudeEntryJSON("assistant", "hello human", "2024-01-01T10:00:01Z", u2, u1),
++	)
++	path := env.writeClaudeSession(t, "test-proj", claudeID+".jsonl", initial)
++
++	stats := env.engine.SyncAll(ctx, nil)
++	require.Equal(t, 1, stats.Synced)
++
++	cp, ok, err := env.db.GetParserCheckpoint(ctx, claudeID)
++	require.NoError(t, err)
++	require.True(t, ok, "full Claude parse must persist a checkpoint")
++	blobs, ok, err := env.db.GetParserCheckpointBlobs(ctx, claudeID)
++	require.NoError(t, err)
++	require.True(t, ok)
++	assert.Equal(t, int64(len(initial)), cp.Offset)
++	assert.Equal(t, []byte(u2), blobs.Cursor)
++	assert.NotEmpty(t, blobs.HashState)
++	assert.NotEmpty(t, cp.TailAnchorDigest)
++	assert.NotEmpty(t, cp.Hash)
++	assert.Equal(t, 2, cp.NextOrdinal)
++	assert.Equal(t, db.ParserCheckpointVersion, cp.Version)
++
++	// Incremental append: append a third message continuing the DAG trunk
++	appended := testjsonl.JoinJSONL(
++		testjsonl.ClaudeEntryJSON("user", "tell me more", "2024-01-01T10:00:02Z", u3, u2),
++	)
++	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
++	require.NoError(t, err)
++	_, err = f.WriteString(appended)
++	require.NoError(t, err)
++	require.NoError(t, f.Close())
++
++	stats = env.engine.SyncAll(ctx, nil)
++	require.Equal(t, 1, stats.Synced)
++
++	sess, err := env.db.GetSessionFull(ctx, claudeID)
++	require.NoError(t, err)
++	require.NotNil(t, sess)
++	assert.True(t, sess.LastWriteIncremental, "incremental Claude append must stay incremental")
++
++	after, ok, err := env.db.GetParserCheckpoint(ctx, claudeID)
++	require.NoError(t, err)
++	require.True(t, ok)
++	afterBlobs, ok, err := env.db.GetParserCheckpointBlobs(ctx, claudeID)
++	require.NoError(t, err)
++	require.True(t, ok)
++	assert.Equal(t, int64(len(initial)+len(appended)), after.Offset)
++	assert.Equal(t, []byte(u3), afterBlobs.Cursor)
++	assert.Equal(t, 3, after.NextOrdinal)
++
++	// Unchanged sweep: syncing without edits skips without re-hashing
++	stats = env.engine.SyncAll(ctx, nil)
++	assert.Equal(t, 0, stats.Synced)
++
++	// DAG fork: append an entry branching off u1 instead of u3
++	forked := testjsonl.JoinJSONL(
++		testjsonl.ClaudeEntryJSON("user", "rewound branch", "2024-01-01T10:00:03Z", "uuid-fork", u1),
++	)
++	f, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
++	require.NoError(t, err)
++	_, err = f.WriteString(forked)
++	require.NoError(t, err)
++	require.NoError(t, f.Close())
++
++	stats = env.engine.SyncAll(ctx, nil)
++	require.Equal(t, 1, stats.Synced)
++	sess, err = env.db.GetSessionFull(ctx, claudeID)
++	require.NoError(t, err)
++	assert.False(t, sess.LastWriteIncremental, "DAG fork must trigger full parse replacement")
++}
+diff --git a/internal/sync/codex_staging.go b/internal/sync/codex_staging.go
+index 4b271232..2ea32111 100644
+--- a/internal/sync/codex_staging.go
++++ b/internal/sync/codex_staging.go
+@@ -70,9 +70,9 @@ type codexStagingSink struct {
+ 	findingPos     []stagedFindingPos
+ 	eventByCallKey map[string]int64
+ 	eventSeq       int64
+-	// A sole event is also its call summary. Keep only its display length
++	// A sole event is also its call summary. Keep only its content
+ 	// and failure verdict so publishing need not load the payload again.
+-	singleSummaryLengths map[string]int
++	singleSummaries map[string]string
+ 	// contentFailures records per-call content-failure verdicts captured
+ 	// during ingestion for sole events or publication for multi-event
+ 	// summaries, so the engine can reuse them in the signal pass.
+@@ -593,14 +593,14 @@ func (s *codexStagingSink) AppendToolResultEvent(ctx context.Context,
+ 	s.eventByCallKey[stageKey]++
+ 	s.addEventFindings(stageKey, eventIndex, storedContent)
+ 	if blanked == 0 && eventIndex == 0 {
+-		if s.singleSummaryLengths == nil {
+-			s.singleSummaryLengths = make(map[string]int)
++		if s.singleSummaries == nil {
++			s.singleSummaries = make(map[string]string)
+ 		}
+ 		summary := storedContent
+ 		if !summaryParticipates {
+ 			summary = ""
+ 		}
+-		s.singleSummaryLengths[stageKey] = len(summary)
++		s.singleSummaries[stageKey] = summary
+ 		if !s.disableSignals {
+ 			if s.contentFailures == nil {
+ 				s.contentFailures = make(map[string]bool)
+@@ -610,7 +610,7 @@ func (s *codexStagingSink) AppendToolResultEvent(ctx context.Context,
+ 			})
+ 		}
+ 	} else {
+-		delete(s.singleSummaryLengths, stageKey)
++		delete(s.singleSummaries, stageKey)
+ 		delete(s.contentFailures, stageKey)
+ 	}
+ 
+@@ -683,13 +683,13 @@ func (s *codexStagingSink) PublishToolResultImages(ctx context.Context) error {
+ 		}
+ 	}
+ 
+-	s.singleSummaryLengths = make(map[string]int)
++	s.singleSummaries = make(map[string]string)
+ 	s.contentFailures = make(map[string]bool)
+ 	s.findings = nil
+ 	s.findingPos = nil
+ 	s.eventByCallKey = make(map[string]int64)
+ 	type singleSummaryCandidate struct {
+-		length  int
++		summary string
+ 		failure bool
+ 	}
+ 	candidates := make(map[string]singleSummaryCandidate)
+@@ -725,7 +725,7 @@ func (s *codexStagingSink) PublishToolResultImages(ctx context.Context) error {
+ 			if participates == 0 {
+ 				summary = ""
+ 			}
+-			candidate := singleSummaryCandidate{length: len(summary)}
++			candidate := singleSummaryCandidate{summary: summary}
+ 			if !s.disableSignals {
+ 				candidate.failure = signals.IsFailure(signals.ToolCallRow{
+ 					Category:      s.categoryByCallKey[callKey],
+@@ -747,7 +747,7 @@ func (s *codexStagingSink) PublishToolResultImages(ctx context.Context) error {
+ 		return s.stageErr
+ 	}
+ 	for callKey, candidate := range candidates {
+-		s.singleSummaryLengths[callKey] = candidate.length
++		s.singleSummaries[callKey] = candidate.summary
+ 		if !s.disableSignals {
+ 			s.contentFailures[callKey] = candidate.failure
+ 		}
+@@ -780,6 +780,37 @@ func (s *codexStagingSink) addEventFindings(
+ 	}
+ }
+ 
++func (s *codexStagingSink) isCollapsedSingleEvent(ctx context.Context, stageKey string) bool {
++	if s.scratch == nil {
++		return false
++	}
++	var eventCount int
++	var soleContent string
++	var hasMetadata int
++	var participates int
++	var blanked int
++	err := s.scratch.QueryRowContext(ctx, `
++		SELECT COUNT(*),
++		       COALESCE(MIN(content), ''),
++		       MAX(CASE WHEN COALESCE(agent_id, '') != '' OR COALESCE(subagent_session_id, '') != '' THEN 1 ELSE 0 END),
++		       MIN(summary_participates),
++		       MAX(blanked)
++		FROM stage_events
++		WHERE call_key = ?
++	`, stageKey).Scan(&eventCount, &soleContent, &hasMetadata, &participates, &blanked)
++	if err != nil || eventCount != 1 || hasMetadata != 0 || participates != 1 || blanked != 0 {
++		return false
++	}
++	if s.blocked[s.categoryByCallKey[stageKey]] {
++		return false
++	}
++	summary, _, err := s.ResolveSummary(ctx, stageKey)
++	if err != nil || summary == "" || summary != soleContent {
++		return false
++	}
++	return true
++}
++
+ // Findings returns the staged event findings with session, ordinal, and
+ // call coordinates stamped from the final message model.
+ func (s *codexStagingSink) Findings(
+@@ -787,15 +818,22 @@ func (s *codexStagingSink) Findings(
+ 	positions map[string]db.StagedToolCallPosition,
+ ) []db.SecretFinding {
+ 	out := make([]db.SecretFinding, len(s.findings))
++	ctx := context.Background()
+ 	for i, f := range s.findings {
+ 		f.SessionID = sessionID
+-		pos, ok := positions[s.findingPos[i].stageKey]
++		stageKey := s.findingPos[i].stageKey
++		pos, ok := positions[stageKey]
+ 		if ok {
+ 			f.MessageOrdinal = pos.Ordinal
+ 			callIdx := pos.CallIndex
+-			evIdx := s.findingPos[i].eventIndex
+ 			f.CallIndex = &callIdx
+-			f.EventIndex = &evIdx
++			if s.isCollapsedSingleEvent(ctx, stageKey) {
++				f.LocationKind = "tool_result"
++				f.EventIndex = nil
++			} else {
++				evIdx := s.findingPos[i].eventIndex
++				f.EventIndex = &evIdx
++			}
+ 		}
+ 		out[i] = f
+ 	}
+@@ -817,6 +855,25 @@ func (s *codexStagingSink) InsertEventsTx(
+ 		return s.stageErr
+ 	}
+ 	for stageKey, pos := range messageOrdinals {
++		var eventCount int
++		var soleStoredContent string
++		if err := s.scratch.QueryRowContext(ctx, `
++			SELECT COUNT(*),
++			       COALESCE(MIN(CASE WHEN blanked = 1 THEN '' ELSE content END), '')
++			FROM stage_events
++			WHERE call_key = ?
++		`, stageKey).Scan(&eventCount, &soleStoredContent); err != nil {
++			return fmt.Errorf(
++				"counting staged events for %s/%s: %w",
++				sessionID, pos.ToolUseID, err,
++			)
++		}
++		if eventCount == 0 {
++			continue
++		}
++		if s.isCollapsedSingleEvent(ctx, stageKey) {
++			continue
++		}
+ 		if _, err := tx.ExecContext(ctx, `
+ 			INSERT INTO tool_result_events (
+ 				session_id, tool_call_message_ordinal, call_index,
+@@ -862,9 +919,7 @@ func (s *codexStagingSink) InsertEventsTx(
+ // is one call's aggregate output (the summary string itself), not the
+ // whole transcript. While the summary is in hand it also records the
+ // call's content-failure verdict (see ContentFailures), so the engine's
+-// post-publish signal fold never resolves summaries a second time. Once that
+-// verdict is recorded, a summary identical to its sole event is omitted
+-// from storage while contentLength retains the displayed length.
++// post-publish signal fold never resolves summaries a second time.
+ func (s *codexStagingSink) ResolveSummary(
+ 	ctx context.Context, stageKey string,
+ ) (summary string, contentLength int, err error) {
+@@ -874,8 +929,8 @@ func (s *codexStagingSink) ResolveSummary(
+ 	if err := ctx.Err(); err != nil {
+ 		return "", 0, err
+ 	}
+-	if length, ok := s.singleSummaryLengths[stageKey]; ok {
+-		return "", length, nil
++	if summary, ok := s.singleSummaries[stageKey]; ok {
++		return summary, len(summary), nil
+ 	}
+ 	blocked := s.blocked[s.categoryByCallKey[stageKey]]
+ 	if blocked {
+diff --git a/internal/sync/codex_staging_summary_test.go b/internal/sync/codex_staging_summary_test.go
+index b235952a..6b8c98e8 100644
+--- a/internal/sync/codex_staging_summary_test.go
++++ b/internal/sync/codex_staging_summary_test.go
+@@ -13,12 +13,13 @@ import (
+ func TestStagedSingleEventSummaryThenAdditionalEvent(t *testing.T) {
+ 	for _, tc := range []struct {
+ 		name, content string
++		wantSummary   string
+ 		length        int
+ 		failure       bool
+ 	}{
+-		{"anonymous", "command not found", 17, true},
+-		{"whitespace", " \n", 0, false},
+-		{"sanitized", "ok\x00", 2, false},
++		{"anonymous", "command not found", "command not found", 17, true},
++		{"whitespace", " \n", "", 0, false},
++		{"sanitized", "ok\x00", "ok", 2, false},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			sink, err := newCodexStagingSink(t.Context(), t.TempDir(), nil)
+@@ -34,7 +35,7 @@ func TestStagedSingleEventSummaryThenAdditionalEvent(t *testing.T) {
+ 			key := db.StagedToolCallKey("call", 0)
+ 			summary, length, err := sink.ResolveSummary(t.Context(), key)
+ 			require.NoError(t, err)
+-			require.Empty(t, summary)
++			require.Equal(t, tc.wantSummary, summary)
+ 			require.Equal(t, tc.length, length)
+ 			require.Equal(t, tc.failure, sink.ContentFailures()[key])
+ 			sink.AppendToolResultEvent(t.Context(), "call", nil, parser.ParsedToolResultEvent{
+@@ -69,7 +70,7 @@ func BenchmarkStagedSingleEventSummary(b *testing.B) {
+ 			for b.Loop() {
+ 				summary, length, err := sink.ResolveSummary(b.Context(), key)
+ 				require.NoError(b, err)
+-				require.Empty(b, summary)
++				require.Equal(b, strings.Repeat("x", size), summary)
+ 				require.Equal(b, size, length)
+ 			}
+ 		})
+diff --git a/internal/sync/codex_staging_test.go b/internal/sync/codex_staging_test.go
+index afdf7419..23425071 100644
+--- a/internal/sync/codex_staging_test.go
++++ b/internal/sync/codex_staging_test.go
+@@ -231,15 +231,16 @@ func TestSyncSingleSessionStagedPublishesRealContent(t *testing.T) {
+ 	found := false
+ 	for _, m := range msgs {
+ 		for _, tc := range m.ToolCalls {
+-			if tc.ToolUseID != "call_a" || len(tc.ResultEvents) == 0 {
++			if tc.ToolUseID != "call_a" {
+ 				continue
+ 			}
+ 			found = true
+-			require.NotContains(t, tc.ResultEvents[0].Content, "staged:",
++			require.NotContains(t, tc.ResultContent, "staged:",
+ 				"the single-session path must publish real output, "+
+ 					"not staged placeholders")
+-			require.Contains(t, tc.ResultEvents[0].Content,
++			require.Contains(t, tc.ResultContent,
+ 				"build passed")
++			require.Empty(t, tc.ResultEvents)
+ 		}
+ 	}
+ 	require.True(t, found, "call_a output must be stored")
+@@ -474,10 +475,10 @@ func TestCodexStagedToolResultSummaryStorage(t *testing.T) {
+ 		wantDisplay string
+ 		wantEvents  int
+ 	}{
+-		{"single event", []string{"command finished"}, "", "command finished", 1},
+-		{"duplicate event", []string{"command finished", "command finished"}, "", "command finished", 1},
++		{"single event", []string{"command finished"}, "command finished", "command finished", 0},
++		{"duplicate event", []string{"command finished", "command finished"}, "command finished", "command finished", 0},
+ 		{"multiple events", []string{"working", "command finished"}, "command finished", "command finished", 2},
+-		{"sanitized single event", []string{"before\x00after"}, "", "beforeafter", 1},
++		{"sanitized single event", []string{"before\x00after"}, "beforeafter", "beforeafter", 0},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			const uuid = "019eb791-cf7d-75c1-8439-9ed74c122d01"
+diff --git a/internal/sync/engine.go b/internal/sync/engine.go
+index cbb3512f..07e8bb14 100644
+--- a/internal/sync/engine.go
++++ b/internal/sync/engine.go
+@@ -1942,7 +1942,29 @@ func (e *Engine) classifyPaths(
+ 	seen := make(map[string]int, len(paths))
+ 	files := make([]parser.DiscoveredFile, 0, len(paths))
+ 	var classificationErr error
++	pathSet := make(map[string]struct{}, len(paths))
+ 	for _, p := range paths {
++		if strings.HasSuffix(p, "-shm") {
++			continue
++		}
++		pathSet[p] = struct{}{}
++	}
++	seenPaths := make(map[string]struct{}, len(paths))
++	for _, p := range paths {
++		if strings.HasSuffix(p, "-shm") {
++			continue
++		}
++		if strings.HasSuffix(p, "-wal") {
++			mainDB := strings.TrimSuffix(p, "-wal")
++			if _, hasMain := pathSet[mainDB]; hasMain {
++				continue
++			}
++		}
++		if _, already := seenPaths[p]; already {
++			continue
++		}
++		seenPaths[p] = struct{}{}
++
+ 		// Codex resolved-index events map to potentially several session
+ 		// sources and must classify even when the event path was deleted, so
+ 		// they are handled by classifyCodexIndexPath. All other changed paths,
+@@ -6490,6 +6512,13 @@ func isCodexFormatAgent(agent parser.AgentType) bool {
+ 	return ingest.IsCodexFormatAgent(agent)
+ }
+ 
++// isCheckpointEligibleAgent reports whether an agent format supports
++// resumable parser checkpoints and incremental tail-appends (Codex formats
++// and Claude Code).
++func isCheckpointEligibleAgent(agent parser.AgentType) bool {
++	return isCodexFormatAgent(agent) || agent == parser.AgentClaude
++}
++
+ func reconciliationWatchRoot(
+ 	path string, watchRoots []parser.WatchRoot, configuredRoots []string,
+ ) string {
+@@ -10748,6 +10777,9 @@ func (e *Engine) collectAndBatchWithOptions(
+ 				r.releaseAll()
+ 				continue
+ 			}
++			if r.cacheSkip && r.incremental.fileMtime != 0 && !r.noCacheSkip {
++				e.cacheSkip(r.skipCacheKey(), r.incremental.fileMtime, r.sourceFingerprint)
++			}
+ 			stats.RecordSynced(1)
+ 			if !sourceProofWithheld {
+ 				baselineJob := r
+@@ -11915,7 +11947,7 @@ func (e *Engine) processProviderFile(
+ 	codexForceFullParse := false
+ 	codexProvenUnchanged := false
+ 	codexAuditDeepVerify := e.checkpointAudit.Load() &&
+-		isCodexFormatAgent(file.Agent)
++		isCheckpointEligibleAgent(file.Agent)
+ 	var codexUnchangedMtime int64
+ 	verifiedCapture, verifiedMtime, verifiedFresh, verifiedStateOK := e.verifiedProviderSourceState(provider, source, file)
+ 	if !forceSourceCwdParse && !codexForceFullParse &&
+@@ -12005,7 +12037,7 @@ func (e *Engine) processProviderFile(
+ 	// warm-sweep behavior while still proving appends before any full content
+ 	// fingerprint read. Audit mode deliberately bypasses this optimization and
+ 	// takes the authoritative full-parse path below.
+-	if isCodexFormatAgent(file.Agent) && !codexAuditDeepVerify {
++	if isCheckpointEligibleAgent(file.Agent) && !codexAuditDeepVerify {
+ 		cpResult, cpErr := e.codexCheckpointFingerprint(ctx, source, file)
+ 		if cpErr != nil {
+ 			log.Printf("codex checkpoint %s: %v", file.Path, cpErr)
+@@ -12687,8 +12719,10 @@ func (e *Engine) processProviderFile(
+ 	// so ownership reconciliation is needed only by real sync engines.
+ 	if (file.Agent == parser.AgentKiro ||
+ 		file.Agent == parser.AgentCline ||
++		(file.Agent == parser.AgentDevin && outcome.ForceReplace) ||
+ 		(file.Agent == parser.AgentOmnigent && outcome.ForceReplace) ||
+ 		(file.Agent == parser.AgentCursorIDE && outcome.ForceReplace) ||
++		(file.Agent == parser.AgentJunie && outcome.ForceReplace) ||
+ 		(file.Agent == parser.AgentTrae && !e.forceParse)) &&
+ 		outcome.ResultSetComplete && len(outcome.SourceErrors) == 0 {
+ 		missingMembers, err = e.providerSourceMissingSessionOwnershipsForCompleteResultWithPreserved(
+@@ -18018,7 +18052,7 @@ func (e *Engine) writeBatchWithOutcomeContext(
+ 			if ctx.Err() != nil {
+ 				return outcome
+ 			}
+-			if isCodexFormatAgent(pw.sess.Agent) {
++			if isCheckpointEligibleAgent(pw.sess.Agent) {
+ 				cp, blobs, cpErr := e.buildCodexFullParseCheckpoint(
+ 					pw.sess.File.Path, pw,
+ 				)
+@@ -18666,7 +18700,7 @@ func (e *Engine) writeBatchBulkWithOutcomeContext(
+ 		snapshotProject := pw.sess.Project
+ 		var checkpoint *db.ParserCheckpoint
+ 		var checkpointBlobs *db.ParserCheckpointBlobs
+-		if isCodexFormatAgent(pw.sess.Agent) {
++		if isCheckpointEligibleAgent(pw.sess.Agent) {
+ 			var checkpointErr error
+ 			checkpoint, checkpointBlobs, checkpointErr = e.buildCodexFullParseCheckpoint(pw.sess.File.Path, pw)
+ 			if checkpointErr != nil {
+@@ -19236,7 +19270,7 @@ func shouldReplaceFullParseMessages(
+ ) bool {
+ 	return forceReplace || pw.forceReplace || pw.needsRetry || stale ||
+ 		revivingSourceMissing ||
+-		isCodexFormatAgent(pw.sess.Agent) ||
++		isCheckpointEligibleAgent(pw.sess.Agent) ||
+ 		// Kiro full parses rebuild the complete accepted message projection;
+ 		// append semantics would retain rows removed or rewritten by the source.
+ 		pw.sess.Agent == parser.AgentKiro ||
+@@ -19433,7 +19467,8 @@ func (e *Engine) writeIncremental(ctx context.Context,
+ 
+ 	var replaceFromOrdinal *int
+ 	if inc.suffixReplace {
+-		replaceFromOrdinal = new(inc.replaceFromOrdinal)
++		ord := inc.replaceFromOrdinal
++		replaceFromOrdinal = &ord
+ 	}
+ 	var signalsMaintained bool
+ 	var maintainer db.SignalMaintainer
+@@ -19686,7 +19721,7 @@ func (e *Engine) writeSessionFullWithResolver(
+ 		}
+ 		var checkpoint *db.ParserCheckpoint
+ 		var checkpointBlobs *db.ParserCheckpointBlobs
+-		if isCodexFormatAgent(pw.sess.Agent) {
++		if isCheckpointEligibleAgent(pw.sess.Agent) {
+ 			var checkpointErr error
+ 			checkpoint, checkpointBlobs, checkpointErr = e.buildCodexFullParseCheckpoint(pw.sess.File.Path, pw)
+ 			if checkpointErr != nil {
+diff --git a/internal/sync/engine_integration_test.go b/internal/sync/engine_integration_test.go
+index 7ab7881a..e574d022 100644
+--- a/internal/sync/engine_integration_test.go
++++ b/internal/sync/engine_integration_test.go
+@@ -15858,9 +15858,7 @@ func TestIncrementalSync_CodexExecAppendRetainsEvents(t *testing.T) {
+ 	call := msgs[1].ToolCalls[0]
+ 	assert.Equal(t, "exec_command", call.ToolName, "tool name")
+ 	assert.Equal(t, "done", call.ResultContent, "result_content")
+-	require.Len(t, call.ResultEvents, 1)
+-	assert.Equal(t, "function_call_output", call.ResultEvents[0].Source)
+-	assert.Equal(t, "done", call.ResultEvents[0].Content)
++	require.Empty(t, call.ResultEvents)
+ 	afterIncremental, err := env.db.GetSessionFull(
+ 		t.Context(), "codex:inc-cx-exec",
+ 	)
+diff --git a/internal/sync/engine_test.go b/internal/sync/engine_test.go
+index de5ecb42..b1a9ec67 100644
+--- a/internal/sync/engine_test.go
++++ b/internal/sync/engine_test.go
+@@ -96,7 +96,7 @@ func TestIncrementalClaudeLateResultLinkScansDefiniteSecret(t *testing.T) {
+ 	require.NoError(t, err)
+ 	found := false
+ 	for _, finding := range findings {
+-		if finding.LocationKind == "tool_result_event" &&
++		if (finding.LocationKind == "tool_result" || finding.LocationKind == "tool_result_event") &&
+ 			strings.Contains(finding.RedactedMatch, "AKIA") {
+ 			found = true
+ 			break
+@@ -10473,6 +10473,31 @@ func TestEngine_ClassifyPathsOpenCodeSQLiteWALFile(
+ 	assert.Equal(t, parser.AgentOpenCode, files[0].Agent)
+ }
+ 
++func TestClassifyPaths_FiltersShmAndFoldsWal(t *testing.T) {
++	database := openTestDB(t)
++	opencodeDir := t.TempDir()
++	engine := NewEngine(t.Context(), database, EngineConfig{
++		AgentDirs: map[parser.AgentType][]string{
++			parser.AgentOpenCode: {opencodeDir},
++		},
++		Machine: "local",
++	})
++
++	dbPath := filepath.Join(opencodeDir, "opencode.db")
++	seedOpenCodeSQLiteWALSession(t, dbPath, "ses_wal")
++	walPath := filepath.Join(opencodeDir, "opencode.db-wal")
++	shmPath := filepath.Join(opencodeDir, "opencode.db-shm")
++
++	// Classifying only shmPath should produce zero discovered files.
++	shmFiles := requireClassifyPaths(t, engine, []string{shmPath})
++	assert.Empty(t, shmFiles)
++
++	// Classifying dbPath, walPath, and shmPath together should deduplicate into exactly one discovered file.
++	combinedFiles := requireClassifyPaths(t, engine, []string{dbPath, walPath, shmPath})
++	require.Len(t, combinedFiles, 1)
++	assert.Equal(t, parser.OpenCodeSQLiteVirtualPath(dbPath, "ses_wal"), combinedFiles[0].Path)
++}
++
+ // seedOpenCodeSQLiteWALSession creates a minimal OpenCode-shaped SQLite
+ // database and keeps its writer open with the session commit held in the WAL.
+ // This exercises the same uncheckpointed state produced by a live OpenCode
+@@ -11546,8 +11571,7 @@ func TestSyncAllReparsesCursorLegacyToolResultsFromVersion101(t *testing.T) {
+ 	require.Len(t, messages, 1)
+ 	require.Len(t, messages[0].ToolCalls, 1)
+ 	call := messages[0].ToolCalls[0]
+-	require.Len(t, call.ResultEvents, 1)
+-	assert.Equal(t, "file1.go", call.ResultEvents[0].Content)
++	require.Empty(t, call.ResultEvents)
+ 	assert.Equal(t, "file1.go", call.ResultContent)
+ }
+ 
+diff --git a/internal/sync/evener_test.go b/internal/sync/evener_test.go
+index 95ae6074..d0eb6d56 100644
+--- a/internal/sync/evener_test.go
++++ b/internal/sync/evener_test.go
+@@ -38,12 +38,11 @@ func TestEvenerRespectsBlockedResultCategories(t *testing.T) {
+ 			require.Len(t, messages, 3)
+ 			require.Len(t, messages[1].ToolCalls, 1)
+ 			call := messages[1].ToolCalls[0]
+-			assert.Equal(t, category, call.Category)
+-			require.Len(t, call.ResultEvents, 1)
+ 			if category == "Bash" {
++				require.Empty(t, call.ResultEvents)
+ 				assert.Equal(t, "result-marker", call.ResultContent)
+-				assert.Equal(t, "result-marker", call.ResultEvents[0].Content)
+ 			} else {
++				require.Len(t, call.ResultEvents, 1)
+ 				assert.Empty(t, call.ResultContent)
+ 				assert.Empty(t, call.ResultEvents[0].Content)
+ 			}
+@@ -100,8 +99,8 @@ func TestEvenerArchiveLifecycle(t *testing.T) {
+ 	assert.Equal(t, messages[1].ThinkingText, exported.Messages[1].ThinkingText)
+ 	assert.Equal(t, messages[1].TokenUsage, exported.Messages[1].TokenUsage)
+ 	require.Len(t, exported.Messages[1].ToolCalls, 1)
+-	require.Len(t, exported.Messages[1].ToolCalls[0].ResultEvents, 1)
+-	assert.Equal(t, "/workspace/demo", exported.Messages[1].ToolCalls[0].ResultEvents[0].Content)
++	require.Empty(t, exported.Messages[1].ToolCalls[0].ResultEvents)
++	assert.Equal(t, "/workspace/demo", exported.Messages[1].ToolCalls[0].ResultContent)
+ 
+ 	unchanged := engine.SyncAll(ctx, nil)
+ 	require.Zero(t, unchanged.Failed)
+diff --git a/internal/sync/junie_integration_test.go b/internal/sync/junie_integration_test.go
+index 0c9ab3f1..4cede6ad 100644
+--- a/internal/sync/junie_integration_test.go
++++ b/internal/sync/junie_integration_test.go
+@@ -474,3 +474,133 @@ func TestJunieBadIndexDoesNotBlockHealthyRoot(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestSyncJunieStartupStubDirectoryIsExcludedAndPurged(t *testing.T) {
++	root := t.TempDir()
++	sessionID := "session-stub"
++	sessionDir := filepath.Join(root, sessionID)
++	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
++	eventsPath := filepath.Join(sessionDir, "events.jsonl")
++
++	// 1. Initial valid session sync
++	require.NoError(t, os.WriteFile(eventsPath, []byte(
++		`{"kind":"UserPromptEvent","requestId":"req-1","prompt":"Hello"}`+"\n",
++	), 0o600))
++
++	database := openTestDB(t)
++	engine := NewEngine(t.Context(), database, EngineConfig{
++		AgentDirs: map[parser.AgentType][]string{parser.AgentJunie: {root}},
++		Machine:   "test",
++	})
++	t.Cleanup(engine.Close)
++
++	first := engine.SyncAll(t.Context(), nil)
++	require.Equal(t, 1, first.Synced)
++	require.Zero(t, first.Failed)
++
++	sess, err := database.GetSessionFull(t.Context(), "junie:"+sessionID)
++	require.NoError(t, err)
++	require.NotNil(t, sess)
++
++	// 2. Rewrite to startup stub (only SystemMessageEvents, no user prompts, no index)
++	require.NoError(t, os.WriteFile(eventsPath, []byte(
++		`{"kind":"SystemMessageEvent","text":"A new version is available"}`+"\n"+
++			`{"kind":"SystemMessageEvent","text":"Model switched to Grok"}`+"\n",
++	), 0o600))
++
++	second := engine.SyncAll(t.Context(), nil)
++	require.Zero(t, second.Failed)
++
++	// Verify session has been deleted from SQLite database
++	sess, err = database.GetSessionFull(t.Context(), "junie:"+sessionID)
++	require.NoError(t, err)
++	require.Nil(t, sess)
++
++	// 3. Fresh startup stub directory never creates a session in SQLite
++	freshStubID := "session-fresh-stub"
++	freshStubDir := filepath.Join(root, freshStubID)
++	require.NoError(t, os.MkdirAll(freshStubDir, 0o755))
++	require.NoError(t, os.WriteFile(filepath.Join(freshStubDir, "events.jsonl"), []byte(
++		`{"kind":"SystemMessageEvent","text":"Update check"}`+"\n",
++	), 0o600))
++
++	third := engine.SyncAll(t.Context(), nil)
++	require.Zero(t, third.Failed)
++
++	sess, err = database.GetSessionFull(t.Context(), "junie:"+freshStubID)
++	require.NoError(t, err)
++	require.Nil(t, sess)
++
++	// 4. Stub directory that later receives a real conversation is ingested normally
++	require.NoError(t, os.WriteFile(filepath.Join(freshStubDir, "events.jsonl"), []byte(
++		`{"kind":"SystemMessageEvent","text":"Update check"}`+"\n"+
++			`{"kind":"UserPromptEvent","requestId":"req-2","prompt":"Real question"}`+"\n",
++	), 0o600))
++
++	fourth := engine.SyncAll(t.Context(), nil)
++	require.Equal(t, 1, fourth.Synced)
++	require.Zero(t, fourth.Failed)
++
++	sess, err = database.GetSessionFull(t.Context(), "junie:"+freshStubID)
++	require.NoError(t, err)
++	require.NotNil(t, sess.FirstMessage)
++	assert.Equal(t, "Real question", *sess.FirstMessage)
++}
++
++func TestSyncJunieVanishedSubagentTombstones(t *testing.T) {
++	root := t.TempDir()
++	sessionID := "session-subagent-tombstone"
++	sessionDir := filepath.Join(root, sessionID)
++	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
++	eventsPath := filepath.Join(sessionDir, "events.jsonl")
++
++	subagentEvents := `{"kind":"UserPromptEvent","requestId":"r1","prompt":"Audit auth","timestampMs":1704067200000}` + "\n" +
++		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"SubagentSpawnedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"sub-step-1-spawned","name":"auth-auditor","task":"Audit the auth module for leaks"}},"timestampMs":1704067200100}` + "\n" +
++		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"MarkdownBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-1","name":"auth-auditor"},"stepId":"sub-step-1-request","text":"Audit the auth module for leaks"}},"timestampMs":1704067200110}` + "\n" +
++		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"AgentThoughtBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-1","name":"auth-auditor"},"stepId":"sub-think-1","text":"Scanning token handling"}},"timestampMs":1704067200120}` + "\n" +
++		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-1","name":"auth-auditor"},"stepId":"sub-res-1","result":"No leaks found."}},"timestampMs":1704067200130}` + "\n" +
++		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"res-1","result":"Audited: clean."}},"timestampMs":1704067200200}` + "\n"
++
++	require.NoError(t, os.WriteFile(eventsPath, []byte(subagentEvents), 0o600))
++
++	database := openTestDB(t)
++	engine := NewEngine(t.Context(), database, EngineConfig{
++		AgentDirs: map[parser.AgentType][]string{parser.AgentJunie: {root}},
++		Machine:   "test",
++	})
++	t.Cleanup(engine.Close)
++
++	first := engine.SyncAll(t.Context(), nil)
++	require.Equal(t, 2, first.Synced)
++	require.Zero(t, first.Failed)
++
++	parentSess, err := database.GetSessionFull(t.Context(), "junie:"+sessionID)
++	require.NoError(t, err)
++	require.NotNil(t, parentSess)
++	assert.Nil(t, parentSess.SourceMissingAt)
++
++	childSess, err := database.GetSessionFull(t.Context(), "junie:"+sessionID+"--agent-1")
++	require.NoError(t, err)
++	require.NotNil(t, childSess)
++	assert.Nil(t, childSess.SourceMissingAt)
++
++	// Rewrite events without the child blocks
++	rewrittenEvents := `{"kind":"UserPromptEvent","requestId":"r1","prompt":"Audit auth","timestampMs":1704067200000}` + "\n" +
++		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"res-1","result":"Audited: clean."}},"timestampMs":1704067200200}` + "\n"
++
++	require.NoError(t, os.WriteFile(eventsPath, []byte(rewrittenEvents), 0o600))
++
++	second := engine.SyncAll(t.Context(), nil)
++	require.Equal(t, 1, second.Synced)
++	require.Zero(t, second.Failed)
++
++	parentSess, err = database.GetSessionFull(t.Context(), "junie:"+sessionID)
++	require.NoError(t, err)
++	require.NotNil(t, parentSess)
++	assert.Nil(t, parentSess.SourceMissingAt)
++
++	childSess, err = database.GetSessionFull(t.Context(), "junie:"+sessionID+"--agent-1")
++	require.NoError(t, err)
++	require.NotNil(t, childSess)
++	assertSourceMissingState(t, childSess)
++}
+diff --git a/internal/sync/opencode_tool_files_test.go b/internal/sync/opencode_tool_files_test.go
+index ca2a441c..97685358 100644
+--- a/internal/sync/opencode_tool_files_test.go
++++ b/internal/sync/opencode_tool_files_test.go
+@@ -76,7 +76,7 @@ func TestOpenCodeV2ToolFilesSurviveSync(t *testing.T) {
+ 				require.NoError(t, database.Reader().QueryRowContext(t.Context(),
+ 					`SELECT COALESCE(result_content, '') FROM tool_calls WHERE session_id = ? AND tool_use_id = ?`,
+ 					"opencode:ses_files", call.ToolUseID).Scan(&storedSummary))
+-				assert.Empty(t, storedSummary, "timing and payload events keep only one stored copy")
++				assert.Equal(t, stored, storedSummary, "summary is stored directly on the tool call")
+ 				var blocks []map[string]any
+ 				require.NoError(t, json.Unmarshal([]byte(stored), &blocks))
+ 				if i == 0 {
+diff --git a/internal/sync/roocode_archive_test.go b/internal/sync/roocode_archive_test.go
+index 91fe6414..bc5bab37 100644
+--- a/internal/sync/roocode_archive_test.go
++++ b/internal/sync/roocode_archive_test.go
+@@ -98,11 +98,10 @@ func TestSyncRooCodeLateCommandResultUpdatesStoredToolCall(t *testing.T) {
+ 	require.Len(t, msgs, 2,
+ 		"the paired output must not appear as an extra message")
+ 	require.Len(t, msgs[1].ToolCalls, 1)
+-	events := msgs[1].ToolCalls[0].ResultEvents
+-	require.Len(t, events, 1,
+-		"the stored tool call must carry the late result event")
+-	assert.Equal(t, "errored", events[0].Status)
+-	assert.Contains(t, events[0].Content, "exit code 1")
++	call := msgs[1].ToolCalls[0]
++	require.Empty(t, call.ResultEvents,
++		"the single late result event is stored directly in result_content")
++	assert.Contains(t, call.ResultContent, "exit code 1")
+ }
+ 
+ // SyncAllSince must exclude unchanged RooCode tasks on stat information
+diff --git a/internal/sync/s3_source_test.go b/internal/sync/s3_source_test.go
+index bb6b8068..98a789d5 100644
+--- a/internal/sync/s3_source_test.go
++++ b/internal/sync/s3_source_test.go
+@@ -631,8 +631,7 @@ func TestSyncAllSinceReparsesCursorS3ToolResultsFromVersion101(t *testing.T) {
+ 	require.Len(t, messages, 1)
+ 	require.Len(t, messages[0].ToolCalls, 1)
+ 	call := messages[0].ToolCalls[0]
+-	require.Len(t, call.ResultEvents, 1)
+-	assert.Equal(t, "file1.go", call.ResultEvents[0].Content)
++	require.Empty(t, call.ResultEvents)
+ 	assert.Equal(t, "file1.go", call.ResultContent)
+ 	assert.Equal(t, db.CurrentDataVersion(), database.GetSessionDataVersion(t.Context(), sessionID))
+ 	require.EqualValues(t, 1, fetches.Load())
+diff --git a/internal/sync/signal_maintain.go b/internal/sync/signal_maintain.go
+index b5e102a9..1741fa62 100644
+--- a/internal/sync/signal_maintain.go
++++ b/internal/sync/signal_maintain.go
+@@ -167,6 +167,32 @@ func (m *incrementalSignalMaintainer) MaintainTx(
+ 		// go and the inserted events are scanned with their real indexes.
+ 		events := q.InsertedResultEvents(u.Position)
+ 		if len(events) == 0 {
++			if fact.ResultContent != "" {
++				deleteKeys = append(deleteKeys, db.FindingDeleteKey{
++					MessageOrdinal: fact.MessageOrdinal,
++					CallIndex:      fact.CallIndex,
++					LocationKind:   "tool_result",
++				})
++				secretScanBytes.Add(int64(len(fact.ResultContent)))
++				matches := secrets.ScanDefinite(fact.ResultContent)
++				for _, match := range matches {
++					callIdx := fact.CallIndex
++					insertFindings = append(insertFindings, db.SecretFinding{
++						SessionID:      m.sessionID,
++						RuleName:       match.Rule,
++						Confidence:     match.Confidence,
++						LocationKind:   "tool_result",
++						MessageOrdinal: fact.MessageOrdinal,
++						CallIndex:      &callIdx,
++						EventIndex:     nil,
++						MatchStart:     match.Start,
++						MatchEnd:       match.End,
++						MatchIndex:     match.Index,
++						RedactedMatch:  match.Redacted,
++						RulesVersion:   secrets.DefiniteRulesVersion(),
++					})
++				}
++			}
+ 			continue
+ 		}
+ 		deleteKeys = append(deleteKeys, db.FindingDeleteKey{
+diff --git a/internal/sync/signal_maintain_test.go b/internal/sync/signal_maintain_test.go
+index 56466493..00ba5d6e 100644
+--- a/internal/sync/signal_maintain_test.go
++++ b/internal/sync/signal_maintain_test.go
+@@ -705,7 +705,7 @@ func TestIncrementalSignalMaintainerParityWithFullResync(t *testing.T) {
+ 	)
+ 	require.NoError(t, err)
+ 	require.Len(t, findings, 1, "the AWS key in the output must be found")
+-	assert.Equal(t, "tool_result_event", findings[0].LocationKind)
++	assert.Equal(t, "tool_result", findings[0].LocationKind)
+ 
+ 	assert.Equal(t, 1, sess.ToolFailureSignalCount, "failure detection reads the deduplicated event content")
+ 	incrementalSignals := snapshotSessionSignals(sess)
+diff --git a/internal/sync/tool_result_images_test.go b/internal/sync/tool_result_images_test.go
+index 69f52ac4..5b919a76 100644
+--- a/internal/sync/tool_result_images_test.go
++++ b/internal/sync/tool_result_images_test.go
+@@ -312,15 +312,16 @@ func TestEngineImagePolicyDeduplicatesLateProjectedResult(t *testing.T) {
+ 		}},
+ 	}))
+ 
+-	var storedSummary, storedEvent string
++	var storedSummary string
+ 	require.NoError(t, database.Reader().QueryRowContext(
+ 		t.Context(), "SELECT COALESCE(result_content, '') FROM tool_calls WHERE session_id = ?", "late-result",
+ 	).Scan(&storedSummary))
++	var eventCount int
+ 	require.NoError(t, database.Reader().QueryRowContext(
+-		t.Context(), "SELECT content FROM tool_result_events WHERE session_id = ?", "late-result",
+-	).Scan(&storedEvent))
+-	assert.Empty(t, storedSummary)
+-	assert.Equal(t, want, storedEvent)
++		t.Context(), "SELECT COUNT(*) FROM tool_result_events WHERE session_id = ?", "late-result",
++	).Scan(&eventCount))
++	assert.Equal(t, want, storedSummary)
++	assert.Zero(t, eventCount)
+ }
+ 
+ func TestReadOnlyResyncReplacementCarriesImagePolicy(t *testing.T) {
+@@ -357,10 +358,16 @@ func TestReadOnlyResyncReplacementCarriesImagePolicy(t *testing.T) {
+ 					ToolCalls: []db.ToolCall{{
+ 						ToolUseID:     "copied-call",
+ 						ResultContent: copiedContent,
+-						ResultEvents: []db.ToolResultEvent{{
+-							ToolUseID: "copied-call", Source: "tool",
+-							Status: "completed", Content: copiedContent,
+-						}},
++						ResultEvents: []db.ToolResultEvent{
++							{
++								ToolUseID: "copied-call", Source: "tool",
++								Status: "completed", Content: copiedContent,
++							},
++							{
++								ToolUseID: "copied-call", Source: "tool",
++								Status: "completed", Content: copiedContent,
++							},
++						},
+ 					}},
+ 				}}))
+ 			}
+@@ -399,10 +406,16 @@ func TestReadOnlyResyncReplacementCarriesImagePolicy(t *testing.T) {
+ 				messages[0].ToolCalls = []db.ToolCall{{
+ 					ToolUseID:     "call-image",
+ 					ResultContent: content,
+-					ResultEvents: []db.ToolResultEvent{{
+-						ToolUseID: "call-image", Source: "tool",
+-						Status: "completed", Content: content,
+-					}},
++					ResultEvents: []db.ToolResultEvent{
++						{
++							ToolUseID: "call-image", Source: "tool",
++							Status: "completed", Content: content,
++						},
++						{
++							ToolUseID: "call-image", Source: "tool",
++							Status: "completed", Content: content,
++						},
++					},
+ 				}}
+ 				return database.ReplaceSessionMessages(t.Context(), "keep0", messages)
+ 			}
+@@ -426,7 +439,7 @@ func TestReadOnlyResyncReplacementCarriesImagePolicy(t *testing.T) {
+ 				require.Len(t, messages, 1)
+ 				require.Len(t, messages[0].ToolCalls, 1)
+ 				assert.NotContains(t, messages[0].ToolCalls[0].ResultContent, "input_image")
+-				require.Len(t, messages[0].ToolCalls[0].ResultEvents, 1)
++				require.Len(t, messages[0].ToolCalls[0].ResultEvents, 2)
+ 				assert.NotContains(t, messages[0].ToolCalls[0].ResultEvents[0].Content,
+ 					"input_image",
+ 				)
+@@ -546,7 +559,7 @@ func TestCodexImageRetentionAcrossFullAndLateResults(t *testing.T) {
+ 						} else {
+ 							assert.Contains(t, calls[0].ResultContent, `"image_ref":"asset://`)
+ 						}
+-						count := 1
++						count := 0
+ 						if late {
+ 							count = 2
+ 						}
+@@ -634,13 +647,14 @@ func TestToolResultImagesOffloadFullIngest(t *testing.T) {
+ 	require.NoError(t, err)
+ 	require.Len(t, messages, 1)
+ 	require.Len(t, messages[0].ToolCalls, 1)
+-	require.Len(t, messages[0].ToolCalls[0].ResultEvents, 1)
+-	require.Contains(t, messages[0].ToolCalls[0].ResultEvents[0].Content, `"image_ref":"asset://`)
++	require.Empty(t, messages[0].ToolCalls[0].ResultEvents)
++	require.Contains(t, messages[0].ToolCalls[0].ResultContent, `"image_ref":"asset://`)
+ 	page, err := database.ListSecretFindings(t.Context(), db.SecretFindingFilter{})
+ 	require.NoError(t, err)
+ 	require.Len(t, page.Findings, 1)
+ 	finding := page.Findings[0]
+-	content := messages[0].ToolCalls[0].ResultEvents[0].Content
++	assert.Equal(t, "tool_result", finding.LocationKind)
++	content := messages[0].ToolCalls[0].ResultContent
+ 	require.LessOrEqual(t, finding.MatchEnd, len(content))
+ 	assert.Equal(t, "AKIA7QHWN2DKR4FYPLJM", content[finding.MatchStart:finding.MatchEnd],
+ 		"secret offsets must address the stored content after image offload")
+diff --git a/internal/sync/tool_result_status_test.go b/internal/sync/tool_result_status_test.go
+index 85a2d6fc..142b99b1 100644
+--- a/internal/sync/tool_result_status_test.go
++++ b/internal/sync/tool_result_status_test.go
+@@ -45,10 +45,7 @@ func TestClaudeLateToolResultPreservesFailureMetadata(t *testing.T) {
+ 	require.Len(t, stored[1].ToolCalls, 1)
+ 	call := stored[1].ToolCalls[0]
+ 	assert.Equal(t, "File does not exist.", call.ResultContent)
+-	require.Len(t, call.ResultEvents, 1)
+-	assert.Equal(t, "errored", call.ResultEvents[0].Status)
+-	assert.Equal(t, "File does not exist.", call.ResultEvents[0].Content)
+-	assert.Equal(t, "2024-01-01T10:00:02Z", call.ResultEvents[0].Timestamp)
++	require.Empty(t, call.ResultEvents, "single result event is collapsed into result_content")
+ 	assert.Equal(t, 1, signals.ComputeToolHealth(ingest.ExtractToolCallRows(stored)).FailureSignalCount)
+ 
+ 	provider, ok := parser.NewProvider(parser.AgentClaude, parser.ProviderConfig{Roots: []string{root}, Machine: "local"})
+@@ -60,8 +57,8 @@ func TestClaudeLateToolResultPreservesFailureMetadata(t *testing.T) {
+ 	require.Len(t, parsed, 1)
+ 	candidate, err := ingest.PrepareCandidate(t.Context(), parsed[0], ingest.ContentOptions{})
+ 	require.NoError(t, err)
+-	assert.Equal(t, candidate.Messages[1].ToolCalls[0].ResultEvents, call.ResultEvents,
+-		"full parsing and late-result storage must retain the same metadata")
++	assert.Equal(t, candidate.Messages[1].ToolCalls[0].ResultContent, call.ResultContent,
++		"full parsing and late-result storage must retain the same summary")
+ 
+ 	require.NoError(t, database.SetSessionDataVersionsContext(t.Context(), []string{"session"}, db.CurrentDataVersion()-1))
+ 	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced,
+@@ -73,5 +70,5 @@ func TestClaudeLateToolResultPreservesFailureMetadata(t *testing.T) {
+ 	require.NoError(t, err)
+ 	require.Len(t, stored, 2)
+ 	require.Len(t, stored[1].ToolCalls, 1)
+-	assert.Equal(t, call.ResultEvents, stored[1].ToolCalls[0].ResultEvents)
++	assert.Equal(t, call.ResultContent, stored[1].ToolCalls[0].ResultContent)
+ }
+diff --git a/internal/sync/visualstudio_copilot_integration_test.go b/internal/sync/visualstudio_copilot_integration_test.go
+index 85c31c0c..32c55b78 100644
+--- a/internal/sync/visualstudio_copilot_integration_test.go
++++ b/internal/sync/visualstudio_copilot_integration_test.go
+@@ -980,7 +980,8 @@ func TestSyncEngineVisualStudioCopilotPreservesToolResultsWhenTraceShrinks(t *te
+ 	msgs := fetchMessages(t, database, sessionID)
+ 	require.Len(t, msgs, 1)
+ 	require.Len(t, msgs[0].ToolCalls, 1)
+-	require.Len(t, msgs[0].ToolCalls[0].ResultEvents, 1)
++	require.Empty(t, msgs[0].ToolCalls[0].ResultEvents)
++	assert.Equal(t, "Build succeeded.", msgs[0].ToolCalls[0].ResultContent)
+ 
+ 	require.NoError(t, os.WriteFile(tracePath, []byte(toolSpan("")), 0o644))
+ 	later := time.Unix(1781293700, 0)
+@@ -992,10 +993,10 @@ func TestSyncEngineVisualStudioCopilotPreservesToolResultsWhenTraceShrinks(t *te
+ 	msgs = fetchMessages(t, database, sessionID)
+ 	require.Len(t, msgs, 1)
+ 	require.Len(t, msgs[0].ToolCalls, 1)
+-	require.Len(t, msgs[0].ToolCalls[0].ResultEvents, 1,
+-		"archived tool result event must be preserved")
++	require.Empty(t, msgs[0].ToolCalls[0].ResultEvents)
+ 	assert.Equal(t, "Build succeeded.",
+-		msgs[0].ToolCalls[0].ResultEvents[0].Content)
++		msgs[0].ToolCalls[0].ResultContent,
++		"archived tool result event must be preserved")
+ }
+ 
+ // TestSyncEngineVisualStudioCopilotMergesRicherMatchedMessageWhenTraceShrinks
+@@ -1077,10 +1078,10 @@ func TestSyncEngineVisualStudioCopilotMergesRicherMatchedMessageWhenTraceShrinks
+ 		"archived-only sibling message must be retained")
+ 	assert.Equal(t, strings.TrimSpace(firstPrompt), msgs[0].Content)
+ 	require.Len(t, msgs[1].ToolCalls, 1)
+-	require.Len(t, msgs[1].ToolCalls[0].ResultEvents, 1,
+-		"richer same-key tool result must be merged into archive")
++	require.Empty(t, msgs[1].ToolCalls[0].ResultEvents)
+ 	assert.Equal(t, "Build succeeded.",
+-		msgs[1].ToolCalls[0].ResultEvents[0].Content)
++		msgs[1].ToolCalls[0].ResultContent,
++		"richer same-key tool result must be merged into archive")
+ 	assert.Equal(t, strings.TrimSpace(lastPrompt), msgs[2].Content)
+ 
+ 	assertSessionState(t, database, sessionID, func(sess *db.Session) {
+@@ -1146,7 +1147,8 @@ func TestSyncEngineVisualStudioCopilotMergesUpdateAndPreservesIncompleteSameCoun
+ 	msgs := fetchMessages(t, database, sessionID)
+ 	require.Len(t, msgs, 2)
+ 	require.Empty(t, msgs[0].ToolCalls[0].ResultEvents)
+-	require.Len(t, msgs[1].ToolCalls[0].ResultEvents, 1)
++	require.Empty(t, msgs[1].ToolCalls[0].ResultEvents)
++	assert.Equal(t, strings.TrimSpace(longResult), msgs[1].ToolCalls[0].ResultContent)
+ 
+ 	reparse := strings.Join([]string{
+ 		toolSpan("tool_build", "call_build", "dotnet build",
+@@ -1164,14 +1166,14 @@ func TestSyncEngineVisualStudioCopilotMergesUpdateAndPreservesIncompleteSameCoun
+ 	))
+ 	msgs = fetchMessages(t, database, sessionID)
+ 	require.Len(t, msgs, 2)
+-	require.Len(t, msgs[0].ToolCalls[0].ResultEvents, 1,
+-		"same-count richer message must be merged")
++	require.Empty(t, msgs[0].ToolCalls[0].ResultEvents)
+ 	assert.Equal(t, "Build succeeded.",
+-		msgs[0].ToolCalls[0].ResultEvents[0].Content)
+-	require.Len(t, msgs[1].ToolCalls[0].ResultEvents, 1,
+-		"same-count incomplete message must keep archived result")
++		msgs[0].ToolCalls[0].ResultContent,
++		"same-count richer message must be merged")
++	require.Empty(t, msgs[1].ToolCalls[0].ResultEvents)
+ 	assert.Equal(t, strings.TrimSpace(longResult),
+-		msgs[1].ToolCalls[0].ResultEvents[0].Content)
++		msgs[1].ToolCalls[0].ResultContent,
++		"same-count incomplete message must keep archived result")
+ }
+ 
+ func TestSyncEngineVisualStudioCopilotMergeDerivesFirstMessageFromMergedRows(t *testing.T) {
+@@ -1465,9 +1467,9 @@ func TestSyncEngineVisualStudioCopilotDoesNotAppendRotatedDuplicateToolCall(t *t
+ 		msgs[0].Content)
+ 	require.Len(t, msgs[0].ToolCalls, 1)
+ 	assert.Equal(t, "call_build", msgs[0].ToolCalls[0].ToolUseID)
+-	require.Len(t, msgs[0].ToolCalls[0].ResultEvents, 1)
++	require.Empty(t, msgs[0].ToolCalls[0].ResultEvents)
+ 	assert.Equal(t, "Build succeeded.",
+-		msgs[0].ToolCalls[0].ResultEvents[0].Content)
++		msgs[0].ToolCalls[0].ResultContent)
+ 	assert.Equal(t, "Archived prompt.", msgs[1].Content)
+ }
+ 
+diff --git a/internal/sync/watcher.go b/internal/sync/watcher.go
+index f1a30df5..78352b80 100644
+--- a/internal/sync/watcher.go
++++ b/internal/sync/watcher.go
+@@ -156,7 +156,22 @@ func (p *pendingWatchBatch) Empty() bool {
+ 		len(p.backendRenames) == 0 && len(p.roots) == 0 && len(p.lifecycle) == 0
+ }
+ 
++func isSQLiteSHMPath(path string) bool {
++	return strings.HasSuffix(path, "-shm")
++}
++
+ func (p *pendingWatchBatch) Add(path string) {
++	if isSQLiteSHMPath(path) {
++		return
++	}
++	if strings.HasSuffix(path, "-wal") {
++		mainDB := strings.TrimSuffix(path, "-wal")
++		if _, exists := p.paths[mainDB]; exists {
++			return
++		}
++	} else {
++		delete(p.paths, path+"-wal")
++	}
+ 	if _, exists := p.paths[path]; exists {
+ 		return
+ 	}
+@@ -172,6 +187,17 @@ func (p *pendingWatchBatch) Add(path string) {
+ // caller stops enumerating. Unrelated pending work can still exhaust even the
+ // reserve, in which case the existing full-sync overflow contract applies.
+ func (p *pendingWatchBatch) AddCreatedSubtreePath(path, root string) bool {
++	if isSQLiteSHMPath(path) {
++		return true
++	}
++	if strings.HasSuffix(path, "-wal") {
++		mainDB := strings.TrimSuffix(path, "-wal")
++		if _, exists := p.paths[mainDB]; exists {
++			return true
++		}
++	} else {
++		delete(p.paths, path+"-wal")
++	}
+ 	if p.fullSync {
+ 		return false
+ 	}
+@@ -239,6 +265,9 @@ func (p *pendingWatchBatch) AddBackendEvent(event backendEvent) bool {
+ 		p.AddReconcileRoot(root)
+ 	}
+ 	if event.Op&backendOpRename != 0 {
++		if isSQLiteSHMPath(event.Path) {
++			return wasFullSync || !p.fullSync
++		}
+ 		rename := pendingBackendRename{
+ 			Path:     event.Path,
+ 			Root:     event.Root,
+diff --git a/internal/sync/watcher_test.go b/internal/sync/watcher_test.go
+index 06a646fc..f1c88707 100644
+--- a/internal/sync/watcher_test.go
++++ b/internal/sync/watcher_test.go
+@@ -498,6 +498,25 @@ func TestPendingWatchBatchOverflowsByEntryCount(t *testing.T) {
+ 	assert.Empty(t, batch.Paths)
+ }
+ 
++func TestPendingWatchBatch_FiltersShmAndFoldsWal(t *testing.T) {
++	pending := newPendingWatchBatch(10, 1_000)
++
++	// -shm should be ignored completely
++	pending.Add("/data/opencode.db-shm")
++	assert.True(t, pending.Empty())
++
++	// -wal should fold into .db
++	pending.Add("/data/opencode.db-wal")
++	assert.False(t, pending.Empty())
++
++	// adding both .db and .wal should produce only a single entry for .db
++	pending.Add("/data/opencode.db")
++
++	batch, ok := pending.Take()
++	require.True(t, ok)
++	assert.Equal(t, []string{"/data/opencode.db"}, batch.Paths)
++}
++
+ func TestWatchBatchAccumulatorMergesAndSortsPublicWork(t *testing.T) {
+ 	accumulator := NewWatchBatchAccumulator(nil)
+ 	rename := WatchRename{

@@ -1,0 +1,308 @@
+package pricing
+
+import (
+	"slices"
+	"strings"
+)
+
+type Match[T any] struct {
+	Value   T
+	Pattern string
+	OK      bool
+}
+
+// NormalizeModelName converts a model id's dots to dashes so agents
+// that report dotted ids (e.g. opencode's claude-opus-4.7) match the
+// dashed LiteLLM pricing keys (claude-opus-4-7). Use only as a
+// fallback after an exact match.
+func NormalizeModelName(model string) string {
+	return strings.ReplaceAll(model, ".", "-")
+}
+
+// canonicalize strips any provider prefix (after the last '/') and
+// converts the string to lowercase, removing all non-alphanumeric characters.
+func canonicalize(s string) string {
+	if idx := strings.LastIndex(s, "/"); idx != -1 {
+		s = s[idx+1:]
+	}
+	var sb strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String()
+}
+
+// Resolve looks up model in m, falling back to NormalizeModelName when
+// there is no exact match, then case-insensitive matches, and finally
+// canonical matches with curated trailing decorations stripped.
+func Resolve[T any](m map[string]T, model string) (T, bool) {
+	match := ResolveMatch(model, m)
+	return match.Value, match.OK
+}
+
+// ResolveMatch is Resolve plus the pricing pattern/key that supplied the
+// value. Pattern is empty when no value is resolved.
+func ResolveMatch[T any](model string, m map[string]T) Match[T] {
+	var zero T
+	// 1. Exact match
+	if v, ok := m[model]; ok {
+		return Match[T]{Value: v, Pattern: model, OK: true}
+	}
+	// 2. Exact match on normalized (dotted to dashed)
+	if norm := NormalizeModelName(model); norm != model {
+		if v, ok := m[norm]; ok {
+			return Match[T]{Value: v, Pattern: norm, OK: true}
+		}
+	}
+	// 3. Case-insensitive exact match
+	lowerModel := strings.ToLower(model)
+	for k, v := range m {
+		if strings.ToLower(k) == lowerModel {
+			return Match[T]{Value: v, Pattern: k, OK: true}
+		}
+	}
+	lowerNorm := strings.ToLower(NormalizeModelName(model))
+	for k, v := range m {
+		if strings.ToLower(k) == lowerNorm {
+			return Match[T]{Value: v, Pattern: k, OK: true}
+		}
+	}
+	// 4. Canonical match with curated decoration stripping
+	if v, pattern, ok := resolveCanonicalMatch(m, model); ok {
+		return Match[T]{Value: v, Pattern: pattern, OK: true}
+	}
+	// 5. Reasoning-effort / speed tier fallback. Agents such as Devin append
+	// a reasoning-effort tier (e.g. "-thinking", "-high", "-medium", "-max")
+	// and sometimes a "-fast" speed tier to a base model that prices
+	// identically regardless of tier. Strip those trailing tiers and retry
+	// the full ladder on the base. This runs only after every exact and
+	// canonical attempt above has failed, so any real model whose full name
+	// is catalogued (mistral-medium, grok-4-fast, o3-mini-high,
+	// moonshot/kimi-k2-thinking) is matched first and never reduced.
+	if base := EffortTierBaseModel(model); base != model {
+		if sub := ResolveMatch(base, m); sub.OK {
+			return sub
+		}
+	}
+	return Match[T]{Value: zero}
+}
+
+// effortTierSuffixes are reasoning-effort tiers that do not change a model's
+// per-token price: the same base model is billed identically whether the
+// provider ran it at minimal or maximal effort. They are only ever stripped
+// as a last resort (see ResolveMatch step 5), so a catalogued model that
+// genuinely ends in one of these words is matched by an earlier exact or
+// canonical step and never reaches the stripping path.
+var effortTierSuffixes = map[string]struct{}{
+	"thinking": {}, "minimal": {}, "low": {}, "medium": {},
+	"high": {}, "xhigh": {}, "max": {},
+}
+
+// EffortTierBaseModel removes trailing reasoning-effort tiers from a model
+// name, plus a single trailing "-fast" speed tier when it rides on top of an
+// effort tier ("<base>-medium-fast"). A bare trailing "-fast" is preserved
+// because some providers price it as a distinct model (xAI grok-*-fast), as is
+// any name that carries no effort tier. Comparison is case-insensitive.
+func EffortTierBaseModel(model string) string {
+	s := model
+	// A speed tier is only strippable atop an effort tier; drop one "-fast"
+	// when the token before it is itself an effort tier.
+	if tok, rest, ok := lastDashToken(s); ok && tok == "fast" {
+		if prev, _, ok2 := lastDashToken(rest); ok2 {
+			if _, isEffort := effortTierSuffixes[prev]; isEffort {
+				s = rest
+			}
+		}
+	}
+	for {
+		tok, rest, ok := lastDashToken(s)
+		if !ok {
+			return s
+		}
+		if _, isEffort := effortTierSuffixes[tok]; !isEffort {
+			return s
+		}
+		s = rest
+	}
+}
+
+// lastDashToken splits off the final '-'-delimited token of s, returning the
+// lowercased token and the remainder before the '-'. It reports false when
+// there is no interior '-' (a leading '-' is not a separator).
+func lastDashToken(s string) (tok, rest string, ok bool) {
+	idx := strings.LastIndex(s, "-")
+	if idx <= 0 {
+		return "", "", false
+	}
+	return strings.ToLower(s[idx+1:]), s[:idx], true
+}
+
+// resolveCanonicalMatch matches the canonicalized model name exactly against
+// canonicalized keys, retrying with a trailing bracketed or parenthesized
+// decoration removed ("claude-fable-5[1m]", "Gemini 3.5 Flash (Medium)") and
+// then a trailing -YYYYMMDD release date removed. Earlier (less-stripped)
+// candidates win. Arbitrary substring matching is deliberately avoided: a
+// shorter pricing key inside a longer model name (gpt-5.5 inside
+// gpt-5.5-codex) would silently misprice a distinct model that should stay
+// unpriced.
+//
+// Keys are ranked so resolution is deterministic when several keys
+// canonicalize alike: a key whose provider prefix matches the model's wins,
+// then an unqualified key, then a provider-qualified key for an unqualified
+// model. Distinct keys tied within one rank are ambiguous and stay unresolved.
+// Keys whose provider conflicts with a qualified model are never considered.
+func resolveCanonicalMatch[T any](m map[string]T, model string) (T, string, bool) {
+	var zero T
+	candidates := canonicalCandidates(model)
+	if len(candidates) == 0 {
+		return zero, "", false
+	}
+
+	const ranks = 3
+	modelProvider := canonicalProvider(model)
+	counts := make([][ranks]int, len(candidates))
+	vals := make([][ranks]T, len(candidates))
+	patterns := make([][ranks]string, len(candidates))
+	for k, v := range m {
+		keyProvider := canonicalProvider(k)
+		if keyProvider != "" && modelProvider != "" &&
+			keyProvider != modelProvider {
+			continue
+		}
+		kCanon := canonicalize(k)
+		if kCanon == "" {
+			continue
+		}
+		rank := keyRank(modelProvider, keyProvider)
+		for i, c := range candidates {
+			if kCanon == c {
+				counts[i][rank]++
+				vals[i][rank] = v
+				patterns[i][rank] = k
+				break
+			}
+		}
+	}
+	for i := range candidates {
+		for r := range ranks {
+			if counts[i][r] == 1 {
+				return vals[i][r], patterns[i][r], true
+			}
+			if counts[i][r] > 1 {
+				return zero, "", false
+			}
+		}
+	}
+	return zero, "", false
+}
+
+// keyRank orders canonical matches: same-provider key (0), unqualified
+// key (1), provider-qualified key for an unqualified model (2).
+func keyRank(modelProvider, keyProvider string) int {
+	switch keyProvider {
+	case "":
+		return 1
+	case modelProvider:
+		return 0
+	default:
+		return 2
+	}
+}
+
+// canonicalCandidates returns the canonical forms of model to try, in
+// decreasing specificity: as reported, with one trailing bracketed or
+// parenthesized decoration removed, and additionally with a trailing
+// -YYYYMMDD release date removed.
+func canonicalCandidates(model string) []string {
+	var candidates []string
+	add := func(s string) {
+		c := canonicalize(s)
+		if c != "" && !slices.Contains(candidates, c) {
+			candidates = append(candidates, c)
+		}
+	}
+	add(model)
+	undecorated := stripTrailingGroup(model)
+	add(undecorated)
+	add(stripTrailingDate(undecorated))
+	return candidates
+}
+
+// canonicalProvider returns the canonicalized provider prefix of a
+// model name ("openai/gpt-5.5" -> "openai"), or "" when unqualified.
+func canonicalProvider(s string) string {
+	idx := strings.LastIndex(s, "/")
+	if idx <= 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for _, r := range strings.ToLower(s[:idx]) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String()
+}
+
+// stripTrailingGroup removes one trailing parenthesized or bracketed
+// decoration: "Gemini 3.5 Flash (Medium)" -> "Gemini 3.5 Flash",
+// "claude-fable-5[1m]" -> "claude-fable-5".
+func stripTrailingGroup(s string) string {
+	t := strings.TrimRight(s, " ")
+	var open string
+	switch {
+	case strings.HasSuffix(t, ")"):
+		open = "("
+	case strings.HasSuffix(t, "]"):
+		open = "["
+	default:
+		return s
+	}
+	i := strings.LastIndex(t, open)
+	if i <= 0 {
+		return s
+	}
+	return strings.TrimRight(t[:i], " ")
+}
+
+// stripTrailingDate removes a trailing -YYYYMMDD release-date suffix:
+// "claude-opus-4-7-20260101" -> "claude-opus-4-7".
+func stripTrailingDate(s string) string {
+	i := strings.LastIndex(s, "-")
+	if i <= 0 || len(s)-i-1 != 8 {
+		return s
+	}
+	for _, r := range s[i+1:] {
+		if r < '0' || r > '9' {
+			return s
+		}
+	}
+	return s[:i]
+}
+
+// OllamaCloudBaseModel removes the Ollama Cloud marker from a model tag.
+// Ollama names its hosted models with a ":cloud" tag ("kimi-k2.7-code:cloud")
+// or a "-cloud" suffix on a size tag ("gpt-oss:120b-cloud"). Both run the
+// same upstream model that Ollama bills per token at that model's own
+// published rate, so the catalog row for the untagged name is the right
+// estimate: "kimi-k2.7-code:cloud" -> "kimi-k2.7-code", "gpt-oss:120b-cloud"
+// -> "gpt-oss:120b". Local tags (":27b-mlx", ":latest", ":31b") are preserved
+// because a locally served model has no per-token price, and the size in a
+// tag is kept because size changes the rate. Comparison is case-insensitive.
+func OllamaCloudBaseModel(model string) string {
+	idx := strings.LastIndex(model, ":")
+	if idx <= 0 {
+		return model
+	}
+	const marker = "cloud"
+	tag := strings.ToLower(model[idx+1:])
+	switch {
+	case tag == marker:
+		return model[:idx]
+	case len(tag) > len(marker)+1 && strings.HasSuffix(tag, "-"+marker):
+		return model[:len(model)-len(marker)-1]
+	}
+	return model
+}

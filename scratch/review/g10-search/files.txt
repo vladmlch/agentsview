@@ -1,0 +1,15 @@
+frontend/e2e/session-find-regressions.spec.ts
+frontend/e2e/session-find.spec.ts
+frontend/src/lib/components/content/FindOverviewRail.svelte
+frontend/src/lib/components/content/FindOverviewRail.test.ts
+frontend/src/lib/components/content/SessionFindView.svelte
+frontend/src/lib/search/README.md
+frontend/src/lib/search/navigation.test.ts
+frontend/src/lib/search/overview.test.ts
+frontend/src/lib/search/results.test.ts
+frontend/src/lib/search/session-index.test.ts
+frontend/src/lib/search/session-index.ts
+frontend/src/lib/search/session-scope.test.ts
+frontend/src/lib/search/session-scope.ts
+frontend/src/lib/stores/inSessionSearch.svelte.ts
+frontend/src/lib/stores/inSessionSearch.test.ts

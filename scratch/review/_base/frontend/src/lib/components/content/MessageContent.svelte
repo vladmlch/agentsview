@@ -1,0 +1,414 @@
+<script lang="ts">
+  import type { Session } from "../../api/types.js";
+import type { DbMessage as Message } from "../../api/generated/index.js";
+  import type { DbCallTiming as CallTiming, DbTurnTiming as TurnTiming } from "../../api/generated/index.js";
+  import { parseContent, enrichSegments } from "../../utils/content-parser.js";
+  import { formatTimestamp, formatTokenUsage } from "../../utils/format.js";
+  import { formatDuration } from "../../utils/duration.js";
+  import { copyToClipboard } from "../../utils/clipboard.js";
+  import { formatMessageForCopy } from "../../utils/copy-message.js";
+  import { sessionAncestryMatches } from "../../utils/session-ancestry.js";
+  import { messages as messagesStore } from "../../stores/messages.svelte.js";
+  import { sessionTiming } from "../../stores/sessionTiming.svelte.js";
+  import { liveTick } from "../../stores/liveTick.svelte.js";
+  import { isRemoteConnection } from "../../api/runtime.js";
+  import { SessionsService, type ResumeRequest, type ResumeResponse } from "../../api/generated/index";
+  import ThinkingBlock from "./ThinkingBlock.svelte";
+  import ToolBlock from "./ToolBlock.svelte";
+  import ParallelGroup from "./ParallelGroup.svelte";
+  import CodeBlock from "./CodeBlock.svelte";
+  import MermaidBlock from "./MermaidBlock.svelte";
+  import SkillBlock from "./SkillBlock.svelte";
+  import { Button, CopyButton } from "@kenn-io/kit-ui";
+  import { ui } from "../../stores/ui.svelte.js";
+  import { pins } from "../../stores/pins.svelte.js";
+  import { sessions } from "../../stores/sessions.svelte.js";
+  import { sync } from "../../stores/sync.svelte.js";
+  import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+  import { blockKey } from "../../search/block-text.js";
+  import { searchBlock } from "../../search/session-block.svelte.js";
+  import { highlightCodeFences } from "../../utils/highlight-fences.js";
+  import { loadAssetImages, renderMarkdown } from "../../utils/markdown.js";
+  import { displayToolName } from "../../utils/toolDisplay.js";
+  import { ChevronDownIcon, ChevronRightIcon, CirclePlayIcon, PinIcon } from "../../icons.js";
+  import { m } from "../../i18n/index.js";
+
+  interface Props {
+    message: Message;
+    session?: Session | null;
+    isSubagentContext?: boolean;
+    searchOrdinal?: number;
+    compact?: boolean;
+    allowMutations?: boolean;
+  }
+  let { message, session, isSubagentContext = false, searchOrdinal, compact = false, allowMutations = true }: Props = $props();
+  let copied = $state(false);
+  let segments = $derived(enrichSegments(
+    parseContent(message.content, message.has_tool_use, message.id, message.content_length),
+    message.tool_calls,
+  ));
+  // Embedded subagents have their own ordinal namespace and are never searched here.
+  let activeSearchOrdinal = $derived(isSubagentContext ? undefined : searchOrdinal);
+  let hasSearchQuery = $derived(activeSearchOrdinal !== undefined && inSessionSearch.isActive);
+  let isUser = $derived(message.role === "user");
+  let mainModel = $derived(!isSubagentContext && messagesStore.sessionId === message.session_id
+    ? messagesStore.mainModel : "");
+  let offMainModel = $derived.by((): string => {
+    if (isUser || !message.model || !mainModel) return "";
+    return message.model !== mainModel ? message.model : "";
+  });
+  let hasContextTokens = $derived(message.has_context_tokens ?? message.context_tokens > 0);
+  let hasOutputTokens = $derived(message.has_output_tokens ?? message.output_tokens > 0);
+  let tokenSummary = $derived(formatTokenUsage(message.context_tokens, hasContextTokens, message.output_tokens, hasOutputTokens));
+  let owningSession = $derived(session !== undefined ? session
+    : sessions.sessions.find((s) => s.id === message.session_id) ?? sessions.activeSession);
+
+  const INLINE_TEAMMATE_MESSAGE_RE =
+    /<teammate-message\b[^>]*\bteammate_id\s*=\s*(?:"[^"]+"|'[^']+'|[^\s>]+)[^>]*>[\s\S]*?<\/teammate-message\s*>/;
+  let hasInlineTeammateMessage = $derived(isUser && !isSubagentContext && segments.some(
+    (segment) => segment.type === "text" && INLINE_TEAMMATE_MESSAGE_RE.test(segment.content),
+  ));
+  let sessionKind = $derived.by((): "teammate" | "subagent" | "user" => {
+    const s = owningSession;
+    if (!s) return "user";
+    const all = sessions.sessions;
+    if (sessionAncestryMatches(s, all, (ancestor) => ancestor.relationship_type === "subagent")) return "subagent";
+    if (sessionAncestryMatches(s, all, (ancestor) => (ancestor.first_message ?? "").includes("<teammate-message"))) return "teammate";
+    return "user";
+  });
+  let roleLabel = $derived.by(() => {
+    if (!isUser) return m.message_content_role_assistant();
+    if (isSubagentContext || sessionKind === "subagent") return m.message_content_role_agent();
+    if (sessionKind === "teammate" || hasInlineTeammateMessage) return m.message_content_role_teammate();
+    return m.message_content_role_user();
+  });
+  let roleIcon = $derived.by(() => {
+    if (!isUser) return "A";
+    if (isSubagentContext || sessionKind === "subagent") return "S";
+    if (sessionKind === "teammate" || hasInlineTeammateMessage) return "T";
+    return "U";
+  });
+  /** Code fences expanded from their filtered placeholder, keyed by segment index. */
+  let expandedCodeBlocks = $state(new Set<number>());
+
+  function toggleCodeBlock(segmentIndex: number) {
+    const next = new Set(expandedCodeBlocks);
+    if (next.has(segmentIndex)) {
+      next.delete(segmentIndex);
+    } else {
+      next.add(segmentIndex);
+    }
+    expandedCodeBlocks = next;
+  }
+
+  function codeFenceToggleLabel(language: string, expanded: boolean): string {
+    if (expanded) {
+      return language
+        ? m.message_content_code_expanded_with_language({ language })
+        : m.message_content_code_expanded();
+    }
+    return language
+      ? m.message_content_code_collapsed_with_language({ language })
+      : m.message_content_code_collapsed();
+  }
+
+  let showText = $derived(ui.isBlockVisible(isUser ? "user" : "assistant"));
+  let accentColor = $derived(isUser ? "var(--accent-blue)" : "var(--accent-purple)");
+  let accentForeground = $derived(isUser ? "var(--accent-blue-foreground)" : "var(--accent-purple-foreground)");
+  let roleBg = $derived(isUser ? "var(--user-bg)" : "var(--assistant-bg)");
+  let pinned = $derived(pins.isPinned(message.id));
+  let pinFeedback = $state("");
+  let forkFeedback = $state("");
+  let turnByMessage = $derived.by(() => {
+    const map = new Map<number, TurnTiming>();
+    for (const turn of sessionTiming.timing?.turns ?? []) map.set(turn.message_id, turn);
+    return map;
+  });
+  let callByToolUseID = $derived.by(() => {
+    const map = new Map<string, CallTiming>();
+    for (const turn of sessionTiming.timing?.turns ?? []) {
+      for (const call of turn.calls) map.set(call.tool_use_id, call);
+    }
+    return map;
+  });
+  function soloDurationLabel(
+    ct: CallTiming | undefined,
+    turn: TurnTiming | undefined,
+    msg: Message,
+  ): string | undefined {
+    if (ct?.duration_ms != null) return formatDuration(ct.duration_ms);
+    if (sessionTiming.timing?.running && turn != null && turn.duration_ms == null) {
+      const startMs = new Date(turn.started_at ?? msg.timestamp).getTime();
+      const elapsed = Number.isNaN(startMs) ? 0 : Math.max(0, liveTick.now - startMs);
+      return m.message_content_running_duration({ duration: formatDuration(elapsed) });
+    }
+    return undefined;
+  }
+  function isRunningTurn(msg: Message): boolean {
+    if (!sessionTiming.timing?.running) return false;
+    const turn = turnByMessage.get(msg.id);
+    return turn != null && turn.duration_ms == null;
+  }
+  let turnSummary = $derived.by(() => {
+    if (isUser || !message.has_tool_use) return null;
+    const calls = message.tool_calls?.length ?? 0;
+    const turn = turnByMessage.get(message.id);
+    if (turn?.duration_ms != null) {
+      return { text: m.message_content_turn_summary({ duration: formatDuration(turn.duration_ms), count: calls }), slow: false, running: false };
+    }
+    if (sessionTiming.timing?.running && turn != null) {
+      const startMs = new Date(turn.started_at ?? message.timestamp).getTime();
+      const elapsed = Number.isNaN(startMs) ? 0 : Math.max(0, liveTick.now - startMs);
+      return { text: m.message_content_running_turn_summary({ duration: formatDuration(elapsed), count: calls }), slow: false, running: true };
+    }
+    return null;
+  });
+  let copyTimer: ReturnType<typeof setTimeout>;
+  let pinTimer: ReturnType<typeof setTimeout>;
+  let forkTimer: ReturnType<typeof setTimeout>;
+  async function handleCopy() {
+    const ok = await copyToClipboard(formatMessageForCopy(message));
+    if (ok) {
+      clearTimeout(copyTimer); copied = true;
+      copyTimer = setTimeout(() => { copied = false; }, 1500);
+    }
+  }
+  async function handleTogglePin() {
+    const wasPinned = pinned;
+    try {
+      await pins.togglePin(message.session_id, message.id, message.ordinal);
+      clearTimeout(pinTimer);
+      pinFeedback = wasPinned ? m.message_content_unpinned() : m.message_content_pinned();
+      pinTimer = setTimeout(() => { pinFeedback = ""; }, 1500);
+    } catch { /* Preserve the existing non-blocking pin interaction. */ }
+  }
+  let canForkFromMessage = $derived(allowMutations && owningSession?.agent === "claude" &&
+    !(owningSession?.id ?? "").includes("~") && !(sync.readOnly && isRemoteConnection()));
+  async function handleForkFromHere() {
+    if (!canForkFromMessage) return;
+    clearTimeout(forkTimer);
+    try {
+      const resp = await SessionsService.postApiV1SessionsByIdResume(
+        { id: message.session_id },
+        {
+          ...(sync.readOnly && !isRemoteConnection() ? { command_only: true } : {}),
+          from_ordinal: message.ordinal, fork_session: true,
+        } satisfies ResumeRequest,
+      ) as ResumeResponse;
+      if (resp.launched) {
+        forkFeedback = m.session_breadcrumb_resumed_in({ target: resp.terminal ?? "terminal" });
+        forkTimer = setTimeout(() => { forkFeedback = ""; }, 2000);
+        return;
+      }
+      if (resp.command) {
+        const ok = await copyToClipboard(resp.command);
+        forkFeedback = ok ? m.session_breadcrumb_command_copied() : m.session_breadcrumb_failed();
+        forkTimer = setTimeout(() => { forkFeedback = ""; }, 2000);
+        return;
+      }
+    } catch { /* Show the existing failure feedback below. */ }
+    forkFeedback = m.session_breadcrumb_failed();
+    forkTimer = setTimeout(() => { forkFeedback = ""; }, 2000);
+  }
+</script>
+
+<div class="message" class:is-user={isUser} class:compact style:border-left-color={accentColor} style:background={roleBg}>
+  <div class="message-header">
+    <span class="role-icon" style:background={accentColor} style:color={accentForeground}>{roleIcon}</span>
+    <span class="role-label" style:color={accentColor}>{roleLabel}</span>
+    <CopyButton revealOnHover {copied} ariaLabel={m.message_content_copy_message()}
+      copiedAriaLabel={m.message_content_copied_message()} title={m.message_content_copy_message()}
+      copiedTitle={m.message_content_copied()} onclick={handleCopy} />
+    {#if allowMutations}
+    <button type="button" class="pin-btn" class:pinned
+      title={pinned ? m.message_content_unpin_message() : m.message_content_pin_message()} onclick={handleTogglePin}>
+      <PinIcon size="14" strokeWidth="1.8" aria-hidden="true" />
+    </button>
+    {/if}
+    {#if canForkFromMessage}
+      <button type="button" class="pin-btn fork-btn" title={m.session_breadcrumb_resume_session()}
+        aria-label={m.session_breadcrumb_resume_session()} onclick={handleForkFromHere}>
+        <CirclePlayIcon size="14" strokeWidth="1.8" aria-hidden="true" />
+      </button>
+    {/if}
+    {#if pinFeedback}<span class="pin-feedback">{pinFeedback}</span>{/if}
+    {#if forkFeedback}<span class="fork-feedback">{forkFeedback}</span>{/if}
+    <div class="header-meta">
+      {#if tokenSummary}<span class="message-tokens">{tokenSummary}</span>{/if}
+      {#if turnSummary}<span class="turn-summary" class:slow={turnSummary.slow} class:running={turnSummary.running}>{turnSummary.text}</span>{/if}
+      <span class="timestamp">{formatTimestamp(message.timestamp)}</span>
+      {#if offMainModel}<span class="message-model" title={offMainModel}>{offMainModel}</span>{/if}
+    </div>
+  </div>
+  <div class="message-body">
+    {#each segments as segment, segmentIndex}
+      {@const searchKey = activeSearchOrdinal === undefined || segment.type === "tool"
+        ? undefined : blockKey(activeSearchOrdinal, segment.type, segmentIndex)}
+      {#if segment.type === "thinking"}
+        {#if ui.isBlockVisible("thinking")}
+          <ThinkingBlock content={segment.content} {searchKey} />
+        {/if}
+      {:else if segment.type === "tool"}
+        <!-- Structured and legacy tool calls are rendered after prose. -->
+      {:else if segment.type === "code"}
+        {@const codeLabel = segment.label?.trim().toLowerCase()}
+        {@const language = segment.label?.trim() ?? ""}
+        {#if ui.isBlockVisible("code")}
+          {#if codeLabel === "mermaid" && !hasSearchQuery}
+            <MermaidBlock content={segment.content} />
+          {:else}
+            <CodeBlock content={segment.content} language={segment.label} {searchKey} />
+          {/if}
+        {:else}
+          {@const expanded = expandedCodeBlocks.has(segmentIndex)}
+          {@const toggleLabel = codeFenceToggleLabel(language, expanded)}
+          <div class="code-fence-block">
+            <Button
+              class="code-fence-toggle"
+              size="sm"
+              surface="soft"
+              ariaExpanded={expanded}
+              label={toggleLabel}
+              title={toggleLabel}
+              onclick={() => toggleCodeBlock(segmentIndex)}
+            >
+              {#snippet trailing()}
+                {#if expanded}
+                  <ChevronDownIcon size="14" strokeWidth="2" aria-hidden="true" />
+                {:else}
+                  <ChevronRightIcon size="14" strokeWidth="2" aria-hidden="true" />
+                {/if}
+              {/snippet}
+            </Button>
+            {#if expanded}
+              {#if codeLabel === "mermaid"}
+                <MermaidBlock content={segment.content} />
+              {:else}
+                <CodeBlock
+                  content={segment.content}
+                  language={segment.label}
+                />
+              {/if}
+            {/if}
+          </div>
+        {/if}
+      {:else if segment.type === "skill"}
+        {#if showText}<SkillBlock content={segment.content} name={segment.label} {searchKey} />{/if}
+      {:else}
+        {#if showText}
+          <div class="text-content markdown" {@attach searchBlock(searchKey)}
+            use:highlightCodeFences={{ content: segment.content }} use:loadAssetImages={segment.content}>
+            {@html renderMarkdown(segment.content, { renderUnknownXmlBlocksAsPreformatted: ui.renderUnknownXmlBlocksAsPreformatted })}
+          </div>
+        {/if}
+      {/if}
+    {/each}
+    {#if ui.isBlockVisible("tool")}
+      {@const turn = turnByMessage.get(message.id)}
+      {@const structuredCalls = message.tool_calls ?? []}
+      {#if structuredCalls.length === 1}
+        {@const soloCall = structuredCalls[0]!}
+        <ToolBlock toolCall={soloCall} content="" label={displayToolName(soloCall)}
+          durationLabel={soloDurationLabel(
+            callByToolUseID.get(soloCall.tool_use_id ?? ""),
+            turn,
+            message,
+          )}
+          isRunning={isRunningTurn(message)}
+          searchScope={activeSearchOrdinal === undefined ? undefined : { ordinal: activeSearchOrdinal, callIdx: 0 }} />
+      {:else if structuredCalls.length >= 2}
+        <ParallelGroup toolCalls={structuredCalls} callTimingByID={callByToolUseID}
+          isRunning={isRunningTurn(message)} searchOrdinal={activeSearchOrdinal} />
+      {:else}
+        {#each segments.filter((s) => s.type === "tool") as seg, segIdx (`${message.id}-${segIdx}`)}
+          <ToolBlock content={seg.content} label={seg.label} toolCall={seg.toolCall}
+            searchScope={activeSearchOrdinal === undefined ? undefined : { ordinal: activeSearchOrdinal, callIdx: `seg${segIdx}` }} />
+        {/each}
+      {/if}
+    {/if}
+  </div>
+</div>
+
+<style>
+  .message { border-left: 4px solid; padding: 14px 20px; border-radius: 0 var(--radius-md) var(--radius-md) 0; }
+  .message-header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .role-icon {
+    width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center;
+    justify-content: center; font-size: 11px; font-weight: 700; color: white; flex-shrink: 0; line-height: 1;
+  }
+  .role-label { font-size: 13px; font-weight: 600; letter-spacing: 0.01em; }
+  .timestamp { font-size: 12px; color: var(--text-muted); }
+  .header-meta { margin-left: auto; display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .message-tokens { font-size: 10px; color: var(--text-muted); font-family: var(--font-mono); white-space: nowrap; }
+  .message-model {
+    font-size: 10px; color: var(--text-muted); padding: 1px 4px; border-radius: 3px;
+    background: var(--bg-tertiary); white-space: nowrap; flex-shrink: 0; opacity: 0.8;
+  }
+  .turn-summary {
+    font-family: var(--font-mono); font-size: 10px; color: var(--text-muted);
+    background: color-mix(in srgb, var(--text-primary) 4%, transparent); padding: 2px 8px;
+    border-radius: var(--radius-sm); border: 1px solid color-mix(in srgb, var(--text-primary) 4%, transparent);
+    white-space: nowrap; flex-shrink: 0;
+  }
+  .turn-summary.slow { color: var(--slow-fg); background: var(--slow-bg); border-color: var(--slow-ring); }
+  .turn-summary.running { color: var(--running-fg); background: var(--running-bg); border-color: var(--running-ring); animation: duration-pulse 1.6s ease-in-out infinite; }
+  .message:hover :global(.kit-copy-btn) { opacity: 1; }
+  .pin-btn {
+    display: flex; align-items: center; justify-content: center; width: 26px; height: 26px;
+    border: none; border-radius: var(--radius-sm, 4px); background: transparent;
+    color: var(--text-muted); cursor: pointer; opacity: 0;
+    transition: opacity 0.15s, background 0.15s, color 0.15s; flex-shrink: 0;
+  }
+  .message:hover .pin-btn, .pin-btn:focus-visible, .pin-btn.pinned { opacity: 1; }
+  @media (hover: none) { .pin-btn { opacity: 1; } }
+  .pin-btn:hover { background: var(--bg-surface-hover); color: var(--text-secondary); }
+  .pin-btn.pinned { color: var(--accent-blue); }
+  .pin-btn:active { transform: var(--press-transform); }
+  .pin-feedback, .fork-feedback { font-size: 11px; color: var(--text-muted); animation: fade-in-out 1.5s ease-in-out; }
+  @keyframes fade-in-out { 0% { opacity: 0; } 15% { opacity: 1; } 75% { opacity: 1; } 100% { opacity: 0; } }
+  .text-content { font-size: 14px; line-height: 1.7; color: var(--text-primary); word-wrap: break-word; }
+  .code-fence-block {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  :global(.code-fence-toggle) {
+    align-self: flex-start;
+    max-width: 100%;
+  }
+
+  .message-body { display: flex; flex-direction: column; gap: 8px; }
+  .markdown :global(p) { margin: 0.5em 0; }
+  .markdown :global(p:first-child) { margin-top: 0; }
+  .markdown :global(p:last-child) { margin-bottom: 0; }
+  .markdown :global(h1), .markdown :global(h2), .markdown :global(h3),
+  .markdown :global(h4), .markdown :global(h5), .markdown :global(h6) { margin: 0.8em 0 0.4em; line-height: 1.3; font-weight: 600; }
+  .markdown :global(h1) { font-size: 1.35em; }
+  .markdown :global(h2) { font-size: 1.2em; }
+  .markdown :global(h3) { font-size: 1.1em; }
+  .markdown :global(h4), .markdown :global(h5), .markdown :global(h6) { font-size: 1em; }
+  .markdown :global(a) { color: var(--accent-blue); text-decoration: none; }
+  .markdown :global(a:hover) { text-decoration: underline; }
+  .markdown :global(code) {
+    font-family: var(--font-mono); font-size: 0.85em; background: var(--bg-inset);
+    border: 1px solid var(--border-muted); border-radius: 4px; padding: 0.15em 0.4em;
+  }
+  .markdown :global(pre:not(.unknown-xml-block)) { background: var(--code-bg); color: var(--code-text); border-radius: var(--radius-md); padding: 12px 16px; overflow-x: auto; margin: 0.5em 0; }
+  .markdown :global(pre code) { background: none; border: none; padding: 0; font-size: 13px; color: inherit; }
+  .markdown :global(blockquote) { border-left: 3px solid var(--border-default); margin: 0.5em 0; padding: 0.3em 1em; color: var(--text-secondary); }
+  .markdown :global(ul), .markdown :global(ol) { padding-left: 1.6em; margin: 0.5em 0; }
+  .markdown :global(li) { margin: 0.2em 0; line-height: 1.65; }
+  .markdown :global(hr) { border: none; border-top: 1px solid var(--border-muted); margin: 0.8em 0; }
+  .markdown :global(table) { border-collapse: collapse; margin: 0.5em 0; width: auto; font-size: 13px; }
+  .markdown :global(th), .markdown :global(td) { border: 1px solid var(--border-muted); padding: 6px 10px; text-align: left; }
+  .markdown :global(th) { background: var(--bg-inset); font-weight: 600; }
+  .markdown :global(img) { max-width: 100%; border-radius: var(--radius-sm); }
+  .markdown :global(strong) { font-weight: 600; }
+  .message.compact { padding: 9px 10px; }
+  .compact .message-header { gap: 6px; margin-bottom: 6px; }
+  .compact .role-icon { width: 18px; height: 18px; font-size: 10px; }
+  .compact .role-label { font-size: 11px; }
+  .compact .timestamp { font-size: 10px; }
+  .compact .text-content { font-size: 12px; line-height: 1.55; }
+</style>
