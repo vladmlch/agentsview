@@ -56,10 +56,11 @@ responsibility in the server.
 - Flatten each assistant turn into a header row, child rows when expanded, and a
   separate final-output row when one exists. Keep the final-output row visible
   when the turn is collapsed. Use the existing virtualizer for all rows and
-  preserve ordering, newest-first behavior, and ordinal navigation. `j`/`k`
-  navigation remains one step per source message ordinal; turn headers are not
-  stops. If a target message is inside a collapsed turn, expand the turn and
-  reveal its child event rows.
+  preserve ordering and ordinal navigation. In newest-first mode, reverse group
+  and child-event order while keeping each group header first; place its
+  final-output row immediately after the header. `j`/`k` navigation remains one
+  step per source message ordinal; turn headers are not stops. If a target message
+  is inside a collapsed turn, expand the turn and reveal its child event rows.
 - Compute displayed ordinals and the unread boundary from rendered, visible
   rows. A collapsed header does not mark hidden child messages read. The visible
   final-output row contributes its source message ordinal to read progress.
