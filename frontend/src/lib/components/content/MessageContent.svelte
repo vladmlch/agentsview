@@ -2,35 +2,30 @@
   import type { Session } from "../../api/types.js";
 import type { DbMessage as Message } from "../../api/generated/index.js";
   import type { DbCallTiming as CallTiming, DbTurnTiming as TurnTiming } from "../../api/generated/index.js";
-  import { parseContent, enrichSegments } from "../../utils/content-parser.js";
+  import { parseContent, enrichSegments, type ContentSegment } from "../../utils/content-parser.js";
   import { formatTimestamp, formatTokenUsage } from "../../utils/format.js";
   import { formatDuration } from "../../utils/duration.js";
-  import { copyToClipboard } from "../../utils/clipboard.js";
-  import { formatMessageForCopy } from "../../utils/copy-message.js";
   import { sessionAncestryMatches } from "../../utils/session-ancestry.js";
   import { messages as messagesStore } from "../../stores/messages.svelte.js";
   import { sessionTiming } from "../../stores/sessionTiming.svelte.js";
   import { liveTick } from "../../stores/liveTick.svelte.js";
-  import { isRemoteConnection } from "../../api/runtime.js";
-  import { SessionsService, type ResumeRequest, type ResumeResponse } from "../../api/generated/index";
   import ThinkingBlock from "./ThinkingBlock.svelte";
   import ToolBlock from "./ToolBlock.svelte";
   import ParallelGroup from "./ParallelGroup.svelte";
   import CodeBlock from "./CodeBlock.svelte";
   import MermaidBlock from "./MermaidBlock.svelte";
   import SkillBlock from "./SkillBlock.svelte";
-  import { Button, CopyButton } from "@kenn-io/kit-ui";
+  import MessageSourceActions from "./MessageSourceActions.svelte";
+  import { Button } from "@kenn-io/kit-ui";
   import { ui } from "../../stores/ui.svelte.js";
-  import { pins } from "../../stores/pins.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
-  import { sync } from "../../stores/sync.svelte.js";
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
   import { blockKey } from "../../search/block-text.js";
   import { searchBlock } from "../../search/session-block.svelte.js";
   import { highlightCodeFences } from "../../utils/highlight-fences.js";
   import { loadAssetImages, renderMarkdown } from "../../utils/markdown.js";
   import { displayToolName } from "../../utils/toolDisplay.js";
-  import { ChevronDownIcon, ChevronRightIcon, CirclePlayIcon, PinIcon } from "../../icons.js";
+  import { ChevronDownIcon, ChevronRightIcon } from "../../icons.js";
   import { m } from "../../i18n/index.js";
 
   interface Props {
@@ -40,13 +35,22 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
     searchOrdinal?: number;
     compact?: boolean;
     allowMutations?: boolean;
+    /** Subset of the message's enriched segments to render (assistant-turn
+     *  event rows). Contiguous in the source, so `eventSegmentStart` recovers
+     *  the original search-key indexes. */
+    eventSegments?: readonly ContentSegment[];
+    /** Index of `eventSegments[0]` in the source message's segment array. */
+    eventSegmentStart?: number;
+    /** Suppress the message header; the event row owns actions and metadata. */
+    hideMessageHeader?: boolean;
   }
-  let { message, session, isSubagentContext = false, searchOrdinal, compact = false, allowMutations = true }: Props = $props();
-  let copied = $state(false);
-  let segments = $derived(enrichSegments(
+  let { message, session, isSubagentContext = false, searchOrdinal, compact = false, allowMutations = true,
+    eventSegments, eventSegmentStart = 0, hideMessageHeader = false }: Props = $props();
+  let allSegments = $derived(enrichSegments(
     parseContent(message.content, message.has_tool_use, message.id, message.content_length),
     message.tool_calls,
   ));
+  let segments = $derived(eventSegments ?? allSegments);
   // Embedded subagents have their own ordinal namespace and are never searched here.
   let activeSearchOrdinal = $derived(isSubagentContext ? undefined : searchOrdinal);
   let hasSearchQuery = $derived(activeSearchOrdinal !== undefined && inSessionSearch.isActive);
@@ -118,9 +122,6 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
   let accentColor = $derived(isUser ? "var(--accent-blue)" : "var(--accent-purple)");
   let accentForeground = $derived(isUser ? "var(--accent-blue-foreground)" : "var(--accent-purple-foreground)");
   let roleBg = $derived(isUser ? "var(--user-bg)" : "var(--assistant-bg)");
-  let pinned = $derived(pins.isPinned(message.id));
-  let pinFeedback = $state("");
-  let forkFeedback = $state("");
   let turnByMessage = $derived.by(() => {
     const map = new Map<number, TurnTiming>();
     for (const turn of sessionTiming.timing?.turns ?? []) map.set(turn.message_id, turn);
@@ -165,87 +166,29 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
     }
     return null;
   });
-  let copyTimer: ReturnType<typeof setTimeout>;
-  let pinTimer: ReturnType<typeof setTimeout>;
-  let forkTimer: ReturnType<typeof setTimeout>;
-  async function handleCopy() {
-    const ok = await copyToClipboard(formatMessageForCopy(message));
-    if (ok) {
-      clearTimeout(copyTimer); copied = true;
-      copyTimer = setTimeout(() => { copied = false; }, 1500);
-    }
-  }
-  async function handleTogglePin() {
-    const wasPinned = pinned;
-    try {
-      await pins.togglePin(message.session_id, message.id, message.ordinal);
-      clearTimeout(pinTimer);
-      pinFeedback = wasPinned ? m.message_content_unpinned() : m.message_content_pinned();
-      pinTimer = setTimeout(() => { pinFeedback = ""; }, 1500);
-    } catch { /* Preserve the existing non-blocking pin interaction. */ }
-  }
-  let canForkFromMessage = $derived(allowMutations && owningSession?.agent === "claude" &&
-    !(owningSession?.id ?? "").includes("~") && !(sync.readOnly && isRemoteConnection()));
-  async function handleForkFromHere() {
-    if (!canForkFromMessage) return;
-    clearTimeout(forkTimer);
-    try {
-      const resp = await SessionsService.postApiV1SessionsByIdResume(
-        { id: message.session_id },
-        {
-          ...(sync.readOnly && !isRemoteConnection() ? { command_only: true } : {}),
-          from_ordinal: message.ordinal, fork_session: true,
-        } satisfies ResumeRequest,
-      ) as ResumeResponse;
-      if (resp.launched) {
-        forkFeedback = m.session_breadcrumb_resumed_in({ target: resp.terminal ?? "terminal" });
-        forkTimer = setTimeout(() => { forkFeedback = ""; }, 2000);
-        return;
-      }
-      if (resp.command) {
-        const ok = await copyToClipboard(resp.command);
-        forkFeedback = ok ? m.session_breadcrumb_command_copied() : m.session_breadcrumb_failed();
-        forkTimer = setTimeout(() => { forkFeedback = ""; }, 2000);
-        return;
-      }
-    } catch { /* Show the existing failure feedback below. */ }
-    forkFeedback = m.session_breadcrumb_failed();
-    forkTimer = setTimeout(() => { forkFeedback = ""; }, 2000);
-  }
 </script>
 
 <div class="message" class:is-user={isUser} class:compact style:border-left-color={accentColor} style:background={roleBg}>
-  <div class="message-header">
-    <span class="role-icon" style:background={accentColor} style:color={accentForeground}>{roleIcon}</span>
-    <span class="role-label" style:color={accentColor}>{roleLabel}</span>
-    <CopyButton revealOnHover {copied} ariaLabel={m.message_content_copy_message()}
-      copiedAriaLabel={m.message_content_copied_message()} title={m.message_content_copy_message()}
-      copiedTitle={m.message_content_copied()} onclick={handleCopy} />
-    {#if allowMutations}
-    <button type="button" class="pin-btn" class:pinned
-      title={pinned ? m.message_content_unpin_message() : m.message_content_pin_message()} onclick={handleTogglePin}>
-      <PinIcon size="14" strokeWidth="1.8" aria-hidden="true" />
-    </button>
-    {/if}
-    {#if canForkFromMessage}
-      <button type="button" class="pin-btn fork-btn" title={m.session_breadcrumb_resume_session()}
-        aria-label={m.session_breadcrumb_resume_session()} onclick={handleForkFromHere}>
-        <CirclePlayIcon size="14" strokeWidth="1.8" aria-hidden="true" />
-      </button>
-    {/if}
-    {#if pinFeedback}<span class="pin-feedback">{pinFeedback}</span>{/if}
-    {#if forkFeedback}<span class="fork-feedback">{forkFeedback}</span>{/if}
-    <div class="header-meta">
-      {#if tokenSummary}<span class="message-tokens">{tokenSummary}</span>{/if}
-      {#if turnSummary}<span class="turn-summary" class:slow={turnSummary.slow} class:running={turnSummary.running}>{turnSummary.text}</span>{/if}
-      <span class="timestamp">{formatTimestamp(message.timestamp)}</span>
-      {#if offMainModel}<span class="message-model" title={offMainModel}>{offMainModel}</span>{/if}
+  {#if !hideMessageHeader}
+    <div class="message-header">
+      <span class="role-icon" style:background={accentColor} style:color={accentForeground}>{roleIcon}</span>
+      <span class="role-label" style:color={accentColor}>{roleLabel}</span>
+      <MessageSourceActions {message} {session} {allowMutations} />
+      <div class="header-meta">
+        {#if tokenSummary}<span class="message-tokens">{tokenSummary}</span>{/if}
+        {#if turnSummary}<span class="turn-summary" class:slow={turnSummary.slow} class:running={turnSummary.running}>{turnSummary.text}</span>{/if}
+        <span class="timestamp">{formatTimestamp(message.timestamp)}</span>
+        {#if offMainModel}<span class="message-model" title={offMainModel}>{offMainModel}</span>{/if}
+      </div>
     </div>
-  </div>
+  {/if}
   <div class="message-body">
     {#each segments as segment, segmentIndex}
+      <!-- `sourceIndex` recovers the segment's index in the source message so
+        search keys stay stable when `eventSegments` carries a subset. -->
+      {@const sourceIndex = eventSegments === undefined ? segmentIndex : eventSegmentStart + segmentIndex}
       {@const searchKey = activeSearchOrdinal === undefined || segment.type === "tool"
-        ? undefined : blockKey(activeSearchOrdinal, segment.type, segmentIndex)}
+        ? undefined : blockKey(activeSearchOrdinal, segment.type, sourceIndex)}
       {#if segment.type === "thinking"}
         {#if inSessionSearch.isBlockEffectivelyVisible("thinking")}
           <ThinkingBlock content={segment.content} {searchKey} />
@@ -262,7 +205,7 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
             <CodeBlock content={segment.content} language={segment.label} {searchKey} />
           {/if}
         {:else}
-          {@const expanded = expandedCodeBlocks.has(segmentIndex)}
+          {@const expanded = expandedCodeBlocks.has(sourceIndex)}
           {@const toggleLabel = codeFenceToggleLabel(language, expanded)}
           <div class="code-fence-block">
             <Button
@@ -272,7 +215,7 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
               ariaExpanded={expanded}
               label={toggleLabel}
               title={toggleLabel}
-              onclick={() => toggleCodeBlock(segmentIndex)}
+              onclick={() => toggleCodeBlock(sourceIndex)}
             >
               {#snippet trailing()}
                 {#if expanded}
@@ -305,7 +248,10 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
         {/if}
       {/if}
     {/each}
-    {#if inSessionSearch.isBlockEffectivelyVisible("tool")}
+    <!-- Tool segments and structured calls render through the trailing tool
+      block in standalone mode; event rows render their own tool events, so
+      a segment subset must not re-emit them here. -->
+    {#if eventSegments === undefined && inSessionSearch.isBlockEffectivelyVisible("tool")}
       {@const turn = turnByMessage.get(message.id)}
       {@const structuredCalls = message.tool_calls ?? []}
       {#if structuredCalls.length === 1}
@@ -354,20 +300,10 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
   }
   .turn-summary.slow { color: var(--slow-fg); background: var(--slow-bg); border-color: var(--slow-ring); }
   .turn-summary.running { color: var(--running-fg); background: var(--running-bg); border-color: var(--running-ring); animation: duration-pulse 1.6s ease-in-out infinite; }
-  .message:hover :global(.kit-copy-btn) { opacity: 1; }
-  .pin-btn {
-    display: flex; align-items: center; justify-content: center; width: 26px; height: 26px;
-    border: none; border-radius: var(--radius-sm, 4px); background: transparent;
-    color: var(--text-muted); cursor: pointer; opacity: 0;
-    transition: opacity 0.15s, background 0.15s, color 0.15s; flex-shrink: 0;
-  }
-  .message:hover .pin-btn, .pin-btn:focus-visible, .pin-btn.pinned { opacity: 1; }
-  @media (hover: none) { .pin-btn { opacity: 1; } }
-  .pin-btn:hover { background: var(--bg-surface-hover); color: var(--text-secondary); }
-  .pin-btn.pinned { color: var(--accent-blue); }
-  .pin-btn:active { transform: var(--press-transform); }
-  .pin-feedback, .fork-feedback { font-size: 11px; color: var(--text-muted); animation: fade-in-out 1.5s ease-in-out; }
-  @keyframes fade-in-out { 0% { opacity: 0; } 15% { opacity: 1; } 75% { opacity: 1; } 100% { opacity: 0; } }
+  /* The extracted source actions hide their pin/fork buttons until hover;
+   * the reveal trigger still covers the whole message row. */
+  .message:hover :global(.kit-copy-btn),
+  .message:hover :global(.pin-btn) { opacity: 1; }
   .text-content { font-size: 14px; line-height: 1.7; color: var(--text-primary); word-wrap: break-word; }
   .code-fence-block {
     display: flex;

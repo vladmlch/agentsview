@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import type { DbToolCall as ToolCall } from "../../api/generated/index.js";
 import type { DbCallTiming as CallTiming } from "../../api/generated/index.js";
 import { setLocale } from "../../i18n/index.js";
+import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
 // @ts-ignore
 import ParallelGroup from "./ParallelGroup.svelte";
 
@@ -80,6 +81,39 @@ describe("ParallelGroup", () => {
     expect(document.querySelector(".pg-count")?.textContent?.trim()).toBe("2 次调用");
     expect(document.querySelectorAll(".tool-duration")).toHaveLength(0);
 
+    unmount(component);
+  });
+});
+
+describe("ParallelGroup turn-scoped collapse", () => {
+  beforeEach(() => {
+    turnCollapse.activateSession(null);
+    turnCollapse.activateSession("s1");
+  });
+  afterEach(() => turnCollapse.activateSession(null));
+
+  it("derives inner block expansion from the collapse key prefix", async () => {
+    const component = mount(ParallelGroup, {
+      target: document.body,
+      props: {
+        toolCalls: [makeToolCall("a"), makeToolCall("b")],
+        collapseKeyPrefix: "s1:11:tool:2",
+        defaultExpanded: true,
+      },
+    });
+    await tick();
+
+    const headers = document.querySelectorAll(".tool-header");
+    expect(headers).toHaveLength(2);
+    for (const header of headers) {
+      expect(header.getAttribute("aria-expanded")).toBe("true");
+    }
+
+    turnCollapse.setEventExpanded("s1:11:tool:2:1", false);
+    await tick();
+    const refreshed = document.querySelectorAll(".tool-header");
+    expect(refreshed[0]!.getAttribute("aria-expanded")).toBe("true");
+    expect(refreshed[1]!.getAttribute("aria-expanded")).toBe("false");
     unmount(component);
   });
 });
