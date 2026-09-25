@@ -481,7 +481,7 @@ Paraglide JS, Playwright.
   owns the disclosure header and renders source actions only on its first
   visible event for that source message.
 
-- [ ] **Step 1: Add failing component tests for one message split into events**
+- [x] **Step 1: Add failing component tests for one message split into events**
 
   Build a message with this exact content:
 
@@ -508,7 +508,7 @@ Paraglide JS, Playwright.
   error output defaults open independently of the turn preference while normal
   output/history drawers stay collapsed.
 
-- [ ] **Step 2: Run the focused component tests and verify RED**
+- [x] **Step 2: Run the focused component tests and verify RED**
 
   ```bash
   ./node_modules/.bin/vp test run \
@@ -519,7 +519,7 @@ Paraglide JS, Playwright.
   Expected: FAIL because the turn/event renderers and segment override do not
   exist.
 
-- [ ] **Step 3: Extract source-message actions without changing behavior**
+- [x] **Step 3: Extract source-message actions without changing behavior**
 
   Move the existing Copy, Pin, and Fork controls and handlers into
   `MessageSourceActions.svelte`. Keep copy formatting, mutation guards,
@@ -527,7 +527,7 @@ Paraglide JS, Playwright.
   extracted actions so existing standalone and focused-mode messages retain the
   same controls.
 
-- [ ] **Step 4: Implement the event-row renderer**
+- [x] **Step 4: Implement the event-row renderer**
 
   Render text/code events with the segment override, thinking and skill events
   with their existing disclosure components, tool events with `ToolBlock` or
@@ -535,21 +535,21 @@ Paraglide JS, Playwright.
   with `SystemBoundaryCard`. Pass a stable disclosure key to each row; do not
   nest another disclosure around an existing event disclosure.
 
-- [ ] **Step 5: Render source actions once per source message**
+- [x] **Step 5: Render source actions once per source message**
 
   Show `MessageSourceActions` on the first rendered child event for that source
   message. Copy still copies the whole `DbMessage`; Pin/Fork still target that
   message's ordinal. Do not repeat timestamp/model metadata on every event row;
   the turn header owns the model, counts, timestamp, token, and context summary.
 
-- [ ] **Step 6: Add event-row locale messages**
+- [x] **Step 6: Add event-row locale messages**
 
   Add `assistant_turn_event_message`, `assistant_turn_message_count`, and
   `assistant_turn_tool_call_count` to every locale. Use Paraglide plural
   variants for both counts and pass numeric `count` plus a locale-formatted
   `countLabel` at the call site.
 
-- [ ] **Step 7: Compile locales and run event-rendering tests**
+- [x] **Step 7: Compile locales and run event-rendering tests**
 
   Run:
 
@@ -582,7 +582,7 @@ Paraglide JS, Playwright.
   pass, including existing copy/pin/fork, role, code, tool, skill, thinking,
   result-history, and parallel-call behavior.
 
-- [ ] **Step 8: Commit the rendering task**
+- [x] **Step 8: Commit the rendering task**
 
   ```bash
   git add \

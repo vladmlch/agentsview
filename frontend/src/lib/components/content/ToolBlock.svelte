@@ -9,6 +9,7 @@
   import { searchBlock } from "../../search/session-block.svelte.js";
   import { searchCollapsed, toolSearchKey, type ToolSearchScope } from "../../search/component-state.js";
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+  import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
   import SearchMatchCount from "./SearchMatchCount.svelte";
   import { m } from "../../i18n/index.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
@@ -34,6 +35,13 @@
     isRunning?: boolean;
     /** Flatten outer spacing when inside a parallel group. */
     inGroup?: boolean;
+    /** Turn-event disclosure key; when present, the header and the
+     *  output/history drawers resolve state through `turnCollapse`. */
+    collapseKey?: string;
+    /** Default expansion for the outer header when no override or bulk
+     *  baseline applies. Output/history drawers keep their own fixed
+     *  defaults: error output opens, everything else stays closed. */
+    defaultExpanded?: boolean;
   }
 
   type Params = Record<string, unknown>;
@@ -95,7 +103,8 @@
   }
 
   let { content, label, toolCall, searchScope, durationLabel,
-    isSlow = false, isRunning = false, inGroup = false }: Props = $props();
+    isSlow = false, isRunning = false, inGroup = false,
+    collapseKey, defaultExpanded = false }: Props = $props();
   let userCollapsed = $state(true);
   let userOutputCollapsed = $state(true);
   let userHistoryCollapsed = $state(true);
@@ -118,17 +127,35 @@
   let resultEvents = $derived((toolCall?.result_events ?? []).map((event) => ({
     ...event, content: displayToolResult(event.content),
   })));
+  /** Result-event statuses that mean the call failed; the output drawer
+   *  defaults open for these even inside collapsed turns. */
+  const ERROR_STATUSES = new Set(["error", "errored", "failed"]);
+  let isErrorResult = $derived(
+    resultEvents.some((event) => ERROR_STATUSES.has(event.status)),
+  );
+  let outputSectionKey = $derived(
+    collapseKey === undefined ? undefined : `${collapseKey}:output`,
+  );
+  let historySectionKey = $derived(
+    collapseKey === undefined ? undefined : `${collapseKey}:history`,
+  );
   let historyKeys = $derived(resultEvents.map((_, index) => toolSearchKey(searchScope, "tool-history", index)));
   let currentInput = $derived(inSessionSearch.isCurrentBlock(inputKey));
   let currentOutput = $derived(inSessionSearch.isCurrentBlock(outputKey));
   let currentHistory = $derived(historyKeys.some((key) => inSessionSearch.isCurrentBlock(key)));
   let historyCount = $derived(historyKeys.reduce((count, key) => count + inSessionSearch.countForBlock(key), 0));
   let matchCount = $derived(inSessionSearch.countForBlock(inputKey) + inSessionSearch.countForBlock(outputKey) + historyCount);
-  let collapsed = $derived(searchCollapsed(userCollapsed,
+  let blockBaseCollapsed = $derived(collapseKey === undefined ? userCollapsed
+    : !turnCollapse.isEventExpanded(collapseKey, defaultExpanded));
+  let outputBaseCollapsed = $derived(outputSectionKey === undefined ? userOutputCollapsed
+    : !turnCollapse.isToolSectionExpanded(outputSectionKey, isErrorResult));
+  let historyBaseCollapsed = $derived(historySectionKey === undefined ? userHistoryCollapsed
+    : !turnCollapse.isToolSectionExpanded(historySectionKey, false));
+  let collapsed = $derived(searchCollapsed(blockBaseCollapsed,
     currentInput || currentOutput || currentHistory, inSessionSearch.navigationRevision, overrideSeq));
-  let outputCollapsed = $derived(searchCollapsed(userOutputCollapsed,
+  let outputCollapsed = $derived(searchCollapsed(outputBaseCollapsed,
     currentOutput, inSessionSearch.navigationRevision, outputOverrideSeq));
-  let historyCollapsed = $derived(searchCollapsed(userHistoryCollapsed,
+  let historyCollapsed = $derived(searchCollapsed(historyBaseCollapsed,
     currentHistory, inSessionSearch.navigationRevision, historyOverrideSeq));
   let contentFullyExpanded = $derived(
     contentOverrideSeq === inSessionSearch.navigationRevision ? userContentFullyExpanded
@@ -246,6 +273,9 @@
       if (sel && sel.toString().length > 0) return;
       userCollapsed = !collapsed;
       overrideSeq = inSessionSearch.navigationRevision;
+      if (collapseKey !== undefined) {
+        turnCollapse.setEventExpanded(collapseKey, !userCollapsed);
+      }
       if (userCollapsed) {
         userContentFullyExpanded = false;
         contentOverrideSeq = inSessionSearch.navigationRevision;
@@ -300,6 +330,9 @@
           if (sel && sel.toString().length > 0) return;
           userOutputCollapsed = !outputCollapsed;
           outputOverrideSeq = inSessionSearch.navigationRevision;
+          if (outputSectionKey !== undefined) {
+            turnCollapse.setToolSectionExpanded(outputSectionKey, !userOutputCollapsed);
+          }
         }}>
           <span class="tool-chevron" class:open={!outputCollapsed}><ChevronRightIcon size="10" strokeWidth="2.4" aria-hidden="true" /></span>
           <span class="output-label">{m.tool_block_output()}</span>
@@ -335,6 +368,9 @@
         if (sel && sel.toString().length > 0) return;
         userHistoryCollapsed = !historyCollapsed;
         historyOverrideSeq = inSessionSearch.navigationRevision;
+        if (historySectionKey !== undefined) {
+          turnCollapse.setToolSectionExpanded(historySectionKey, !userHistoryCollapsed);
+        }
       }}>
         <span class="tool-chevron" class:open={!historyCollapsed}><ChevronRightIcon size="10" strokeWidth="2.4" aria-hidden="true" /></span>
         <span class="output-label">{m.tool_block_history()}</span>

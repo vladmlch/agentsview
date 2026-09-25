@@ -2376,6 +2376,27 @@
   ],
   "settings_image_cleanup_compact_note": "Removing payloads rewrites the stored rows. The archive file keeps its size until you run agentsview db compact.",
   "appearance_render_unknown_xml_blocks": "Render unknown XML blocks as preformatted text",
+  "assistant_turn_event_message": "Message",
+  "assistant_turn_message_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} message",
+        "countPlural=other": "{countLabel} messages"
+      }
+    }
+  ],
+  "assistant_turn_tool_call_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} tool call",
+        "countPlural=other": "{countLabel} tool calls"
+      }
+    }
+  ],
   "go_to_session_title": "Go to session",
   "go_to_session_input_label": "Session ID or UUID",
   "go_to_session_placeholder": "Paste a session ID or UUID",

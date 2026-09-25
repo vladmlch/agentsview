@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import { mount, tick, unmount, type ComponentProps } from "svelte";
 import type { DbToolCall as ToolCall } from "../../api/generated/index.js";
 import { setLocale } from "../../i18n/index.js";
+import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
 import retainedFixtureSource from "../../utils/__fixtures__/retained-tool-image-1735.json?raw";
 const SMALL_PNG_DATA_URI =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
@@ -647,5 +648,118 @@ describe("ToolBlock collapsed previews", () => {
     });
     expect(text(".tool-preview")).toContain("active task");
     expect(text(".tool-preview")).not.toContain("legacy todo");
+  });
+});
+
+describe("ToolBlock turn-scoped collapse keys", () => {
+  beforeEach(() => {
+    turnCollapse.activateSession(null);
+    turnCollapse.activateSession("s1");
+  });
+  afterEach(() => turnCollapse.activateSession(null));
+
+  it("drives block expansion from the store when keyed", async () => {
+    await render({
+      toolCall: call("Bash", { command: "pwd" }),
+      collapseKey: "s1:9:tool:1",
+      defaultExpanded: true,
+    });
+    expect(document.querySelector(".tool-content")).not.toBeNull();
+
+    turnCollapse.setEventExpanded("s1:9:tool:1", false);
+    await tick();
+    expect(document.querySelector(".tool-content")).toBeNull();
+    expect(turnCollapse.isEventExpanded("s1:9:tool:1", true)).toBe(false);
+  });
+
+  it("opens error output by default while keeping history collapsed", async () => {
+    await render({
+      toolCall: call(
+        "Bash",
+        { command: "false" },
+        {
+          result_content: "boom",
+          result_events: [
+            {
+              event_index: 0,
+              status: "errored",
+              source: "result",
+              content: "boom",
+              content_length: 4,
+            },
+          ],
+        },
+      ),
+      collapseKey: "s1:9:tool:1",
+      defaultExpanded: true,
+    });
+    expect(document.querySelector(".output-content")?.textContent).toContain("boom");
+    expect(document.querySelector(".result-history")).toBeNull();
+
+    turnCollapse.setToolSectionExpanded("s1:9:tool:1:history", true);
+    await tick();
+    expect(document.querySelector(".result-history")).not.toBeNull();
+  });
+
+  it("keeps normal output and history collapsed when keyed", async () => {
+    await render({
+      toolCall: call(
+        "Read",
+        { file_path: "a.ts" },
+        {
+          result_content: "fine",
+          result_events: [
+            {
+              event_index: 0,
+              status: "completed",
+              source: "result",
+              content: "fine",
+              content_length: 4,
+            },
+          ],
+        },
+      ),
+      collapseKey: "s1:9:tool:1",
+      defaultExpanded: true,
+    });
+    expect(document.querySelector(".output-content")).toBeNull();
+    expect(document.querySelector(".result-history")).toBeNull();
+
+    await click(".output-header");
+    expect(document.querySelector(".output-content")?.textContent).toContain("fine");
+    expect(turnCollapse.isToolSectionExpanded("s1:9:tool:1:output", false)).toBe(true);
+  });
+
+  it("lets explicit store state close error output", async () => {
+    turnCollapse.setToolSectionExpanded("s1:9:tool:1:output", false);
+    await render({
+      toolCall: call(
+        "Bash",
+        { command: "false" },
+        {
+          result_content: "boom",
+          result_events: [
+            {
+              event_index: 0,
+              status: "errored",
+              source: "result",
+              content: "boom",
+              content_length: 4,
+            },
+          ],
+        },
+      ),
+      collapseKey: "s1:9:tool:1",
+      defaultExpanded: true,
+    });
+    expect(document.querySelector(".output-content")).toBeNull();
+  });
+
+  it("leaves unkeyed blocks fully collapsed regardless of result status", async () => {
+    await render({
+      toolCall: call("Bash", { command: "false" }, { result_content: "boom" }),
+    });
+    expect(document.querySelector(".tool-content")).toBeNull();
+    expect(document.querySelector(".output-content")).toBeNull();
   });
 });

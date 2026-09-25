@@ -664,3 +664,60 @@ describe("MessageContent filtered code fences", () => {
     unmount(component);
   });
 });
+
+describe("MessageContent event segments", () => {
+  it("renders only the provided segments with original search indexes", async () => {
+    const content = [
+      "[Thinking]",
+      "plan",
+      "[/Thinking]",
+      "",
+      "Visible answer.",
+      "",
+      "```ts",
+      "const n = 1;",
+      "```",
+    ].join("\n");
+    await render(message({ content, has_thinking: true, ordinal: 5 }), {
+      eventSegments: [
+        { type: "text", content: "Visible answer." },
+        { type: "code", content: "const n = 1;\n", label: "ts" },
+      ],
+      eventSegmentStart: 1,
+      hideMessageHeader: true,
+      searchOrdinal: 5,
+    });
+
+    expect(document.querySelector(".message-header")).toBeNull();
+    expect(document.querySelector(".thinking-block")).toBeNull();
+    expect(text(".text-content")).toContain("Visible answer.");
+    expect(text(".code-content")).toContain("const n = 1;");
+    expect(document.querySelector('[data-search-block="5:text:1"]')).not.toBeNull();
+    expect(document.querySelector('[data-search-block="5:code:2"]')).not.toBeNull();
+  });
+
+  it("skips the trailing tool block while rendering event segments", async () => {
+    await render(
+      message({
+        content: "Working.",
+        has_tool_use: true,
+        tool_calls: [
+          {
+            tool_use_id: "c1",
+            tool_name: "Bash",
+            category: "Bash",
+            input_json: '{"command":"pwd"}',
+          },
+        ],
+      }),
+      {
+        eventSegments: [{ type: "text", content: "Working." }],
+        hideMessageHeader: true,
+      },
+    );
+
+    expect(text(".text-content")).toContain("Working.");
+    expect(document.querySelector(".tool-block")).toBeNull();
+    expect(document.querySelector(".parallel-group")).toBeNull();
+  });
+});

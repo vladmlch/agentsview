@@ -2293,6 +2293,25 @@
   ],
   "settings_image_cleanup_compact_note": "删除载荷会重写存储的行。在运行 agentsview db compact 之前，存档文件大小保持不变。",
   "appearance_render_unknown_xml_blocks": "将未知 XML 块渲染为预格式化文本",
+  "assistant_turn_event_message": "消息",
+  "assistant_turn_message_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 条消息"
+      }
+    }
+  ],
+  "assistant_turn_tool_call_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 次 tool call"
+      }
+    }
+  ],
   "go_to_session_title": "跳转到会话",
   "go_to_session_input_label": "会话 ID 或 UUID",
   "go_to_session_placeholder": "粘贴会话 ID 或 UUID",

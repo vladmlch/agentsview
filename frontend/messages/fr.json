@@ -2375,6 +2375,27 @@
   ],
   "settings_image_cleanup_compact_note": "La suppression des charges réécrit les lignes stockées. La taille du fichier d'archive reste inchangée jusqu'à ce que vous exécutiez agentsview db compact.",
   "appearance_render_unknown_xml_blocks": "Afficher les blocs XML inconnus en texte préformaté",
+  "assistant_turn_event_message": "Message",
+  "assistant_turn_message_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} message",
+        "countPlural=other": "{countLabel} messages"
+      }
+    }
+  ],
+  "assistant_turn_tool_call_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} appel d'outil",
+        "countPlural=other": "{countLabel} appels d'outil"
+      }
+    }
+  ],
   "go_to_session_title": "Accéder à une session",
   "go_to_session_input_label": "ID ou UUID de session",
   "go_to_session_placeholder": "Collez un ID ou UUID de session",

@@ -2378,6 +2378,27 @@
   ],
   "settings_image_cleanup_compact_note": "Məlumat yüklərinin silinməsi saxlanılmış sətirləri yenidən yazır. Arxiv faylının ölçüsü agentsview db compact əmrini icra edənədək dəyişmir.",
   "appearance_render_unknown_xml_blocks": "Naməlum XML bloklarını əvvəlcədən formatlanmış mətn kimi göstər",
+  "assistant_turn_event_message": "Mesaj",
+  "assistant_turn_message_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} mesaj",
+        "countPlural=other": "{countLabel} mesaj"
+      }
+    }
+  ],
+  "assistant_turn_tool_call_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} alət çağırışı",
+        "countPlural=other": "{countLabel} alət çağırışı"
+      }
+    }
+  ],
   "go_to_session_title": "Sessiyaya keç",
   "go_to_session_input_label": "Sessiya ID-si və ya UUID",
   "go_to_session_placeholder": "Sessiya ID-sini və ya UUID-ni yapışdır",
