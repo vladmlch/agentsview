@@ -4,6 +4,7 @@ import {
   displayToolName,
   displayToolResult,
 } from "./toolDisplay.js";
+import { setLocale } from "../i18n/index.js";
 import retainedFixtureSource from "./__fixtures__/retained-tool-image-1735.json?raw";
 
 const SMALL_PNG_DATA_URI =
@@ -40,6 +41,12 @@ describe("displayToolName", () => {
 
   it("returns tool_name when category is empty string", () => {
     expect(displayToolName({ tool_name: "Read", category: "" })).toBe("Read");
+  });
+
+  it("uses localized labels for Devin subagent calls and results", () => {
+    setLocale("en");
+    expect(displayToolName({ tool_name: "run_subagent", category: "Task" })).toBe("Subagent:");
+    expect(displayToolName({ tool_name: "read_subagent", category: "Task" })).toBe("Subagent result:");
   });
 });
 

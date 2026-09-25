@@ -831,35 +831,89 @@ func TestParseDevinSessionMessageNodesMissingParentFallsBackToAllNodes(t *testin
 	assert.Equal(t, 7, sess.PeakContextTokens)
 }
 
-func TestParseDevinSessionTranscriptStillWinsOverMessageNodes(t *testing.T) {
-	const sessionID = "session-transcript-wins"
+func TestParseDevinSessionPrefersMessageNodesOverTranscript(t *testing.T) {
+	const sessionID = "session-message-nodes-win"
 	fixture := newDevinTestFixture(t, devinSessionRow{
 		ID:               sessionID,
-		Title:            "Transcript wins",
-		WorkingDirectory: "/tmp/transcript-wins",
+		Title:            "Message nodes win",
+		WorkingDirectory: "/tmp/message-nodes-win",
 		Model:            "db-model",
 		CreatedAt:        new(int64(1704103200)),
 		LastActivityAt:   new(int64(1704103209)),
+		MainChainID:      new(int64(2)),
 	})
 	fixture.writeTranscript(t, sessionID, `{
 		"agent":{"model_name":"transcript-model"},
 		"steps":[
-			{"step_id":"step-1","source":"user","timestamp":"2024-01-01T10:00:01Z","message":"Use transcript"},
-			{"step_id":"step-2","source":"agent","timestamp":"2024-01-01T10:00:05Z","message":"Transcript answer"}
+			{"step_id":"step-1","source":"user","timestamp":"2024-01-01T10:00:01Z","message":"Stale exported request"},
+			{"step_id":"step-2","source":"agent","timestamp":"2024-01-01T10:00:05Z","message":"Stale exported answer"}
 		]
 	}`)
 	fixture.insertMessageNodes(t,
-		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"Use fallback instead"}`, CreatedAt: 1704103201},
-		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ChatMessage: `{"role":"assistant","content":"Fallback answer"}`, CreatedAt: 1704103205},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"Current message_nodes request"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ParentNodeID: new(int64(1)), ChatMessage: `{"role":"assistant","content":"Current message_nodes answer"}`, CreatedAt: 1704103205},
 	)
 
 	sess, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
 	require.NoError(t, err)
 	require.Len(t, msgs, 2)
-	assert.Equal(t, "Use transcript", sess.FirstMessage)
-	assert.Equal(t, "transcript-model", msgs[0].Model)
-	assert.Equal(t, "Use transcript", msgs[0].Content)
-	assert.Equal(t, "Transcript answer", msgs[1].Content)
+	assert.Equal(t, "Current message_nodes request", sess.FirstMessage)
+	assert.Equal(t, "db-model", msgs[0].Model)
+	assert.Equal(t, "Current message_nodes request", msgs[0].Content)
+	assert.Equal(t, "Current message_nodes answer", msgs[1].Content)
+	assert.Equal(t, "session-message-nodes-win:1", msgs[0].SourceUUID)
+}
+
+func TestParseDevinSessionFallsBackToTranscriptWhenMessageNodeSchemaIsUnavailable(t *testing.T) {
+	const sessionID = "session-transcript-schema-fallback"
+	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Transcript fallback",
+		WorkingDirectory: "/tmp/transcript-fallback",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103209)),
+	}, `{
+		"steps":[
+			{"step_id":"step-1","source":"user","timestamp":"2024-01-01T10:00:01Z","message":"Use the exported transcript"},
+			{"step_id":"step-2","source":"agent","timestamp":"2024-01-01T10:00:05Z","message":"Transcript fallback works"}
+		]
+	}`)
+	execDevinTestSQL(t, dbPath, `DROP TABLE message_nodes`)
+
+	sess, msgs, err := parseDevinSession(t.Context(), dbPath, sessionID, "local")
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "Use the exported transcript", sess.FirstMessage)
+	assert.Equal(t, "Transcript fallback works", msgs[1].Content)
+}
+
+func TestParseDevinSessionFallsBackToTranscriptWhenNodeMessageIsInvalid(t *testing.T) {
+	const sessionID = "session-invalid-node-fallback"
+	fixture := newDevinTestFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Transcript fallback",
+		WorkingDirectory: "/tmp/invalid-node-fallback",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103209)),
+		MainChainID:      new(int64(1)),
+	})
+	fixture.writeTranscript(t, sessionID, `{
+		"steps":[
+			{"step_id":"step-1","source":"user","timestamp":"2024-01-01T10:00:01Z","message":"Use the exported transcript"},
+			{"step_id":"step-2","source":"agent","timestamp":"2024-01-01T10:00:05Z","message":"Transcript fallback works"}
+		]
+	}`)
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `not valid JSON`, CreatedAt: 1704103201},
+	)
+
+	sess, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "Use the exported transcript", sess.FirstMessage)
+	assert.Equal(t, "Transcript fallback works", msgs[1].Content)
 }
 
 func TestParseDevinSessionMissingTranscriptWithoutDBMessagesReturnsRedactedError(t *testing.T) {
@@ -881,6 +935,81 @@ func TestParseDevinSessionMissingTranscriptWithoutDBMessagesReturnsRedactedError
 	require.ErrorContains(t, err, devinRedactedTranscriptPath())
 	require.ErrorContains(t, err, devinRedactedSessionID())
 	assert.NotContains(t, err.Error(), sessionID)
+}
+
+func TestParseDevinMessageNodeSubagentCallsAndRoleToolResults(t *testing.T) {
+	const sessionID = "session-node-subagents"
+	fixture := newDevinTestFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Node subagents",
+		WorkingDirectory: "/tmp/node-subagents",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103209)),
+		MainChainID:      new(int64(4)),
+	})
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"Implement this task"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ParentNodeID: new(int64(1)), ChatMessage: `{"role":"assistant","tool_calls":[{"id":"run-1","name":"run_subagent","arguments":{"title":"Review parser behavior","task":"Review the parser and summarize its current behavior."}}]}`, CreatedAt: 1704103202},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 3, ParentNodeID: new(int64(2)), ChatMessage: `{"role":"assistant","tool_calls":[{"id":"read-1","name":"read_subagent","arguments":{"agent_id":"agent-fixture-1"}}]}`, CreatedAt: 1704103203},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 4, ParentNodeID: new(int64(3)), ChatMessage: `{"role":"tool","tool_call_id":"read-1","content":"Subagent task complete.\nSummary ready."}`, CreatedAt: 1704103204},
+	)
+
+	_, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
+	require.NoError(t, err)
+	require.Len(t, msgs, 4)
+
+	runCalls := msgs[1].ToolCalls
+	require.Len(t, runCalls, 1)
+	assert.Equal(t, "run-1", runCalls[0].ToolUseID)
+	assert.Equal(t, "run_subagent", runCalls[0].ToolName)
+	assert.JSONEq(t, `{"title":"Review parser behavior","task":"Review the parser and summarize its current behavior."}`, runCalls[0].InputJSON)
+
+	readCalls := msgs[2].ToolCalls
+	require.Len(t, readCalls, 1)
+	assert.Equal(t, "read_subagent", readCalls[0].ToolName)
+	assert.JSONEq(t, `{"agent_id":"agent-fixture-1"}`, readCalls[0].InputJSON)
+
+	toolResults := msgs[3].ToolResults
+	require.Len(t, toolResults, 1)
+	assert.Equal(t, "read-1", toolResults[0].ToolUseID)
+	assert.Equal(t, "Subagent task complete.\nSummary ready.", DecodeContent(toolResults[0].ContentRaw))
+}
+
+func TestParseDevinTranscriptSubagentToolCallsAndObservationResults(t *testing.T) {
+	const sessionID = "session-transcript-subagents"
+	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Transcript subagents",
+		WorkingDirectory: "/tmp/transcript-subagents",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103209)),
+	}, `{
+		"steps":[
+			{"step_id":"run-1","source":"agent","timestamp":"2024-01-01T10:00:01Z","message":"Starting the requested work.","tool_calls":[{"tool_call_id":"run-1","function_name":"run_subagent","arguments":{"title":"Review parser behavior","task":"Review the parser and summarize its current behavior."}}]},
+			{"step_id":"read-1","source":"agent","timestamp":"2024-01-01T10:00:02Z","message":"Collecting the completed report.","tool_calls":[{"tool_call_id":"read-1","function_name":"read_subagent","arguments":{"agent_id":"agent-fixture-1"}}],"observation":{"results":[{"source_call_id":"read-1","content":"Subagent task complete.\nSummary ready."}]}}
+		]
+	}`)
+
+	_, msgs, err := parseDevinSession(t.Context(), dbPath, sessionID, "local")
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+
+	runCalls := msgs[0].ToolCalls
+	require.Len(t, runCalls, 1)
+	assert.Equal(t, "run-1", runCalls[0].ToolUseID)
+	assert.Equal(t, "run_subagent", runCalls[0].ToolName)
+	assert.JSONEq(t, `{"title":"Review parser behavior","task":"Review the parser and summarize its current behavior."}`, runCalls[0].InputJSON)
+
+	readCalls := msgs[1].ToolCalls
+	require.Len(t, readCalls, 1)
+	assert.Equal(t, "read_subagent", readCalls[0].ToolName)
+	assert.JSONEq(t, `{"agent_id":"agent-fixture-1"}`, readCalls[0].InputJSON)
+	toolResults := msgs[1].ToolResults
+	require.Len(t, toolResults, 1)
+	assert.Equal(t, "read-1", toolResults[0].ToolUseID)
+	assert.Equal(t, "Subagent task complete.\nSummary ready.", DecodeContent(toolResults[0].ContentRaw))
 }
 
 func TestParseDevinSessionFallbackErrorsStayRedacted(t *testing.T) {
@@ -1100,10 +1229,9 @@ func TestParseDevinSessionMessageNodesMarksAppendedContinuation(t *testing.T) {
 	assert.Equal(t, 1, sess.UserMessageCount)
 }
 
-// A transcript export that opens with the continuation summary lost the
-// pre-continuation history just like the bare main chain does; the parser
-// prepends the recovered eras from message_nodes.
-func TestParseDevinSessionTranscriptRecoversPreContinuationEra(t *testing.T) {
+// A transcript export that opens with the continuation summary can lag the
+// valid node history. The parser uses the recovered eras and current chain.
+func TestParseDevinSessionPrefersMessageNodesForContinuedTranscript(t *testing.T) {
 	const sessionID = "session-continued-export"
 	fixture := newDevinTestFixture(t, devinSessionRow{
 		ID:               sessionID,
@@ -1137,16 +1265,17 @@ func TestParseDevinSessionTranscriptRecoversPreContinuationEra(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, sess)
 
-	// Recovered era first, then the transcript's own steps.
-	require.Len(t, msgs, 6)
+	// Recovered era first, then the complete current chain from message_nodes.
+	require.Len(t, msgs, 7)
 	assert.Equal(t, RoleSystem, msgs[0].Role)
 	assert.Equal(t, RoleUser, msgs[1].Role)
 	assert.Equal(t, "original user prompt", msgs[1].Content)
 	assert.Equal(t, "era one work", msgs[2].Content)
-	assert.Equal(t, "era two context", msgs[3].Content)
-	assert.True(t, msgs[4].IsCompactBoundary)
-	assert.Equal(t, "compact_boundary", msgs[4].SourceSubtype)
-	assert.Equal(t, "post-compaction work", msgs[5].Content)
+	assert.Equal(t, "context", msgs[3].Content)
+	assert.Equal(t, "era two context", msgs[4].Content)
+	assert.True(t, msgs[5].IsCompactBoundary)
+	assert.Equal(t, "compact_boundary", msgs[5].SourceSubtype)
+	assert.Equal(t, "post-compaction work", msgs[6].Content)
 
 	assert.Equal(t, "original user prompt", sess.FirstMessage)
 	assert.Equal(t, 1, sess.UserMessageCount)
@@ -1155,10 +1284,9 @@ func TestParseDevinSessionTranscriptRecoversPreContinuationEra(t *testing.T) {
 	}
 }
 
-// An export that carries real content before the continuation summary already
-// contains the full thread; recovered eras would duplicate it, so the
-// transcript stays authoritative.
-func TestParseDevinSessionTranscriptWithPreBoundaryWorkSkipsRecovery(t *testing.T) {
+// A full export can contain rows missing from a valid native node
+// representation; the parser still selects the node history as one source.
+func TestParseDevinSessionPrefersMessageNodesOverFullTranscript(t *testing.T) {
 	const sessionID = "session-full-export"
 	fixture := newDevinTestFixture(t, devinSessionRow{
 		ID:               sessionID,
@@ -1193,8 +1321,12 @@ func TestParseDevinSessionTranscriptWithPreBoundaryWorkSkipsRecovery(t *testing.
 	require.NoError(t, err)
 	require.NotNil(t, sess)
 
-	require.Len(t, msgs, 5)
+	require.Len(t, msgs, 6)
+	assert.Equal(t, "era one context", msgs[0].Content)
 	assert.Equal(t, "original user prompt", msgs[1].Content)
-	assert.True(t, msgs[3].IsCompactBoundary)
+	assert.Equal(t, "context", msgs[2].Content)
+	assert.Equal(t, "era two context", msgs[3].Content)
+	assert.True(t, msgs[4].IsCompactBoundary)
+	assert.Equal(t, "post-compaction work", msgs[5].Content)
 	assert.Equal(t, 1, sess.UserMessageCount)
 }
