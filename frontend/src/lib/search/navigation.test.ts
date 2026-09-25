@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import type { SearchBlockKind } from "./block-text.js";
 import type { Match } from "./session-index.js";
 import {
   cursorFor,
@@ -15,6 +16,8 @@ function match(ordinal: number, block = "text:0", occurrence = 0): Match {
     occurrence,
     start: occurrence * 7,
     end: occurrence * 7 + 6,
+    kind: block.split(":")[0] as SearchBlockKind,
+    role: "assistant",
   };
 }
 

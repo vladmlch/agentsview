@@ -555,8 +555,9 @@ export function enrichSegments(
  * Returns true when at least one segment of the message would be
  * rendered given the supplied visibility predicate.
  *
- * `isVisible` is called with a BlockType string -- the component
- * passes `ui.isBlockVisible`, but tests can supply any predicate.
+ * `isVisible` is called with a BlockType string -- the session scope
+ * passes its reveal-aware effective-visibility predicate, but tests can
+ * supply any predicate.
  */
 export function hasVisibleSegments(
   msg: Message,
