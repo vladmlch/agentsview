@@ -56,13 +56,17 @@
     messages.messages.filter((m) => !isSystemMessage(m)),
   );
 
-  // Share transcript row visibility and searchable block filters with the index.
+  // Share transcript row visibility and searchable block filters with the
+  // index. Types a live search reveals render here too, without touching the
+  // saved filter.
   let sessionScope = $derived(
     projectSessionScope({
       messages: messages.messages,
+      sessionId: messages.sessionId ?? undefined,
       transcriptMode: ui.transcriptMode,
       visibleBlocks: ui.visibleBlocks,
       hasBlockFilters: ui.hasBlockFilters,
+      revealedBlocks: inSessionSearch.revealedBlockTypes,
       keepAnswerBeforeTrailingTools: keepsAnswerBeforeTrailingTools(
         settings.sessionProviders,
         sessions.activeSession?.agent,
@@ -70,7 +74,7 @@
     }),
   );
 
-  let displayItemsAsc = $derived(sessionScope.items);
+  let displayItemsAsc = $derived(sessionScope.displayItems);
 
   let normalDisplayItemsAsc = $derived(sessionScope.normalItems);
 

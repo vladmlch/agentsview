@@ -2,7 +2,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { tick } from "svelte";
 import type { DbMessage as Message } from "../api/generated/index.js";
-import { InSessionSearchStore } from "./inSessionSearch.svelte.js";
+import { InSessionSearchStore, type SearchView } from "./inSessionSearch.svelte.js";
+import type { BlockType } from "./ui.svelte.js";
 import { reactiveSource, reactiveView } from "./__fixtures__/search-state.svelte.js";
 
 vi.mock("./messages.svelte.js", () => ({
@@ -48,7 +49,10 @@ function message(ordinal: number, content: string, overrides: Partial<Message> =
 }
 
 const stores: InSessionSearchStore[] = [];
-function setup(items = [message(0, "needle needle"), message(2, "needle")]) {
+function setup(
+  items = [message(0, "needle needle"), message(2, "needle")],
+  viewInit: Partial<SearchView> = {},
+) {
   const ensureOrdinalLoaded = vi.fn().mockResolvedValue(undefined);
   const source = reactiveSource({
     sessionId: "session-a",
@@ -67,6 +71,7 @@ function setup(items = [message(0, "needle needle"), message(2, "needle")]) {
     sortNewestFirst: false,
     selectOrdinal,
     setFollowLatest,
+    ...viewInit,
   });
   const store = new InSessionSearchStore(source, view);
   stores.push(store);
@@ -321,6 +326,96 @@ describe("local in-session search", () => {
     await tick();
     expect(store.total).toBe(2);
     expect(store.currentOrdinal).toBe(1);
+  });
+
+  it("reveals the types owning hidden-kind matches without saving filters", async () => {
+    const items = [
+      message(0, "needle", { role: "user" }),
+      message(1, "[Thinking]\nneedle\n[/Thinking]", { has_thinking: true }),
+      message(2, "", {
+        tool_calls: [
+          {
+            category: "",
+            tool_name: "Read",
+            result_content: "needle",
+          },
+        ],
+      }),
+      message(3, "needle"),
+    ];
+    const { store, view } = setup(items, {
+      visibleBlocks: new Set<BlockType>(["assistant"]),
+      hasBlockFilters: true,
+    });
+    await search(store);
+    // user text + thinking + tool output + assistant text all match.
+    expect(store.total).toBe(4);
+    expect([...store.revealedBlockTypes].sort()).toEqual(["thinking", "tool", "user"]);
+    // The saved filter is untouched by the temporary reveal.
+    expect([...view.visibleBlocks!].sort()).toEqual(["assistant"]);
+    expect(store.isBlockEffectivelyVisible("thinking")).toBe(true);
+    // Clearing the query ends the temporary reveal.
+    store.clearQuery();
+    expect([...store.revealedBlockTypes]).toEqual([]);
+    expect(store.isBlockEffectivelyVisible("thinking")).toBe(false);
+  });
+
+  it("suppresses a type hidden while the find view stays open", async () => {
+    const items = [
+      message(0, "prompt", { role: "user" }),
+      message(1, "[Thinking]\nneedle\n[/Thinking]", { has_thinking: true }),
+    ];
+    const { store, view } = setup(items, {
+      visibleBlocks: new Set<BlockType>(["user", "assistant", "thinking"]),
+      hasBlockFilters: true,
+    });
+    await search(store);
+    // Thinking was already visible, so nothing is revealed yet.
+    expect(store.revealedBlockTypes.has("thinking")).toBe(false);
+    // Manually hiding the type suppresses the reveal its match would cause.
+    view.visibleBlocks = new Set<BlockType>(["user", "assistant"]);
+    await tick();
+    expect(store.revealedBlockTypes.has("thinking")).toBe(false);
+    expect(store.isBlockEffectivelyVisible("thinking")).toBe(false);
+    // The match stays indexed even while suppressed.
+    expect(store.countForBlock("1:thinking:0")).toBe(1);
+    // The suppression survives query changes while the view stays open.
+    store.clearQuery();
+    await tick();
+    store.query = "needle";
+    await tick();
+    await vi.advanceTimersByTimeAsync(200);
+    await tick();
+    expect(store.revealedBlockTypes.has("thinking")).toBe(false);
+    // Closing and reopening the find view clears the suppression.
+    store.close();
+    await search(store);
+    expect(store.revealedBlockTypes.has("thinking")).toBe(true);
+  });
+
+  it("clears suppression when a manually hidden type is re-enabled", async () => {
+    const items = [
+      message(0, "prompt", { role: "user" }),
+      message(1, "[Thinking]\nneedle\n[/Thinking]", { has_thinking: true }),
+    ];
+    const { store, view } = setup(items, {
+      visibleBlocks: new Set<BlockType>(["user", "assistant"]),
+      hasBlockFilters: true,
+    });
+    await search(store);
+    expect(store.revealedBlockTypes.has("thinking")).toBe(true);
+    store.noteManualBlockFilterChange("thinking", false);
+    await tick();
+    expect(store.revealedBlockTypes.has("thinking")).toBe(false);
+    store.noteManualBlockFilterChange("thinking", true);
+    await tick();
+    expect(store.revealedBlockTypes.has("thinking")).toBe(true);
+    // Saving the type visible makes it ordinary, not a reveal.
+    view.visibleBlocks = new Set<BlockType>(["user", "assistant", "thinking"]);
+    await tick();
+    expect(store.revealedBlockTypes.has("thinking")).toBe(false);
+    expect(store.isBlockEffectivelyVisible("thinking")).toBe(true);
+    expect(store.countForBlock("1:thinking:0")).toBe(1);
   });
 });
 

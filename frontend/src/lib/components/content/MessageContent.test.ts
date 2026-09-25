@@ -54,6 +54,7 @@ vi.mock("../../stores/inSessionSearch.svelte.js", () => ({
     isCurrentBlock: () => false,
     countForBlock: () => 0,
     currentOccurrence: () => -1,
+    isBlockEffectivelyVisible: (type: string) => uiState.isBlockVisible(type),
   },
 }));
 vi.mock("../../api/runtime.js", () => ({ isRemoteConnection: () => state.remote }));

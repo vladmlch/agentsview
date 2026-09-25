@@ -2,6 +2,7 @@
 import { describe, expect, it } from "vite-plus/test";
 import type { DbMessage as Message } from "../api/generated/index.js";
 import type { BlockType } from "../stores/ui.svelte.js";
+import { buildSessionIndex } from "./session-index.js";
 import { keepsAnswerBeforeTrailingTools, projectSessionScope } from "./session-scope.js";
 
 const ALL: ReadonlySet<BlockType> = new Set([
@@ -83,7 +84,9 @@ describe("session search scope", () => {
     expect(result.messages).toContain(thinkingPlusTool);
     expect(result.allowsBlock(thinkingPlusTool, "thinking")).toBe(true);
     expect(result.allowsBlock(thinkingPlusTool, "tool-output")).toBe(false);
-    expect(result.messages).not.toContain(legacyTool);
+    // Hidden tool-only rows leave the rendered list but stay searchable.
+    expect(result.messages).toContain(legacyTool);
+    expect(result.displayItems.flatMap((item) => item.ordinals)).toEqual([2]);
     expect(result.allowsBlock(legacyTool, "tool-input")).toBe(false);
   });
 
@@ -91,12 +94,54 @@ describe("session search scope", () => {
     const user = message(4, "hello", { role: "user" });
     const assistant = message(5, "hello");
     const result = scope([user, assistant], filtered(["assistant"]));
-    expect(result.messages).not.toContain(user);
+    // Filter-hidden source messages remain eligible for the search index.
+    expect(result.messages).toContain(user);
+    expect(result.displayItems.flatMap((item) => item.ordinals)).toEqual([5]);
     expect(result.allowsBlock(user, "text")).toBe(false);
     expect(result.allowsBlock(user, "skill")).toBe(false);
     expect(result.messages).toContain(assistant);
     expect(result.allowsBlock(assistant, "text")).toBe(true);
     expect(result.allowsBlock(assistant, "skill")).toBe(true);
+  });
+
+  it("keeps filter-hidden blocks searchable while rendering only visible content", () => {
+    const prompt = message(0, "find the needle", { role: "user" });
+    const thinking = message(1, "[Thinking]\nneedle\n[/Thinking]", {
+      has_thinking: true,
+    });
+    const result = scope([prompt, thinking], filtered(["user", "assistant"]));
+    // Transcript nodes keep full group membership before block filtering.
+    expect(result.items.map((node) => node.kind)).toEqual(["prompt", "assistant-turn"]);
+    expect(result.items[1]!.ordinals).toEqual([1]);
+    expect(result.messages).toContain(thinking);
+    // The rendered list and the per-kind gate still respect the filter.
+    expect(result.displayItems.flatMap((item) => item.ordinals)).toEqual([0]);
+    expect(result.allowsBlock(thinking, "thinking")).toBe(false);
+    const index = buildSessionIndex(result.messages, "needle");
+    expect(index.matches).toContainEqual(
+      expect.objectContaining({
+        kind: "thinking",
+        role: "assistant",
+        blockKey: "1:thinking:0",
+      }),
+    );
+  });
+
+  it("lets a temporarily revealed type render without joining the saved filter", () => {
+    const prompt = message(0, "find the needle", { role: "user" });
+    const thinking = message(1, "[Thinking]\nneedle\n[/Thinking]", {
+      has_thinking: true,
+    });
+    const result = scope([prompt, thinking], {
+      ...filtered(["user", "assistant"]),
+      revealedBlocks: new Set<BlockType>(["thinking"]),
+    });
+    // The reveal overlay renders the hidden row but never enters the saved
+    // filter gate that non-search consumers consult.
+    expect(result.displayItems.flatMap((item) => item.ordinals)).toEqual([0, 1]);
+    expect(result.normalItems.flatMap((item) => item.ordinals)).toEqual([0, 1]);
+    expect(result.allowsBlock(thinking, "thinking")).toBe(false);
+    expect(result.allowsBlock(thinking, "code")).toBe(false);
   });
 
   it("maps thinking and code to their own filters", () => {
@@ -115,10 +160,32 @@ describe("session search scope", () => {
       message(3, "next", { role: "user" }),
     ];
     const result = scope(messages, { transcriptMode: "focused" });
-    expect(result.items.flatMap((item) => item.ordinals)).toEqual([0, 2, 3]);
+    expect(result.displayItems.flatMap((item) => item.ordinals)).toEqual([0, 2, 3]);
+    expect(result.items.map((node) => node.kind)).toEqual(["prompt", "assistant-turn", "prompt"]);
     expect(result.messages.map((item) => item.ordinal)).toEqual([0, 2, 3]);
     expect(result.allowsBlock(messages[1]!, "text")).toBe(false);
     expect(result.normalItems.flatMap((item) => item.ordinals)).toEqual([0, 1, 2, 3]);
+  });
+
+  it("keeps intermediate focused-mode messages out of search under block filters", () => {
+    const messages = [
+      message(0, "prompt", { role: "user" }),
+      message(1, "intermediate needle"),
+      message(2, "final needle"),
+      message(3, "next", { role: "user" }),
+    ];
+    const result = scope(messages, {
+      transcriptMode: "focused",
+      ...filtered(["user"]),
+    });
+    // The filtered focused projection hides the assistant answer, but the
+    // mode-selected source messages stay eligible for the search index. Only
+    // the non-selected intermediate assistant message stays out.
+    expect(result.displayItems.flatMap((item) => item.ordinals)).toEqual([0, 3]);
+    expect(result.messages.map((item) => item.ordinal)).toEqual([0, 2, 3]);
+    expect(result.messages).not.toContain(messages[1]!);
+    const index = buildSessionIndex(result.messages, "needle");
+    expect(index.total).toBe(1);
   });
 
   it("keeps the answer before trailing tools only when the provider asks", () => {
@@ -161,7 +228,7 @@ it.each(["normal", "focused"] as const)(
     const prompt = message(0, "Show the example", { role: "user" });
     const code = message(1, "```ts\nconst needle = 1;\n```");
     const result = scope([prompt, code], { ...filtered(["user", "assistant"]), transcriptMode });
-    expect(result.items.flatMap((item) => item.ordinals)).toEqual([0, 1]);
+    expect(result.displayItems.flatMap((item) => item.ordinals)).toEqual([0, 1]);
     expect(result.allowsBlock(code, "code")).toBe(false);
   },
 );

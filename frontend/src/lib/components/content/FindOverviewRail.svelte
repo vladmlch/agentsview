@@ -2,6 +2,7 @@
   import { untrack } from "svelte";
   import type { DisplayItem } from "../../utils/display-items.js";
   import { collectSearchBlocks } from "../../search/block-text.js";
+  import { blockTypeForKind } from "../../search/session-scope.js";
   import { nearestOverviewMatch, overviewLocations, overviewTicks, overviewY } from "../../search/overview.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
@@ -22,6 +23,7 @@
     const ordered = newestFirst ? [...items].reverse() : items;
     const matches = inSessionSearch.matches;
     const scope = inSessionSearch.scope;
+    const revealed = inSessionSearch.revealedBlockTypes;
     const total = totalSize;
     const renderUnknownXmlBlocksAsPreformatted = ui.renderUnknownXmlBlocksAsPreformatted;
     return untrack(() => overviewLocations(ordered.map((item, index) => {
@@ -31,7 +33,8 @@
         : newestFirst ? [...item.messages].reverse() : item.messages;
       return { offset, size: Math.max(1, end - offset), blocks: messages.flatMap((message) =>
         collectSearchBlocks(message, { renderUnknownXmlBlocksAsPreformatted })
-          .filter((block) => scope?.allowsBlock(message, block.kind))) };
+          .filter((block) => (scope?.allowsBlock(message, block.kind) ?? false)
+            || revealed.has(blockTypeForKind(block.kind, message.role)))) };
     }), matches));
   });
 
