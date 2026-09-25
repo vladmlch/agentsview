@@ -527,7 +527,11 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // from the plaintext transcript its agent brain wrote, and .gemini/antigravity-ide
 // is a default Antigravity root. Re-parse unchanged Antigravity sources so those
 // conversations reach the archive.)
-const dataVersion = 117
+// (118: Devin message_nodes thinking is read from the observed
+// {thinking, signature, signature_type} object instead of a plain string
+// that Devin never writes. Re-parse Devin sessions to restore dropped
+// thinking text on assistant messages.)
+const dataVersion = 118
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
