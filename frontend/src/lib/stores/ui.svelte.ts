@@ -283,8 +283,9 @@ class UIStore {
   followLatest: boolean = $state(readStoredBool(FOLLOW_LATEST_KEY, false));
   followLatestRequest: number = $state(0);
   /** Default expansion for assistant turn headers and their child event
-   *  rows. Manual and bulk expansion choices live in the session-scoped
-   *  turn-collapse store and are not affected by this preference. */
+   *  rows: `true` means they render collapsed by default. Manual and bulk
+   *  expansion choices live in the session-scoped turn-collapse store and
+   *  are not affected by this preference. */
   autoCollapseAssistantTurns: boolean = $state(readStoredBool(AUTO_COLLAPSE_TURNS_KEY, true));
 
   /**

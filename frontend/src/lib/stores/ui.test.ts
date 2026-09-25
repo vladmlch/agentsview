@@ -23,6 +23,7 @@ describe("UIStore", () => {
     ui.pendingScrollOrdinal = null;
     ui.followLatest = false;
     ui.followLatestRequest = 0;
+    ui.setAutoCollapseAssistantTurns(true);
   });
 
   describe("activeModal", () => {
@@ -669,6 +670,32 @@ describe("UIStore", () => {
 
       ui.setAutoCollapseAssistantTurns(true);
       expect(ui.autoCollapseAssistantTurns).toBe(true);
+    });
+
+    it("falls back to enabled when the stored value is invalid", async () => {
+      const original = globalThis.localStorage;
+      Object.defineProperty(globalThis, "localStorage", {
+        value: {
+          getItem: vi.fn((key: string) =>
+            key === "agentsview-auto-collapse-turns" ? "yes" : null,
+          ),
+          setItem: vi.fn(),
+        },
+        writable: true,
+        configurable: true,
+      });
+
+      try {
+        // @ts-expect-error -- query string busts module cache
+        const mod = await import("./ui.svelte.js?autoCollapseInvalid");
+        expect(mod.ui.autoCollapseAssistantTurns).toBe(true);
+      } finally {
+        Object.defineProperty(globalThis, "localStorage", {
+          value: original,
+          writable: true,
+          configurable: true,
+        });
+      }
     });
   });
 
