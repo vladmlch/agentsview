@@ -238,7 +238,7 @@ Paraglide JS, Playwright.
   temporarily revealed type suppresses that reveal for the open search view;
   re-enabling it clears suppression.
 
-- [ ] **Step 1: Write failing session-scope and index tests**
+- [x] **Step 1: Write failing session-scope and index tests**
 
   Add a fixture with one user prompt and one assistant message whose content is
   `"[Thinking]\nneedle\n[/Thinking]"`. With only `user` and `assistant` block
@@ -247,7 +247,7 @@ Paraglide JS, Playwright.
   `buildSessionIndex(scope.messages, "needle")` returns the thinking match.
   Add a focused-mode case proving intermediate assistant messages remain absent.
 
-- [ ] **Step 2: Run focused scope/index tests and verify RED**
+- [x] **Step 2: Run focused scope/index tests and verify RED**
 
   ```bash
   ./node_modules/.bin/vp test run \
@@ -259,21 +259,21 @@ Paraglide JS, Playwright.
   Expected: FAIL because scope membership is currently filtered before search
   and `Match` has no block-kind/role metadata.
 
-- [ ] **Step 3: Separate source membership from rendered visibility**
+- [x] **Step 3: Separate source membership from rendered visibility**
 
   Update `projectSessionScope` to construct the transcript tree before applying
   child-event visibility. Return all eligible source messages for the selected
   transcript mode, and retain `allowsBlock` for rendered events. Preserve
   `isSystemMessage`, compact-boundary, mid-turn-system, and focused-mode rules.
 
-- [ ] **Step 4: Index all block types in the current transcript mode**
+- [x] **Step 4: Index all block types in the current transcript mode**
 
   Update `buildSessionIndex` to include each searchable block's `kind` and its
   source message role in `Match`. Build the active search index from the
   filter-independent `SessionScope.messages` and do not pass the current block
   visibility predicate to `buildSessionIndex`.
 
-- [ ] **Step 5: Derive ephemeral matched-type reveals**
+- [x] **Step 5: Derive ephemeral matched-type reveals**
 
   Map match kinds to the owning block type (`thinking`, `code`, `tool`, `user`,
   or `assistant`). Reveal only types hidden by the saved filter. Do not write
@@ -285,7 +285,7 @@ Paraglide JS, Playwright.
   Closing search clears suppression and reveals without changing the user's
   saved filter.
 
-- [ ] **Step 6: Update search regressions and verify GREEN**
+- [x] **Step 6: Update search regressions and verify GREEN**
 
   Update `MessageList-search.test.ts` so normal-mode search finds hidden
   thinking and tool-output matches, displays matching hidden types temporarily,
@@ -313,7 +313,7 @@ Paraglide JS, Playwright.
   Expected: tests and focused checks pass, including hidden-type search and
   saved-filter preservation.
 
-- [ ] **Step 7: Commit the scope/search task**
+- [x] **Step 7: Commit the scope/search task**
 
   ```bash
   git add \

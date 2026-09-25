@@ -1,7 +1,7 @@
 /** Occurrence-level search over message data, independent of mounted DOM. */
 import type { MarkdownRenderOptions } from "../utils/markdown.js";
 import type { DbMessage as Message } from "../api/generated/index.js";
-import { collectSearchBlocks, type SearchBlock } from "./block-text.js";
+import { collectSearchBlocks, type SearchBlock, type SearchBlockKind } from "./block-text.js";
 import { createOccurrenceMatcher, prepareSearchText, type PreparedSearchText } from "./dom-text.js";
 
 // Weak ownership releases folded text when a message version is discarded.
@@ -22,6 +22,10 @@ export interface Match {
   occurrence: number;
   start: number;
   end: number;
+  /** The searchable block kind that produced the match. */
+  kind: SearchBlockKind;
+  /** The role of the source message the match came from. */
+  role: Message["role"];
 }
 
 export interface SessionIndex {
@@ -34,14 +38,14 @@ export interface SessionIndex {
 /**
  * Return chronological, non-overlapping matches using the shared text matcher.
  * Offsets are UTF-16 offsets in the block's rendered text. The input array and
- * its messages are never mutated; transcript visibility enters only through the
- * optional predicate, so callers pass the messages and blocks the current
- * filters actually render.
+ * its messages are never mutated. Every searchable block in `messages` is
+ * indexed — block-visibility filtering belongs to the caller's scope, which
+ * selects which source messages are eligible, so hidden filter types still
+ * produce matches that an active search can temporarily reveal.
  */
 export function buildSessionIndex(
   messages: readonly Message[],
   query: string,
-  allowsBlock?: (message: Message, block: SearchBlock) => boolean,
   renderOptions: MarkdownRenderOptions = {},
   wholeWord = false,
 ): SessionIndex {
@@ -63,7 +67,6 @@ export function buildSessionIndex(
 
   for (const message of ordered) {
     for (const block of collectSearchBlocks(message, renderOptions)) {
-      if (allowsBlock && !allowsBlock(message, block)) continue;
       const occurrences = matchText(preparedText(block));
       if (!occurrences.length) continue;
       index.byBlock.set(block.key, occurrences.length);
@@ -78,6 +81,8 @@ export function buildSessionIndex(
           occurrence,
           start,
           end,
+          kind: block.kind,
+          role: message.role,
         });
       });
     }

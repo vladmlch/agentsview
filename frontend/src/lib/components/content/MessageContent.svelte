@@ -112,7 +112,9 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
       : m.message_content_code_collapsed();
   }
 
-  let showText = $derived(ui.isBlockVisible(isUser ? "user" : "assistant"));
+  let showText = $derived(
+    inSessionSearch.isBlockEffectivelyVisible(isUser ? "user" : "assistant"),
+  );
   let accentColor = $derived(isUser ? "var(--accent-blue)" : "var(--accent-purple)");
   let accentForeground = $derived(isUser ? "var(--accent-blue-foreground)" : "var(--accent-purple-foreground)");
   let roleBg = $derived(isUser ? "var(--user-bg)" : "var(--assistant-bg)");
@@ -245,7 +247,7 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
       {@const searchKey = activeSearchOrdinal === undefined || segment.type === "tool"
         ? undefined : blockKey(activeSearchOrdinal, segment.type, segmentIndex)}
       {#if segment.type === "thinking"}
-        {#if ui.isBlockVisible("thinking")}
+        {#if inSessionSearch.isBlockEffectivelyVisible("thinking")}
           <ThinkingBlock content={segment.content} {searchKey} />
         {/if}
       {:else if segment.type === "tool"}
@@ -253,7 +255,7 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
       {:else if segment.type === "code"}
         {@const codeLabel = segment.label?.trim().toLowerCase()}
         {@const language = segment.label?.trim() ?? ""}
-        {#if ui.isBlockVisible("code")}
+        {#if inSessionSearch.isBlockEffectivelyVisible("code")}
           {#if codeLabel === "mermaid" && !hasSearchQuery}
             <MermaidBlock content={segment.content} />
           {:else}
@@ -303,7 +305,7 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
         {/if}
       {/if}
     {/each}
-    {#if ui.isBlockVisible("tool")}
+    {#if inSessionSearch.isBlockEffectivelyVisible("tool")}
       {@const turn = turnByMessage.get(message.id)}
       {@const structuredCalls = message.tool_calls ?? []}
       {#if structuredCalls.length === 1}
