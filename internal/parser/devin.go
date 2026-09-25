@@ -21,6 +21,8 @@ import (
 
 const devinDBFilename = "sessions.db"
 
+var errInvalidDevinMessageNode = errors.New("invalid devin message_nodes chat_message")
+
 // DevinSessionMeta is lightweight metadata for a Devin session row.
 type DevinSessionMeta struct {
 	RawSessionID string
@@ -316,21 +318,26 @@ func parseDevinSession(ctx context.Context, dbPath, rawSessionID, machine string
 		return nil, nil, sql.ErrNoRows
 	}
 
+	// message_nodes is Devin's live session history. Explicit exports can lag
+	// behind it, so use the node chain whenever the database has a usable node
+	// representation; the export remains the compatibility fallback.
+	nodeSess, nodeMsgs, nodeOK, nodesErr := parseDevinSessionFromMessageNodes(
+		ctx, dbPath, rawSessionID, machine, meta,
+	)
+	if nodesErr == nil && nodeOK {
+		return nodeSess, nodeMsgs, nil
+	}
+	if nodesErr != nil && !errors.Is(nodesErr, errInvalidDevinMessageNode) {
+		return nil, nil, nodesErr
+	}
+
 	transcriptPath := filepath.Join(filepath.Dir(dbPath), "transcripts", rawSessionID+".json")
 	info, err := os.Stat(transcriptPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return nil, nil, newDevinTranscriptError("stat", err)
 		}
-		fallbackErr := newDevinTranscriptError("missing", nil)
-		sess, msgs, ok, err := parseDevinSessionFromMessageNodes(ctx, dbPath, rawSessionID, machine, meta)
-		if err == nil && ok {
-			return sess, msgs, nil
-		}
-		if err != nil {
-			return nil, nil, fallbackErr
-		}
-		return nil, nil, fallbackErr
+		return nil, nil, newDevinTranscriptError("missing", nil)
 	}
 
 	data, err := os.ReadFile(transcriptPath)
@@ -571,6 +578,21 @@ func listDevinMessageNodes(ctx context.Context, dbPath, rawSessionID string) ([]
 	}
 	defer db.Close()
 
+	// Older Devin databases can have session metadata without the message-node
+	// table, and partial schemas cannot provide a stable ordered representation.
+	var requiredColumns int
+	err = db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		  FROM pragma_table_info('message_nodes')
+		 WHERE name IN ('row_id', 'session_id', 'node_id', 'parent_node_id', 'chat_message', 'created_at')
+	`).Scan(&requiredColumns)
+	if err != nil {
+		return nil, err
+	}
+	if requiredColumns != 6 {
+		return nil, nil
+	}
+
 	rows, err := db.QueryContext(ctx, `
 		SELECT row_id,
 		       node_id,
@@ -607,7 +629,7 @@ func parseDevinDBMessageNode(
 	model string,
 ) (ParsedMessage, bool, error) {
 	if !gjson.Valid(row.ChatMessage) {
-		return ParsedMessage{}, false, errors.New("invalid devin message_nodes chat_message")
+		return ParsedMessage{}, false, errInvalidDevinMessageNode
 	}
 	root := gjson.Parse(row.ChatMessage)
 	role, isSystem, ok := devinDBRole(root.Get("role").Str)
@@ -623,7 +645,7 @@ func parseDevinDBMessageNode(
 		hasThinking = true
 	}
 
-	topLevelToolCalls, topLevelToolText := parseDevinDBToolCalls(root.Get("tool_calls"))
+	topLevelToolCalls, topLevelToolText := parseDevinToolCalls(root.Get("tool_calls"))
 	if len(topLevelToolCalls) > 0 {
 		toolCalls = append(toolCalls, topLevelToolCalls...)
 		hasToolUse = true
@@ -698,7 +720,7 @@ func markDevinContinuationBoundary(msg *ParsedMessage, role RoleType, isSystem b
 // opens with the continuation summary before any non-system step: the export
 // then covers only the post-compaction era and the earlier history must come
 // from the message_nodes forest. A transcript with real content before the
-// boundary already carries the full thread and stays authoritative.
+// boundary already carries the full thread, so recovered eras are not added.
 func devinTranscriptLostPreContinuation(messages []ParsedMessage) bool {
 	for _, msg := range messages {
 		if msg.IsCompactBoundary {
@@ -732,6 +754,9 @@ func devinRecoveredEraMessages(
 	for _, row := range devinRecoveredEraRows(rows, chain, meta) {
 		msg, ok, err := parseDevinDBMessageNode(rawSessionID, row, len(out), model)
 		if err != nil {
+			if errors.Is(err, errInvalidDevinMessageNode) {
+				return nil, nil
+			}
 			return nil, err
 		}
 		if ok {
@@ -824,7 +849,7 @@ func devinMetricInt(value gjson.Result) (int, bool) {
 	return 0, true
 }
 
-func parseDevinDBToolCalls(toolCalls gjson.Result) ([]ParsedToolCall, string) {
+func parseDevinToolCalls(toolCalls gjson.Result) ([]ParsedToolCall, string) {
 	if !toolCalls.IsArray() {
 		return nil, ""
 	}
@@ -833,9 +858,9 @@ func parseDevinDBToolCalls(toolCalls gjson.Result) ([]ParsedToolCall, string) {
 		parts  []string
 	)
 	toolCalls.ForEach(func(_, tc gjson.Result) bool {
-		parsedCall, ok := parseDevinDBToolCall(tc)
+		parsedCall, ok := parseDevinToolCall(tc)
 		if ok {
-			if text := formatDevinDBToolCall(parsedCall); text != "" {
+			if text := formatDevinToolCall(parsedCall); text != "" {
 				parsedCall.Rendering = text
 				parts = append(parts, text)
 			}
@@ -846,32 +871,35 @@ func parseDevinDBToolCalls(toolCalls gjson.Result) ([]ParsedToolCall, string) {
 	return parsed, strings.Join(parts, "\n")
 }
 
-func parseDevinDBToolCall(tc gjson.Result) (ParsedToolCall, bool) {
+func parseDevinToolCall(tc gjson.Result) (ParsedToolCall, bool) {
 	if parsed, ok := parseToolCall(context.Background(), tc); ok {
 		return parsed, true
 	}
-	name := firstNonEmpty(tc.Get("function.name").Str, tc.Get("name").Str)
+	name := firstNonEmpty(
+		tc.Get("function.name").Str,
+		tc.Get("function_name").Str,
+		tc.Get("name").Str,
+	)
 	if name == "" {
 		return ParsedToolCall{}, false
 	}
 	input := tc.Get("function.arguments")
+	if !input.Exists() {
+		input = toolCallInput(tc)
+	}
 	inputJSON := input.Raw
 	if input.Type == gjson.String {
 		inputJSON = input.Str
 	}
-	if inputJSON == "" {
-		input = toolCallInput(tc)
-		inputJSON = input.Raw
-	}
 	return ParsedToolCall{
-		ToolUseID: tc.Get("id").Str,
+		ToolUseID: firstNonEmpty(tc.Get("id").Str, tc.Get("tool_call_id").Str),
 		ToolName:  name,
 		Category:  NormalizeToolCategory(name),
 		InputJSON: inputJSON,
 	}, true
 }
 
-func formatDevinDBToolCall(tc ParsedToolCall) string {
+func formatDevinToolCall(tc ParsedToolCall) string {
 	block := map[string]any{"name": tc.ToolName}
 	if strings.TrimSpace(tc.InputJSON) != "" {
 		var input any
@@ -895,6 +923,28 @@ func parseDevinDBToolResult(toolCallID, content gjson.Result) (ParsedToolResult,
 		ContentLength: toolResultContentLength(content),
 		ContentRaw:    content.Raw,
 	}, true
+}
+
+func parseDevinObservationResults(observation gjson.Result) []ParsedToolResult {
+	results := observation.Get("results")
+	if !results.IsArray() {
+		return nil
+	}
+	var parsed []ParsedToolResult
+	results.ForEach(func(_, result gjson.Result) bool {
+		toolCallID := strings.TrimSpace(result.Get("source_call_id").Str)
+		content := result.Get("content")
+		if toolCallID == "" || !content.Exists() {
+			return true
+		}
+		parsed = append(parsed, ParsedToolResult{
+			ToolUseID:     toolCallID,
+			ContentLength: toolResultContentLength(content),
+			ContentRaw:    content.Raw,
+		})
+		return true
+	})
+	return parsed
 }
 
 // devinContinuationSummaryPrefix opens the system message Devin inserts when a
@@ -1260,6 +1310,13 @@ func parseDevinStep(rawSessionID string, step gjson.Result, ordinal int, model s
 	}
 	toolCalls = append(toolCalls, topLevelToolCalls...)
 	toolResults = append(toolResults, extractTopLevelToolResults(step.Get("tool_result"))...)
+	exportToolCalls, exportToolText := parseDevinToolCalls(step.Get("tool_calls"))
+	if exportToolText != "" {
+		content = joinNonEmpty(content, exportToolText)
+		hasToolUse = true
+	}
+	toolCalls = append(toolCalls, exportToolCalls...)
+	toolResults = append(toolResults, parseDevinObservationResults(step.Get("observation"))...)
 
 	if strings.TrimSpace(content) == "" && len(toolCalls) == 0 && len(toolResults) == 0 {
 		return ParsedMessage{}, false

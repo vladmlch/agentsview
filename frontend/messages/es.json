@@ -374,6 +374,8 @@
   "tool_block_status_label": "estado:",
   "tool_block_source_label": "origen:",
   "tool_block_agent_label": "agente:",
+  "tool_block_subagent_label": "Subagente:",
+  "tool_block_subagent_result_label": "Resultado del subagente:",
   "tool_block_show_less": "mostrar menos",
   "tool_block_show_all_lines": [
     {

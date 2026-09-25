@@ -361,6 +361,8 @@
   "tool_block_status_label": "狀態：",
   "tool_block_source_label": "來源：",
   "tool_block_agent_label": "agent：",
+  "tool_block_subagent_label": "子代理：",
+  "tool_block_subagent_result_label": "子代理結果：",
   "tool_block_show_less": "收起",
   "tool_block_show_all_lines": [
     {

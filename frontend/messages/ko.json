@@ -361,6 +361,8 @@
   "tool_block_status_label": "상태:",
   "tool_block_source_label": "출처:",
   "tool_block_agent_label": "에이전트:",
+  "tool_block_subagent_label": "서브에이전트:",
+  "tool_block_subagent_result_label": "서브에이전트 결과:",
   "tool_block_show_less": "간략히 보기",
   "tool_block_show_all_lines": [
     {

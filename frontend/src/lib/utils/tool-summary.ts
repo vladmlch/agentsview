@@ -119,11 +119,25 @@ function isTaskCall(name: string, cat: string | undefined): boolean {
  * input_json and reads result_content; never throws.
  */
 export function summarizeToolCall(toolCall: ToolCall): string | null {
+  if (toolCall.tool_name === "read_subagent") {
+    const result = asString(toolCall.result_content);
+    return result ? firstLine(result) : null;
+  }
+
   const p = parseParams(toolCall);
   if (!p) return null;
 
   const name = toolCall.tool_name;
   const cat = toolCall.category;
+
+  if (name === "run_subagent") {
+    const summary =
+      asString(p.title) ??
+      asString(p.task) ??
+      asString(p.description) ??
+      asString(p.prompt);
+    return summary ? firstLine(summary) : null;
+  }
 
   const special = specialSummary(name, p);
   if (special) return special;
