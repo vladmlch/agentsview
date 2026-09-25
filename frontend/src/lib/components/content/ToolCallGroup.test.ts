@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 import { sessionTiming } from "../../stores/sessionTiming.svelte.js";
+import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
 import { mount, tick, unmount } from "svelte";
 import type { DbMessage as Message } from "../../api/generated/index.js";
 // @ts-ignore
@@ -140,6 +141,55 @@ describe("ToolCallGroup", () => {
     expect(divider?.textContent).toContain("New messages");
     expect(document.querySelector('[data-message-ordinal="2"]')).not.toBeNull();
 
+    unmount(component);
+  });
+});
+
+describe("ToolCallGroup turn-scoped collapse", () => {
+  beforeEach(() => {
+    turnCollapse.activateSession(null);
+    turnCollapse.activateSession("s1");
+  });
+  afterEach(() => turnCollapse.activateSession(null));
+
+  it("forwards collapse keys to inner tool blocks", async () => {
+    const message = makeToolMessage(1);
+    message.tool_calls = [
+      {
+        category: "Bash",
+        tool_name: "Bash",
+        input_json: '{"command":"false"}',
+        result_content: "boom",
+        result_events: [
+          {
+            event_index: 0,
+            status: "errored",
+            source: "result",
+            content: "boom",
+            content_length: 4,
+          },
+        ],
+      },
+    ];
+    const component = mount(ToolCallGroup, {
+      target: document.body,
+      props: {
+        messages: [message],
+        timestamp: message.timestamp,
+        collapseKeyPrefix: "s1:20:tool-rollup:0",
+        defaultExpanded: true,
+      },
+    });
+    await tick();
+
+    // The inner block expands from the store default and opens its error
+    // output drawer while the result history stays collapsed.
+    expect(document.querySelector(".output-content")?.textContent).toContain("boom");
+    expect(document.querySelector(".result-history")).toBeNull();
+
+    turnCollapse.setEventExpanded("s1:20:tool-rollup:0:2:0", false);
+    await tick();
+    expect(document.querySelector(".output-content")).toBeNull();
     unmount(component);
   });
 });

@@ -2,6 +2,7 @@
   import { searchBlock } from "../../search/session-block.svelte.js";
   import { searchCollapsed } from "../../search/component-state.js";
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+  import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
   import SearchMatchCount from "./SearchMatchCount.svelte";
   import { m } from "../../i18n/index.js";
   import { loadAssetImages, renderMarkdown } from "../../utils/markdown.js";
@@ -13,19 +14,33 @@
     content: string;
     name?: string;
     searchKey?: string;
+    /** Turn-event disclosure key; when present, expansion state resolves
+     *  through `turnCollapse` instead of only local state. */
+    collapseKey?: string;
+    /** Default expansion used when no override or bulk baseline applies. */
+    defaultExpanded?: boolean;
   }
 
-  let { content, name, searchKey }: Props = $props();
+  let { content, name, searchKey, collapseKey, defaultExpanded = false }: Props = $props();
   let userCollapsed = $state(true);
   let overrideSeq = $state(-1);
+  let baseCollapsed = $derived(
+    collapseKey === undefined
+      ? userCollapsed
+      : !turnCollapse.isEventExpanded(collapseKey, defaultExpanded),
+  );
   let collapsed = $derived(searchCollapsed(
-    userCollapsed, inSessionSearch.isCurrentBlock(searchKey),
+    baseCollapsed, inSessionSearch.isCurrentBlock(searchKey),
     inSessionSearch.navigationRevision, overrideSeq,
   ));
 
-  let previewLine = $derived(
-    content.split("\n")[0]?.slice(0, 80) ?? "",
-  );
+  /** First content line, truncated at 80 Unicode code points — an emoji
+   *  counts as one point and surrogate pairs are never split. */
+  let previewLine = $derived.by(() => {
+    const first = content.split("\n")[0] ?? "";
+    const points = Array.from(first);
+    return points.length > 80 ? `${points.slice(0, 80).join("")}…` : first;
+  });
 </script>
 
 <div class="skill-block">
@@ -37,6 +52,9 @@
       if (sel && sel.toString().length > 0) return;
       userCollapsed = !collapsed;
       overrideSeq = inSessionSearch.navigationRevision;
+      if (collapseKey !== undefined) {
+        turnCollapse.setEventExpanded(collapseKey, !userCollapsed);
+      }
     }}
   >
     <span class="skill-chevron" class:open={!collapsed}>

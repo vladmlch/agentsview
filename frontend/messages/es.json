@@ -2358,6 +2358,27 @@
   ],
   "settings_image_cleanup_compact_note": "Quitar las cargas útiles reescribe las filas almacenadas. El archivo de almacenamiento conserva su tamaño hasta que ejecutes agentsview db compact.",
   "appearance_render_unknown_xml_blocks": "Mostrar los bloques XML desconocidos como texto preformateado",
+  "assistant_turn_event_message": "Mensaje",
+  "assistant_turn_message_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} mensaje",
+        "countPlural=other": "{countLabel} mensajes"
+      }
+    }
+  ],
+  "assistant_turn_tool_call_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} llamada a herramienta",
+        "countPlural=other": "{countLabel} llamadas a herramienta"
+      }
+    }
+  ],
   "go_to_session_title": "Ir a sesión",
   "go_to_session_input_label": "ID o UUID de sesión",
   "go_to_session_placeholder": "Pega un ID o UUID de sesión",

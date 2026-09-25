@@ -2344,6 +2344,27 @@
   ],
   "settings_image_cleanup_compact_note": "ペイロードの削除は保存済み行を書き換えます。agentsview db compact を実行するまでアーカイブファイルのサイズは変わりません。",
   "appearance_render_unknown_xml_blocks": "不明なXMLブロックを整形済みテキストとして表示",
+  "assistant_turn_event_message": "メッセージ",
+  "assistant_turn_message_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 件のメッセージ",
+        "countPlural=other": "{countLabel} 件のメッセージ"
+      }
+    }
+  ],
+  "assistant_turn_tool_call_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 個のツール呼び出し",
+        "countPlural=other": "{countLabel} 個のツール呼び出し"
+      }
+    }
+  ],
   "go_to_session_title": "セッションへ移動",
   "go_to_session_input_label": "セッションIDまたはUUID",
   "go_to_session_placeholder": "セッションIDまたはUUIDを貼り付け",
