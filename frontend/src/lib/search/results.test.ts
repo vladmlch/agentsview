@@ -33,6 +33,8 @@ function match(ordinal: number, occurrence = 0): Match {
     occurrence,
     start: occurrence * 7,
     end: occurrence * 7 + 6,
+    kind: "text",
+    role: "assistant",
   };
 }
 describe("find result snippets", () => {

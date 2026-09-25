@@ -1009,6 +1009,7 @@ Paraglide JS, Playwright.
 
 - Modify: `frontend/e2e/message-content.spec.ts`
 - Modify: `frontend/e2e/session-find.spec.ts`
+- Modify: `frontend/e2e/session-find-regressions.spec.ts`
 - Modify: `docs/superpowers/plans/2026-09-25-assistant-turn-collapse.md`
 
 **Interfaces:**
