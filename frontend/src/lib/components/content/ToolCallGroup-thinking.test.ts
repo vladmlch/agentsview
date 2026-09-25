@@ -104,7 +104,7 @@ describe("thinking inside tool groups", () => {
       expect(document.querySelectorAll(".thinking-content")).toHaveLength(0);
     },
   );
-  it("keeps hidden thinking out of the group index and the DOM", async () => {
+  it("temporarily reveals hidden thinking for matches without saving filters", async () => {
     ui.visibleBlocks = new Set(["user", "assistant", "tool"]);
     await mountGroup(true, false);
     expect(document.querySelector(".thinking-header")).toBeNull();
@@ -113,10 +113,16 @@ describe("thinking inside tool groups", () => {
     await tick();
     await vi.advanceTimersByTimeAsync(150);
     await tick();
-    expect(inSessionSearch.total).toBe(0);
-    expect(inSessionSearch.countForBlock("7:thinking:0")).toBe(0);
+    // Filter-hidden thinking stays in the index and its type is revealed for
+    // the open find view; the saved filter itself is untouched.
+    expect(inSessionSearch.total).toBe(4);
+    expect(inSessionSearch.countForBlock("7:thinking:0")).toBe(2);
+    expect(document.querySelectorAll(".thinking-header")).toHaveLength(2);
+    expect(document.querySelector("[data-search-current]")).not.toBeNull();
+    expect(ui.visibleBlocks.has("thinking")).toBe(false);
+    inSessionSearch.close();
+    await tick();
     expect(document.querySelector(".thinking-header")).toBeNull();
-    expect(document.querySelector("[data-search-current]")).toBeNull();
   });
   it("keeps manual collapse until the next occurrence is selected", async () => {
     await render(true, false);

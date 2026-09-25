@@ -67,7 +67,7 @@ it("positions visible matches without hidden thinking, including live filter cha
   component = mount(FindOverviewRail, {
     target: document.body,
     props: {
-      items: inSessionSearch.scope!.items,
+      items: inSessionSearch.scope!.displayItems,
       totalSize: 100,
       newestFirst: false,
       rowOffset: () => 0,

@@ -39,8 +39,24 @@ describe("buildSessionIndex", () => {
   it("counts occurrences rather than messages", () => {
     const index = buildSessionIndex([message(3, "needle needle")], "needle");
     expect(index.matches).toEqual([
-      { ordinal: 3, blockKey: "3:text:0", occurrence: 0, start: 0, end: 6 },
-      { ordinal: 3, blockKey: "3:text:0", occurrence: 1, start: 7, end: 13 },
+      {
+        ordinal: 3,
+        blockKey: "3:text:0",
+        occurrence: 0,
+        start: 0,
+        end: 6,
+        kind: "text",
+        role: "assistant",
+      },
+      {
+        ordinal: 3,
+        blockKey: "3:text:0",
+        occurrence: 1,
+        start: 7,
+        end: 13,
+        kind: "text",
+        role: "assistant",
+      },
     ]);
     expect(index.total).toBe(2);
     expect(index.byBlock.get("3:text:0")).toBe(2);
@@ -130,6 +146,30 @@ describe("buildSessionIndex", () => {
     ]);
     expect(index.byOrdinal.get(4)).toBe(7);
     expect(index.matches.map((match) => match.occurrence)).toEqual([0, 1, 0, 1, 2, 0, 0]);
+    expect(index.matches.map((match) => match.kind)).toEqual([
+      "tool-input",
+      "tool-input",
+      "tool-output",
+      "tool-output",
+      "tool-output",
+      "tool-history",
+      "tool-history",
+    ]);
+    expect(index.matches.every((match) => match.role === "assistant")).toBe(true);
+  });
+
+  it("records each match's block kind and source message role", () => {
+    const source = [
+      message(0, "needle", { role: "user" }),
+      message(1, "[Thinking]\nneedle\n[/Thinking]", { has_thinking: true }),
+      message(2, "needle"),
+    ];
+    const index = buildSessionIndex(source, "needle");
+    expect(index.matches.map((match) => [match.kind, match.role, match.blockKey])).toEqual([
+      ["text", "user", "0:text:0"],
+      ["thinking", "assistant", "1:thinking:0"],
+      ["text", "assistant", "2:text:0"],
+    ]);
   });
 
   it("excludes system and boundary cards", () => {
@@ -158,7 +198,7 @@ describe("buildSessionIndex", () => {
     expect(nextIndex.total).toBe(3);
   });
 
-  it("skips blocks the caller's scope excludes while keeping the others intact", () => {
+  it("indexes every searchable block so filters stay out of membership", () => {
     const source = [
       message(4, "", {
         has_tool_use: true,
@@ -173,15 +213,11 @@ describe("buildSessionIndex", () => {
       }),
       message(5, "needle prose"),
     ];
-    const textOnly = buildSessionIndex(
-      source,
-      "needle",
-      (_message, block) => block.kind === "text",
-    );
-    expect(textOnly.matches.map((match) => match.blockKey)).toEqual(["5:text:0"]);
-    expect(textOnly.byBlock.has("4:tool-output:0")).toBe(false);
-    const everything = buildSessionIndex(source, "needle", () => true);
-    expect(everything.total).toBe(4);
+    const index = buildSessionIndex(source, "needle");
+    expect(index.total).toBe(4);
+    expect(index.byBlock.has("4:tool-output:0")).toBe(true);
+    expect(index.byBlock.has("4:tool-input:0")).toBe(true);
+    expect(index.byBlock.get("5:text:0")).toBe(1);
   });
 
   it("refreshes replaced same-length output data", () => {
