@@ -11,6 +11,7 @@ import {
   type SearchCursor,
 } from "../search/navigation.js";
 import {
+  blockTypeForKind,
   keepsAnswerBeforeTrailingTools,
   projectSessionScope,
   type SessionScope,
@@ -44,9 +45,12 @@ export interface SearchView {
   visibleBlocks?: ReadonlySet<BlockType>;
   hasBlockFilters?: boolean;
   renderUnknownXmlBlocksAsPreformatted?: boolean;
+  /** Saved block-visibility predicate; used when `visibleBlocks` is absent. */
+  isBlockVisible?(type: BlockType): boolean;
 }
 
 const EMPTY_MATCHES: Match[] = [];
+const EMPTY_BLOCK_TYPES: ReadonlySet<BlockType> = new Set();
 
 export class InSessionSearchStore {
   isOpen = $state(false);
@@ -60,12 +64,15 @@ export class InSessionSearchStore {
   focusRequest = $state(0);
   resultsOpen = $state(false);
   private historyFailed = $state(false);
+  /** Types the user manually hid while the find view is open. */
+  private suppressedTypes = $state(new Set<BlockType>());
 
   private source: SearchMessageSource = messages;
   private view: SearchView = ui;
   private disposeEffects: () => void;
   private previousSessionId: string | null;
   private historyRequest: { sessionId: string; promise: Promise<void> } | null = null;
+  private previousVisibleBlocks: ReadonlySet<BlockType> | undefined;
 
   private historyIncomplete = $derived(
     this.source.hasOlder || this.source.historyComplete === false,
@@ -77,6 +84,7 @@ export class InSessionSearchStore {
     if (!this.source.sessionId) return null;
     return projectSessionScope({
       messages: this.source.messages,
+      sessionId: this.source.sessionId,
       transcriptMode: this.view.transcriptMode,
       visibleBlocks: this.view.visibleBlocks,
       hasBlockFilters: this.view.hasBlockFilters,
@@ -92,10 +100,11 @@ export class InSessionSearchStore {
     if (!this.source.sessionId || !this.isActive) return null;
     const scope = this.scope;
     if (!scope) return null;
+    // Every searchable block of every eligible message is indexed; block
+    // filters shape what renders, not what the search can find.
     return buildSessionIndex(
       scope.messages,
       this.debouncedQuery,
-      (message, block) => scope.allowsBlock(message, block.kind),
       { renderUnknownXmlBlocksAsPreformatted: this.view.renderUnknownXmlBlocksAsPreformatted },
       this.wholeWord,
     );
@@ -104,6 +113,23 @@ export class InSessionSearchStore {
   orderedMatches: readonly Match[] = $derived(
     matchesInDisplayOrder(this.matches, this.view.sortNewestFirst),
   );
+  /**
+   * Saved-hidden block types that own at least one active match, temporarily
+   * revealed for the open find view. Suppressed types stay hidden; closing
+   * search clears both reveals and suppression. Never persisted.
+   */
+  revealedBlockTypes: ReadonlySet<BlockType> = $derived.by(() => {
+    if (!this.isOpen) return EMPTY_BLOCK_TYPES;
+    const saved = this.view.visibleBlocks;
+    if (saved === undefined) return EMPTY_BLOCK_TYPES;
+    let revealed: Set<BlockType> | null = null;
+    for (const match of this.matches) {
+      const type = blockTypeForKind(match.kind, match.role);
+      if (saved.has(type) || this.suppressedTypes.has(type)) continue;
+      (revealed ??= new Set<BlockType>()).add(type);
+    }
+    return revealed ?? EMPTY_BLOCK_TYPES;
+  });
   total = $derived(this.index?.total ?? 0);
   loadingHistory = $derived(
     this.isOpen &&
@@ -139,6 +165,7 @@ export class InSessionSearchStore {
           this.composing = false;
           this.historyRequest = null;
           this.historyFailed = false;
+          this.suppressedTypes = new Set();
           this.navigationRevision++;
           if (!sessionId) this.close();
         });
@@ -170,6 +197,24 @@ export class InSessionSearchStore {
           }
         }, 150);
         return () => clearTimeout(timer);
+      });
+
+      $effect(() => {
+        const saved = this.view.visibleBlocks;
+        const open = this.isOpen;
+        untrack(() => {
+          const previous = this.previousVisibleBlocks;
+          this.previousVisibleBlocks = saved ? new Set(saved) : saved;
+          if (!open || !previous || !saved) return;
+          // A manual hide while the find view is open suppresses the
+          // temporary reveal; re-enabling clears that suppression.
+          for (const type of previous) {
+            if (!saved.has(type)) this.noteManualBlockFilterChange(type, false);
+          }
+          for (const type of saved) {
+            if (!previous.has(type)) this.noteManualBlockFilterChange(type, true);
+          }
+        });
       });
 
       $effect(() => {
@@ -288,7 +333,36 @@ export class InSessionSearchStore {
     this.debouncedQuery = "";
     this.current = null;
     this.resultsOpen = false;
+    this.suppressedTypes = new Set();
     this.navigationRevision++;
+  }
+
+  /**
+   * Records a saved-filter change while the find view is open. Hiding a type
+   * suppresses its temporary reveal until it is re-enabled or the view
+   * closes; re-enabling clears the suppression. Ignored while closed.
+   */
+  noteManualBlockFilterChange(type: BlockType, visible: boolean): void {
+    if (!this.isOpen) return;
+    if (visible === !this.suppressedTypes.has(type)) return;
+    // Reassign rather than mutate: `$state`-proxied Set mutations do not
+    // invalidate `$derived` readers in all contexts.
+    const next = new Set(this.suppressedTypes);
+    if (visible) {
+      next.delete(type);
+    } else {
+      next.add(type);
+    }
+    this.suppressedTypes = next;
+  }
+
+  /** Saved block visibility plus the open search's temporary reveals. */
+  isBlockEffectivelyVisible(type: BlockType): boolean {
+    const saved = this.view.visibleBlocks;
+    const savedVisible = this.view.isBlockVisible
+      ? this.view.isBlockVisible(type)
+      : saved === undefined || saved.has(type);
+    return savedVisible || this.revealedBlockTypes.has(type);
   }
 
   toggleWholeWord(): void {

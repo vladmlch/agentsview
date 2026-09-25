@@ -11,7 +11,7 @@
   import ToolBlock from "./ToolBlock.svelte";
   import ThinkingBlock from "./ThinkingBlock.svelte";
   import { collectSearchBlocks } from "../../search/block-text.js";
-  import { ui } from "../../stores/ui.svelte.js";
+  import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
   import ParallelGroup from "./ParallelGroup.svelte";
   import { CopyButton } from "@kenn-io/kit-ui";
   import { displayToolName } from "../../utils/toolDisplay.js";
@@ -109,7 +109,7 @@
       {@const calls = message.tool_calls ?? []}
       {@const turn = turnByMessage.get(message.id)}
       <div data-message-ordinal={message.ordinal}>
-        {#if ui.isBlockVisible("thinking")}
+        {#if inSessionSearch.isBlockEffectivelyVisible("thinking")}
           {#each collectSearchBlocks(message).filter((block) => block.kind === "thinking") as block (block.key)}
             <ThinkingBlock content={block.text} searchKey={searchable ? block.key : undefined} />
           {/each}

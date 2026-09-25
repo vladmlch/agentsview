@@ -60,6 +60,16 @@ function message(ordinal: number, content: string, overrides: Partial<Message> =
   };
 }
 
+const BLOCK_FILTER_KEY = "agentsview-block-filters";
+
+async function search(query = "needle") {
+  inSessionSearch.open();
+  inSessionSearch.query = query;
+  await tick();
+  await vi.advanceTimersByTimeAsync(200);
+  await tick();
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
   vi.clearAllMocks();
@@ -85,8 +95,11 @@ beforeEach(() => {
     }),
   ];
   messages.messageCount = 3;
-  ui.visibleBlocks = new Set(["user"]);
-  ui.setTranscriptMode("focused");
+  ui.showAllBlocks();
+  for (const type of ["assistant", "thinking", "tool", "code", "system"] as const) {
+    ui.setBlockVisible(type, false);
+  }
+  ui.setTranscriptMode("normal");
   ui.messageLayout = "skim";
   ui.sortNewestFirst = false;
   ui.followLatest = false;
@@ -114,22 +127,112 @@ afterEach(async () => {
 });
 
 describe("MessageList search visibility", () => {
-  it("respects block filters and focused mode while searching without changing preferences", async () => {
+  it("indexes filter-hidden blocks and temporarily reveals their types", async () => {
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    // Baseline: only the user row renders; hidden types stay unmounted.
+    const before = document.querySelectorAll(".virtual-row").length;
+    expect(before).toBe(1);
+    expect(document.querySelectorAll(".thinking-header")).toHaveLength(0);
+    expect(document.querySelector(".tool-block")).toBeNull();
+    const filters = [...ui.visibleBlocks];
+    const stored = localStorage.getItem(BLOCK_FILTER_KEY);
+
+    await search();
+
+    // Hidden thinking and tool-output blocks join the index…
+    expect(inSessionSearch.total).toBe(3);
+    expect(inSessionSearch.countForBlock("1:thinking:0")).toBe(1);
+    expect(inSessionSearch.countForBlock("2:tool-output:0")).toBe(1);
+    // …their owning types are temporarily revealed…
+    expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(true);
+    expect(inSessionSearch.revealedBlockTypes.has("tool")).toBe(true);
+    // …so the filtered rows and blocks mount without touching preferences.
+    expect(document.querySelectorAll(".virtual-row").length).toBe(3);
+    expect(document.querySelectorAll(".thinking-header").length).toBeGreaterThan(0);
+    expect(document.querySelector(".tool-block")).not.toBeNull();
+    expect([...ui.visibleBlocks]).toEqual(filters);
+    expect(localStorage.getItem(BLOCK_FILTER_KEY)).toBe(stored);
+
+    inSessionSearch.close();
+    await tick();
+    // Closing the find view restores the saved filter output.
+    expect(document.querySelectorAll(".virtual-row")).toHaveLength(before);
+    expect(document.querySelectorAll(".thinking-header")).toHaveLength(0);
+    expect(document.querySelector(".tool-block")).toBeNull();
+  });
+
+  it("keeps a manually hidden revealed type suppressed until the find view closes", async () => {
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await search();
+    expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(true);
+    expect(document.querySelectorAll(".thinking-header").length).toBeGreaterThan(0);
+
+    // The filter control reports the manual hide; the type is suppressed.
+    inSessionSearch.noteManualBlockFilterChange("thinking", false);
+    ui.setBlockVisible("thinking", false);
+    await tick();
+    expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(false);
+    expect(document.querySelectorAll(".thinking-header")).toHaveLength(0);
+    // The match remains indexed while the type is suppressed.
+    expect(inSessionSearch.countForBlock("1:thinking:0")).toBe(1);
+
+    // The suppression survives query changes while the view stays open.
+    inSessionSearch.query = "needl";
+    await tick();
+    await vi.advanceTimersByTimeAsync(200);
+    await tick();
+    expect(inSessionSearch.countForBlock("1:thinking:0")).toBe(1);
+    expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(false);
+    expect(document.querySelectorAll(".thinking-header")).toHaveLength(0);
+
+    // Reopening the find view reveals the hidden type again (query persists).
+    inSessionSearch.close();
+    inSessionSearch.open();
+    await tick();
+    await vi.advanceTimersByTimeAsync(200);
+    await tick();
+    expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(true);
+    expect(document.querySelectorAll(".thinking-header").length).toBeGreaterThan(0);
+  });
+
+  it("suppresses a saved-visible type manually hidden during search", async () => {
+    ui.setBlockVisible("thinking", true);
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await search();
+    expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(false);
+    expect(document.querySelectorAll(".thinking-header").length).toBeGreaterThan(0);
+
+    // Hiding the type while the find view is open suppresses its reveal, so
+    // the thinking match stops mounting instead of auto-revealing.
+    ui.setBlockVisible("thinking", false);
+    await tick();
+    expect(inSessionSearch.countForBlock("1:thinking:0")).toBe(1);
+    expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(false);
+    expect(document.querySelectorAll(".thinking-header")).toHaveLength(0);
+
+    // Re-enabling the saved filter clears the suppression.
+    ui.setBlockVisible("thinking", true);
+    await tick();
+    expect(document.querySelectorAll(".thinking-header").length).toBeGreaterThan(0);
+  });
+
+  it("keeps focused-mode intermediates out of search even with matching hidden types", async () => {
+    ui.setTranscriptMode("focused");
     component = mount(MessageList, { target: document.body });
     await tick();
     const before = document.querySelectorAll(".virtual-row").length;
     const filters = [...ui.visibleBlocks];
     expect(document.querySelector(".layout-skim")).not.toBeNull();
-    inSessionSearch.open();
-    inSessionSearch.query = "needle";
-    await tick();
-    await vi.advanceTimersByTimeAsync(200);
-    await tick();
-    // Only the visible user text is searchable and rendered; hidden thinking
-    // and tool blocks contribute no count and no DOM.
+    await search();
+    // Focused mode keeps its message-level projection: the intermediate
+    // thinking-only and tool-only rows are not eligible for the index.
     expect(inSessionSearch.total).toBe(1);
     expect(inSessionSearch.countForOrdinal(0)).toBe(1);
     expect(inSessionSearch.countForBlock("1:thinking:0")).toBe(0);
+    expect([...inSessionSearch.revealedBlockTypes]).toEqual([]);
     expect(document.querySelectorAll(".virtual-row")).toHaveLength(before);
     expect(document.querySelectorAll(".thinking-header")).toHaveLength(0);
     expect(document.querySelector(".tool-block")).toBeNull();
@@ -142,68 +245,6 @@ describe("MessageList search visibility", () => {
     await tick();
     expect(document.querySelectorAll(".virtual-row")).toHaveLength(before);
     expect(document.querySelector(".layout-skim")).not.toBeNull();
-  });
-
-  it("applies a filter change during an active query to counts, DOM, and the current result", async () => {
-    component = mount(MessageList, { target: document.body });
-    await tick();
-    inSessionSearch.open();
-    inSessionSearch.query = "needle";
-    await tick();
-    await vi.advanceTimersByTimeAsync(200);
-    await tick();
-    expect(inSessionSearch.total).toBe(1);
-    expect(inSessionSearch.resolvedCurrent?.blockKey).toBe("0:text:0");
-
-    ui.setBlockVisible("thinking", true);
-    await tick();
-    await vi.advanceTimersByTimeAsync(50);
-    await tick();
-    expect(inSessionSearch.total).toBe(2);
-    expect(inSessionSearch.countForBlock("1:thinking:0")).toBe(1);
-    expect(document.querySelectorAll(".thinking-header").length).toBeGreaterThan(0);
-
-    ui.setBlockVisible("thinking", false);
-    await tick();
-    await vi.advanceTimersByTimeAsync(50);
-    await tick();
-    expect(inSessionSearch.total).toBe(1);
-    expect(inSessionSearch.countForBlock("1:thinking:0")).toBe(0);
-    expect(document.querySelectorAll(".thinking-header")).toHaveLength(0);
-    // The removed occurrence is replaced deterministically, not left dangling.
-    expect(inSessionSearch.resolvedCurrent?.blockKey).toBe("0:text:0");
-    expect(
-      document.querySelector('[data-search-current="true"]')?.getAttribute("data-search-block"),
-    ).toBe("0:text:0");
-  });
-
-  it("clears the current highlight and pending reveal when filters leave no match", async () => {
-    component = mount(MessageList, { target: document.body });
-    await tick();
-    inSessionSearch.open();
-    inSessionSearch.query = "needle";
-    await tick();
-    await vi.advanceTimersByTimeAsync(200);
-    await tick();
-    expect(inSessionSearch.total).toBe(1);
-    expect(document.querySelector('[data-search-current="true"]')).not.toBeNull();
-
-    for (const type of ["user"] as const) ui.setBlockVisible(type, false);
-    await tick();
-    await vi.advanceTimersByTimeAsync(200);
-    await tick();
-    expect(inSessionSearch.total).toBe(0);
-    expect(inSessionSearch.resolvedCurrent).toBeNull();
-    expect(document.querySelector("[data-search-current]")).toBeNull();
-
-    // Restoring the filter restores the searchable range without retyping.
-    ui.setBlockVisible("user", true);
-    await tick();
-    await vi.advanceTimersByTimeAsync(200);
-    await tick();
-    expect(inSessionSearch.total).toBe(1);
-    expect(inSessionSearch.query).toBe("needle");
-    expect(inSessionSearch.resolvedCurrent?.blockKey).toBe("0:text:0");
   });
 
   it("cancels stale virtual scrolling after closing search", async () => {
