@@ -43,7 +43,11 @@ export interface SessionScopeInput {
 }
 
 export interface SessionScope {
-  /** Transcript nodes for the selected mode with full group membership. */
+  /**
+   * Transcript nodes for the selected mode with full group membership.
+   * Staged for the turn-collapse rendering tasks; nothing consumes it in
+   * production yet.
+   */
   items: TranscriptNode[];
   /** Display items the current transcript mode and filters render. */
   displayItems: DisplayItem[];
@@ -90,6 +94,8 @@ export function projectSessionScope(input: SessionScopeInput): SessionScope {
     visibleBlocks === undefined || visibleBlocks.has(type);
   // The search reveal layers over the saved filter for rendered output only;
   // it is never persisted to the user's block-visibility preference.
+  // Must agree with InSessionSearchStore.isBlockEffectivelyVisible, which
+  // applies the same saved-or-revealed rule inside message components.
   const isEffectivelyVisible = (type: BlockType): boolean =>
     isVisible(type) || (revealedBlocks?.has(type) ?? false);
   // A filtered code fence still renders its manually expandable placeholder.

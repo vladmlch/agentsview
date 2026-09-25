@@ -282,7 +282,11 @@ class UIStore {
   followLatest: boolean = $state(readStoredBool(FOLLOW_LATEST_KEY, false));
   followLatestRequest: number = $state(0);
 
-  /** Set of block types currently visible. */
+  /**
+   * Set of block types currently visible. Writers MUST reassign this Set
+   * rather than mutate it in place — the in-session search diff effect
+   * snapshots the previous reference to detect manual filter changes.
+   */
   visibleBlocks: Set<BlockType> = $state(readBlockFilters());
 
   constructor() {

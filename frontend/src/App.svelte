@@ -73,6 +73,7 @@
   import { messages } from "./lib/stores/messages.svelte.js";
   import { sync } from "./lib/stores/sync.svelte.js";
   import { ui } from "./lib/stores/ui.svelte.js";
+  import { inSessionSearch } from "./lib/stores/inSessionSearch.svelte.js";
   import { router } from "./lib/stores/router.svelte.js";
   import { starred } from "./lib/stores/starred.svelte.js";
   import { pins } from "./lib/stores/pins.svelte.js";
@@ -308,11 +309,13 @@
     const items = messageListRef?.getDisplayItems();
     if (!items || items.length === 0) return;
 
+    // Prompt rows an active search reveals are navigable too, so the jump
+    // target check uses effective visibility rather than the saved filter.
     const ordinal = findUserPromptOrdinal(
       items,
       ui.selectedOrdinal,
       ui.sortNewestFirst ? -delta : delta,
-      ui.isBlockVisible("user"),
+      inSessionSearch.isBlockEffectivelyVisible("user"),
     );
     if (ordinal !== undefined) navigateToMessageOrdinal(ordinal);
   }
