@@ -185,7 +185,7 @@ Paraglide JS, Playwright.
   Expected: tests and focused format/lint/type checks pass; existing tool-rollup
   and transcript-mode behavior remains unchanged.
 
-- [ ] **Step 5: Commit the projection task**
+- [x] **Step 5: Commit the projection task**
 
   ```bash
   git add \
