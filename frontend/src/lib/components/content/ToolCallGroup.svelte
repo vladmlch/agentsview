@@ -24,9 +24,15 @@
     searchable?: boolean;
     sortNewestFirst?: boolean;
     divider?: { ordinal: number; label: string };
+    /** Turn-event key prefix; each member block derives its disclosure key
+     *  as `${collapseKeyPrefix}:${message.id}` plus the call index. */
+    collapseKeyPrefix?: string;
+    /** Default expansion for member blocks when the prefix is set. */
+    defaultExpanded?: boolean;
   }
 
-  let { messages, timestamp, searchable = false, sortNewestFirst = false, divider }: Props = $props();
+  let { messages, timestamp, searchable = false, sortNewestFirst = false, divider,
+    collapseKeyPrefix, defaultExpanded = false }: Props = $props();
   let copied = $state(false);
 
   function messageToolCount(message: Message): number {
@@ -108,10 +114,15 @@
       {/if}
       {@const calls = message.tool_calls ?? []}
       {@const turn = turnByMessage.get(message.id)}
+      {@const messageScope = collapseKeyPrefix === undefined ? undefined : `${collapseKeyPrefix}:${message.id}`}
       <div data-message-ordinal={message.ordinal}>
         {#if inSessionSearch.isBlockEffectivelyVisible("thinking")}
           {#each collectSearchBlocks(message).filter((block) => block.kind === "thinking") as block (block.key)}
-            <ThinkingBlock content={block.text} searchKey={searchable ? block.key : undefined} />
+            <!-- block.key is `${ordinal}:thinking:${segmentIndex}`; reuse the
+              trailing segment index so the disclosure key stays stable. -->
+            <ThinkingBlock content={block.text} searchKey={searchable ? block.key : undefined}
+              collapseKey={messageScope === undefined ? undefined : `${messageScope}:thinking:${block.key.split(":").pop()}`}
+              {defaultExpanded} />
           {/each}
         {/if}
         {#if calls.length === 1}
@@ -127,6 +138,8 @@
             )}
             isRunning={isRunningTurn(message)}
             searchScope={searchable ? { ordinal: message.ordinal, callIdx: 0 } : undefined}
+            collapseKey={messageScope === undefined ? undefined : `${messageScope}:0`}
+            {defaultExpanded}
           />
         {:else if calls.length >= 2}
           <ParallelGroup
@@ -134,6 +147,8 @@
             callTimingByID={callByToolUseID}
             isRunning={isRunningTurn(message)}
             searchOrdinal={searchable ? message.ordinal : undefined}
+            collapseKeyPrefix={messageScope}
+            {defaultExpanded}
           />
         {:else}
           {#each enrichSegments(parseContent(message.content, message.has_tool_use, message.id, message.content_length), message.tool_calls).filter((s) => s.type === "tool") as seg, segIdx (`${message.id}-${segIdx}`)}
@@ -142,6 +157,8 @@
               label={seg.label}
               toolCall={seg.toolCall}
               searchScope={searchable ? { ordinal: message.ordinal, callIdx: `seg${segIdx}` } : undefined}
+              collapseKey={messageScope === undefined ? undefined : `${messageScope}:seg${segIdx}`}
+              {defaultExpanded}
             />
           {/each}
         {/if}

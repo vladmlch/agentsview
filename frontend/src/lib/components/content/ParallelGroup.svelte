@@ -11,6 +11,11 @@
     callTimingByID?: Map<string, CallTiming>;
     isRunning?: boolean;
     searchOrdinal?: number;
+    /** Turn-event key prefix; each member block resolves its disclosure as
+     *  `${collapseKeyPrefix}:${index}` through `turnCollapse`. */
+    collapseKeyPrefix?: string;
+    /** Default expansion for member blocks when the prefix is set. */
+    defaultExpanded?: boolean;
   }
 
   let {
@@ -18,6 +23,8 @@
     callTimingByID,
     isRunning = false,
     searchOrdinal,
+    collapseKeyPrefix,
+    defaultExpanded = false,
   }: Props = $props();
 
 </script>
@@ -42,6 +49,8 @@
         durationLabel={dur}
         inGroup={true}
         searchScope={searchOrdinal === undefined ? undefined : { ordinal: searchOrdinal, callIdx: i }}
+        collapseKey={collapseKeyPrefix === undefined ? undefined : `${collapseKeyPrefix}:${i}`}
+        {defaultExpanded}
       />
     {/each}
   </div>
