@@ -31,6 +31,16 @@ const THINKING_LEGACY_RE = /\[Thinking\]\n?([\s\S]*?)(?=\n\[|\n\n|$)/g;
  */
 const SKILL_RE = /\[Skill: (.+?)\]\n?([\s\S]*?)\n?\[\/Skill\]/g;
 
+/**
+ * Skill injections emitted as XML envelopes (Devin, Claude-based
+ * harnesses): an optional "Instructions for the "name" skill:"
+ * header line followed by a <skill name="…" …> block. The closing
+ * tag may be absent, in which case the block runs to end of text.
+ * The <skill tag must start a line so inline mentions stay text.
+ */
+const SKILL_XML_RE =
+  /(?:^|\n)[ \t]*(?:Instructions for the[^\n]*\n(?:[ \t]*\n)*)?<skill\b[^>]*?\bname="([^"]*)"[^>]*>([\s\S]*?)(?:<\/skill>|$)/g;
+
 const TOOL_NAMES =
   "Tool|Read|Write|Edit|Patch|Bash|Glob|Grep|Other|TaskCreate|TaskUpdate|TaskGet|TaskList|Task|Agent|Skill|" +
   "SendMessage|Question|Todo List|Entering Plan Mode|" +
@@ -288,6 +298,24 @@ function extractMatches(text: string, parseTools = true): Match[] {
 
   // Skill blocks
   for (const m of text.matchAll(SKILL_RE)) {
+    const start = m.index!;
+    const end = start + m[0].length;
+    if (insideInlineCode(start, codeSpans)) continue;
+    const overlaps = matches.some((o) => start >= o.start && start < o.end);
+    if (overlaps) continue;
+    matches.push({
+      start,
+      end,
+      segment: {
+        type: "skill",
+        content: (m[2] ?? "").trim(),
+        label: m[1] ?? "",
+      },
+    });
+  }
+
+  // Skill injection envelopes (<skill name="…" …>…</skill>)
+  for (const m of text.matchAll(SKILL_XML_RE)) {
     const start = m.index!;
     const end = start + m[0].length;
     if (insideInlineCode(start, codeSpans)) continue;
