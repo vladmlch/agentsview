@@ -2503,7 +2503,23 @@ schemas keep their existing ordering behavior.
   (`sessions.main_chain_id` walked up via `parent_node_id`); summing every row
   double-counts retries and edits. Older databases that predate
   `sessions.main_chain_id` keep that field invalid and fall back to all
-  message nodes in creation order. Verified against a live Devin CLI database.
+  message nodes in creation order. When Devin continues a compacted session,
+  it re-roots the context: the new chain starts at a fresh snapshot whose
+  system node opens with "You are continuing work from a previous
+  conversation thread", and the earlier thread remains only on sibling
+  subtrees branching off that shared prefix. The parser recovers those
+  pre-continuation eras: sibling subtrees headed by a system node that hang
+  off chain nodes preceding an on-chain summary are linearized into messages
+  (sibling nodes sharing one `message_id` are pending/committed duplicates
+  resolved to the higher `node_id`; forks with distinct message_ids resolve
+  toward the deepest subtree, the era's surviving line), while user- or
+  assistant-headed siblings are edits and abandoned retries and stay
+  excluded. Continuation-summary nodes are surfaced as `compact_boundary`
+  markers, matching the Claude compact-boundary convention. Exported
+  transcripts open with the same summary step and likewise drop
+  pre-continuation steps, so the transcript path recovers eras from
+  `message_nodes` too unless the export carries real content before the
+  boundary. Verified against a live Devin CLI database 2026-09-25.
   Assistant `chat_message.thinking` is an object
   (`{"thinking": string, "signature": ..., "signature_type": ...}`), never a
   bare string: across a live database every populated node used the object
