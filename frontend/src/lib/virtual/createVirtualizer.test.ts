@@ -317,4 +317,48 @@ describe("createVirtualizer reactivity", () => {
       unmount(component);
     },
   );
+
+  it.each([
+    {
+      type: "element" as const,
+      options: {
+        count: 10,
+        getScrollElement: () => document.createElement("div"),
+        estimateSize: (): number => 50,
+      },
+    },
+    {
+      type: "window" as const,
+      options: {
+        count: 20,
+        estimateSize: (): number => 50,
+      },
+    },
+  ])(
+    "updates instance getter when options change ($type virtualizer)",
+    async ({ type, options }) => {
+      const onInstanceChange = vi.fn();
+      const container = document.createElement("div");
+
+      const component = mount(VirtualizerTest, {
+        target: container,
+        props: { type, options, onInstanceChange },
+      });
+
+      await tick();
+      expect(onInstanceChange).toHaveBeenCalledTimes(1);
+
+      component.setOptions({
+        ...options,
+        count: 30,
+      });
+      await tick();
+      vi.advanceTimersByTime(ASYNC_UPDATE_DELAY_MS);
+      await tick();
+
+      expect(onInstanceChange).toHaveBeenCalledTimes(2);
+      unmount(component);
+    },
+  );
 });
+

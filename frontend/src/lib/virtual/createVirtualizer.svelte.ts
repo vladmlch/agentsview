@@ -95,6 +95,8 @@ function createBaseVirtualizer<TScroll extends Element | Window, TItem extends E
 
     postUpdate?.(instance, opts, cacheKeyChanged);
 
+    bumpVersion();
+
     return () => {
       instance?._willUpdate();
     };
