@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Button, Checkbox, SegmentedControl, Typeahead } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
+  import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
   import { settings } from "../../stores/settings.svelte.js";
   import {
     ui,
@@ -48,6 +49,15 @@
       label: `${step}%`,
     })),
   );
+
+  /** Same protocol as the header's block filter: while the find view is
+   *  open, record the manual choice first so a temporary reveal is
+   *  suppressed, then save the persistent visibility choice. */
+  function handleBlockToggle(type: BlockType) {
+    const next = !inSessionSearch.isBlockEffectivelyVisible(type);
+    inSessionSearch.noteManualBlockFilterChange(type, next);
+    ui.setBlockVisible(type, next);
+  }
 </script>
 
 <div class="appearance-settings">
@@ -112,13 +122,22 @@
     />
   </div>
 
+  <div class="setting-row">
+    <Checkbox
+      checked={ui.autoCollapseAssistantTurns}
+      onchange={(checked) => ui.setAutoCollapseAssistantTurns(checked)}
+      ariaLabel={m.appearance_auto_collapse_assistant_turns()}
+      label={m.appearance_auto_collapse_assistant_turns()}
+    />
+  </div>
+
   <div class="setting-row column">
     <span class="setting-label">{m.appearance_block_visibility()}</span>
     <div class="block-toggles">
       {#each ALL_BLOCK_TYPES as bt}
         <Checkbox
-          checked={ui.isBlockVisible(bt)}
-          onchange={() => ui.toggleBlock(bt)}
+          checked={inSessionSearch.isBlockEffectivelyVisible(bt)}
+          onchange={() => handleBlockToggle(bt)}
           label={BLOCK_LABELS[bt]}
         />
       {/each}

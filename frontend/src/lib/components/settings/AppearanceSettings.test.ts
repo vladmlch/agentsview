@@ -1,10 +1,17 @@
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { tick } from "svelte";
 
 import AppearanceSettings from "./AppearanceSettings.svelte";
+import MessageContent from "../content/MessageContent.svelte";
 import { SettingsService } from "../../api/generated/index";
+import type { DbMessage as Message } from "../../api/generated/index.js";
+import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+import { messages } from "../../stores/messages.svelte.js";
+import { sessions } from "../../stores/sessions.svelte.js";
 import { settings } from "../../stores/settings.svelte.js";
 import { sync } from "../../stores/sync.svelte.js";
+import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 
 vi.mock("../../api/generated/index", async (importOriginal) => {
@@ -21,6 +28,34 @@ const settingsService = SettingsService as unknown as {
   putApiV1Settings: ReturnType<typeof vi.fn>;
 };
 const originalIsDesktop = sync.isDesktop;
+const AUTO_COLLAPSE_TURNS_KEY = "agentsview-auto-collapse-turns";
+
+function searchMessage(
+  ordinal: number,
+  role: Message["role"],
+  content: string,
+  overrides: Partial<Message> = {},
+): Message {
+  return {
+    id: 9000 + ordinal,
+    session_id: "appearance-search",
+    ordinal,
+    role,
+    content,
+    content_length: content.length,
+    timestamp: `2026-06-13T12:00:${String(ordinal).padStart(2, "0")}Z`,
+    has_thinking: false,
+    thinking_text: "",
+    has_tool_use: false,
+    model: "",
+    context_tokens: 0,
+    output_tokens: 0,
+    has_context_tokens: false,
+    has_output_tokens: false,
+    is_system: false,
+    ...overrides,
+  } as Message;
+}
 
 describe("AppearanceSettings", () => {
   beforeEach(() => {
@@ -44,12 +79,26 @@ describe("AppearanceSettings", () => {
       writable: true,
       configurable: true,
     });
+    inSessionSearch.close();
+    inSessionSearch.clearQuery();
+    messages.clear();
+    sessions.activeSessionId = null;
+    ui.showAllBlocks();
+    ui.setAutoCollapseAssistantTurns(true);
+    turnCollapse.activateSession(null);
   });
 
   afterEach(() => {
     ui.setZoomLevel(100);
     ui.renderUnknownXmlBlocksAsPreformatted = false;
     if (ui.highContrast) ui.toggleHighContrast();
+    inSessionSearch.close();
+    inSessionSearch.clearQuery();
+    messages.clear();
+    sessions.activeSessionId = null;
+    ui.showAllBlocks();
+    ui.setAutoCollapseAssistantTurns(true);
+    turnCollapse.activateSession(null);
     settings.chartPalette = "agentsview";
     settings.readOnly = false;
     settings.loaded = false;
@@ -202,5 +251,79 @@ describe("AppearanceSettings", () => {
 
     expect((getByRole("radio", { name: "Agentsview" }) as HTMLButtonElement).disabled).toBe(true);
     expect((getByRole("radio", { name: "Matplotlib" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("persists the assistant-turn collapse preference locally", async () => {
+    const { getByRole } = render(AppearanceSettings);
+    const checkbox = getByRole("checkbox", {
+      name: "Collapse assistant turns by default",
+    }) as HTMLInputElement;
+
+    expect(checkbox.checked).toBe(true);
+    expect(ui.autoCollapseAssistantTurns).toBe(true);
+
+    await fireEvent.click(checkbox);
+
+    expect(checkbox.checked).toBe(false);
+    expect(ui.autoCollapseAssistantTurns).toBe(false);
+    await waitFor(() => expect(localStorage.getItem(AUTO_COLLAPSE_TURNS_KEY)).toBe("false"));
+
+    await fireEvent.click(checkbox);
+    expect(ui.autoCollapseAssistantTurns).toBe(true);
+    await waitFor(() => expect(localStorage.getItem(AUTO_COLLAPSE_TURNS_KEY)).toBe("true"));
+
+    // The preference is browser-local; it never posts to server settings.
+    expect(settingsService.putApiV1Settings).not.toHaveBeenCalled();
+  });
+
+  it("suppresses a search-revealed block type when its filter hides during search", async () => {
+    const thinkingMessage = searchMessage(
+      1,
+      "assistant",
+      "[Thinking]\nneedle\n[/Thinking]\nworking",
+      { has_thinking: true },
+    );
+    messages.sessionId = "appearance-search";
+    messages.hasOlder = false;
+    messages.loading = false;
+    messages.messages = [
+      searchMessage(0, "user", "ask"),
+      thinkingMessage,
+      searchMessage(2, "assistant", "done"),
+    ];
+    ui.setBlockVisible("thinking", false);
+    await tick();
+    inSessionSearch.isOpen = true;
+    inSessionSearch.query = "needle";
+    inSessionSearch.debouncedQuery = "needle";
+
+    const { getByRole } = render(AppearanceSettings);
+    render(MessageContent, { props: { message: thinkingMessage } });
+    await waitFor(() => expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(true));
+
+    // The hidden type is temporarily revealed: content mounts and the
+    // checkbox reports effective visibility rather than the saved filter.
+    expect(document.querySelector(".thinking-block")).not.toBeNull();
+    const thinkingBox = getByRole("checkbox", {
+      name: "Thinking blocks",
+    }) as HTMLInputElement;
+    expect(thinkingBox.checked).toBe(true);
+
+    await fireEvent.click(thinkingBox);
+
+    // The manual hide suppresses the temporary reveal immediately while the
+    // saved filter was already hidden and stays hidden.
+    await waitFor(() => expect(document.querySelector(".thinking-block")).toBeNull());
+    expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(false);
+    expect(inSessionSearch.isBlockEffectivelyVisible("thinking")).toBe(false);
+    expect(ui.isBlockVisible("thinking")).toBe(false);
+    expect(thinkingBox.checked).toBe(false);
+
+    // Closing the find view keeps the saved (hidden) choice, not the reveal.
+    inSessionSearch.close();
+    await tick();
+    expect(inSessionSearch.isBlockEffectivelyVisible("thinking")).toBe(false);
+    expect(ui.isBlockVisible("thinking")).toBe(false);
+    expect(thinkingBox.checked).toBe(false);
   });
 });

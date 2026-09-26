@@ -903,7 +903,7 @@ Paraglide JS, Playwright.
   `message_content_show_full_prompt`, and `message_content_show_less`.
   Event-count and bulk-action keys are added in their rendering/control tasks.
 
-- [ ] **Step 1: Write failing setting and prompt tests**
+- [x] **Step 1: Write failing setting and prompt tests**
 
   Add an `AppearanceSettings.test.ts` assertion for the accessible checkbox
   name, its default-on value, toggling to off, and matching `localStorage`
@@ -916,7 +916,7 @@ Paraglide JS, Playwright.
   emoji-only prompts so counting and slicing never split surrogate pairs.
   Verify attachments render independently.
 
-- [ ] **Step 2: Run focused settings and prompt tests and verify RED**
+- [x] **Step 2: Run focused settings and prompt tests and verify RED**
 
   ```bash
   ./node_modules/.bin/vp test run \
@@ -927,7 +927,7 @@ Paraglide JS, Playwright.
   Expected: FAIL because the preference control and prompt disclosure are not
   present.
 
-- [ ] **Step 3: Add localized preference and prompt labels**
+- [x] **Step 3: Add localized preference and prompt labels**
 
   Add `appearance_auto_collapse_assistant_turns`,
   `message_content_show_full_prompt`, and `message_content_show_less` to every
@@ -940,7 +940,7 @@ Paraglide JS, Playwright.
 
   Expected: Paraglide compilation completes with no missing-key error.
 
-- [ ] **Step 4: Implement the Appearance preference and prompt disclosure**
+- [x] **Step 4: Implement the Appearance preference and prompt disclosure**
 
   Add the auto-collapse checkbox to the existing Appearance settings rows and
   bind it to `ui.setAutoCollapseAssistantTurns`. Do not send a server settings
@@ -955,7 +955,7 @@ Paraglide JS, Playwright.
   by source message ID in `TurnCollapseStore`; keep attachments outside the
   disclosure and preserve the current image filter.
 
-- [ ] **Step 5: Run setting and prompt tests and verify GREEN**
+- [x] **Step 5: Run setting and prompt tests and verify GREEN**
 
   ```bash
   npm run i18n:compile
@@ -967,7 +967,7 @@ Paraglide JS, Playwright.
   Expected: PASS for checkbox value/storage, filter override, exact 600/601
   code-point behavior, expansion/collapse copy, and independent attachments.
 
-- [ ] **Step 6: Document the transcript behavior**
+- [x] **Step 6: Document the transcript behavior**
 
   Update `docs/usage.md` in Message Layouts / Message Display and Settings to
   explain collapsed assistant turns, event rows, the auto-collapse preference,
@@ -975,7 +975,7 @@ Paraglide JS, Playwright.
   prompt preview. Add the preference to the Appearance row in the Settings
   table. Preserve existing descriptions of focused mode and filters.
 
-- [ ] **Step 7: Run component, changed-file, and docs checks**
+- [x] **Step 7: Run component, changed-file, and docs checks**
 
   ```bash
   ./node_modules/.bin/vp check \
@@ -989,7 +989,7 @@ Paraglide JS, Playwright.
   Expected: changed-file format/lint/type checks and documentation validation
   pass.
 
-- [ ] **Step 8: Commit settings, copy, and docs**
+- [x] **Step 8: Commit settings, copy, and docs**
 
   ```bash
   git add \
