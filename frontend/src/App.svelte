@@ -292,12 +292,26 @@
     }
 
     const curIdx = ordinals.indexOf(selected);
-    const nextIdx = Math.max(
-      0,
-      Math.min(ordinals.length - 1, curIdx + delta),
-    );
-    if (nextIdx === curIdx) return;
+    if (curIdx >= 0) {
+      const nextIdx = Math.max(
+        0,
+        Math.min(ordinals.length - 1, curIdx + delta),
+      );
+      if (nextIdx === curIdx) return;
+      navigateToMessageOrdinal(ordinals[nextIdx]!);
+      return;
+    }
 
+    // The selection isn't a navigable stop (e.g. a folded turn member's
+    // ordinal recorded by a header click). Anchor the step where it would
+    // sort in display order — ordinals run newest-first when sorted that
+    // way — so j moves to the next stop after it and k to the one before.
+    const insertionIdx = ordinals.findIndex((ordinal) =>
+      ui.sortNewestFirst ? ordinal < selected : ordinal > selected,
+    );
+    const slot = insertionIdx < 0 ? ordinals.length : insertionIdx;
+    const nextIdx = delta > 0 ? slot : slot - 1;
+    if (nextIdx < 0 || nextIdx >= ordinals.length) return;
     navigateToMessageOrdinal(ordinals[nextIdx]!);
   }
 

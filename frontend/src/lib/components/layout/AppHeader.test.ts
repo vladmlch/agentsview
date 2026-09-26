@@ -25,6 +25,8 @@ import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 import { router } from "../../stores/router.svelte.js";
 import { setLocale } from "../../i18n/index.js";
+import { projectSessionScope } from "../../search/session-scope.js";
+import type { AssistantTurnItem } from "../../utils/assistant-turns.js";
 import type { Session } from "../../api/types.js";
 import type { DbMessage as Message } from "../../api/generated/index.js";
 
@@ -445,6 +447,44 @@ describe("AppHeader transcript controls", () => {
     bulkButton()!.click();
     await tick();
     expect(turnCollapse.bulkBaseline).toBe("collapse");
+    expect(bulkButton()!.getAttribute("aria-label")).toBe("Expand all");
+  });
+
+  it("flips the bulk label when a nested tool output drawer folds", async () => {
+    messages.messages = [
+      headerMessage(0, "user", "ask"),
+      headerMessage(1, "assistant", "working", {
+        has_tool_use: true,
+        tool_calls: [
+          {
+            category: "",
+            tool_name: "Read",
+            tool_use_id: "t1",
+            result_content: "done",
+          },
+        ],
+      }),
+      headerMessage(2, "assistant", "done"),
+    ];
+    component = mount(AppHeader, { target: document.body });
+    await tick();
+
+    bulkButton()!.click();
+    await tick();
+    expect(bulkButton()!.getAttribute("aria-label")).toBe("Collapse all");
+
+    // Folding one tool block's output drawer — a nested disclosure the
+    // label used to ignore — must bring "Expand all" back.
+    const scope = projectSessionScope({
+      messages: messages.messages,
+      sessionId: "sess-123",
+    });
+    const turn = scope.items.find(
+      (item): item is AssistantTurnItem => item.kind === "assistant-turn",
+    )!;
+    const toolEvent = turn.events.find((event) => event.kind === "tool")!;
+    turnCollapse.setToolSectionExpanded(`${toolEvent.key}:output`, false);
+    await tick();
     expect(bulkButton()!.getAttribute("aria-label")).toBe("Expand all");
   });
 

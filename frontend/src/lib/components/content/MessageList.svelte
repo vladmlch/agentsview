@@ -21,6 +21,7 @@
   import type { DisplayItem } from "../../utils/display-items.js";
   import type {
     AssistantTurnItem,
+    LeadingTurnAnchor,
     TranscriptNode,
     TurnEvent,
   } from "../../utils/assistant-turns.js";
@@ -136,7 +137,11 @@
   ): TurnEvent | null {
     const parts = blockKey.split(":");
     const kind = parts[1] ?? "";
+    // `${ordinal}:${kind}:${index}` carries the enriched segment index
+    // for text/code/thinking/skill blocks; `seg`-prefixed or fractional
+    // trailing parts parse to NaN and only degrade to kind matching.
     const segmentIndex = Number(parts[2]);
+    const hasSegmentIndex = Number.isInteger(segmentIndex);
     const candidates = turn.events.filter((event) =>
       event.ordinals.includes(ordinal),
     );
@@ -144,16 +149,31 @@
       candidates.find((event) => kinds.includes(event.kind)) ?? null;
     const bySegmentIndex = (kind: TurnEvent["kind"]) =>
       candidates.find(
-        (event) => event.kind === kind && event.segmentIndex === segmentIndex,
+        (event) =>
+          hasSegmentIndex &&
+          event.kind === kind &&
+          event.segmentIndex === segmentIndex,
+      ) ?? null;
+    // Adjacent text/code segments merge into one event covering
+    // [segmentIndex, segmentIndex + segments.length); an index from a
+    // later segment still belongs to that run's disclosure.
+    const inRun = (kind: TurnEvent["kind"]) =>
+      candidates.find(
+        (event) =>
+          hasSegmentIndex &&
+          event.kind === kind &&
+          event.segmentIndex !== undefined &&
+          segmentIndex >= event.segmentIndex &&
+          segmentIndex < event.segmentIndex + (event.segments?.length ?? 1),
       ) ?? null;
     switch (kind) {
       case "text":
       case "code":
-        return bySegmentIndex("message") ?? byKinds("message");
+        return inRun("message") ?? byKinds("message");
       case "thinking":
         return bySegmentIndex("thinking") ?? byKinds("thinking");
       case "skill":
-        return byKinds("skill");
+        return bySegmentIndex("skill") ?? byKinds("skill");
       case "tool-input":
       case "tool-output":
       case "tool-history":
@@ -876,22 +896,20 @@
   // The leading partial turn re-anchors to an earlier message id when an
   // older page is prepended, which changes its key. Carrying the turn's
   // manual expansion override to the new key keeps a turn the user opened
-  // open across loadOlder/re-anchoring.
-  let leadingTurnAnchor: { key: string; firstMessageId: number } | null = null;
+  // open across loadOlder/re-anchoring. `sessionScope.leadingTurn` is the
+  // unfiltered normal-mode anchor, so this runs in either transcript mode.
+  let leadingTurn: LeadingTurnAnchor | null = null;
   $effect(() => {
-    const first = sessionScope.items[0];
-    const next =
-      ui.transcriptMode === "normal" && first?.kind === "assistant-turn"
-        ? { key: first.key, firstMessageId: first.firstMessageId }
-        : null;
-    const previous = leadingTurnAnchor;
-    leadingTurnAnchor = next;
+    const next = sessionScope.leadingTurn;
+    const previous = leadingTurn;
+    leadingTurn = next;
     if (
       previous !== null &&
       next !== null &&
       previous.key !== next.key &&
-      first?.kind === "assistant-turn" &&
-      first.messages.some((message) => message.id === previous.firstMessageId)
+      // Same-turn check: a re-anchor keeps the old first message inside
+      // the new turn's members; a genuinely different turn does not.
+      next.memberIds.includes(previous.firstMessageId)
     ) {
       turnCollapse.migrateTurnKey(previous.key, next.key);
     }
