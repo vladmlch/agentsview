@@ -947,6 +947,20 @@ fixtures retain this field; missing identities remain source-local.
   sources in place to recover this evidence without changing source or session
   IDs.
 
+- **Paginated rollout continuation stitching (2026-09-26):** Codex sessions
+  interrupted or resumed across multiple rollout files record
+  `history_mode: "paginated"` with a `history_base` object in `session_meta`.
+  `history_base.thread_id` identifies the predecessor segment, either by
+  direct rollout UUID or by segment suffix (`_<segment_id>.jsonl`), and
+  `history_base.end_ordinal_exclusive` defines the slice boundary that excludes
+  interrupted or aborted turns (`turn_aborted`). Agentsview stitches ancestor
+  segments up through the root segment into the leaf segment's session with
+  continuous message ordinals `0..N`, preserving the root `FirstMessage` and
+  `StartedAt` while taking `EndedAt` from the leaf segment. Rollout filename
+  matching in discovery and source resolution recognizes both unsegmented
+  `rollout-*-{uuid}.jsonl` and segmented `rollout-*-{uuid}_{segment_uuid}.jsonl`
+  patterns; each segment keys as its own continuation-page session.
+
 - **Evidence:** `source`.
 
 - **Upstream:** Clone `https://github.com/openai/codex.git` at
