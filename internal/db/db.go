@@ -541,7 +541,9 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // (121: Devin message_nodes subagent trees are stored as parent-linked child
 // sessions. Re-parse Devin sessions to materialize their transcript-backed
 // subagents from the source database.)
-const dataVersion = 121
+// (122: duplicate Devin subagent roots sharing a prompt message_id are
+// coalesced onto the most complete transcript tree.)
+const dataVersion = 122
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 

@@ -2604,19 +2604,25 @@ schemas keep their existing ordering behavior.
   producer source.
 - **Subagent message trees:** observed CLI databases store child transcripts
   as separate roots in the `message_nodes` forest. A root system message
-  containing `You are a subagent of Devin` identifies a child; its messages
-  are the descendants reached through `parent_node_id`. Roots containing
-  `You are a Summarizer` are auxiliary summaries, not child transcripts.
-  Only a subagent root with descendant messages is emitted as a child session.
-  Its application ID is scoped to the parent session and root node:
-  `devin:<parent-session-id>:agent-<root-node-id>`. The root `node_id` is
-  local to its parent session. This identity is AgentsView's derived key, not
-  a producer-supplied session ID. The CLI schema remains unpublished.
+  containing `You are a subagent of Devin` identifies a candidate child; its
+  messages are the descendants reached through `parent_node_id`. Roots
+  containing `You are a Summarizer` are auxiliary summaries, not child
+  transcripts. The forest can contain multiple disconnected roots for the
+  same task. Copies retain the `message_id` of the first user prompt even
+  when their root `node_id` differs. Group copies by that prompt ID and keep
+  the tree with the most descendant rows; use the higher root `node_id` to
+  break ties. A unique prompt-only tree can still represent an unfinished
+  child. The emitted application ID is scoped to the parent session and the
+  selected representative root node:
+  `devin:<parent-session-id>:agent-<root-node-id>`. This is AgentsView's
+  derived key, not a producer-supplied session ID. The CLI schema remains
+  unpublished.
   Child trees are emitted separately and are not interleaved with a parent's
   transcript export.
   `run_subagent` and `read_subagent` calls remain events in the parent
   transcript; an event or its `agent_id` alone does not establish a child
-  transcript. Verified against the local CLI database on 2026-09-26.
+  transcript. Duplicate prompt IDs and their progressively populated tree
+  copies were verified against the local CLI database on 2026-09-26.
 - **Usage and cost:** Message or aggregate metrics can persist prompt,
   completion, and cached tokens. The parser handles multiple observed field
   names; no authoritative provider-reported USD value is consumed, so pricing
