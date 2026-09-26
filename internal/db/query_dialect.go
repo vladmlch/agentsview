@@ -539,6 +539,7 @@ func BuildSessionBaseFilterSQL(
 	preds := []string{
 		"message_count > 0",
 		"deleted_at IS NULL",
+		"source_missing_at IS NULL",
 	}
 	if f.IncludeEmpty {
 		preds = preds[1:]
@@ -626,6 +627,7 @@ func buildSessionFilterWithBuilder(
 	basePreds := []string{
 		q("message_count") + " > 0",
 		q("deleted_at") + " IS NULL",
+		q("source_missing_at") + " IS NULL",
 	}
 	if f.IncludeEmpty {
 		basePreds = basePreds[1:]
@@ -682,6 +684,7 @@ func buildSessionFilterWithBuilder(
 		"SELECT s.id FROM sessions s" +
 		" JOIN tree t ON " + b.dialect.ParentRelation("s", "t") +
 		" WHERE s.message_count > 0 AND s.deleted_at IS NULL" +
+		" AND s.source_missing_at IS NULL" +
 		childAutomationWhere +
 		") SELECT id FROM tree"
 
