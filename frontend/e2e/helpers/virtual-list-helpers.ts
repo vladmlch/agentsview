@@ -64,20 +64,28 @@ export async function waitForRowCountStable(
  * Virtual rows can briefly overlap while the virtualizer
  * re-measures heights after sort or expansion changes; a click
  * issued during that window can dispatch to a neighboring row.
+ * Re-scrolling inside the poll keeps the row reachable while
+ * those positions shift.
  */
 export async function waitForRowHitTarget(locator: Locator): Promise<void> {
-  await locator.scrollIntoViewIfNeeded();
   await expect
     .poll(
-      () =>
-        locator.evaluate((el) => {
-          const rect = el.getBoundingClientRect();
-          const hit = document.elementFromPoint(
-            rect.left + rect.width / 2,
-            rect.top + rect.height / 2,
-          );
-          return hit instanceof Element && el.contains(hit);
-        }),
+      async () => {
+        try {
+          await locator.scrollIntoViewIfNeeded();
+          return await locator.evaluate((el) => {
+            const rect = el.getBoundingClientRect();
+            const hit = document.elementFromPoint(
+              rect.left + rect.width / 2,
+              rect.top + rect.height / 2,
+            );
+            return hit instanceof Element && el.contains(hit);
+          });
+        } catch {
+          // Mid-remount rows can reject scrolling; retry on the next poll.
+          return false;
+        }
+      },
       { timeout: 5_000 },
     )
     .toBe(true);

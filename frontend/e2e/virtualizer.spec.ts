@@ -152,7 +152,7 @@ test.describe("Virtualizer measurement", () => {
 
     const totalHeight = await container.evaluate((el) => el.getBoundingClientRect().height);
 
-    // With overscan=5 and only 5 items, all should be in DOM
+    // With overscan=5 and only 7 items, all should be in DOM
     expect(Math.abs(totalHeight - sumOfHeights)).toBeLessThanOrEqual(5);
   });
 
