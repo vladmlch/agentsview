@@ -217,6 +217,9 @@
     // Rollups and system rows own no `isEventExpanded` disclosure; their
     // member blocks self-disclose through the search-collapsed path.
     if (event && event.kind !== "tool-rollup" && event.kind !== "system") {
+      // The final-output event's preview row ignores this override, but
+      // recording it keeps `allTurnRowsExpanded` honest: "message" stays
+      // in `DISCLOSURE_EVENT_KINDS`.
       turnCollapse.setEventExpanded(event.key, true);
     }
   }
@@ -297,6 +300,41 @@
       if (fallback < 0 && row.ordinals.includes(ordinal)) fallback = index;
     }
     return fallback;
+  }
+
+  /** Row that actually mounts the match's search block — resolved through
+   *  the same owner-event path `expandOrdinalTarget` uses. A match owned
+   *  by the turn's final-output event lives on the `final-output` row:
+   *  its `turn-event` preview mounts no search blocks, and centering that
+   *  first ordinal claimant can leave the output row outside the rendered
+   *  window so `findSearchBlock` never sees the block. Any other event's
+   *  match lands on its own `turn-event` row rather than an earlier
+   *  same-message claimant (e.g. thinking before text). Falls back to
+   *  `findRowIndex` when no precise row exists — filtered event, focused
+   *  mode, or an owner with no mounted row. */
+  function searchMountRowIndex(ordinal: number, blockKey?: string): number {
+    const owner =
+      ui.transcriptMode === "normal"
+        ? findOrdinalOwner(sessionScope.items, ordinal)
+        : null;
+    if (owner) {
+      const event = blockKey
+        ? (blockOwnerEvent(owner.turn, ordinal, blockKey) ?? owner.event)
+        : owner.event;
+      if (event) {
+        const index =
+          event.key === owner.turn.finalOutput?.key
+            ? transcriptRows.findIndex(
+                (row) =>
+                  row.kind === "final-output" && row.turn.key === owner.turn.key,
+              )
+            : transcriptRows.findIndex(
+                (row) => row.kind === "turn-event" && row.event.key === event.key,
+              );
+        if (index >= 0) return index;
+      }
+    }
+    return findRowIndex(ordinal);
   }
 
   /** Ordinals in the row's internal display order — tool-group and rollup
@@ -1054,7 +1092,10 @@
         // a large turn expansion — a top-aligned row can be pushed just
         // above the fold as estimates converge.
         expandOrdinalTarget(match.ordinal, match.blockKey);
-        return scrollToDisplayIndex(() => displayIndexOf(match.ordinal), 0, 0, reqId, "center");
+        return scrollToDisplayIndex(
+          () => searchMountRowIndex(match.ordinal, match.blockKey),
+          0, 0, reqId, "center",
+        );
       },
       scrollToOffset: (offset) => virtualizer.instance?.scrollToOffset(
         Math.round(offset), { align: "start" },
@@ -1257,7 +1298,7 @@
               <AssistantTurnEventRow
                 event={row.event}
                 ownsSourceActions={sourceActionKeys.events.has(row.key)}
-                previewOnly={row.event === row.turn.finalOutput}
+                previewOnly={row.event.key === row.turn.finalOutput?.key}
                 divider={dividerHere && row.event.kind === "tool-rollup"
                   ? readProgressDivider
                   : undefined}

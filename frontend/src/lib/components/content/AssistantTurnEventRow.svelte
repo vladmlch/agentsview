@@ -172,7 +172,9 @@
           <span class="event-label">{m.assistant_turn_event_message()}</span>
           <SearchMatchCount count={matchCount} />
           {#if preview}
-            <span class="event-preview">{preview}</span>
+            <!-- The same text is announced by the final-output row
+              immediately after. -->
+            <span class="event-preview" aria-hidden="true">{preview}</span>
           {/if}
         </div>
       {:else}
@@ -325,7 +327,9 @@
     min-width: 0;
     user-select: text;
   }
-  .event-toggle:hover {
+  /* The static preview variant shares the layout class but is not
+     interactive — keep the hover affordance on the button only. */
+  button.event-toggle:hover {
     background: var(--bg-surface-hover);
     color: var(--text-primary);
   }
