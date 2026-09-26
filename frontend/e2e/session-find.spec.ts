@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import type { Message } from "../src/lib/api/types.js";
+import type { DbMessage as Message } from "../src/lib/api/generated/index.js";
 
 const SESSION_ID = "test-session-xlarge-5500";
 const QUERY = "needle";
@@ -34,6 +34,8 @@ function fixtureMessages(): Message[] {
       model: "",
       context_tokens: 0,
       output_tokens: 0,
+      has_context_tokens: false,
+      has_output_tokens: false,
       is_system: false,
     };
   });
@@ -222,27 +224,33 @@ async function stepOccurrences(page: Page, total: number, direction: "F3" | "Shi
     await expect(counter).not.toHaveText(before);
     let current: Awaited<ReturnType<typeof currentGeometry>> = null;
     await expect
-      .poll(async () => {
-        const first = await currentGeometry(page);
-        if (first?.visible && !first.native) {
-          current = first;
-          return true;
-        }
-        await page.evaluate(
-          () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
-        );
-        const second = await currentGeometry(page);
-        if (
-          first?.visible &&
-          second?.visible &&
-          first.key === second.key &&
-          first.offset === second.offset
-        ) {
-          current = second;
-          return true;
-        }
-        return false;
-      })
+      .poll(
+        async () => {
+          const first = await currentGeometry(page);
+          if (first?.visible && !first.native) {
+            current = first;
+            return true;
+          }
+          await page.evaluate(
+            () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
+          );
+          const second = await currentGeometry(page);
+          if (
+            first?.visible &&
+            second?.visible &&
+            first.key === second.key &&
+            first.offset === second.offset
+          ) {
+            current = second;
+            return true;
+          }
+          return false;
+        },
+        // Reveal on a 5500-row virtual transcript involves mount,
+        // scroll, and re-measure; allow more than the 5s default
+        // under parallel load.
+        { timeout: 15_000 },
+      )
       .toBe(true);
     expect(current).not.toBeNull();
     steps.push(current!);
@@ -335,30 +343,28 @@ test.describe("In-session find", () => {
     });
   });
 
-  test("excludes tool calls hidden at start and restores them when the filter returns", async ({
-    page,
-  }) => {
+  test("keeps hidden tool calls indexed and honors a manual hide", async ({ page }) => {
     const fixture = await installFixture(page, { hidden: ["tool"] });
     fixture.releaseHistory();
     const transcript = await openSession(page);
     await openFind(page);
-    await expectCompleteIndex(page, PROSE_MATCHES);
+    // Normal-mode block filters do not shrink the search index: the tool
+    // matches stay indexed and their blocks are temporarily revealed.
+    await expectCompleteIndex(page, ALL_MATCHES);
     await openResults(page);
-    const hiddenSteps = await stepOccurrences(page, PROSE_MATCHES, "F3");
+    const hiddenSteps = await stepOccurrences(page, ALL_MATCHES, "F3");
     const hiddenKeys = new Set(hiddenSteps.map((step) => step.key!));
-    expect(hiddenKeys.has("12:tool-output:0")).toBe(false);
-    expect(hiddenKeys.has("12:tool-history:0.0")).toBe(false);
-    await expect(transcript.locator(".tool-block")).toHaveCount(0);
+    expect(hiddenKeys.has("12:tool-output:0")).toBe(true);
+    expect(hiddenKeys.has("12:tool-history:0.0")).toBe(true);
+    expect(await page.evaluate(() => localStorage.getItem("agentsview-block-filters"))).toBe(
+      JSON.stringify({ hidden: ["tool"] }),
+    );
 
+    // Hiding the revealed type manually suppresses the temporary reveal;
+    // the index and the current match are unchanged.
     await toggleBlockFilter(page, "Tool calls");
     await expectCompleteIndex(page, ALL_MATCHES);
-    const shownSteps = await stepOccurrences(page, ALL_MATCHES, "F3");
-    const shownKeys = new Set(shownSteps.map((step) => step.key!));
-    expect(shownKeys.has("12:tool-output:0")).toBe(true);
-    expect(shownKeys.has("12:tool-history:0.0")).toBe(true);
-
-    await toggleBlockFilter(page, "Tool calls");
-    await expectCompleteIndex(page, PROSE_MATCHES);
+    await expect(transcript.locator(".tool-block")).toHaveCount(0);
     await expect
       .poll(async () => {
         const current = await currentGeometry(page);
@@ -366,6 +372,55 @@ test.describe("In-session find", () => {
       })
       .toBe(true);
     await expect(transcript.locator("mark")).toHaveCount(0);
+
+    // Re-enabling clears the suppression and reveals the blocks again.
+    await toggleBlockFilter(page, "Tool calls");
+    await expectCompleteIndex(page, ALL_MATCHES);
+    const shownSteps = await stepOccurrences(page, 4, "F3");
+    expect(shownSteps.at(-1)?.key).toBe("12:tool-output:0");
+    await expect(transcript.locator(".tool-block").first()).toBeVisible();
+  });
+
+  test("hidden-type search reveals matches without persisting filters", async ({ page }) => {
+    const fixture = await installFixture(page, { hidden: ["thinking", "tool"] });
+    fixture.releaseHistory();
+    const transcript = await openSession(page);
+    const input = await openFind(page);
+
+    // Hidden block types stay indexed: all seven needle matches resolve
+    // and their folded rows mount while the search view navigates to them.
+    await expectCompleteIndex(page, ALL_MATCHES);
+    await openResults(page);
+    const steps = await stepOccurrences(page, ALL_MATCHES, "F3");
+    const keys = new Set(steps.map((step) => step.key!));
+    expect(keys.has("7:thinking:0")).toBe(true);
+    expect(keys.has("12:tool-output:0")).toBe(true);
+    expect(keys.has("12:tool-history:0.0")).toBe(true);
+    // The reveal is ephemeral — the persisted filter is untouched.
+    expect(await page.evaluate(() => localStorage.getItem("agentsview-block-filters"))).toBe(
+      JSON.stringify({ hidden: ["thinking", "tool"] }),
+    );
+
+    // Land on the hidden thinking match so its revealed block mounts.
+    const thinkingSteps = await stepOccurrences(page, 2, "F3");
+    expect(thinkingSteps.at(-1)?.key).toBe("7:thinking:0");
+    await expect(transcript.locator(".thinking-block").first()).toBeVisible();
+
+    // Manually hiding a revealed type wins over the temporary reveal
+    // while the saved filter still records the same hidden types.
+    await toggleBlockFilter(page, "Thinking blocks");
+    await expect(transcript.locator(".thinking-block")).toHaveCount(0);
+    expect(await page.evaluate(() => localStorage.getItem("agentsview-block-filters"))).toBe(
+      JSON.stringify({ hidden: ["thinking", "tool"] }),
+    );
+
+    // Clearing the query drops every temporary reveal, but the turn the
+    // search expanded keeps its disclosure.
+    await input.fill("");
+    await expect(transcript.locator(".thinking-block")).toHaveCount(0);
+    await expect(transcript.locator(".tool-block")).toHaveCount(0);
+    await expect(transcript.locator("[data-search-current]")).toHaveCount(0);
+    await expect(transcript.locator('.turn-header[aria-expanded="true"]').first()).toBeVisible();
   });
 
   test("keeps the current occurrence valid when a filter hides it mid-search", async ({ page }) => {
@@ -387,20 +442,20 @@ test.describe("In-session find", () => {
     await expect.poll(async () => (await currentGeometry(page))?.visible).toBe(true);
 
     await toggleBlockFilter(page, "Tool calls");
-    await expectCompleteIndex(page, PROSE_MATCHES);
-    await expect
-      .poll(async () => {
-        const current = await currentGeometry(page);
-        return current !== null && current.visible && !TOOL_KEYS.includes(current.key ?? "");
-      })
-      .toBe(true);
-    await expect(transcript.locator('[data-search-current="true"]')).not.toHaveCount(0);
-    await expect(transcript.locator("[data-search-current]")).toHaveCount(1);
+    // The match stays indexed while its hidden block unmounts.
+    await expectCompleteIndex(page, ALL_MATCHES);
+    await expect(transcript.locator(".tool-block")).toHaveCount(0);
+    await expect(transcript.locator("[data-search-current]")).toHaveCount(0);
 
     await toggleBlockFilter(page, "Tool calls");
     await expectCompleteIndex(page, ALL_MATCHES);
     await expect(input).toHaveValue(QUERY);
-    await expect.poll(async () => (await currentGeometry(page))?.visible).toBe(true);
+    await expect
+      .poll(async () => {
+        const current = await currentGeometry(page);
+        return current !== null && current.visible && current.key === "12:tool-output:0";
+      })
+      .toBe(true);
   });
 
   test("keeps counts and block navigation without the Highlight API", async ({ page }) => {
@@ -413,11 +468,12 @@ test.describe("In-session find", () => {
     fixture.releaseHistory();
     const transcript = await openSession(page);
     await openFind(page);
-    await expectCompleteIndex(page, PROSE_MATCHES);
-    const hiddenSteps = await stepOccurrences(page, PROSE_MATCHES, "F3");
+    // Tool calls stay indexed while hidden and are temporarily revealed.
+    await expectCompleteIndex(page, ALL_MATCHES);
+    const hiddenSteps = await stepOccurrences(page, ALL_MATCHES, "F3");
     expect(hiddenSteps.every((step) => step.native === false)).toBe(true);
     expect(hiddenSteps.every((step) => step.visible === true)).toBe(true);
-    expect(hiddenSteps.some((step) => TOOL_KEYS.includes(step.key ?? ""))).toBe(false);
+    expect(hiddenSteps.some((step) => TOOL_KEYS.includes(step.key ?? ""))).toBe(true);
     await expect(transcript.locator('[data-search-current="true"]')).toHaveCount(1);
     await expect(transcript.locator("mark")).toHaveCount(0);
     expect(
@@ -427,7 +483,11 @@ test.describe("In-session find", () => {
       }),
     ).not.toContain(true);
 
-    // The tool filter still owns its blocks when it returns.
+    // A manual hide suppresses the temporary reveal; re-enabling hands
+    // the blocks back to the saved filter.
+    await toggleBlockFilter(page, "Tool calls");
+    await expectCompleteIndex(page, ALL_MATCHES);
+    await expect(transcript.locator(".tool-block")).toHaveCount(0);
     await toggleBlockFilter(page, "Tool calls");
     await expectCompleteIndex(page, ALL_MATCHES);
     const shownSteps = await stepOccurrences(page, ALL_MATCHES, "F3");

@@ -11,7 +11,9 @@ const LOC = {
 const COLD_WEBKIT_TEST_TIMEOUT_MS = 30_000;
 
 const MIXED_CONTENT_SESSION_ID = "test-session-mixed-content-7";
-const MIXED_CONTENT_DISPLAY_ROWS = 6;
+// Three prompt rows plus a turn-header/final-output pair for each of the
+// two collapsed assistant turns.
+const MIXED_CONTENT_DISPLAY_ROWS = 7;
 
 const TOOL_BLOCK_PATH =
   "/workspace/packages/agentsview/frontend/src/lib/components/content/ToolBlock.svelte";
@@ -36,12 +38,49 @@ async function expectSessionLoaded(page: Page, sessionId: string, expectedRows?:
   }
 }
 
+/** Opens the nth assistant-turn header so its child event rows mount. */
+async function expandTurn(page: Page, index: number): Promise<Locator> {
+  const header = page.locator(".turn-header").nth(index);
+  await expect(header).toBeVisible();
+  await header.click();
+  await expect(header).toHaveAttribute("aria-expanded", "true");
+  return header;
+}
+
 test.describe("Mixed content rendering", () => {
   test.describe.configure({ timeout: COLD_WEBKIT_TEST_TIMEOUT_MS });
+
+  test("assistant turn starts collapsed and final output remains visible", async ({ page }) => {
+    const sid = await selectSession(page);
+    await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
+
+    const headers = page.locator(".turn-header");
+    await expect(headers).toHaveCount(2);
+    await expect(headers.nth(0)).toHaveAttribute("aria-expanded", "false");
+    await expect(headers.nth(1)).toHaveAttribute("aria-expanded", "false");
+
+    // The answer stays readable while the intermediate work stays folded:
+    // each collapsed turn still renders its final-output row.
+    const outputs = page.locator(".turn-output");
+    await expect(outputs).toHaveCount(2);
+    await expect(outputs.nth(0)).toContainText("Here is my analysis.");
+    await expect(outputs.nth(1)).toContainText("visible response after thinking");
+
+    // Thinking and tool blocks only mount inside an expanded turn.
+    await expect(page.locator(".thinking-block")).toHaveCount(0);
+    await expect(page.locator(".tool-block")).toHaveCount(0);
+
+    await expandTurn(page, 0);
+    await expect(page.locator(".thinking-block").first()).toBeVisible();
+    await expect(page.locator(".tool-block")).toHaveCount(0);
+  });
 
   test("tool group renders for consecutive tool-only messages", async ({ page }) => {
     const sid = await selectSession(page);
     await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
+
+    // The tool rollup lives inside the collapsed second assistant turn.
+    await expandTurn(page, 1);
 
     const toolGroup = page.locator(".tool-group");
     await expect(toolGroup).toBeVisible();
@@ -59,6 +98,7 @@ test.describe("Mixed content rendering", () => {
   test("tool block expands on click and text is selectable", async ({ page }) => {
     const sid = await selectSession(page);
     await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
+    await expandTurn(page, 1);
 
     const toolBlock = page.locator(".tool-block").first();
     await expect(toolBlock).toBeVisible();
@@ -97,6 +137,7 @@ test.describe("Mixed content rendering", () => {
         await page.setViewportSize({ width, height: 900 });
         const sid = await selectSession(page);
         await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
+        await expandTurn(page, 1);
         const pathTool = page
           .locator(".tool-block")
           .filter({
@@ -130,6 +171,7 @@ test.describe("Mixed content rendering", () => {
   test("text selection does not collapse tool block", async ({ page }) => {
     const sid = await selectSession(page);
     await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
+    await expandTurn(page, 1);
 
     // Expand the tool block first
     const toolBlock = page.locator(".tool-block").first();
@@ -162,6 +204,8 @@ test.describe("Mixed content rendering", () => {
   test("thinking block is collapsed by default", async ({ page }) => {
     const sid = await selectSession(page);
     await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
+    // The thinking block mounts inside the expanded first turn.
+    await expandTurn(page, 0);
 
     const thinkingBlock = page.locator(".thinking-block").first();
     await expect(thinkingBlock).toBeVisible();
@@ -348,6 +392,12 @@ test.describe("retained tool images", () => {
 
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto(`/sessions/${sessionId}`);
+    // The four tool-only messages fold into one collapsed assistant turn;
+    // expand it so the rollup's tool blocks mount.
+    const turnHeader = page.locator(".turn-header");
+    await expect(turnHeader).toBeVisible();
+    await turnHeader.click();
+    await expect(turnHeader).toHaveAttribute("aria-expanded", "true");
     await expect(page.locator(".tool-block")).toHaveCount(4);
 
     const retainedBlock = page

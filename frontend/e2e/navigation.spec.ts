@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { SessionsPage } from "./pages/sessions-page";
+import { waitForRowHitTarget } from "./helpers/virtual-list-helpers";
 
 test.describe("Navigation", () => {
   let sp: SessionsPage;
@@ -131,7 +132,8 @@ test.describe("Navigation", () => {
     await session.click();
     await expect(session).toHaveClass(/active/);
     await expect(sp.scroller).toHaveAttribute("data-messages-session-id", sessionId);
-    await expect(sp.messageRows).toHaveCount(6);
+    // Three prompts plus a turn-header/final-output pair per collapsed turn.
+    await expect(sp.messageRows).toHaveCount(7);
 
     const users = sp.messageRows.filter({
       has: page.locator(".message.is-user"),
@@ -139,11 +141,14 @@ test.describe("Navigation", () => {
     await users.first().click();
     await expect(users.first()).toHaveClass(/selected/);
 
-    const assistants = sp.messageRows.filter({
-      has: page.locator(".message:not(.is-user)"),
-    });
+    // Plain j moves by message ordinal: it expands the owning assistant
+    // turn and lands on the event row that renders the next stop — the
+    // turn's final output is a static preview, so the selected row is a
+    // turn-event, not a flat message row.
     await page.keyboard.press("j");
-    await expect(assistants.first()).toHaveClass(/selected/);
+    const assistantSelection = page.locator(".virtual-row.selected");
+    await expect(assistantSelection).toHaveCount(1);
+    await expect(assistantSelection.locator(".turn-event")).toHaveCount(1);
     await users.first().click();
 
     await page.keyboard.press("Shift+J");
@@ -151,11 +156,15 @@ test.describe("Navigation", () => {
     await page.keyboard.press("Shift+K");
     await expect(users.first()).toHaveClass(/selected/);
 
+    await waitForRowHitTarget(users.nth(1));
     await users.nth(1).click();
     await sp.toggleSortOrder();
     await expect(users.nth(1)).toHaveClass(/selected/);
     await page.keyboard.press("Shift+J");
     await expect(users.nth(2)).toHaveClass(/selected/);
+    // Rows re-measure after the sort toggle and reveal scroll;
+    // wait for them to stop overlapping before clicking.
+    await waitForRowHitTarget(users.nth(1));
     await users.nth(1).click();
     await page.keyboard.press("Shift+K");
     await expect(users.nth(0)).toHaveClass(/selected/);

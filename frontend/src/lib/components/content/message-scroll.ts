@@ -6,7 +6,7 @@ export interface ScrollMetrics {
   clientHeight: number;
 }
 
-export type ScrollAlign = "start" | "end";
+export type ScrollAlign = "start" | "end" | "center";
 
 export function getAlignedOffsetScrollAlign(_align: ScrollAlign): "start" {
   return "start";
