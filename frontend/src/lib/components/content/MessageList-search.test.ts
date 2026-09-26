@@ -202,6 +202,50 @@ describe("MessageList search visibility", () => {
     expect(localStorage.getItem(BLOCK_FILTER_KEY)).toBe(stored);
   });
 
+  it("expands the event disclosure that owns a later-run segment", async () => {
+    // Adjacent text/code segments merge into one event per run, so the
+    // second run's disclosure — not the first message event — owns the
+    // code block at segment index 3.
+    messages.messages = [
+      message(0, "prompt", { role: "user" }),
+      message(1, "part zero\n[Thinking]\nthought\n[/Thinking]\npart two\n```\nneedle\n```", {
+        has_thinking: true,
+      }),
+      message(2, "[Skill: one]\nfirst\n[/Skill]\n[Skill: two]\nneedle\n[/Skill]\ntail"),
+      message(3, "final answer"),
+    ];
+    messages.messageCount = 4;
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    const msg1Id = messages.messages[1]!.id;
+    const msg2Id = messages.messages[2]!.id;
+
+    await search();
+    expect(inSessionSearch.countForBlock("1:code:3")).toBe(1);
+    expect(inSessionSearch.countForBlock("2:skill:1")).toBe(1);
+
+    // The pinned first match reveals itself: the code block sits in the
+    // SECOND text/code run, so its own `message:2` disclosure opens —
+    // not the first message event on the same message.
+    await settleReveal();
+    expect(turnCollapse.isEventExpanded(`search-list:${msg1Id}:message:2`, false)).toBe(true);
+    expect(turnCollapse.isEventExpanded(`search-list:${msg1Id}:message:0`, false)).toBe(false);
+    expect(document.querySelector('[data-search-block="1:code:3"]')).not.toBeNull();
+
+    // Each skill segment keys its own disclosure too — the second one,
+    // not the first skill event on the same message. A mounted skill row
+    // self-discloses the current block, so the store path only runs when
+    // the row is unmounted: fold the turn and let the reveal re-mount it.
+    inSessionSearch.next();
+    await settleReveal();
+    expect(document.querySelector('[data-search-block="2:skill:1"]')).not.toBeNull();
+    turnCollapse.setTurnExpanded(`search-list:turn:${msg1Id}`, false);
+    await settleReveal();
+    expect(turnCollapse.isEventExpanded(`search-list:${msg2Id}:skill:1`, false)).toBe(true);
+    expect(turnCollapse.isEventExpanded(`search-list:${msg2Id}:skill:0`, false)).toBe(false);
+    expect(document.querySelector('[data-search-block="2:skill:1"]')).not.toBeNull();
+  });
+
   it("keeps a manually hidden revealed type suppressed until the find view closes", async () => {
     component = mount(MessageList, { target: document.body });
     await tick();

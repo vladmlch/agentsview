@@ -652,6 +652,36 @@ describe("MessageList follow cancellation", () => {
     expect(document.querySelectorAll(".turn-event")).toHaveLength(4);
   });
 
+  it("migrates the leading turn's expansion when prepend lands in focused mode", async () => {
+    // The re-anchor projection is mode-independent: a loadOlder that
+    // lands while focused mode renders still carries the manual
+    // expansion the user made on the leading normal-mode turn.
+    ui.setTranscriptMode("focused");
+    messages.messages = [
+      { ...makeMessage(5), role: "assistant" },
+      { ...makeMessage(6), role: "assistant" },
+    ];
+    messages.messageCount = 7;
+    messages.activeSessionToken = "current";
+    setVirtualRows(4);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    turnCollapse.setTurnExpanded("s1:turn:6", true);
+    await tick();
+
+    messages.messages = [
+      { ...makeMessage(3), role: "assistant" },
+      { ...makeMessage(4), role: "assistant" },
+      { ...makeMessage(5), role: "assistant" },
+      { ...makeMessage(6), role: "assistant" },
+    ];
+    setVirtualRows(6);
+    await tick();
+
+    expect(turnCollapse.isTurnExpanded("s1:turn:4", false)).toBe(true);
+  });
+
   it("renders a collapsed header for the empty pre-first-token turn and reveals streamed output", async () => {
     messages.messages = [
       { ...makeMessage(0), role: "user" },
