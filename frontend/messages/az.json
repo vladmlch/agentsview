@@ -66,6 +66,8 @@
   "header_transcript_filter_label": "Blok növlərini süz",
   "header_transcript_visibility": "Blokların görünməsi",
   "header_transcript_show_all": "Hamısını göstər",
+  "transcript_expand_all": "Hamısını aç",
+  "transcript_collapse_all": "Hamısını yığ",
   "header_transcript_blocks_user": "İstifadəçi mesajları",
   "header_transcript_blocks_assistant": "Köməkçi mətni",
   "header_transcript_blocks_thinking": "Düşünmə blokları",

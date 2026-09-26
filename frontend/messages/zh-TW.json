@@ -64,6 +64,8 @@
   "header_transcript_filter_label": "篩選 block 類型",
   "header_transcript_visibility": "Block 可見性",
   "header_transcript_show_all": "全部顯示",
+  "transcript_expand_all": "全部展開",
+  "transcript_collapse_all": "全部摺疊",
   "header_transcript_blocks_user": "使用者訊息",
   "header_transcript_blocks_assistant": "助手文本",
   "header_transcript_blocks_thinking": "思考區塊",

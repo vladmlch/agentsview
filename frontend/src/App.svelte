@@ -121,6 +121,7 @@
         scrollToOrdinal: (o: number) => void;
         getDisplayItems: () => DisplayItem[];
         getNormalDisplayItems: () => DisplayItem[];
+        getNavigableOrdinals: () => number[];
       }
     | undefined = $state(undefined);
 
@@ -277,32 +278,27 @@
     });
   });
 
+  // One j/k step crosses one source message ordinal. Turn headers are
+  // never stops: the list comes from the transcript rows that render
+  // content, already in display order for the active sort direction.
   function navigateMessage(delta: number) {
-    const items = messageListRef?.getDisplayItems();
-    if (!items || items.length === 0) return;
-
-    const sorted = ui.sortNewestFirst
-      ? [...items].reverse()
-      : items;
+    const ordinals = messageListRef?.getNavigableOrdinals();
+    if (!ordinals || ordinals.length === 0) return;
 
     const selected = ui.selectedOrdinal;
     if (selected === null) {
-      const first = sorted[0]!;
-      navigateToMessageOrdinal(first.ordinals[0]!);
+      navigateToMessageOrdinal(ordinals[0]!);
       return;
     }
 
-    const curIdx = sorted.findIndex((item) =>
-      item.ordinals.includes(selected),
-    );
+    const curIdx = ordinals.indexOf(selected);
     const nextIdx = Math.max(
       0,
-      Math.min(sorted.length - 1, curIdx + delta),
+      Math.min(ordinals.length - 1, curIdx + delta),
     );
     if (nextIdx === curIdx) return;
 
-    const next = sorted[nextIdx]!;
-    navigateToMessageOrdinal(next.ordinals[0]!);
+    navigateToMessageOrdinal(ordinals[nextIdx]!);
   }
 
   function navigateUserPrompt(delta: number) {

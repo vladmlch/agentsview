@@ -64,6 +64,8 @@
   "header_transcript_filter_label": "Filtrer les types de blocs",
   "header_transcript_visibility": "Visibilité des blocs",
   "header_transcript_show_all": "Tout afficher",
+  "transcript_expand_all": "Tout développer",
+  "transcript_collapse_all": "Tout réduire",
   "header_transcript_blocks_user": "Messages utilisateur",
   "header_transcript_blocks_assistant": "Texte de l'assistant",
   "header_transcript_blocks_thinking": "Blocs de réflexion",

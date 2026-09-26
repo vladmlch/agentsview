@@ -64,6 +64,8 @@
   "header_transcript_filter_label": "フィルターブロックタイプ",
   "header_transcript_visibility": "ブロックの可視性",
   "header_transcript_show_all": "すべて表示",
+  "transcript_expand_all": "すべて展開",
+  "transcript_collapse_all": "すべて折りたたむ",
   "header_transcript_blocks_user": "ユーザーメッセージ",
   "header_transcript_blocks_assistant": "アシスタントテキスト",
   "header_transcript_blocks_thinking": "思考ブロック",

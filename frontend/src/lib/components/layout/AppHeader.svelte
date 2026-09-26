@@ -38,6 +38,16 @@
     type BlockType,
   } from "../../stores/ui.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
+  import { messages } from "../../stores/messages.svelte.js";
+  import { settings } from "../../stores/settings.svelte.js";
+  import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+  import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
+  import {
+    keepsAnswerBeforeTrailingTools,
+    projectSessionScope,
+  } from "../../search/session-scope.js";
+  import { isTurnEventVisible } from "../../utils/turn-visibility.js";
+  import type { TurnEvent } from "../../utils/assistant-turns.js";
   import { sync } from "../../stores/sync.svelte.js";
   import { router, type Route } from "../../stores/router.svelte.js";
   import {
@@ -187,6 +197,73 @@
   const activeSessionFilePath = $derived(
     sessions.activeSession?.file_path ?? "",
   );
+
+  /** Event kinds that own an `isEventExpanded` disclosure. Rollups and
+   *  system rows do not, so they cannot hold back a "collapse all" label. */
+  const DISCLOSURE_EVENT_KINDS = new Set<TurnEvent["kind"]>([
+    "message",
+    "thinking",
+    "skill",
+    "tool",
+  ]);
+
+  /** True when every assistant turn that renders rows — and every
+   *  expandable child event inside it — currently resolves expanded.
+   *  Derived from the same projection the transcript renders, plus the
+   *  session bulk baseline; never enumerated from the DOM. */
+  const allTurnRowsExpanded = $derived.by(() => {
+    const scope = projectSessionScope({
+      messages: messages.messages,
+      sessionId: messages.sessionId ?? undefined,
+      transcriptMode: "normal",
+      visibleBlocks: ui.visibleBlocks,
+      hasBlockFilters: ui.hasBlockFilters,
+      revealedBlocks: inSessionSearch.revealedBlockTypes,
+      keepAnswerBeforeTrailingTools: keepsAnswerBeforeTrailingTools(
+        settings.sessionProviders,
+        sessions.activeSession?.agent,
+      ),
+    });
+    const defaultExpanded = !ui.autoCollapseAssistantTurns;
+    const effectivelyVisible = (type: BlockType) =>
+      inSessionSearch.isBlockEffectivelyVisible(type);
+    let eligible = false;
+    for (const node of scope.items) {
+      if (node.kind !== "assistant-turn") continue;
+      const visible = node.events.filter((event) =>
+        isTurnEventVisible(event, effectivelyVisible),
+      );
+      if (visible.length === 0) continue;
+      eligible = true;
+      if (!turnCollapse.isTurnExpanded(node.key, defaultExpanded)) {
+        return false;
+      }
+      for (const event of visible) {
+        if (!DISCLOSURE_EVENT_KINDS.has(event.kind)) continue;
+        if (!turnCollapse.isEventExpanded(event.key, defaultExpanded)) {
+          return false;
+        }
+      }
+    }
+    return eligible;
+  });
+
+  /** Manual filter change while search is open suppresses the temporary
+   *  reveal; the note is a no-op when the find view is closed. The toggle
+   *  flips the *effective* state the checkbox displays. */
+  function handleBlockToggle(type: BlockType) {
+    const next = !inSessionSearch.isBlockEffectivelyVisible(type);
+    inSessionSearch.noteManualBlockFilterChange(type, next);
+    ui.setBlockVisible(type, next);
+  }
+
+  /** Show every block type and lift any search-time suppressions. */
+  function handleShowAllBlocks() {
+    for (const type of ALL_BLOCK_TYPES) {
+      inSessionSearch.noteManualBlockFilterChange(type, true);
+    }
+    ui.showAllBlocks();
+  }
 
   // Close block filter dropdown on outside click
   $effect(() => {
@@ -390,6 +467,29 @@
 
         <span class="strip-divider"></span>
 
+        {#if ui.transcriptMode === "normal"}
+          <button
+            class="pill pill-bulk"
+            onclick={() =>
+              allTurnRowsExpanded
+                ? turnCollapse.collapseAll()
+                : turnCollapse.expandAll()
+            }
+            title={allTurnRowsExpanded
+              ? m.transcript_collapse_all()
+              : m.transcript_expand_all()}
+            aria-label={allTurnRowsExpanded
+              ? m.transcript_collapse_all()
+              : m.transcript_expand_all()}
+          >
+            <span class="pill-label"
+              >{allTurnRowsExpanded
+                ? m.transcript_collapse_all()
+                : m.transcript_expand_all()}</span
+            >
+          </button>
+        {/if}
+
         <div class="filter-wrap">
           <button
             class="pill pill-icon"
@@ -409,11 +509,11 @@
             <div class="block-filter-dropdown kit-popover-card" bind:this={filterDropRef}>
               <div class="block-filter-title">{m.header_transcript_visibility()}</div>
               {#each ALL_BLOCK_TYPES as bt}
-                {@const visible = ui.isBlockVisible(bt)}
+                {@const visible = inSessionSearch.isBlockEffectivelyVisible(bt)}
                 <button
                   class="block-filter-item"
                   class:active={visible}
-                  onclick={() => ui.toggleBlock(bt)}
+                  onclick={() => handleBlockToggle(bt)}
                 >
                   <span
                     class="block-filter-dot"
@@ -430,7 +530,7 @@
               {#if ui.hasBlockFilters}
                 <button
                   class="block-filter-reset"
-                  onclick={() => ui.showAllBlocks()}
+                  onclick={handleShowAllBlocks}
                 >
                   {m.header_transcript_show_all()}
                 </button>
@@ -1163,6 +1263,12 @@
 
     .pill-label {
       font-size: 0;
+    }
+
+    /* The expand/collapse toggle has no compact letter form; drop it
+       with the other nonessential controls. */
+    .pill-bulk {
+      display: none;
     }
 
     /* Show first letter only via data attrs */

@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import { analytics } from "./lib/stores/analytics.svelte.js";
 import { analyticsPageDates } from "./lib/stores/analyticsPageDates.js";
 import { insights } from "./lib/stores/insights.svelte.js";
+import { inSessionSearch } from "./lib/stores/inSessionSearch.svelte.js";
 import { messages } from "./lib/stores/messages.svelte.js";
 import { pins } from "./lib/stores/pins.svelte.js";
 import { router } from "./lib/stores/router.svelte.js";
@@ -13,6 +14,7 @@ import { createSessionsStore, sessions } from "./lib/stores/sessions.svelte.js";
 import { settings } from "./lib/stores/settings.svelte.js";
 import { starred } from "./lib/stores/starred.svelte.js";
 import { sync } from "./lib/stores/sync.svelte.js";
+import { turnCollapse } from "./lib/stores/turn-collapse.svelte.js";
 import { ui } from "./lib/stores/ui.svelte.js";
 import { usage } from "./lib/stores/usage.svelte.js";
 import { yokedDates } from "./lib/stores/yokedDates.svelte.js";
@@ -1367,6 +1369,138 @@ describe("App root Sessions landing", () => {
     });
     expect(localStorage.getItem("session-filters")).toBe(saved);
     detach();
+  });
+});
+
+function navMessage(
+  ordinal: number,
+  role: Message["role"],
+  content: string,
+  overrides: Partial<Message> = {},
+): Message {
+  return {
+    id: 5000 + ordinal,
+    session_id: "s1",
+    ordinal,
+    role,
+    content,
+    content_length: content.length,
+    timestamp: `2026-01-01T00:00:${String(ordinal).padStart(2, "0")}Z`,
+    has_thinking: false,
+    thinking_text: "",
+    has_tool_use: false,
+    model: "",
+    context_tokens: 0,
+    output_tokens: 0,
+    has_context_tokens: false,
+    has_output_tokens: false,
+    is_system: false,
+    is_sidechain: false,
+    ...overrides,
+  } as Message;
+}
+
+describe("App transcript keyboard navigation", () => {
+  beforeEach(() => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "navigateToSession").mockResolvedValue();
+    router.route = "sessions";
+    router.sessionId = "s1";
+    sessions.activeSessionId = "s1";
+    messages.sessionId = "s1";
+    messages.loading = false;
+    messages.hasOlder = false;
+    messages.messages = [
+      navMessage(0, "user", "first ask"),
+      navMessage(1, "assistant", "[Thinking]\nplan\n[/Thinking]\nworking on it", {
+        has_thinking: true,
+      }),
+      navMessage(2, "assistant", "final answer"),
+      navMessage(3, "user", "second ask"),
+      // A hidden system user row between the second prompt and its
+      // answer must never be a prompt-jump target.
+      navMessage(4, "user", "system notice", { is_system: true }),
+      navMessage(5, "assistant", "second answer"),
+    ];
+    ui.setTranscriptMode("normal");
+    ui.setAutoCollapseAssistantTurns(true);
+    ui.showAllBlocks();
+    ui.sortNewestFirst = false;
+    ui.followLatest = false;
+    ui.selectedOrdinal = null;
+    turnCollapse.activateSession(null);
+    inSessionSearch.close();
+  });
+
+  afterEach(() => {
+    inSessionSearch.close();
+    turnCollapse.activateSession(null);
+    messages.clear();
+    ui.setTranscriptMode("normal");
+    ui.setAutoCollapseAssistantTurns(true);
+    ui.showAllBlocks();
+    ui.sortNewestFirst = false;
+    ui.selectedOrdinal = null;
+  });
+
+  function key(k: string, shiftKey = false) {
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: k, shiftKey }));
+  }
+
+  it("steps j/k one source message ordinal at a time and expands the owning turn", async () => {
+    component = mount(App, { target: document.body });
+    await flushEffects();
+
+    key("j");
+    await flushEffects();
+    expect(ui.selectedOrdinal).toBe(0);
+
+    // The folded member (ordinal 1) is not a stop: j lands on the turn's
+    // final-output ordinal and expands its owning turn on the way.
+    key("j");
+    await flushEffects();
+    expect(ui.selectedOrdinal).toBe(2);
+    expect(turnCollapse.isTurnExpanded("s1:turn:5001", false)).toBe(true);
+
+    // Expanded member events join the navigable ordinals: k reaches the
+    // previously folded message.
+    key("k");
+    await flushEffects();
+    expect(ui.selectedOrdinal).toBe(1);
+
+    key("j");
+    key("j");
+    await flushEffects();
+    expect(ui.selectedOrdinal).toBe(3);
+
+    key("j");
+    await flushEffects();
+    expect(ui.selectedOrdinal).toBe(5);
+    expect(turnCollapse.isTurnExpanded("s1:turn:5005", false)).toBe(true);
+
+    // Clamped at the last navigable ordinal.
+    key("j");
+    await flushEffects();
+    expect(ui.selectedOrdinal).toBe(5);
+  });
+
+  it("keeps Shift+J/K prompt jumps on real user messages", async () => {
+    component = mount(App, { target: document.body });
+    await flushEffects();
+
+    ui.selectedOrdinal = 5;
+    key("K", true);
+    await flushEffects();
+    // The hidden system-user row at ordinal 4 is never a jump target.
+    expect(ui.selectedOrdinal).toBe(3);
+
+    key("K", true);
+    await flushEffects();
+    expect(ui.selectedOrdinal).toBe(0);
+
+    key("J", true);
+    await flushEffects();
+    expect(ui.selectedOrdinal).toBe(3);
   });
 });
 

@@ -66,6 +66,8 @@
   "header_transcript_filter_label": "Filtrar tipos de bloque",
   "header_transcript_visibility": "Visibilidad de bloques",
   "header_transcript_show_all": "Mostrar todo",
+  "transcript_expand_all": "Expandir todo",
+  "transcript_collapse_all": "Contraer todo",
   "header_transcript_blocks_user": "Mensajes del usuario",
   "header_transcript_blocks_assistant": "Texto del asistente",
   "header_transcript_blocks_thinking": "Bloques de razonamiento",
