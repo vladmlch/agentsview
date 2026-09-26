@@ -990,6 +990,7 @@ func (db *DB) getSidebarSessionIndexPage(
 			JOIN tree t ON s.parent_session_id = t.id
 			WHERE s.message_count > 0
 			  AND s.deleted_at IS NULL
+			  AND s.source_missing_at IS NULL
 			  ` + childAutomationWhere + `
 		)
 		` + sidebarStarredRootCTE(f.Starred) + `,
@@ -1072,6 +1073,7 @@ func (db *DB) getSidebarSessionIndexPage(
 			JOIN tree t ON s.parent_session_id = t.id
 			WHERE s.message_count > 0
 			  AND s.deleted_at IS NULL
+			  AND s.source_missing_at IS NULL
 			  ` + childAutomationWhere + `
 		),
 		ranked_tree(id, ord) AS (
@@ -1733,6 +1735,7 @@ func (db *DB) GetChildSessions(
 	query := "SELECT " + sessionBaseCols +
 		" FROM sessions WHERE parent_session_id = ?" +
 		" AND deleted_at IS NULL" +
+		" AND source_missing_at IS NULL" +
 		" ORDER BY started_at"
 	rows, err := db.getReader().QueryContext(ctx, query, parentID)
 	if err != nil {
