@@ -626,7 +626,10 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // parent. Re-parse Antigravity sessions so stored rows gain
 // parent_session_id, relationship_type, subagent session names, and
 // tool-call spawn edges.)
-const dataVersion = 152
+// (153: the Devin CLI parser now recursively unwinds prior compaction eras
+// via metadata.summarized_from across disconnected message_nodes root trees,
+// restoring pre-compaction history in multi-generation compacted sessions.)
+const dataVersion = 153
 
 const archiveOnlyVersionBase = 1 << 20
 
