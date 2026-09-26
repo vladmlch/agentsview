@@ -3808,3 +3808,203 @@ func TestCodexDuplicateCallIDsAttachOutputsToLatestCall(t *testing.T) {
 	assert.Equal(t, "first result", msgs[2].ToolCalls[0].ResultEvents[0].Content)
 	assert.Equal(t, "second result", msgs[2].ToolCalls[0].ResultEvents[1].Content)
 }
+
+func TestCodexContinuationStitching_TwoSegments(t *testing.T) {
+	tmpDir := t.TempDir()
+	dayDir := filepath.Join(tmpDir, "2026", "09", "25")
+	require.NoError(t, os.MkdirAll(dayDir, 0o755))
+
+	parentName := "rollout-2026-09-25T23-27-50-01a0da77-5113-7a91-a159-a02da927e59f_01a0da77-ab21-7ae3-9b15-89aaa174b1d5.jsonl"
+	parentPath := filepath.Join(dayDir, parentName)
+	parentContent := strings.Join([]string{
+		`{"timestamp":"2026-09-25T23:27:50Z","ordinal":0,"type":"session_meta","payload":{"id":"01a0da77-5113-7a91-a159-a02da927e59f","history_mode":"paginated","history_base":null}}`,
+		`{"timestamp":"2026-09-25T23:27:51Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Initial user prompt in parent"}]}}`,
+		`{"timestamp":"2026-09-25T23:27:52Z","ordinal":2,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Assistant response in parent"}]}}`,
+		`{"timestamp":"2026-09-25T23:27:53Z","ordinal":3,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Aborted user turn"}]}}`,
+		`{"timestamp":"2026-09-25T23:27:54Z","ordinal":4,"type":"event_msg","payload":{"type":"turn_aborted"}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(parentPath, []byte(parentContent), 0o644))
+
+	leafName := "rollout-2026-09-25T23-54-13-01a0da77-5113-7a91-a159-a02da927e59f_01a0da8f-d2a9-7fa1-85e4-d0ee0f72587d.jsonl"
+	leafPath := filepath.Join(dayDir, leafName)
+	leafContent := strings.Join([]string{
+		`{"timestamp":"2026-09-25T23:54:13Z","ordinal":3,"type":"session_meta","payload":{"id":"01a0da77-5113-7a91-a159-a02da927e59f","history_mode":"paginated","history_base":{"thread_id":"01a0da77-ab21-7ae3-9b15-89aaa174b1d5","end_ordinal_exclusive":3}}}`,
+		`{"timestamp":"2026-09-25T23:54:14Z","ordinal":4,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"4 ok\n5 ok"}]}}`,
+		`{"timestamp":"2026-09-25T23:54:15Z","ordinal":5,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Accepted both choices"}]}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(leafPath, []byte(leafContent), 0o644))
+
+	provider := newCodexTestProvider(t, tmpDir)
+	source := requireCodexProviderSource(t, provider, "01a0da77-5113-7a91-a159-a02da927e59f")
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
+		Source: source,
+	})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+
+	sess := outcome.Results[0].Result.Session
+	msgs := outcome.Results[0].Result.Messages
+
+	assert.Equal(t, "codex:01a0da77-5113-7a91-a159-a02da927e59f", sess.ID)
+	assert.Equal(t, "Initial user prompt in parent", sess.FirstMessage)
+	assert.Equal(t, 2, sess.UserMessageCount)
+	assert.Equal(t, 4, sess.MessageCount)
+
+	require.Len(t, msgs, 4)
+	assert.Equal(t, 0, msgs[0].Ordinal)
+	assert.Equal(t, RoleUser, msgs[0].Role)
+	assert.Equal(t, "Initial user prompt in parent", msgs[0].Content)
+
+	assert.Equal(t, 1, msgs[1].Ordinal)
+	assert.Equal(t, RoleAssistant, msgs[1].Role)
+	assert.Equal(t, "Assistant response in parent", msgs[1].Content)
+
+	assert.Equal(t, 2, msgs[2].Ordinal)
+	assert.Equal(t, RoleUser, msgs[2].Role)
+	assert.Equal(t, "4 ok\n5 ok", msgs[2].Content)
+
+	assert.Equal(t, 3, msgs[3].Ordinal)
+	assert.Equal(t, RoleAssistant, msgs[3].Role)
+	assert.Equal(t, "Accepted both choices", msgs[3].Content)
+
+	for _, m := range msgs {
+		assert.NotContains(t, m.Content, "Aborted user turn")
+	}
+}
+
+func TestCodexContinuationStitching_ThreeSegments(t *testing.T) {
+	tmpDir := t.TempDir()
+	dayDir := filepath.Join(tmpDir, "2026", "09", "25")
+	require.NoError(t, os.MkdirAll(dayDir, 0o755))
+
+	seg1Name := "rollout-2026-09-25T10-00-00-01a00000-0000-0000-0000-000000000001_01a00000-0000-0000-0000-000000000011.jsonl"
+	seg1Path := filepath.Join(dayDir, seg1Name)
+	seg1Content := strings.Join([]string{
+		`{"timestamp":"2026-09-25T10:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"01a00000-0000-0000-0000-000000000001","history_mode":"paginated","history_base":null}}`,
+		`{"timestamp":"2026-09-25T10:00:01Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Prompt 1"}]}}`,
+		`{"timestamp":"2026-09-25T10:00:02Z","ordinal":2,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reply 1"}]}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(seg1Path, []byte(seg1Content), 0o644))
+
+	seg2Name := "rollout-2026-09-25T11-00-00-01a00000-0000-0000-0000-000000000001_01a00000-0000-0000-0000-000000000022.jsonl"
+	seg2Path := filepath.Join(dayDir, seg2Name)
+	seg2Content := strings.Join([]string{
+		`{"timestamp":"2026-09-25T11:00:00Z","ordinal":3,"type":"session_meta","payload":{"id":"01a00000-0000-0000-0000-000000000001","history_mode":"paginated","history_base":{"thread_id":"01a00000-0000-0000-0000-000000000011","end_ordinal_exclusive":3}}}`,
+		`{"timestamp":"2026-09-25T11:00:01Z","ordinal":4,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Prompt 2"}]}}`,
+		`{"timestamp":"2026-09-25T11:00:02Z","ordinal":5,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reply 2"}]}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(seg2Path, []byte(seg2Content), 0o644))
+
+	leafName := "rollout-2026-09-25T12-00-00-01a00000-0000-0000-0000-000000000001_01a00000-0000-0000-0000-000000000033.jsonl"
+	leafPath := filepath.Join(dayDir, leafName)
+	leafContent := strings.Join([]string{
+		`{"timestamp":"2026-09-25T12:00:00Z","ordinal":6,"type":"session_meta","payload":{"id":"01a00000-0000-0000-0000-000000000001","history_mode":"paginated","history_base":{"thread_id":"01a00000-0000-0000-0000-000000000022","end_ordinal_exclusive":6}}}`,
+		`{"timestamp":"2026-09-25T12:00:01Z","ordinal":7,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Prompt 3"}]}}`,
+		`{"timestamp":"2026-09-25T12:00:02Z","ordinal":8,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reply 3"}]}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(leafPath, []byte(leafContent), 0o644))
+
+	provider := newCodexTestProvider(t, tmpDir)
+	source := requireCodexProviderSource(t, provider, "01a00000-0000-0000-0000-000000000001")
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
+		Source: source,
+	})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+
+	sess := outcome.Results[0].Result.Session
+	msgs := outcome.Results[0].Result.Messages
+
+	assert.Equal(t, "Prompt 1", sess.FirstMessage)
+	assert.Equal(t, 3, sess.UserMessageCount)
+	assert.Equal(t, 6, sess.MessageCount)
+	require.Len(t, msgs, 6)
+
+	assert.Equal(t, "Prompt 1", msgs[0].Content)
+	assert.Equal(t, "Reply 1", msgs[1].Content)
+	assert.Equal(t, "Prompt 2", msgs[2].Content)
+	assert.Equal(t, "Reply 2", msgs[3].Content)
+	assert.Equal(t, "Prompt 3", msgs[4].Content)
+	assert.Equal(t, "Reply 3", msgs[5].Content)
+
+	for i := range msgs {
+		assert.Equal(t, i, msgs[i].Ordinal)
+	}
+}
+
+func TestCodexContinuationStitching_PatternB_DirectUUID(t *testing.T) {
+	tmpDir := t.TempDir()
+	dayDir := filepath.Join(tmpDir, "2026", "08", "26")
+	require.NoError(t, os.MkdirAll(dayDir, 0o755))
+
+	parentUUID := "01a03d68-37cf-7030-9390-bb41fd9cc84a"
+	parentName := fmt.Sprintf("rollout-2026-08-26T11-30-35-%s.jsonl", parentUUID)
+	parentPath := filepath.Join(dayDir, parentName)
+	parentContent := strings.Join([]string{
+		fmt.Sprintf(`{"timestamp":"2026-08-26T11:30:35Z","ordinal":0,"type":"session_meta","payload":{"id":"%s"}}`, parentUUID),
+		`{"timestamp":"2026-08-26T11:30:36Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Pattern B Question"}]}}`,
+		`{"timestamp":"2026-08-26T11:30:37Z","ordinal":2,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Pattern B Answer"}]}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(parentPath, []byte(parentContent), 0o644))
+
+	leafUUID := "01a03d6a-4380-7720-a740-f136201c821f"
+	leafName := fmt.Sprintf("rollout-2026-08-26T11-32-49-%s.jsonl", leafUUID)
+	leafPath := filepath.Join(dayDir, leafName)
+	leafContent := strings.Join([]string{
+		fmt.Sprintf(`{"timestamp":"2026-08-26T11:32:49Z","ordinal":3,"type":"session_meta","payload":{"id":"%s","history_mode":"paginated","history_base":{"thread_id":"%s","end_ordinal_exclusive":3}}}`, leafUUID, parentUUID),
+		`{"timestamp":"2026-08-26T11:32:50Z","ordinal":4,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Followup Question"}]}}`,
+		`{"timestamp":"2026-08-26T11:32:51Z","ordinal":5,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Followup Answer"}]}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(leafPath, []byte(leafContent), 0o644))
+
+	provider := newCodexTestProvider(t, tmpDir)
+	source := requireCodexProviderSource(t, provider, leafUUID)
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
+		Source: source,
+	})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+
+	sess := outcome.Results[0].Result.Session
+	msgs := outcome.Results[0].Result.Messages
+
+	assert.Equal(t, "Pattern B Question", sess.FirstMessage)
+	assert.Equal(t, 2, sess.UserMessageCount)
+	assert.Equal(t, 4, sess.MessageCount)
+	require.Len(t, msgs, 4)
+
+	assert.Equal(t, "Pattern B Question", msgs[0].Content)
+	assert.Equal(t, "Pattern B Answer", msgs[1].Content)
+	assert.Equal(t, "Followup Question", msgs[2].Content)
+	assert.Equal(t, "Followup Answer", msgs[3].Content)
+}
+
+func TestCodexContinuationStitching_MissingParent_FailOpen(t *testing.T) {
+	tmpDir := t.TempDir()
+	dayDir := filepath.Join(tmpDir, "2026", "09", "25")
+	require.NoError(t, os.MkdirAll(dayDir, 0o755))
+
+	leafUUID := "01a09999-5113-7a91-a159-a02da927e59f"
+	leafName := fmt.Sprintf("rollout-2026-09-25T23-54-13-%s.jsonl", leafUUID)
+	leafPath := filepath.Join(dayDir, leafName)
+	leafContent := strings.Join([]string{
+		fmt.Sprintf(`{"timestamp":"2026-09-25T23:54:13Z","ordinal":0,"type":"session_meta","payload":{"id":"%s","history_mode":"paginated","history_base":{"thread_id":"nonexistent-uuid","end_ordinal_exclusive":10}}}`, leafUUID),
+		`{"timestamp":"2026-09-25T23:54:14Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Only message available"}]}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(leafPath, []byte(leafContent), 0o644))
+
+	provider := newCodexTestProvider(t, tmpDir)
+	source := requireCodexProviderSource(t, provider, leafUUID)
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
+		Source: source,
+	})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+
+	sess := outcome.Results[0].Result.Session
+	msgs := outcome.Results[0].Result.Messages
+
+	assert.Equal(t, "Only message available", sess.FirstMessage)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "Only message available", msgs[0].Content)
+}

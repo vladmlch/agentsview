@@ -543,7 +543,10 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // (121: the Devin CLI parser now recursively unwinds prior compaction eras
 // via metadata.summarized_from across disconnected message_nodes root trees,
 // restoring pre-compaction history in multi-generation compacted sessions.)
-const dataVersion = 121
+// (122: Codex rollout continuation segments with history_mode: "paginated"
+// are now stitched across history_base ancestor chains into a single session,
+// restoring the initial prompt and complete conversation history.)
+const dataVersion = 122
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 

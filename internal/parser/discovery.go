@@ -18,10 +18,12 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// uuidRe matches a standard UUID (8-4-4-4-12 hex) at the end of a rollout filename stem.
+// uuidRe matches a standard UUID (8-4-4-4-12 hex) in a rollout filename stem,
+// with an optional continuation segment suffix (_<segment_uuid>).
 var uuidRe = regexp.MustCompile(
 	`^rollout-.*-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-` +
-		`[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$`,
+		`[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})` +
+		`(?:_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})?$`,
 )
 
 const (
