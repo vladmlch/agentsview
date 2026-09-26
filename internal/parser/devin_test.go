@@ -1340,7 +1340,7 @@ func TestParseDevinSessionRecoversMultiGenerationCompactedRoots(t *testing.T) {
 		Model:            "db-model",
 		CreatedAt:        new(int64(1704103200)),
 		LastActivityAt:   new(int64(1704103500)),
-		MainChainID:      new(int64(302)),
+		MainChainID:      new(int64(303)),
 	})
 
 	fixture.insertMessageNodes(t,
@@ -1348,26 +1348,41 @@ func TestParseDevinSessionRecoversMultiGenerationCompactedRoots(t *testing.T) {
 		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 101, ParentNodeID: new(int64(100)), ChatMessage: `{"message_id":"m-101","role":"user","content":"original user prompt"}`, CreatedAt: 1704103202},
 		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 102, ParentNodeID: new(int64(101)), ChatMessage: `{"message_id":"m-102","role":"assistant","content":"era one work"}`, CreatedAt: 1704103203},
 
-		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 200, ChatMessage: `{"message_id":"m-200","role":"system","content":"era 2 system"}`, CreatedAt: 1704103301},
-		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 201, ParentNodeID: new(int64(200)), ChatMessage: `{"message_id":"m-201","role":"system","content":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: era 1"}`, CreatedAt: 1704103302, MetadataJSON: `{"summarized_from": 102}`},
-		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 202, ParentNodeID: new(int64(201)), ChatMessage: `{"message_id":"m-202","role":"assistant","content":"era two work"}`, CreatedAt: 1704103303},
+		// Era 2 re-injects Devin boilerplate prompts before the continuation summary.
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 200, ChatMessage: `{"message_id":"m-200","role":"system","content":"You are Devin, an interactive command line agent from Cognition."}`, CreatedAt: 1704103301},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 201, ParentNodeID: new(int64(200)), ChatMessage: `{"message_id":"m-201","role":"system","content":"Available subagent profiles for the ` + "`run_subagent`" + ` tool."}`, CreatedAt: 1704103301},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 202, ParentNodeID: new(int64(201)), ChatMessage: `{"message_id":"m-202","role":"system","content":"You are powered by SWE-2 Max."}`, CreatedAt: 1704103301},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 203, ParentNodeID: new(int64(202)), ChatMessage: `{"message_id":"m-203","role":"system","content":"## Parallel tool calls\n\nBefore each response, first privately list what you need next"}`, CreatedAt: 1704103301},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 204, ParentNodeID: new(int64(203)), ChatMessage: `{"message_id":"m-204","role":"system","content":"<available_skills>\nThe following skills can be invoked"}`, CreatedAt: 1704103301},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 205, ParentNodeID: new(int64(204)), ChatMessage: `{"message_id":"m-205","role":"system","content":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: era 1"}`, CreatedAt: 1704103302, MetadataJSON: `{"summarized_from": 102}`},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 206, ParentNodeID: new(int64(205)), ChatMessage: `{"message_id":"m-206","role":"assistant","content":"era two work"}`, CreatedAt: 1704103303},
 
-		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 300, ChatMessage: `{"message_id":"m-300","role":"system","content":"era 3 system"}`, CreatedAt: 1704103401},
-		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 301, ParentNodeID: new(int64(300)), ChatMessage: `{"message_id":"m-301","role":"system","content":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: era 2"}`, CreatedAt: 1704103402, MetadataJSON: `{"summarized_from": 202}`},
-		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 302, ParentNodeID: new(int64(301)), ChatMessage: `{"message_id":"m-302","role":"assistant","content":"era three work"}`, CreatedAt: 1704103403},
+		// Era 3 also re-injects Devin boilerplate prompts before its continuation summary.
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 300, ChatMessage: `{"message_id":"m-300","role":"system","content":"You are Devin, an interactive command line agent from Cognition."}`, CreatedAt: 1704103401},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 301, ParentNodeID: new(int64(300)), ChatMessage: `{"message_id":"m-301","role":"system","content":"<rules type=\"always-on\">\n<rule name=\"r1\" path=\"/tmp\"/>\n</rules>"}`, CreatedAt: 1704103401},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 302, ParentNodeID: new(int64(301)), ChatMessage: `{"message_id":"m-302","role":"system","content":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: era 2"}`, CreatedAt: 1704103402, MetadataJSON: `{"summarized_from": 206}`},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 303, ParentNodeID: new(int64(302)), ChatMessage: `{"message_id":"m-303","role":"assistant","content":"era three work"}`, CreatedAt: 1704103403},
 	)
 
 	sess, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
 	require.NoError(t, err)
 	require.NotNil(t, sess)
 
-	require.Len(t, msgs, 9)
+	// Boilerplate system prompts in era 2 and era 3 are suppressed, while era 1's
+	// initial system prompt and each era's continuation summary are preserved.
+	require.Len(t, msgs, 7)
+	assert.Equal(t, "era 1 system", msgs[0].Content)
 	assert.Equal(t, "original user prompt", msgs[1].Content)
 	assert.Equal(t, "era one work", msgs[2].Content)
-	assert.True(t, msgs[4].IsCompactBoundary)
-	assert.Equal(t, "era two work", msgs[5].Content)
-	assert.True(t, msgs[7].IsCompactBoundary)
-	assert.Equal(t, "era three work", msgs[8].Content)
+	assert.True(t, msgs[3].IsCompactBoundary)
+	assert.Equal(t, "compact_boundary", msgs[3].SourceSubtype)
+	assert.Equal(t, "era two work", msgs[4].Content)
+	assert.True(t, msgs[5].IsCompactBoundary)
+	assert.Equal(t, "compact_boundary", msgs[5].SourceSubtype)
+	assert.Equal(t, "era three work", msgs[6].Content)
 	assert.Equal(t, "original user prompt", sess.FirstMessage)
 	assert.Equal(t, 1, sess.UserMessageCount)
+	for i, m := range msgs {
+		assert.Equal(t, i, m.Ordinal)
+	}
 }
