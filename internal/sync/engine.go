@@ -12549,6 +12549,7 @@ func (e *Engine) processProviderFile(
 	// so ownership reconciliation is needed only by real sync engines.
 	if (file.Agent == parser.AgentKiro ||
 		file.Agent == parser.AgentCline ||
+		(file.Agent == parser.AgentDevin && outcome.ForceReplace) ||
 		(file.Agent == parser.AgentOmnigent && outcome.ForceReplace) ||
 		(file.Agent == parser.AgentCursorIDE && outcome.ForceReplace) ||
 		(file.Agent == parser.AgentTrae && !e.forceParse)) &&

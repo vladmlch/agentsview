@@ -538,7 +538,10 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // (120: Devin message_nodes are preferred over possibly stale transcript
 // exports, and Devin subagent calls/results are normalized from both formats.
 // Re-parse Devin sessions to restore current messages and tool details.)
-const dataVersion = 120
+// (121: Devin message_nodes subagent trees are stored as parent-linked child
+// sessions. Re-parse Devin sessions to materialize their transcript-backed
+// subagents from the source database.)
+const dataVersion = 121
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
