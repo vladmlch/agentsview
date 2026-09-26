@@ -1017,7 +1017,7 @@ Paraglide JS, Playwright.
 - E2E coverage uses the existing mixed-content fixture and the existing hidden-
   block search fixture. No new backend fixture or package dependency is needed.
 
-- [ ] **Step 1: Update the mixed-content transcript workflow test**
+- [x] **Step 1: Update the mixed-content transcript workflow test**
 
   Add the test
   `assistant turn starts collapsed and final output remains visible`.
@@ -1029,7 +1029,7 @@ Paraglide JS, Playwright.
   including retained-image tests, to open the owning turn and tool rollup first.
   Keep the assertion that final text stays visible while thinking is collapsed.
 
-- [ ] **Step 2: Add a filtered-search end-to-end test**
+- [x] **Step 2: Add a filtered-search end-to-end test**
 
   Add the test `hidden-type search reveals matches without persisting filters`.
   In `session-find.spec.ts`, set the thinking and tool filters hidden in local
@@ -1040,7 +1040,7 @@ Paraglide JS, Playwright.
   the searched turn remains expanded. Preserve `PROSE_MATCHES` only for focused
   mode; a normal-mode block filter must not reduce the search index.
 
-- [ ] **Step 3: Run focused Playwright tests**
+- [x] **Step 3: Run focused Playwright tests**
 
   Run from `frontend/`:
 
@@ -1051,7 +1051,7 @@ Paraglide JS, Playwright.
 
   Expected: both new workflows pass against the normal test server and fixture.
 
-- [ ] **Step 4: Run frontend and documentation verification**
+- [x] **Step 4: Run frontend and documentation verification**
 
   First run `./node_modules/.bin/vp check` and record its output. The current
   baseline reports 21 unrelated formatting files; do not edit them. Then run:
@@ -1072,7 +1072,7 @@ Paraglide JS, Playwright.
   validation pass. The full formatter check may still report the 21 unrelated
   files observed before implementation; do not modify them for this feature.
 
-- [ ] **Step 5: Review and complete the plan**
+- [x] **Step 5: Review and complete the plan**
 
   Mark completed checkboxes only after their command succeeds. Review `git diff`
   and `git status --short`; confirm only approved frontend, locale, docs, and

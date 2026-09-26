@@ -75,6 +75,7 @@
             <AssistantTurnEventRow
               {event}
               ownsSourceActions={owningEventKeys.has(event.key)}
+              previewOnly={event === turn.finalOutput}
               {session}
               {allowMutations}
             />

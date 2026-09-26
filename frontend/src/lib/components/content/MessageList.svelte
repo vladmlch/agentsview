@@ -1049,9 +1049,12 @@
       ensureLoaded: (ordinal) => messages.ensureOrdinalLoaded(ordinal),
       mountMessage: () => {
         // The match can live inside a folded turn/event: expand before
-        // the destination row index is computed.
+        // the destination row index is computed. Centering the freshly
+        // mounted row leaves slack for the measurement drift that follows
+        // a large turn expansion — a top-aligned row can be pushed just
+        // above the fold as estimates converge.
         expandOrdinalTarget(match.ordinal, match.blockKey);
-        return scrollToDisplayIndex(() => displayIndexOf(match.ordinal), 0, 0, reqId);
+        return scrollToDisplayIndex(() => displayIndexOf(match.ordinal), 0, 0, reqId, "center");
       },
       scrollToOffset: (offset) => virtualizer.instance?.scrollToOffset(
         Math.round(offset), { align: "start" },
@@ -1254,6 +1257,7 @@
               <AssistantTurnEventRow
                 event={row.event}
                 ownsSourceActions={sourceActionKeys.events.has(row.key)}
+                previewOnly={row.event === row.turn.finalOutput}
                 divider={dividerHere && row.event.kind === "tool-rollup"
                   ? readProgressDivider
                   : undefined}

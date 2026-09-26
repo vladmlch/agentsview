@@ -129,7 +129,9 @@ test.describe("Session list", () => {
 
     await sp.messageRows.first().click();
     await page.keyboard.press("ArrowDown");
-    await expect(sp.messageRows.nth(1)).toHaveClass(/selected/);
+    // j/k stops at content rows only: the prompt's next ordinal is rendered
+    // by the collapsed turn's final-output row, past its header.
+    await expect(sp.messageRows.nth(2)).toHaveClass(/selected/);
   });
 
   const filterCases = [

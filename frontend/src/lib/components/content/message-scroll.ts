@@ -6,7 +6,7 @@ export interface ScrollMetrics {
   clientHeight: number;
 }
 
-export type ScrollAlign = "start" | "end";
+export type ScrollAlign = "start" | "end" | "center";
 
 export function getLatestDisplayIndex(displayCount: number, newestFirst: boolean): number {
   if (displayCount <= 0) return -1;

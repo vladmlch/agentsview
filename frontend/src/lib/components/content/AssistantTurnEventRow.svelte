@@ -34,6 +34,10 @@
     /** True when this row is the first rendered event of its source
      *  message and therefore carries the Copy/Pin/Fork controls. */
     ownsSourceActions?: boolean;
+    /** True for the event that also backs the turn's always-visible
+     *  output row: it stays a collapsed preview permanently so the same
+     *  source text is never rendered twice. */
+    previewOnly?: boolean;
     /** Unread boundary landing inside a tool rollup; forwarded to
      *  ToolCallGroup so it renders next to the first unread member. */
     divider?: { ordinal: number; label: string };
@@ -44,6 +48,7 @@
   let {
     event,
     ownsSourceActions = false,
+    previewOnly = false,
     divider,
     session,
     allowMutations = true,
@@ -159,36 +164,49 @@
 >
   <div class="event-content">
     {#if event.kind === "message"}
-      <button
-        class="event-toggle"
-        aria-expanded={expanded}
-        onclick={() => {
-          const sel = window.getSelection();
-          if (sel && sel.toString().length > 0) return;
-          turnCollapse.setEventExpanded(event.key, !expanded);
-        }}
-      >
-        <span class="event-chevron" class:open={expanded}>
-          <ChevronRightIcon size="10" strokeWidth="2.4" aria-hidden="true" />
-        </span>
-        <span class="event-label">{m.assistant_turn_event_message()}</span>
-        <SearchMatchCount count={matchCount} />
-        {#if !expanded && preview}
-          <span class="event-preview">{preview}</span>
-        {/if}
-      </button>
-      {#if expanded}
-        <div class="event-body">
-          <MessageContent
-            message={event.message}
-            {eventSegments}
-            eventSegmentStart={event.segmentIndex ?? 0}
-            hideMessageHeader
-            searchOrdinal={event.message.ordinal}
-            {session}
-            {allowMutations}
-          />
+      {#if previewOnly}
+        <!-- The final output renders in full in its own row below; this
+          event row stays a non-interactive preview so the source text is
+          never mounted twice. -->
+        <div class="event-toggle event-toggle-static">
+          <span class="event-label">{m.assistant_turn_event_message()}</span>
+          <SearchMatchCount count={matchCount} />
+          {#if preview}
+            <span class="event-preview">{preview}</span>
+          {/if}
         </div>
+      {:else}
+        <button
+          class="event-toggle"
+          aria-expanded={expanded}
+          onclick={() => {
+            const sel = window.getSelection();
+            if (sel && sel.toString().length > 0) return;
+            turnCollapse.setEventExpanded(event.key, !expanded);
+          }}
+        >
+          <span class="event-chevron" class:open={expanded}>
+            <ChevronRightIcon size="10" strokeWidth="2.4" aria-hidden="true" />
+          </span>
+          <span class="event-label">{m.assistant_turn_event_message()}</span>
+          <SearchMatchCount count={matchCount} />
+          {#if !expanded && preview}
+            <span class="event-preview">{preview}</span>
+          {/if}
+        </button>
+        {#if expanded}
+          <div class="event-body">
+            <MessageContent
+              message={event.message}
+              {eventSegments}
+              eventSegmentStart={event.segmentIndex ?? 0}
+              hideMessageHeader
+              searchOrdinal={event.message.ordinal}
+              {session}
+              {allowMutations}
+            />
+          </div>
+        {/if}
       {/if}
     {:else if event.kind === "thinking" && thinkingEvent}
       <ThinkingBlock

@@ -58,3 +58,27 @@ export async function waitForRowCountStable(
 
   await waitForStableValue(() => sp.messageRows.count(), durationMs, 200);
 }
+
+/**
+ * Waits until the row's center point resolves to the row itself.
+ * Virtual rows can briefly overlap while the virtualizer
+ * re-measures heights after sort or expansion changes; a click
+ * issued during that window can dispatch to a neighboring row.
+ */
+export async function waitForRowHitTarget(locator: Locator): Promise<void> {
+  await locator.scrollIntoViewIfNeeded();
+  await expect
+    .poll(
+      () =>
+        locator.evaluate((el) => {
+          const rect = el.getBoundingClientRect();
+          const hit = document.elementFromPoint(
+            rect.left + rect.width / 2,
+            rect.top + rect.height / 2,
+          );
+          return hit instanceof Element && el.contains(hit);
+        }),
+      { timeout: 5_000 },
+    )
+    .toBe(true);
+}
