@@ -320,4 +320,31 @@ describe("AssistantTurnEventRow", () => {
     expect(document.querySelector(".system-boundary")).not.toBeNull();
     expect(document.querySelector(".system-boundary .label")?.textContent).toContain("Task");
   });
+
+  it("falls back to the fence label preview when the role filter hides the text", async () => {
+    uiState.hideBlock("assistant");
+    await render(
+      event({
+        segments: [
+          { type: "text", content: "Visible answer." },
+          { type: "code", content: "const n = 1;\n", label: "ts" },
+        ],
+        segmentIndex: 1,
+      }),
+    );
+    expect(document.querySelector(".event-preview")?.textContent).toBe("```ts");
+  });
+
+  it("renders the expandable fence placeholder for a filtered code segment", async () => {
+    uiState.hideBlock("code");
+    await render(
+      event({
+        segments: [{ type: "code", content: "const n = 1;\n", label: "ts" }],
+        segmentIndex: 1,
+      }),
+    );
+    await click(".event-toggle");
+    expect(document.querySelector(".code-fence-toggle")).not.toBeNull();
+    expect(document.querySelector(".code-content")).toBeNull();
+  });
 });
