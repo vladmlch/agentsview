@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import type { DbMessage as Message } from "../../api/generated/index.js";
 import { messages } from "../../stores/messages.svelte.js";
@@ -578,5 +578,127 @@ describe("MessageList follow cancellation", () => {
     await tick();
     // Expanded, each member event is a stop and the output row adds none.
     expect(api.getNavigableOrdinals()).toEqual([0, 1, 2, 3]);
+  });
+
+  it("expands the owning turn before scrolling to a folded ordinal", async () => {
+    messages.messages = [
+      { ...makeMessage(0), role: "user" },
+      { ...makeMessage(1), role: "assistant" },
+      { ...makeMessage(2), role: "assistant" },
+    ];
+    messages.messageCount = 3;
+    messages.activeSessionToken = "current";
+    // Collapsed turn rows: prompt, header, final output.
+    setVirtualRows(3);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    expect(document.querySelector(".turn-header")?.getAttribute("aria-expanded")).toBe("false");
+
+    (
+      component as ReturnType<typeof mount> & {
+        scrollToOrdinal: (ordinal: number) => void;
+      }
+    ).scrollToOrdinal(1);
+    // Expanded rows are prompt, header, two member events, final output.
+    // Update the virtualizer before the reactive re-render runs.
+    setVirtualRows(5);
+    await tick();
+
+    // The owning turn expanded before the destination row index was read,
+    // so the folded member's event row is the scroll target.
+    const turnKey = `s1:turn:${messages.messages[1]!.id}`;
+    expect(turnCollapse.isTurnExpanded(turnKey, false)).toBe(true);
+    expect(document.querySelector(".turn-header")?.getAttribute("aria-expanded")).toBe("true");
+    expect(document.querySelectorAll(".turn-event")).toHaveLength(2);
+    await vi.waitFor(() => {
+      expect(virtualizerMock.scrollToIndex).toHaveBeenCalledWith(
+        2,
+        expect.objectContaining({ align: "start" }),
+      );
+    });
+  });
+
+  it("keeps a manually expanded leading turn expanded across an older-page prepend", async () => {
+    // While earlier pages are unloaded the leading partial turn anchors
+    // on the oldest loaded message (id = ordinal + 1 → 6).
+    messages.messages = [
+      { ...makeMessage(5), role: "assistant" },
+      { ...makeMessage(6), role: "assistant" },
+    ];
+    messages.messageCount = 7;
+    messages.activeSessionToken = "current";
+    setVirtualRows(4);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    turnCollapse.setTurnExpanded("s1:turn:6", true);
+    await tick();
+    expect(document.querySelector(".turn-header")?.getAttribute("aria-expanded")).toBe("true");
+
+    // loadOlder prepends two earlier assistant messages; the same turn
+    // re-anchors on id 4 and carries its manual expansion along.
+    messages.messages = [
+      { ...makeMessage(3), role: "assistant" },
+      { ...makeMessage(4), role: "assistant" },
+      { ...makeMessage(5), role: "assistant" },
+      { ...makeMessage(6), role: "assistant" },
+    ];
+    setVirtualRows(6);
+    await tick();
+
+    expect(turnCollapse.isTurnExpanded("s1:turn:4", false)).toBe(true);
+    expect(document.querySelector(".turn-header")?.getAttribute("aria-expanded")).toBe("true");
+    expect(document.querySelectorAll(".turn-event")).toHaveLength(4);
+  });
+
+  it("renders a collapsed header for the empty pre-first-token turn and reveals streamed output", async () => {
+    messages.messages = [
+      { ...makeMessage(0), role: "user" },
+      { ...makeMessage(1), role: "assistant", content: "", content_length: 0 },
+    ];
+    messages.messageCount = 2;
+    messages.activeSessionToken = "current";
+    setVirtualRows(2);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    // The still-empty streaming turn keeps its collapsed header mounted so
+    // the pending reply is visible before the first token arrives.
+    const emptyHeader = document.querySelector(".turn-header");
+    expect(emptyHeader).not.toBeNull();
+    expect(emptyHeader!.getAttribute("aria-expanded")).toBe("false");
+    expect(document.querySelectorAll(".turn-event")).toHaveLength(0);
+
+    // The first tokens land in the always-visible output row while the
+    // turn stays collapsed.
+    messages.messages = [
+      { ...makeMessage(0), role: "user" },
+      { ...makeMessage(1), role: "assistant", content: "hel", content_length: 3 },
+    ];
+    setVirtualRows(3);
+    await tick();
+    expect(document.querySelector(".turn-header")?.getAttribute("aria-expanded")).toBe("false");
+    expect(document.body.textContent).toContain("hel");
+    expect(document.querySelectorAll(".turn-event")).toHaveLength(0);
+
+    // A manually expanded turn stays expanded as the same message grows.
+    const turnKey = `s1:turn:${messages.messages[1]!.id}`;
+    turnCollapse.setTurnExpanded(turnKey, true);
+    setVirtualRows(4);
+    await tick();
+    messages.messages = [
+      { ...makeMessage(0), role: "user" },
+      {
+        ...makeMessage(1),
+        role: "assistant",
+        content: "hello world",
+        content_length: 11,
+      },
+    ];
+    await tick();
+    expect(document.querySelector(".turn-header")?.getAttribute("aria-expanded")).toBe("true");
+    expect(document.body.textContent).toContain("hello world");
   });
 });

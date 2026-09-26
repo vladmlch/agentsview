@@ -71,6 +71,15 @@ async function search(query = "needle") {
   await tick();
 }
 
+/** Lets the reveal loop finish: expansion, remount, and its frame settles. */
+async function settleReveal() {
+  await tick();
+  for (let i = 0; i < 12; i++) {
+    await vi.advanceTimersByTimeAsync(250);
+    await tick();
+  }
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
   vi.clearAllMocks();
@@ -83,7 +92,9 @@ beforeEach(() => {
   messages.loading = false;
   messages.messages = [
     message(0, "needle in visible user", { role: "user" }),
-    message(1, "[Thinking]\nneedle\n[/Thinking]", { has_thinking: true }),
+    message(1, "[Thinking]\nneedle\n[/Thinking]\nneedle in middle text", {
+      has_thinking: true,
+    }),
     message(2, "", {
       has_tool_use: true,
       tool_calls: [
@@ -94,16 +105,16 @@ beforeEach(() => {
         },
       ],
     }),
+    message(3, "final answer text"),
   ];
-  messages.messageCount = 3;
+  messages.messageCount = 4;
   ui.showAllBlocks();
   for (const type of ["assistant", "thinking", "tool", "code", "system"] as const) {
     ui.setBlockVisible(type, false);
   }
   ui.setTranscriptMode("normal");
-  // Expanded turns mount each revealed block's event row directly; the
-  // collapsed-header reveal path is covered by the turn-collapse tests.
-  ui.setAutoCollapseAssistantTurns(false);
+  // Turns start collapsed so reveal must expand the owning turn and event.
+  ui.setAutoCollapseAssistantTurns(true);
   turnCollapse.activateSession(null);
   ui.messageLayout = "skim";
   ui.sortNewestFirst = false;
@@ -134,46 +145,70 @@ afterEach(async () => {
 });
 
 describe("MessageList search visibility", () => {
-  it("indexes filter-hidden blocks and temporarily reveals their types", async () => {
+  it("expands the owning turn and event disclosures to reach hidden-type matches", async () => {
     component = mount(MessageList, { target: document.body });
     await tick();
     // Baseline: only the user row renders; hidden types stay unmounted.
-    const before = document.querySelectorAll(".virtual-row").length;
-    expect(before).toBe(1);
-    expect(document.querySelectorAll(".thinking-header")).toHaveLength(0);
-    expect(document.querySelector(".tool-block")).toBeNull();
+    expect(document.querySelectorAll(".virtual-row")).toHaveLength(1);
+    expect(document.querySelector(".turn-header")).toBeNull();
     const filters = [...ui.visibleBlocks];
     const stored = localStorage.getItem(BLOCK_FILTER_KEY);
 
     await search();
 
-    // Hidden thinking and tool-output blocks join the index…
-    expect(inSessionSearch.total).toBe(3);
+    // Hidden thinking, mid-turn text, and tool-output blocks join the index…
+    expect(inSessionSearch.total).toBe(4);
     expect(inSessionSearch.countForBlock("1:thinking:0")).toBe(1);
+    expect(inSessionSearch.countForBlock("1:text:1")).toBe(1);
     expect(inSessionSearch.countForBlock("2:tool-output:0")).toBe(1);
     // …their owning types are temporarily revealed…
     expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(true);
     expect(inSessionSearch.revealedBlockTypes.has("tool")).toBe(true);
-    // …so the filtered rows and blocks mount without touching preferences.
-    // The expanded turn adds a header row plus one row per revealed event.
-    expect(document.querySelectorAll(".virtual-row").length).toBe(4);
-    expect(document.querySelectorAll(".thinking-header").length).toBeGreaterThan(0);
-    expect(document.querySelector(".tool-block")).not.toBeNull();
+    expect(inSessionSearch.revealedBlockTypes.has("assistant")).toBe(true);
+    // …so the turn header and final-output row mount; the current match is
+    // the visible user row, so the turn itself stays collapsed.
+    expect(document.querySelectorAll(".virtual-row")).toHaveLength(3);
+    const header = document.querySelector(".turn-header");
+    expect(header).not.toBeNull();
+    expect(header!.getAttribute("aria-expanded")).toBe("false");
+    expect(document.querySelectorAll(".thinking-header")).toHaveLength(0);
+    expect(document.querySelector(".tool-block")).toBeNull();
     expect([...ui.visibleBlocks]).toEqual(filters);
     expect(localStorage.getItem(BLOCK_FILTER_KEY)).toBe(stored);
 
-    inSessionSearch.close();
-    await tick();
-    // Closing the find view restores the saved filter output.
-    expect(document.querySelectorAll(".virtual-row")).toHaveLength(before);
-    expect(document.querySelectorAll(".thinking-header")).toHaveLength(0);
-    expect(document.querySelector(".tool-block")).toBeNull();
+    // The thinking match expands the turn and mounts the exact block.
+    inSessionSearch.next();
+    await settleReveal();
+    expect(document.querySelector(".turn-header")!.getAttribute("aria-expanded")).toBe("true");
+    expect(document.querySelector('[data-search-block="1:thinking:0"]')).not.toBeNull();
+
+    // The mid-turn text match lives inside the message event disclosure:
+    // it expands so the block can mount.
+    inSessionSearch.next();
+    await settleReveal();
+    expect(document.querySelector('[data-search-block="1:text:1"]')).not.toBeNull();
+    const messageToggle = document.querySelector(
+      '.turn-event[data-event-kind="message"] .event-toggle',
+    );
+    expect(messageToggle?.getAttribute("aria-expanded")).toBe("true");
+
+    // The tool-output match nested inside the rollup mounts too.
+    inSessionSearch.next();
+    await settleReveal();
+    expect(document.querySelector('[data-search-block="2:tool-output:0"]')).not.toBeNull();
+
+    // Saved filters and localStorage stay untouched by the temporary reveal.
+    expect([...ui.visibleBlocks]).toEqual(filters);
+    expect(localStorage.getItem(BLOCK_FILTER_KEY)).toBe(stored);
   });
 
   it("keeps a manually hidden revealed type suppressed until the find view closes", async () => {
     component = mount(MessageList, { target: document.body });
     await tick();
     await search();
+    // Expand the owning turn by navigating to its thinking match.
+    inSessionSearch.next();
+    await settleReveal();
     expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(true);
     expect(document.querySelectorAll(".thinking-header").length).toBeGreaterThan(0);
 
@@ -202,11 +237,14 @@ describe("MessageList search visibility", () => {
     await vi.advanceTimersByTimeAsync(200);
     await tick();
     expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(true);
+    inSessionSearch.next();
+    await settleReveal();
     expect(document.querySelectorAll(".thinking-header").length).toBeGreaterThan(0);
   });
 
   it("suppresses a saved-visible type manually hidden during search", async () => {
     ui.setBlockVisible("thinking", true);
+    ui.setAutoCollapseAssistantTurns(false);
     component = mount(MessageList, { target: document.body });
     await tick();
     await search();
@@ -236,7 +274,7 @@ describe("MessageList search visibility", () => {
     expect(document.querySelector(".layout-skim")).not.toBeNull();
     await search();
     // Focused mode keeps its message-level projection: the intermediate
-    // thinking-only and tool-only rows are not eligible for the index.
+    // thinking/text and tool-only rows are not eligible for the index.
     expect(inSessionSearch.total).toBe(1);
     expect(inSessionSearch.countForOrdinal(0)).toBe(1);
     expect(inSessionSearch.countForBlock("1:thinking:0")).toBe(0);
