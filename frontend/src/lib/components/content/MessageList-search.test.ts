@@ -246,6 +246,31 @@ describe("MessageList search visibility", () => {
     expect(document.querySelector('[data-search-block="2:skill:1"]')).not.toBeNull();
   });
 
+  it("opens a truncated prompt's disclosure so a tail match mounts and highlights", async () => {
+    messages.messages = [
+      message(0, `${"pad ".repeat(160)}needle`, { role: "user" }),
+      message(1, "final answer text"),
+    ];
+    messages.messageCount = 2;
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    const promptId = messages.messages[0]!.id;
+    // The tail folds behind the prompt disclosure: no needle in the DOM yet.
+    expect(turnCollapse.isUserPromptExpanded(promptId)).toBe(false);
+    expect(document.querySelector(".prompt-toggle")).not.toBeNull();
+    expect(document.body.textContent).not.toContain("needle");
+
+    await search();
+    // The match is indexed while folded; navigation expands the disclosure
+    // so the block mounts and takes the current highlight.
+    expect(inSessionSearch.countForBlock("0:text:0")).toBe(1);
+    await settleReveal();
+    expect(turnCollapse.isUserPromptExpanded(promptId)).toBe(true);
+    const block = document.querySelector('[data-search-block="0:text:0"]');
+    expect(block).not.toBeNull();
+    expect(block!.getAttribute("data-search-current")).toBe("true");
+  });
+
   it("keeps a manually hidden revealed type suppressed until the find view closes", async () => {
     component = mount(MessageList, { target: document.body });
     await tick();

@@ -22,6 +22,7 @@
   import type {
     AssistantTurnItem,
     LeadingTurnAnchor,
+    PromptNode,
     TranscriptNode,
     TurnEvent,
   } from "../../utils/assistant-turns.js";
@@ -32,7 +33,7 @@
     flattenTranscriptRows,
     type TranscriptRow,
   } from "../../utils/transcript-rows.js";
-  import { hasVisibleSegments } from "../../utils/content-parser.js";
+  import { hasVisibleSegments, promptIsTruncated } from "../../utils/content-parser.js";
   import type { BlockType } from "../../stores/ui.svelte.js";
   import {
     isSystemBoundaryMessage,
@@ -186,11 +187,23 @@
     }
   }
 
-  /** Expand the owning turn — and the child event disclosure when one
-   *  keys it — so a scroll target folded inside a turn has a mountable
-   *  row before the destination index is computed. `blockKey` picks the
-   *  exact event when one ordinal spans several of them. */
+  /** Expand the owning disclosure — a truncated prompt, the assistant
+   *  turn, and the child event disclosure when one keys it — so a scroll
+   *  target folded inside any of them has a mountable row before the
+   *  destination index is computed. `blockKey` picks the exact event when
+   *  one ordinal spans several of them. */
   function expandOrdinalTarget(ordinal: number, blockKey?: string): void {
+    // A truncated user prompt folds everything past the preview behind its
+    // disclosure — open it before scrolling so a match inside the tail can
+    // mount and highlight. This runs in every transcript mode; turn
+    // expansion below stays normal-mode only.
+    const promptNode = sessionScope.items.find(
+      (node): node is PromptNode =>
+        node.kind === "prompt" && node.ordinals.includes(ordinal),
+    );
+    if (promptNode && promptIsTruncated(promptNode.item.message.content)) {
+      turnCollapse.setUserPromptExpanded(promptNode.item.message.id, true);
+    }
     if (ui.transcriptMode !== "normal") return;
     const owner = findOrdinalOwner(sessionScope.items, ordinal);
     if (!owner) return;
@@ -921,6 +934,10 @@
   });
 
   async function revealSearchMatch(match: Match, sessionId: string, reqId: number): Promise<boolean> {
+    // Expand folded owners before the reveal checks mounted blocks: a
+    // truncated prompt already mounts its preview under the match's block
+    // key, so `findSearchBlock` alone cannot tell the tail text is missing.
+    expandOrdinalTarget(match.ordinal, match.blockKey);
     return revealMatch({
       ordinal: match.ordinal,
       blockKey: match.blockKey,

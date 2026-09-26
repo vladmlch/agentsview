@@ -817,4 +817,78 @@ describe("MessageContent user prompt disclosure", () => {
     await tick();
     expect(text(".text-content")).toBe(content);
   });
+
+  it("renders a marker inside the preview slice once, in the attachment region", async () => {
+    const content = "a".repeat(100) + " [Image #1] " + "b".repeat(601);
+    await render(message({ role: "user", content }));
+
+    expect(text(".text-content")).not.toContain("[Image #1]");
+    const attachments = document.querySelector(".prompt-attachments");
+    expect(attachments).not.toBeNull();
+    expect(attachments!.textContent).toContain("[Image #1]");
+    const messageBody = document.querySelector(".message-body")!;
+    expect(messageBody.textContent!.match(/\[Image #1\]/g) ?? []).toHaveLength(1);
+  });
+
+  it("lifts line-anchored audio and document markers out of the preview", async () => {
+    const content = "please review\n[audio]\n[document notes.pdf]\n" + "b".repeat(601);
+    await render(message({ role: "user", content }));
+
+    expect(text(".text-content")).not.toContain("[audio]");
+    expect(text(".text-content")).not.toContain("[document notes.pdf]");
+    const attachments = document.querySelector(".prompt-attachments")!;
+    expect(attachments).not.toBeNull();
+    expect(attachments.textContent).toContain("[audio]");
+    expect(attachments.textContent).toContain("[document notes.pdf]");
+  });
+
+  it("leaves markers inside code spans and fenced blocks in the body", async () => {
+    const content = "a".repeat(601) + "\n\n`[Image #1]`\n\n```\n[file]\n```";
+    await render(message({ role: "user", content }));
+
+    // Collapsed: nothing extracts, and the tail stays folded entirely.
+    expect(document.querySelector(".prompt-attachments")).toBeNull();
+    expect(document.querySelector(".code-content")).toBeNull();
+
+    await click("button.prompt-toggle");
+    expect(document.querySelector(".prompt-attachments")).toBeNull();
+    expect(document.querySelector(".text-content code")?.textContent).toBe("[Image #1]");
+    expect(text(".code-content")).toContain("[file]");
+  });
+
+  it("renders a fence inside the preview slice once, without a parsed CodeBlock", async () => {
+    const content = "a".repeat(100) + "\n\n```sh\necho early\n```\n\n" + "b".repeat(500);
+    await render(message({ role: "user", content }));
+
+    const messageBody = document.querySelector(".message-body")!;
+    expect(messageBody.textContent!.match(/echo early/g) ?? []).toHaveLength(1);
+    expect(document.querySelector(".code-content")).toBeNull();
+
+    // Expanded, the fence renders through the parsed-segment CodeBlock path.
+    await click("button.prompt-toggle");
+    expect(document.querySelector(".code-content")).not.toBeNull();
+    expect(text(".code-content")).toContain("echo early");
+  });
+
+  it("keeps a fence past the preview fully folded while collapsed", async () => {
+    const content = "a".repeat(620) + "\n\n```sh\necho tail\n```";
+    await render(message({ role: "user", content }));
+
+    expect(text(".message-body")).not.toContain("echo tail");
+    expect(document.querySelector(".code-content")).toBeNull();
+
+    await click("button.prompt-toggle");
+    expect(text(".code-content")).toContain("echo tail");
+  });
+
+  it("keeps a marker-looking markdown link as a link", async () => {
+    const content = "a".repeat(601) + "\n\n[file](https://example.com)";
+    await render(message({ role: "user", content }));
+
+    expect(document.querySelector(".prompt-attachments")).toBeNull();
+    await click("button.prompt-toggle");
+    const link = document.querySelector(".text-content a");
+    expect(link?.getAttribute("href")).toBe("https://example.com");
+    expect(link?.textContent).toBe("file");
+  });
 });

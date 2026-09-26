@@ -443,3 +443,14 @@ export class InSessionSearchStore {
 }
 
 export const inSessionSearch = new InSessionSearchStore();
+
+/** The shared manual block-filter protocol used by every filter control:
+ *  read the next state from effective visibility, record the manual choice
+ *  while the find view is open so a temporary reveal is suppressed, then
+ *  persist it. The note must run before the saved visibility flips or the
+ *  suppression cannot be told apart from a persisted preference. */
+export function toggleBlockFilter(type: BlockType): void {
+  const next = !inSessionSearch.isBlockEffectivelyVisible(type);
+  inSessionSearch.noteManualBlockFilterChange(type, next);
+  ui.setBlockVisible(type, next);
+}

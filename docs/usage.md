@@ -637,7 +637,8 @@ copies the command instead of launching it; remote sessions cannot be forked
 from the browser.
 
 Long user prompts collapse to a preview. When a prompt runs past 600 Unicode
-code points, only the first 500 code points render, followed by a **Show full
+code points, only the first 500 code points render — the rest of the prompt,
+including fenced code and other parsed segments, folds behind a **Show full
 prompt** button; expanded prompts offer **Show less**. Attachment references
 such as images and pasted-file markers stay visible outside the collapsed
 region. The disclosure is per message, resets with the session, and is not
@@ -752,8 +753,8 @@ toggles visibility of six content categories:
 Turning off **Code** collapses each fenced block into an inline placeholder
 showing its language and an **Expand** button. Expand or collapse individual
 blocks without changing the global filter. Messages containing only code keep
-their placeholder. Filtered code stays out of in-session search; turn **Code**
-back on to include it.
+their placeholder. Filtered code still matches in-session search and is
+temporarily revealed by it; turn **Code** back on to keep it visible.
 
 System boundary cards are the compact rows that mark a session continuation or
 resume, an interrupted request, a task notification, or stop hook feedback.
