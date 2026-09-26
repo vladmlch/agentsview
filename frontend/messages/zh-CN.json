@@ -2295,6 +2295,9 @@
   ],
   "settings_image_cleanup_compact_note": "删除载荷会重写存储的行。在运行 agentsview db compact 之前，存档文件大小保持不变。",
   "appearance_render_unknown_xml_blocks": "将未知 XML 块渲染为预格式化文本",
+  "appearance_auto_collapse_assistant_turns": "默认折叠助手回合",
+  "message_content_show_full_prompt": "显示完整提示",
+  "message_content_show_less": "收起",
   "assistant_turn_event_message": "消息",
   "assistant_turn_message_count": [
     {

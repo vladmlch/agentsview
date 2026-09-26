@@ -2377,6 +2377,9 @@
   ],
   "settings_image_cleanup_compact_note": "La suppression des charges réécrit les lignes stockées. La taille du fichier d'archive reste inchangée jusqu'à ce que vous exécutiez agentsview db compact.",
   "appearance_render_unknown_xml_blocks": "Afficher les blocs XML inconnus en texte préformaté",
+  "appearance_auto_collapse_assistant_turns": "Réduire les tours de l'assistant par défaut",
+  "message_content_show_full_prompt": "Afficher le prompt complet",
+  "message_content_show_less": "Afficher moins",
   "assistant_turn_event_message": "Message",
   "assistant_turn_message_count": [
     {

@@ -2380,6 +2380,9 @@
   ],
   "settings_image_cleanup_compact_note": "Məlumat yüklərinin silinməsi saxlanılmış sətirləri yenidən yazır. Arxiv faylının ölçüsü agentsview db compact əmrini icra edənədək dəyişmir.",
   "appearance_render_unknown_xml_blocks": "Naməlum XML bloklarını əvvəlcədən formatlanmış mətn kimi göstər",
+  "appearance_auto_collapse_assistant_turns": "Köməkçi növbələrini susmaya görə yığ",
+  "message_content_show_full_prompt": "Tam sorğunu göstər",
+  "message_content_show_less": "Daha az göstər",
   "assistant_turn_event_message": "Mesaj",
   "assistant_turn_message_count": [
     {

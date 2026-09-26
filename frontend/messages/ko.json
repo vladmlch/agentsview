@@ -2295,6 +2295,9 @@
   ],
   "settings_image_cleanup_compact_note": "페이로드를 제거하면 저장된 행이 다시 작성됩니다. agentsview db compact를 실행할 때까지 아카이브 파일 크기는 유지됩니다.",
   "appearance_render_unknown_xml_blocks": "알 수 없는 XML 블록을 미리 서식이 지정된 텍스트로 표시",
+  "appearance_auto_collapse_assistant_turns": "어시스턴트 턴을 기본으로 접기",
+  "message_content_show_full_prompt": "전체 프롬프트 보기",
+  "message_content_show_less": "간략히 보기",
   "assistant_turn_event_message": "메시지",
   "assistant_turn_message_count": [
     {
