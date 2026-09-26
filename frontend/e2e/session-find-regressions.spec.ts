@@ -115,8 +115,9 @@ test.describe("session find audit regressions", () => {
       await expect(current).toBeVisible();
       await page.keyboard.press("Escape");
       // Thinking stays rendered by its filter; only the search expansion
-      // ends. The thinking block lives inside the tool rollup, whose
-      // members self-disclose ephemerally rather than through turn state.
+      // ends. The thinking block is a sibling turn event next to the tool
+      // rollup — both self-disclose ephemerally rather than through turn
+      // state.
       await expect(page.locator(".thinking-header")).toHaveCount(1);
       await expect(page.locator(".thinking-content")).toHaveCount(0);
       await expect(page.locator("[data-search-current]")).toHaveCount(0);

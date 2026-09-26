@@ -10,6 +10,7 @@ import type {
 import type { TurnEvent } from "../../utils/assistant-turns.js";
 import type { ContentSegment } from "../../utils/content-parser.js";
 import { setLocale } from "../../i18n/index.js";
+import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
 import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
 import AssistantTurnEventRow from "./AssistantTurnEventRow.svelte";
 
@@ -161,6 +162,29 @@ describe("AssistantTurnEventRow", () => {
     await click(".event-toggle");
     expect(document.querySelector(".text-content")?.textContent).toContain("Visible answer.");
     expect(document.querySelector(".code-content")?.textContent).toContain("const n = 1;");
+  });
+
+  it("renders a non-interactive static preview when previewOnly", async () => {
+    const countSpy = vi.spyOn(inSessionSearch, "countForBlock").mockReturnValue(2);
+    await render(
+      event({
+        segments: [{ type: "text", content: "Final answer text." }],
+        segmentIndex: 0,
+      }),
+      { previewOnly: true },
+    );
+    // No toggle button or expandable body — the full content lives in the
+    // final-output row — but the label, match count, preview, and ordinal
+    // marker still render for the event list.
+    expect(document.querySelector("button.event-toggle")).toBeNull();
+    expect(document.querySelector(".event-body")).toBeNull();
+    expect(document.querySelector(".event-toggle-static")).not.toBeNull();
+    expect(document.querySelector(".event-label")?.textContent).not.toBe("");
+    expect(document.querySelector(".search-match-count")).not.toBeNull();
+    expect(document.querySelector(".event-preview")?.textContent).toBe("Final answer text.");
+    expect(document.querySelector(".event-preview")?.getAttribute("aria-hidden")).toBe("true");
+    expect(document.querySelector(".turn-event")?.getAttribute("data-message-ordinal")).toBe("1");
+    countSpy.mockRestore();
   });
 
   it("keeps original source segment indexes in search block keys", async () => {
