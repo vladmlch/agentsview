@@ -1079,7 +1079,7 @@ Paraglide JS, Playwright.
   test files changed. Do not stage generated Paraglide output unless the repo
   tracks it as part of the established workflow.
 
-- [ ] **Step 6: Commit the final verification/test changes**
+- [x] **Step 6: Commit the final verification/test changes**
 
   ```bash
   git add \
