@@ -309,49 +309,64 @@ func devinRedactedSessionID() string {
 	return "<redacted-session-id>"
 }
 
-func parseDevinSession(ctx context.Context, dbPath, rawSessionID, machine string) (*ParsedSession, []ParsedMessage, error) {
+func parseDevinSession(
+	ctx context.Context, dbPath, rawSessionID, machine string,
+) (*ParsedSession, []ParsedMessage, error) {
+	session, messages, _, err := parseDevinSessionWithSubagents(
+		ctx, dbPath, rawSessionID, machine,
+	)
+	return session, messages, err
+}
+
+func parseDevinSessionWithSubagents(
+	ctx context.Context, dbPath, rawSessionID, machine string,
+) (*ParsedSession, []ParsedMessage, []devinParsedSubagent, error) {
 	meta, err := getDevinSessionMeta(ctx, dbPath, rawSessionID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if meta == nil {
-		return nil, nil, sql.ErrNoRows
+		return nil, nil, nil, sql.ErrNoRows
 	}
 
 	// message_nodes is Devin's live session history. Explicit exports can lag
 	// behind it, so use the node chain whenever the database has a usable node
 	// representation; the export remains the compatibility fallback.
-	nodeSess, nodeMsgs, nodeOK, nodesErr := parseDevinSessionFromMessageNodes(
-		ctx, dbPath, rawSessionID, machine, meta,
-	)
+	nodeSess, nodeMsgs, nodeSubagents, nodeOK, nodesErr :=
+		parseDevinSessionFromMessageNodesWithSubagents(
+			ctx, dbPath, rawSessionID, machine, meta,
+		)
 	if nodesErr == nil && nodeOK {
-		return nodeSess, nodeMsgs, nil
+		return nodeSess, nodeMsgs, nodeSubagents, nil
+	}
+	if _, ok := errors.AsType[*devinSubagentParseError](nodesErr); ok {
+		return nil, nil, nil, nodesErr
 	}
 	if nodesErr != nil && !errors.Is(nodesErr, errInvalidDevinMessageNode) {
-		return nil, nil, nodesErr
+		return nil, nil, nil, nodesErr
 	}
 
 	transcriptPath := filepath.Join(filepath.Dir(dbPath), "transcripts", rawSessionID+".json")
 	info, err := os.Stat(transcriptPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			return nil, nil, newDevinTranscriptError("stat", err)
+			return nil, nil, nil, newDevinTranscriptError("stat", err)
 		}
-		return nil, nil, newDevinTranscriptError("missing", nil)
+		return nil, nil, nil, newDevinTranscriptError("missing", nil)
 	}
 
 	data, err := os.ReadFile(transcriptPath)
 	if err != nil {
-		return nil, nil, newDevinTranscriptError("read", err)
+		return nil, nil, nil, newDevinTranscriptError("read", err)
 	}
 	if !gjson.ValidBytes(data) {
-		return nil, nil, newDevinTranscriptError("invalid", nil)
+		return nil, nil, nil, newDevinTranscriptError("invalid", nil)
 	}
 
 	root := gjson.ParseBytes(data)
 	steps := root.Get("steps")
 	if !steps.IsArray() {
-		return nil, nil, newDevinTranscriptError("missing steps array in", nil)
+		return nil, nil, nil, newDevinTranscriptError("missing steps array in", nil)
 	}
 
 	model := firstNonEmpty(root.Get("agent.model_name").Str, metaValue(meta, func(m *DevinSessionMeta) string { return m.Model }))
@@ -399,7 +414,7 @@ func parseDevinSession(ctx context.Context, dbPath, rawSessionID, machine string
 	if devinTranscriptLostPreContinuation(messages) {
 		recovered, rerr := devinRecoveredEraMessages(ctx, dbPath, rawSessionID, meta, model)
 		if rerr != nil {
-			return nil, nil, rerr
+			return nil, nil, nil, rerr
 		}
 		if len(recovered) > 0 {
 			messages = append(recovered, messages...)
@@ -446,26 +461,52 @@ func parseDevinSession(ctx context.Context, dbPath, rawSessionID, machine string
 	sess := buildDevinParsedSession(meta, rawSessionID, machine, cwd, firstMessage, startedAt, endedAt, userMsgCount, messages, fileInfo)
 	accumulateMessageTokenUsage(sess, messages)
 	applyDevinFinalMetrics(sess, root.Get("final_metrics"))
-	return sess, messages, nil
+	return sess, messages, nodeSubagents, nil
 }
 
 func parseDevinSessionFromMessageNodes(ctx context.Context,
 	dbPath, rawSessionID, machine string,
 	meta *DevinSessionMeta,
 ) (*ParsedSession, []ParsedMessage, bool, error) {
+	session, messages, _, ok, err :=
+		parseDevinSessionFromMessageNodesWithSubagents(
+			ctx, dbPath, rawSessionID, machine, meta,
+		)
+	return session, messages, ok, err
+}
+
+func parseDevinSessionFromMessageNodesWithSubagents(
+	ctx context.Context,
+	dbPath, rawSessionID, machine string,
+	meta *DevinSessionMeta,
+) (*ParsedSession, []ParsedMessage, []devinParsedSubagent, bool, error) {
 	rows, err := listDevinMessageNodes(ctx, dbPath, rawSessionID)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, nil, false, err
 	}
 	if len(rows) == 0 {
-		return nil, nil, false, nil
+		return nil, nil, nil, false, nil
 	}
 
 	model := metaValue(meta, func(m *DevinSessionMeta) string { return m.Model })
 	cwd := metaValue(meta, func(m *DevinSessionMeta) string { return m.CWD })
+	fileInfo := devinBaseFileInfo(dbPath, rawSessionID)
+	partition, err := partitionDevinSubagentMessageNodes(ctx, rows)
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+	subagents, err := parseDevinSubagentNodeTrees(
+		ctx, rawSessionID, machine, meta, fileInfo, partition.Trees,
+	)
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
 
 	chain := devinMainChainRows(rows, meta)
 	ordered := append(devinRecoveredEraRows(rows, chain, meta), chain...)
+	ordered = devinMessageNodesWithout(
+		ordered, partition.ExcludedNodeIDs,
+	)
 
 	var (
 		messages     []ParsedMessage
@@ -477,7 +518,7 @@ func parseDevinSessionFromMessageNodes(ctx context.Context,
 	for _, row := range ordered {
 		msg, ok, err := parseDevinDBMessageNode(rawSessionID, row, len(messages), model)
 		if err != nil {
-			return nil, nil, false, err
+			return nil, nil, subagents, false, err
 		}
 		if !ok {
 			continue
@@ -497,7 +538,7 @@ func parseDevinSessionFromMessageNodes(ctx context.Context,
 		}
 	}
 	if len(messages) == 0 {
-		return nil, nil, false, nil
+		return nil, nil, subagents, false, nil
 	}
 
 	startedAt := firstNonZeroTime(
@@ -510,11 +551,10 @@ func parseDevinSessionFromMessageNodes(ctx context.Context,
 		startedAt,
 	)
 
-	fileInfo := devinBaseFileInfo(dbPath, rawSessionID)
 	devinApplyFileInfoTimes(&fileInfo, meta, endedAt)
 	sess := buildDevinParsedSession(meta, rawSessionID, machine, cwd, firstMessage, startedAt, endedAt, userMsgCount, messages, fileInfo)
 	accumulateMessageTokenUsage(sess, messages)
-	return sess, messages, true, nil
+	return sess, messages, subagents, true, nil
 }
 
 // devinMainChainRows returns the message-node rows along the session's main
@@ -749,9 +789,16 @@ func devinRecoveredEraMessages(
 	if len(rows) == 0 {
 		return nil, nil
 	}
+	partition, err := partitionDevinSubagentMessageNodes(ctx, rows)
+	if err != nil {
+		return nil, err
+	}
 	chain := devinMainChainRows(rows, meta)
 	var out []ParsedMessage
 	for _, row := range devinRecoveredEraRows(rows, chain, meta) {
+		if _, excluded := partition.ExcludedNodeIDs[row.NodeID]; excluded {
+			continue
+		}
 		msg, ok, err := parseDevinDBMessageNode(rawSessionID, row, len(out), model)
 		if err != nil {
 			if errors.Is(err, errInvalidDevinMessageNode) {

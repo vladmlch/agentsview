@@ -105,7 +105,9 @@ func (p *devinProvider) Parse(
 		return ParseOutcome{}, fmt.Errorf("stat %s: %w", src.DBPath, err)
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
-	sess, msgs, err := parseDevinSession(ctx, src.DBPath, src.SessionID, machine)
+	sess, msgs, subagents, err := parseDevinSessionWithSubagents(
+		ctx, src.DBPath, src.SessionID, machine,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ParseOutcome{
 			ResultSetComplete: true,
@@ -129,11 +131,22 @@ func (p *devinProvider) Parse(
 	if req.Fingerprint.Hash != "" {
 		sess.File.Hash = req.Fingerprint.Hash
 	}
-	return ParseOutcome{
-		Results: []ParseResultOutcome{{
-			Result:      ParseResult{Session: *sess, Messages: msgs},
+	results := make([]ParseResultOutcome, 0, 1+len(subagents))
+	results = append(results, ParseResultOutcome{
+		Result:      ParseResult{Session: *sess, Messages: msgs},
+		DataVersion: DataVersionCurrent,
+	})
+	for _, subagent := range subagents {
+		results = append(results, ParseResultOutcome{
+			Result: ParseResult{
+				Session:  subagent.Session,
+				Messages: subagent.Messages,
+			},
 			DataVersion: DataVersionCurrent,
-		}},
+		})
+	}
+	return ParseOutcome{
+		Results:           results,
 		ResultSetComplete: true,
 		ForceReplace:      true,
 	}, nil
@@ -285,7 +298,10 @@ func (s devinSourceSet) StoredSourceHintScopes(
 			continue
 		}
 		if ref, ok := s.sourceRef(root, req.Path, true); ok {
-			return []StoredSourceHintScope{{Path: ref.DisplayPath}}
+			return []StoredSourceHintScope{{
+				Path:                  ref.DisplayPath,
+				IncludeVirtualMembers: true,
+			}}
 		}
 		if dbPath, ok := s.dbPathForEvent(root, req.Path); ok {
 			return []StoredSourceHintScope{{
@@ -295,7 +311,8 @@ func (s devinSourceSet) StoredSourceHintScopes(
 		if sessionID, ok := s.transcriptSessionIDForEvent(root, req.Path); ok {
 			dbPath := filepath.Join(root, "cli", devinDBFilename)
 			return []StoredSourceHintScope{{
-				Path: VirtualSourcePath(dbPath, sessionID),
+				Path:                  VirtualSourcePath(dbPath, sessionID),
+				IncludeVirtualMembers: true,
 			}}
 		}
 	}
@@ -313,13 +330,17 @@ func (s devinSourceSet) FindSource(
 		if path == "" {
 			continue
 		}
+		rawSessionID := req.RawSessionID
+		if parentSessionID, _, ok := parseDevinSubagentRawSessionID(rawSessionID); ok {
+			rawSessionID = parentSessionID
+		}
 		for _, root := range s.roots {
 			ref, ok := s.sourceRef(root, path, true)
 			if !ok {
 				continue
 			}
 			src := ref.Opaque.(devinSource)
-			if req.RawSessionID != "" && src.SessionID != req.RawSessionID {
+			if rawSessionID != "" && src.SessionID != rawSessionID {
 				continue
 			}
 			if req.RequireFreshSource {
@@ -334,11 +355,15 @@ func (s devinSourceSet) FindSource(
 			return ref, true, nil
 		}
 	}
-	if req.RawSessionID == "" {
+	rawSessionID := req.RawSessionID
+	if parentSessionID, _, ok := parseDevinSubagentRawSessionID(rawSessionID); ok {
+		rawSessionID = parentSessionID
+	}
+	if rawSessionID == "" {
 		return SourceRef{}, false, nil
 	}
 	for _, root := range s.roots {
-		ref, ok, err := s.findByRawSessionID(ctx, root, req.RawSessionID, req.RequireFreshSource)
+		ref, ok, err := s.findByRawSessionID(ctx, root, rawSessionID, req.RequireFreshSource)
 		if err != nil {
 			return SourceRef{}, false, err
 		}
@@ -534,6 +559,9 @@ func (s devinSourceSet) sourceRef(root, path string, allowMissing bool) (SourceR
 	root = filepath.Clean(root)
 	path = filepath.Clean(path)
 	dbPath, sessionID, ok := ParseVirtualSourcePathForBase(path, devinDBFilename)
+	if !ok {
+		dbPath, sessionID, _, ok = parseDevinSubagentVirtualSourcePath(path)
+	}
 	if !ok || sessionID == "" {
 		return SourceRef{}, false
 	}
