@@ -14,14 +14,27 @@
   import CompactBoundaryDivider from "./CompactBoundaryDivider.svelte";
   import SystemBoundaryCard from "../system/SystemBoundaryCard.svelte";
   import ToolCallGroup from "./ToolCallGroup.svelte";
+  import AssistantTurnHeader from "./AssistantTurnHeader.svelte";
+  import AssistantTurnEventRow from "./AssistantTurnEventRow.svelte";
+  import AssistantTurnOutput from "./AssistantTurnOutput.svelte";
   import type { DbMessage as Message } from "../../api/generated/index.js";
   import type { DisplayItem } from "../../utils/display-items.js";
+  import type { TranscriptNode, TurnEvent } from "../../utils/assistant-turns.js";
+  import { isTurnEventVisible } from "../../utils/turn-visibility.js";
+  import {
+    displayTranscriptRow,
+    flattenTranscriptRows,
+    type TranscriptRow,
+  } from "../../utils/transcript-rows.js";
+  import { hasVisibleSegments } from "../../utils/content-parser.js";
+  import type { BlockType } from "../../stores/ui.svelte.js";
   import {
     isSystemBoundaryMessage,
     isSystemMessage,
   } from "../../utils/messages.js";
   import { resolveMessageLayout } from "../../utils/message-layout.js";
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+  import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
   import { sessionActivity } from "../../stores/sessionActivity.svelte.js";
   import SessionFindView from "./SessionFindView.svelte";
   import {
@@ -78,27 +91,136 @@
 
   let normalDisplayItemsAsc = $derived(sessionScope.normalItems);
 
+  // Drop standalone/prompt nodes whose source item renders nothing under
+  // the effective filters — the same `itemVisible` rule session-scope
+  // applies to its flat display items. Turn-internal filtering happens
+  // per event inside `flattenTranscriptRows`.
+  const isEffectivelyVisible = (type: BlockType): boolean =>
+    inSessionSearch.isBlockEffectivelyVisible(type);
+  // A filtered code fence still renders its expandable placeholder.
+  const isTranscriptBlockVisible = (type: BlockType): boolean =>
+    type === "code" || isEffectivelyVisible(type);
+  const isNodeVisible = (node: TranscriptNode): boolean =>
+    node.kind === "assistant-turn" ||
+    node.item.kind === "tool-group" ||
+    hasVisibleSegments(node.item.message, isTranscriptBlockVisible);
+
+  let renderableNodes = $derived(sessionScope.items.filter(isNodeVisible));
+
+  const isTurnExpanded = (key: string): boolean =>
+    turnCollapse.isTurnExpanded(key, !ui.autoCollapseAssistantTurns);
+  const isEventVisible = (event: TurnEvent): boolean =>
+    isTurnEventVisible(event, isEffectivelyVisible);
+
+  /**
+   * Virtual rows in display order. Normal mode flattens the assistant-turn
+   * tree; focused mode keeps the flat message-level projection. Both row
+   * kinds share the TranscriptRow contract so scrolling, selection, read
+   * progress, and search geometry treat them uniformly.
+   */
+  let transcriptRows = $derived.by<TranscriptRow[]>(() => {
+    if (ui.transcriptMode === "focused") {
+      const rows = displayItemsAsc.map(displayTranscriptRow);
+      return ui.sortNewestFirst ? rows.reverse() : rows;
+    }
+    return flattenTranscriptRows(
+      renderableNodes,
+      isTurnExpanded,
+      isEventVisible,
+      ui.sortNewestFirst,
+    );
+  });
+
+  /** Copy/Pin/Fork land on the first rendered row of each source message:
+   *  the first turn-event row for its message, or the final-output row
+   *  when no child event renders that message (collapsed turns and
+   *  events hidden by filters both count as not rendered). */
+  let sourceActionKeys = $derived.by(() => {
+    const claimed = new Set<number>();
+    const events = new Set<string>();
+    for (const row of transcriptRows) {
+      if (row.kind !== "turn-event") continue;
+      if (claimed.has(row.event.message.id)) continue;
+      claimed.add(row.event.message.id);
+      events.add(row.key);
+    }
+    const outputs = new Set<string>();
+    for (const row of transcriptRows) {
+      if (row.kind !== "final-output") continue;
+      if (!claimed.has(row.event.message.id)) outputs.add(row.key);
+    }
+    return { events, outputs };
+  });
+
+  /** Progress ordinals are the only ordinals whose content a row actually
+   *  renders — a collapsed turn header contributes none. Sorted ascending
+   *  regardless of display direction for boundary math. */
   let displayedOrdinals = $derived.by(() =>
-    displayItemsAsc.flatMap((item) => item.ordinals),
+    transcriptRows
+      .flatMap((row) => row.progressOrdinals)
+      .sort((a, b) => a - b),
   );
 
   let displayedOrdinalsSignature = $derived(
     displayedOrdinals.join(","),
   );
 
-  function itemAt(index: number, newestFirst = ui.sortNewestFirst) {
-    if (newestFirst) {
-      const mapped = displayItemsAsc.length - 1 - index;
-      return displayItemsAsc[mapped];
+  function rowAt(index: number): TranscriptRow | undefined {
+    return transcriptRows[index];
+  }
+
+  /** Whether the row renders content for `ordinal` — the turn-header's
+   *  empty tuple widens to a readonly list here. */
+  function rowRendersOrdinal(row: TranscriptRow, ordinal: number): boolean {
+    const rendered: readonly number[] = row.progressOrdinals;
+    return rendered.includes(ordinal);
+  }
+
+  /** First row rendering the ordinal wins; rows only carrying it for
+   *  click/selection lookup (a collapsed turn header) are the fallback so
+   *  navigation lands on rendered content when both exist. */
+  function findRowIndex(ordinal: number): number {
+    let fallback = -1;
+    for (let index = 0; index < transcriptRows.length; index++) {
+      const row = transcriptRows[index]!;
+      if (rowRendersOrdinal(row, ordinal)) return index;
+      if (fallback < 0 && row.ordinals.includes(ordinal)) fallback = index;
     }
-    return displayItemsAsc[index];
+    return fallback;
+  }
+
+  /** Ordinals in the row's internal display order — tool-group and rollup
+   *  members render newest-first when that sort is on. */
+  function orderedRowOrdinals(row: TranscriptRow): number[] {
+    return ui.sortNewestFirst
+      ? [...row.progressOrdinals].reverse()
+      : row.progressOrdinals;
+  }
+
+  /** Exactly one row carries the selection outline: the row rendering the
+   *  selected ordinal, with the collapsed header as fallback — the same
+   *  resolution `findRowIndex` uses for scrolling. */
+  let selectedRowIndex = $derived(
+    ui.selectedOrdinal === null ? -1 : findRowIndex(ui.selectedOrdinal),
+  );
+
+  function rowTimestamp(row: TranscriptRow): string | null {
+    switch (row.kind) {
+      case "display":
+        return row.item.kind === "message"
+          ? row.item.message.timestamp
+          : row.item.timestamp;
+      case "turn-header":
+        return row.turn.timestamp;
+      default:
+        return row.event.message.timestamp;
+    }
   }
 
   const virtualizer = createVirtualizer(() => {
-    const count = displayItemsAsc.length;
+    const count = transcriptRows.length;
     const el = containerRef ?? null;
     const sid = sessions.activeSessionId ?? "";
-    const newestFirst = ui.sortNewestFirst;
     return {
       count,
       getScrollElement: () => el,
@@ -107,12 +229,9 @@
       useAnimationFrameWithResizeObserver: true,
       measureCacheKey: sid,
       getItemKey: (index: number) => {
-        const item = itemAt(index, newestFirst);
-        if (!item) return `${sid}-${index}`;
-        if (item.kind === "tool-group") {
-          return `${sid}-tg-${item.ordinals[0]}`;
-        }
-        return `${sid}-m-${item.message.ordinal}`;
+        const row = rowAt(index);
+        if (!row) return `${sid}-${index}`;
+        return row.key;
       },
     };
   });
@@ -145,17 +264,9 @@
     const scrollTop = v.scrollOffset ?? 0;
     for (const vi of items) {
       if (vi.end <= scrollTop) continue;
-      const item =
-        displayItemsAsc[
-          ui.sortNewestFirst
-            ? displayItemsAsc.length - 1 - vi.index
-            : vi.index
-        ];
-      if (!item) continue;
-      const ts =
-        item.kind === "message"
-          ? item.message.timestamp
-          : item.timestamp;
+      const row = rowAt(vi.index);
+      if (!row) continue;
+      const ts = rowTimestamp(row);
       if (ts) {
         sessionActivity.firstVisibleTimestamp = ts;
         return;
@@ -208,17 +319,17 @@
 
     for (const row of v.getVirtualItems()) {
       if (row.end <= top || row.start >= bottom) continue;
-      const item = itemAt(row.index);
-      if (!item) continue;
-      if (item.kind === "message") {
-        visibleOrdinals.add(item.message.ordinal);
-        maxVisibleOrdinal = maxVisibleOrdinal === null
-          ? item.message.ordinal
-          : Math.max(maxVisibleOrdinal, item.message.ordinal);
-        continue;
-      }
+      const transcriptRow = rowAt(row.index);
+      if (!transcriptRow) continue;
 
-      for (const ordinal of visibleToolGroupOrdinals(row.index)) {
+      // Multi-ordinal rows (tool groups and turn rollups) expose
+      // per-member ordinal markers so only the members actually inside
+      // the viewport count. Every other row counts its progress ordinals
+      // outright — a collapsed turn header's empty list adds nothing.
+      const ordinals = transcriptRow.progressOrdinals.length > 1
+        ? (visibleMarkedOrdinals(row.index) ?? [])
+        : transcriptRow.progressOrdinals;
+      for (const ordinal of ordinals) {
         visibleOrdinals.add(ordinal);
         maxVisibleOrdinal = maxVisibleOrdinal === null
           ? ordinal
@@ -272,17 +383,24 @@
     }
   }
 
-  function visibleToolGroupOrdinals(
+  /** Member ordinals whose `data-message-ordinal` marker is inside the
+   *  viewport for one virtual row. Returns `null` when the row exposes no
+   *  markers at all, so callers can fall back to the row's progress
+   *  ordinals — distinct from an empty list, which means the row has
+   *  markers but none are on screen. */
+  function visibleMarkedOrdinals(
     rowIndex: number,
-  ): number[] {
-    if (!containerRef) return [];
+  ): number[] | null {
+    if (!containerRef) return null;
     const row = containerRef.querySelector<HTMLElement>(
       `.virtual-row[data-index="${rowIndex}"]`,
     );
-    if (!row) return [];
+    if (!row) return null;
+    const markers = row.querySelectorAll<HTMLElement>("[data-message-ordinal]");
+    if (markers.length === 0) return null;
     const rootRect = containerRef.getBoundingClientRect();
     const ordinals: number[] = [];
-    for (const node of row.querySelectorAll<HTMLElement>("[data-message-ordinal]")) {
+    for (const node of markers) {
       const ordinal = Number(node.dataset.messageOrdinal);
       if (!Number.isInteger(ordinal) || ordinal < 0) continue;
       const rect = node.getBoundingClientRect();
@@ -392,7 +510,7 @@
         if (
           (ui.sortNewestFirst &&
             lastVisible >=
-              displayItemsAsc.length - threshold) ||
+              transcriptRows.length - threshold) ||
           (!ui.sortNewestFirst &&
             firstVisible <= threshold)
         ) {
@@ -509,7 +627,7 @@
     return settleVirtualScroll({
       index, align, waitFrames, scrollRetries,
       getVirtualizer: () => virtualizer.instance,
-      getCount: () => displayItemsAsc.length,
+      getCount: () => transcriptRows.length,
       isCurrent: () => !destroyed && reqId === lastScrollRequest,
       nextFrame: raf,
     });
@@ -523,21 +641,16 @@
     const reqId = ++lastScrollRequest;
     activeFollowScrollRequest = null;
 
-    const idxAsc = displayItemsAsc.findIndex((item) =>
-      item.ordinals.includes(ordinal),
-    );
-    if (idxAsc >= 0) {
-      const idx = ui.sortNewestFirst
-        ? displayItemsAsc.length - 1 - idxAsc
-        : idxAsc;
-      scrollToDisplayIndex(idx, 0, 0, reqId);
+    const rowIndex = findRowIndex(ordinal);
+    if (rowIndex >= 0) {
+      scrollToDisplayIndex(rowIndex, 0, 0, reqId);
       return;
     }
 
     await messages.ensureOrdinalLoaded(ordinal);
     if (reqId !== lastScrollRequest) return;
 
-    // Let Svelte re-derive displayItemsAsc and the
+    // Let Svelte re-derive transcriptRows and the
     // virtualizer update its count after loading.
     // Two frames: one for Svelte reactivity, one for
     // virtualizer resize observation.
@@ -545,14 +658,9 @@
     await raf();
     if (reqId !== lastScrollRequest) return;
 
-    const loadedIdxAsc = displayItemsAsc.findIndex(
-      (item) => item.ordinals.includes(ordinal),
-    );
-    if (loadedIdxAsc < 0) return;
-    const loadedIdx = ui.sortNewestFirst
-      ? displayItemsAsc.length - 1 - loadedIdxAsc
-      : loadedIdxAsc;
-    scrollToDisplayIndex(loadedIdx, 0, 0, reqId);
+    const loadedRowIndex = findRowIndex(ordinal);
+    if (loadedRowIndex < 0) return;
+    scrollToDisplayIndex(loadedRowIndex, 0, 0, reqId);
   }
 
   export function scrollToOrdinal(ordinal: number) {
@@ -563,7 +671,7 @@
     const reqId = ++lastScrollRequest;
     activeFollowScrollRequest = reqId;
     const idx = getLatestDisplayIndex(
-      displayItemsAsc.length,
+      transcriptRows.length,
       ui.sortNewestFirst,
     );
     if (idx < 0) return;
@@ -631,14 +739,6 @@
     return `${m.ordinal}:${m.content_length}:${m.timestamp}`;
   }
 
-  function itemOrdinals(item: DisplayItem): number[] {
-    if (item.kind === "message") return [item.message.ordinal];
-    const source = ui.sortNewestFirst
-      ? [...item.messages].reverse()
-      : item.messages;
-    return source.map((message) => message.ordinal);
-  }
-
   $effect(() => {
     const follow = ui.followLatest;
     if (!follow) {
@@ -649,7 +749,7 @@
   $effect(() => {
     const follow = ui.followLatest;
     const request = ui.followLatestRequest;
-    const count = displayItemsAsc.length;
+    const count = transcriptRows.length;
     const latest = latestDisplaySignature();
     const newestFirst = ui.sortNewestFirst;
     const sessionId = messages.sessionId;
@@ -672,6 +772,29 @@
     return normalDisplayItemsAsc;
   }
 
+  /** Source-message ordinals a j/k navigation pass can stop at: each
+   *  ordinal a rendered row contributes, once, in transcript order.
+   *  Turn headers add no step — their member ordinals travel with the
+   *  event and output rows that render them. */
+  export function getNavigableOrdinals(): number[] {
+    const seen = new Set<number>();
+    const ordinals: number[] = [];
+    for (const row of transcriptRows) {
+      for (const ordinal of orderedRowOrdinals(row)) {
+        if (seen.has(ordinal)) continue;
+        seen.add(ordinal);
+        ordinals.push(ordinal);
+      }
+    }
+    return ordinals;
+  }
+
+  // Turn collapse state is session-scoped; switching sessions drops every
+  // override, bulk baseline, and prompt disclosure so it cannot leak.
+  $effect(() => {
+    turnCollapse.activateSession(messages.sessionId);
+  });
+
   let searchRevealKey = $derived.by(() => {
     const match = inSessionSearch.resolvedCurrent;
     return match ? `${match.ordinal}:${match.blockKey}:${match.occurrence}` : "";
@@ -687,9 +810,8 @@
         inSessionSearch.isActive,
       ensureLoaded: (ordinal) => messages.ensureOrdinalLoaded(ordinal),
       mountMessage: () => {
-        const ascIndex = displayItemsAsc.findIndex((item) => item.ordinals.includes(match.ordinal));
-        if (ascIndex < 0) return Promise.resolve(false);
-        const index = ui.sortNewestFirst ? displayItemsAsc.length - 1 - ascIndex : ascIndex;
+        const index = findRowIndex(match.ordinal);
+        if (index < 0) return Promise.resolve(false);
         return scrollToDisplayIndex(index, 0, 0, reqId);
       },
       scrollToOffset: (offset) => virtualizer.instance?.scrollToOffset(
@@ -704,7 +826,7 @@
     const request = inSessionSearch.navigationRevision;
     const key = searchRevealKey;
     const sessionId = messages.sessionId;
-    const count = displayItemsAsc.length;
+    const count = transcriptRows.length;
     const newestFirst = ui.sortNewestFirst;
     if (!inSessionSearch.isActive || !sessionId || !containerRef) return;
     if (!key) {
@@ -755,9 +877,10 @@
 
     const unreadBoundary = unreadBoundaryOrdinal(latestOrdinal);
 
-    const items = ui.sortNewestFirst
-      ? [...displayItemsAsc].reverse()
-      : displayItemsAsc;
+    // transcriptRows are already in display order; only ordinals whose
+    // content renders (progressOrdinals) can host the boundary, so a
+    // collapsed turn header never hides the divider inside folded work.
+    const rows = transcriptRows;
 
     if (ui.sortNewestFirst) {
       if (messages.activeSessionUnreadOrdinal === null) {
@@ -767,8 +890,8 @@
           unreadBoundary === marker.ordinal + 1
         ? marker.ordinal
         : unreadBoundary;
-      for (const item of items) {
-        for (const ordinal of itemOrdinals(item)) {
+      for (const row of rows) {
+        for (const ordinal of orderedRowOrdinals(row)) {
           if (ordinal <= dividerBoundary) {
             return {
               ordinal,
@@ -780,8 +903,8 @@
       return null;
     }
 
-    for (const item of items) {
-      for (const ordinal of itemOrdinals(item)) {
+    for (const row of rows) {
+      for (const ordinal of orderedRowOrdinals(row)) {
         if (ordinal >= unreadBoundary) {
           return {
             ordinal,
@@ -816,9 +939,8 @@
   </EmptyState>
 {:else}
   <SessionFindView
-    items={displayItemsAsc}
+    rows={transcriptRows}
     totalSize={virtualizer.instance?.getTotalSize() ?? 0}
-    newestFirst={ui.sortNewestFirst}
     rowOffset={(index) => virtualizer.instance?.getOffsetForIndex(index, "start")?.[0] ?? index * 120}
   >
   <div
@@ -833,51 +955,80 @@
     <div
       style="height: {virtualizer.instance?.getTotalSize() ?? 0}px; width: 100%; position: relative;"
     >
-      {#each virtualizer.instance?.getVirtualItems() ?? [] as row (row.key)}
-        {@const item = itemAt(row.index)}
-        {#if item}
+      {#each virtualizer.instance?.getVirtualItems() ?? [] as virtualRow (virtualRow.key)}
+        {@const row = rowAt(virtualRow.index)}
+        {#if row}
+          {@const dividerHere = readProgressDivider !== null &&
+            rowRendersOrdinal(row, readProgressDivider.ordinal)}
           <!-- svelte-ignore a11y_click_events_have_key_events -->
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
             class="virtual-row"
-            class:selected={ui.selectedOrdinal !== null &&
-              item.ordinals.includes(ui.selectedOrdinal)}
-            data-index={row.index}
-            style="position: absolute; top: 0; left: 0; width: 100%; transform: translateY({row.start}px);"
+            class:selected={virtualRow.index === selectedRowIndex}
+            data-index={virtualRow.index}
+            style="position: absolute; top: 0; left: 0; width: 100%; transform: translateY({virtualRow.start}px);"
             use:measureElement={virtualizer.instance}
             onclick={() => {
               const sel = window.getSelection();
               if (sel && sel.toString().length > 0) return;
-              ui.selectOrdinal(item.ordinals[0]!);
+              ui.selectOrdinal(row.ordinals[0]!);
             }}
           >
-            {#if item.kind !== "tool-group" && readProgressDivider !== null && item.ordinals.includes(readProgressDivider.ordinal)}
-              <div class="read-progress-divider" role="separator" aria-label={m.read_progress_boundary()}>
-                {readProgressDivider.label}
-              </div>
-            {/if}
-            {#if item.kind === "tool-group"}
-              <ToolCallGroup
-                messages={item.messages}
-                timestamp={item.timestamp}
-                searchable={true}
-                sortNewestFirst={ui.sortNewestFirst}
-                divider={readProgressDivider !== null && item.ordinals.includes(readProgressDivider.ordinal)
+            {#if row.kind === "display"}
+              {@const item = row.item}
+              {#if item.kind === "tool-group"}
+                <ToolCallGroup
+                  messages={item.messages}
+                  timestamp={item.timestamp}
+                  searchable={true}
+                  sortNewestFirst={ui.sortNewestFirst}
+                  divider={dividerHere ? readProgressDivider : undefined}
+                />
+              {:else}
+                {#if dividerHere}
+                  <div class="read-progress-divider" role="separator" aria-label={m.read_progress_boundary()}>
+                    {readProgressDivider!.label}
+                  </div>
+                {/if}
+                {#if item.message.is_compact_boundary}
+                  <CompactBoundaryDivider message={item.message} />
+                {:else if isSystemBoundaryMessage(item.message)}
+                  <SystemBoundaryCard
+                    subtype={item.message.source_subtype}
+                    content={item.message.content}
+                    timestamp={item.message.timestamp}
+                  />
+                {:else}
+                  <MessageContent
+                    message={item.message}
+                    searchOrdinal={item.message.ordinal}
+                  />
+                {/if}
+              {/if}
+            {:else if row.kind === "turn-header"}
+              <AssistantTurnHeader turn={row.turn} />
+            {:else if row.kind === "turn-event"}
+              {#if dividerHere && row.event.kind !== "tool-rollup"}
+                <div class="read-progress-divider" role="separator" aria-label={m.read_progress_boundary()}>
+                  {readProgressDivider!.label}
+                </div>
+              {/if}
+              <AssistantTurnEventRow
+                event={row.event}
+                ownsSourceActions={sourceActionKeys.events.has(row.key)}
+                divider={dividerHere && row.event.kind === "tool-rollup"
                   ? readProgressDivider
                   : undefined}
               />
-            {:else if item.message.is_compact_boundary}
-              <CompactBoundaryDivider message={item.message} />
-            {:else if isSystemBoundaryMessage(item.message)}
-              <SystemBoundaryCard
-                subtype={item.message.source_subtype}
-                content={item.message.content}
-                timestamp={item.message.timestamp}
-              />
             {:else}
-              <MessageContent
-                message={item.message}
-                searchOrdinal={item.message.ordinal}
+              {#if dividerHere}
+                <div class="read-progress-divider" role="separator" aria-label={m.read_progress_boundary()}>
+                  {readProgressDivider!.label}
+                </div>
+              {/if}
+              <AssistantTurnOutput
+                event={row.event}
+                ownsSourceActions={sourceActionKeys.outputs.has(row.key)}
               />
             {/if}
           </div>

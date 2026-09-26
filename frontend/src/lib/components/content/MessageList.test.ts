@@ -5,6 +5,7 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
 import { messages } from "../../stores/messages.svelte.js";
 import { readProgress } from "../../stores/read-progress.svelte.js";
 import { sessions } from "../../stores/sessions.svelte.js";
+import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 import { setLocale } from "../../i18n/index.js";
 
@@ -100,9 +101,11 @@ describe("MessageList follow cancellation", () => {
     ui.sortNewestFirst = false;
     ui.showAllBlocks();
     ui.setTranscriptMode("normal");
+    ui.setAutoCollapseAssistantTurns(true);
     ui.selectedOrdinal = null;
     ui.pendingScrollOrdinal = null;
     ui.pendingScrollSession = null;
+    turnCollapse.activateSession(null);
     readProgress.reset();
     setVirtualRows(1);
     rafSpy = vi
@@ -123,6 +126,8 @@ describe("MessageList follow cancellation", () => {
     messages.clear();
     sessions.activeSessionId = null;
     ui.followLatest = false;
+    ui.setAutoCollapseAssistantTurns(true);
+    turnCollapse.activateSession(null);
     readProgress.reset();
     document.body.innerHTML = "";
   });
@@ -257,9 +262,12 @@ describe("MessageList follow cancellation", () => {
 
     expect(readProgress.get("s1")?.token).toBe("previous");
 
+    // Newest-first rows are [msg4, turn-header, final-output, msg2,
+    // turn-header, final-output, msg0]: the latest and boundary ordinals
+    // live on rows 0 and 6.
     virtualizerMock.getVirtualItems.mockReturnValue([
       { index: 0, key: "row-0", start: 0, end: 100 },
-      { index: 4, key: "row-4", start: 100, end: 200 },
+      { index: 6, key: "row-6", start: 100, end: 200 },
     ]);
     document.querySelector<HTMLElement>(".message-list-scroll")?.dispatchEvent(new Event("scroll"));
     await new Promise((resolve) => window.setTimeout(resolve, 20));
@@ -330,7 +338,9 @@ describe("MessageList follow cancellation", () => {
     ];
     messages.messageCount = 1;
     ui.setBlockVisible("code", false);
-    setVirtualRows(1);
+    // The lone assistant message forms a turn: header row plus the
+    // always-visible final-output row that hosts the fence.
+    setVirtualRows(2);
 
     component = mount(MessageList, { target: document.body });
     await tick();
@@ -391,7 +401,11 @@ describe("MessageList follow cancellation", () => {
     messages.messageCount = 2;
     messages.activeSessionToken = "current";
     ui.sortNewestFirst = true;
-    setVirtualRows(2);
+    // Turn rows are [header, final-output, prompt]; the whole short
+    // transcript fits the viewport so the boundary and latest ordinals
+    // are both on screen.
+    virtualizerMock.scrollRect.height = 400;
+    setVirtualRows(3);
     readProgress.baseline("s1", "previous", 0);
 
     component = mount(MessageList, { target: document.body });
@@ -416,8 +430,10 @@ describe("MessageList follow cancellation", () => {
 
     expect(readProgress.get("s1")?.token).toBe("previous");
 
+    // Newest-first rows are [msg2, turn-header, final-output, msg0]; the
+    // unread boundary (ordinal 0) is on the last row.
     virtualizerMock.getVirtualItems.mockReturnValue([
-      { index: 2, key: "row-2", start: 0, end: 100 },
+      { index: 3, key: "row-3", start: 0, end: 100 },
     ]);
     document.querySelector<HTMLElement>(".message-list-scroll")?.dispatchEvent(new Event("scroll"));
     await new Promise((resolve) => window.setTimeout(resolve, 20));
@@ -431,8 +447,11 @@ describe("MessageList follow cancellation", () => {
     messages.activeSessionToken = "current";
     messages.activeSessionUnreadOrdinal = null;
     ui.sortNewestFirst = true;
+    // Newest-first rows are [turn-header, final-output, msg2, turn-header,
+    // final-output, msg0]: the latest ordinal sits on row 1 and the raw
+    // boundary (ordinal 0) on row 5.
     virtualizerMock.getVirtualItems.mockReturnValue([
-      { index: 0, key: "row-0", start: 0, end: 100 },
+      { index: 1, key: "row-1", start: 0, end: 100 },
     ]);
     readProgress.baseline("s1", "previous", 2);
 
@@ -443,7 +462,7 @@ describe("MessageList follow cancellation", () => {
     expect(readProgress.get("s1")?.token).toBe("previous");
 
     virtualizerMock.getVirtualItems.mockReturnValue([
-      { index: 3, key: "row-3", start: 0, end: 100 },
+      { index: 5, key: "row-5", start: 0, end: 100 },
     ]);
     document.querySelector<HTMLElement>(".message-list-scroll")?.dispatchEvent(new Event("scroll"));
     await new Promise((resolve) => window.setTimeout(resolve, 20));
@@ -478,13 +497,23 @@ describe("MessageList follow cancellation", () => {
   });
 
   it("does not acknowledge a boundary hidden by a visible ordinal gap", async () => {
-    messages.messages = [makeMessage(0), makeMessage(1), makeMessage(2)];
-    messages.messageCount = 3;
+    // Ordinal 1 is a folded turn member: the collapsed turn renders only
+    // its final output (ordinal 2), so the boundary snaps forward to the
+    // first rendered ordinal and a visible gap means it stays unread.
+    messages.messages = [
+      { ...makeMessage(0), role: "user" },
+      { ...makeMessage(1), role: "assistant" },
+      { ...makeMessage(2), role: "assistant" },
+      { ...makeMessage(3), role: "user" },
+    ];
+    messages.messageCount = 4;
     messages.activeSessionToken = "current";
     messages.activeSessionUnreadOrdinal = 1;
+    // Chronological rows are [msg0, turn-header, final-output, msg3];
+    // only the flanking prompt rows are visible.
     virtualizerMock.getVirtualItems.mockReturnValue([
       { index: 0, key: "row-0", start: 0, end: 100 },
-      { index: 2, key: "row-2", start: 100, end: 200 },
+      { index: 3, key: "row-3", start: 100, end: 200 },
     ]);
     readProgress.baseline("s1", "previous", 2);
 
@@ -522,5 +551,32 @@ describe("MessageList follow cancellation", () => {
     await new Promise((resolve) => window.setTimeout(resolve, 20));
 
     expect(readProgress.get("s1")?.token).toBe("current");
+  });
+
+  it("lists each rendered source ordinal once in transcript order", async () => {
+    messages.messages = [
+      { ...makeMessage(0), role: "user" },
+      { ...makeMessage(1), role: "assistant" },
+      { ...makeMessage(2), role: "assistant" },
+      { ...makeMessage(3), role: "user" },
+    ];
+    messages.messageCount = 4;
+    messages.activeSessionToken = "current";
+    setVirtualRows(4);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    const api = component as ReturnType<typeof mount> & {
+      getNavigableOrdinals: () => number[];
+    };
+    // The collapsed turn contributes only its final-output ordinal; the
+    // header is never a navigation stop.
+    expect(api.getNavigableOrdinals()).toEqual([0, 2, 3]);
+
+    ui.setAutoCollapseAssistantTurns(false);
+    await tick();
+    // Expanded, each member event is a stop and the output row adds none.
+    expect(api.getNavigableOrdinals()).toEqual([0, 1, 2, 3]);
   });
 });
