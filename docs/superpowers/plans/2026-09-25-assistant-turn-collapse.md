@@ -677,7 +677,7 @@ Paraglide JS, Playwright.
   supply their own source ordinals. Tool rollups use the existing
   `[data-message-ordinal]` measurement behavior to count only visible calls.
 
-- [ ] **Step 1: Write failing flattening and read-progress tests**
+- [x] **Step 1: Write failing flattening and read-progress tests**
 
   Test one collapsed turn with source ordinals `[1, 2, 3]` and a final output at
   ordinal `3`: chronological rows must be `turn-header`, child events, and
@@ -688,7 +688,7 @@ Paraglide JS, Playwright.
   the header stays first, the final-output row follows it, and child events
   reverse.
 
-- [ ] **Step 2: Run the focused row tests and verify RED**
+- [x] **Step 2: Run the focused row tests and verify RED**
 
   ```bash
   ./node_modules/.bin/vp test run src/lib/utils/transcript-rows.test.ts
@@ -697,7 +697,7 @@ Paraglide JS, Playwright.
   Expected: FAIL because `flattenTranscriptRows` and `TranscriptRow` do not
   exist.
 
-- [ ] **Step 3: Implement the pure flattening function**
+- [x] **Step 3: Implement the pure flattening function**
 
   Preserve source keys. Use `${sessionId}-th-${turn.key}` for headers,
   `${sessionId}-te-${event.key}` for child events, and
@@ -705,7 +705,7 @@ Paraglide JS, Playwright.
   enabled, reverse top-level nodes and child events but keep each turn header
   first and its full final-output row immediately after the header.
 
-- [ ] **Step 4: Replace `MessageList`'s virtual source with transcript rows**
+- [x] **Step 4: Replace `MessageList`'s virtual source with transcript rows**
 
   Use `TranscriptRow.key` for `getItemKey`, retain the session measurement
   cache, and render the correct row component by `kind`. The existing
@@ -714,7 +714,7 @@ Paraglide JS, Playwright.
   `getNavigableOrdinals()` that returns unique visible source-message ordinals
   in transcript order.
 
-- [ ] **Step 5: Preserve search overview geometry and read progress**
+- [x] **Step 5: Preserve search overview geometry and read progress**
 
   Pass virtual transcript rows to `SessionFindView` and `FindOverviewRail`,
   mapping each match ordinal to its visible child/final row offset. Compute
@@ -722,7 +722,7 @@ Paraglide JS, Playwright.
   `progressOrdinals`, not group membership. Keep the final-output source ordinal
   included only while its separate row is visible.
 
-- [ ] **Step 6: Run focused virtual-list tests and verify GREEN**
+- [x] **Step 6: Run focused virtual-list tests and verify GREEN**
 
   ```bash
   ./node_modules/.bin/vp test run \
@@ -740,7 +740,7 @@ Paraglide JS, Playwright.
   ordinal selection, read progress, measured scrolling, and find overview
   offsets.
 
-- [ ] **Step 7: Commit the virtual-row task**
+- [x] **Step 7: Commit the virtual-row task**
 
   ```bash
   git add \

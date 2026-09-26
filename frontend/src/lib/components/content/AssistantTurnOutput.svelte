@@ -26,7 +26,9 @@
   }: Props = $props();
 </script>
 
-<div class="turn-output">
+<!-- The ordinal marker lets read progress count the always-visible output
+     row the same way flat message rows are counted. -->
+<div class="turn-output" data-message-ordinal={event.message.ordinal}>
   <div class="output-content">
     <MessageContent
       message={event.message}

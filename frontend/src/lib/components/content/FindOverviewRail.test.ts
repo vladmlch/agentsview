@@ -5,6 +5,7 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
 import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
 import { messages } from "../../stores/messages.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
+import { displayTranscriptRow } from "../../utils/transcript-rows.js";
 import FindOverviewRail from "./FindOverviewRail.svelte";
 
 let component: ReturnType<typeof mount> | undefined;
@@ -67,9 +68,8 @@ it("positions visible matches without hidden thinking, including live filter cha
   component = mount(FindOverviewRail, {
     target: document.body,
     props: {
-      items: inSessionSearch.scope!.displayItems,
+      rows: inSessionSearch.scope!.displayItems.map(displayTranscriptRow),
       totalSize: 100,
-      newestFirst: false,
       rowOffset: () => 0,
     },
   });

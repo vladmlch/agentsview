@@ -34,6 +34,9 @@
     /** True when this row is the first rendered event of its source
      *  message and therefore carries the Copy/Pin/Fork controls. */
     ownsSourceActions?: boolean;
+    /** Unread boundary landing inside a tool rollup; forwarded to
+     *  ToolCallGroup so it renders next to the first unread member. */
+    divider?: { ordinal: number; label: string };
     session?: Session | null;
     allowMutations?: boolean;
   }
@@ -41,6 +44,7 @@
   let {
     event,
     ownsSourceActions = false,
+    divider,
     session,
     allowMutations = true,
   }: Props = $props();
@@ -68,7 +72,9 @@
   );
 
   let eventSegments = $derived(event.segments ?? []);
-  let roleType = $derived(event.message.role === "user" ? "user" : "assistant");
+  let roleType = $derived<"user" | "assistant">(
+    event.message.role === "user" ? "user" : "assistant",
+  );
   let preview = $derived.by(() => {
     if (event.kind !== "message") return "";
     // When the role filter hides assistant/user text, fall back to the code
@@ -87,12 +93,15 @@
   });
   let matchCount = $derived.by(() => {
     if (event.kind !== "message" || event.segmentIndex === undefined) return 0;
+    // Message events hold only text/code runs — both searchable kinds.
     return eventSegments.reduce(
       (count, segment, index) =>
-        count +
-        inSessionSearch.countForBlock(
-          blockKey(event.message.ordinal, segment.type, event.segmentIndex! + index),
-        ),
+        segment.type === "text" || segment.type === "code"
+          ? count +
+            inSessionSearch.countForBlock(
+              blockKey(event.message.ordinal, segment.type, event.segmentIndex! + index),
+            )
+          : count,
       0,
     );
   });
@@ -138,7 +147,16 @@
   );
 </script>
 
-<div class="turn-event" data-event-kind={event.kind}>
+<!-- Single-source events mark their own ordinal so read progress counts a
+     mounted row; a tool rollup already marks each member message inside
+     ToolCallGroup, so the wrapper stays unmarked there. -->
+<div
+  class="turn-event"
+  data-event-kind={event.kind}
+  data-message-ordinal={event.kind === "tool-rollup"
+    ? undefined
+    : event.message.ordinal}
+>
   <div class="event-content">
     {#if event.kind === "message"}
       <button
@@ -227,6 +245,7 @@
         timestamp={event.message.timestamp}
         searchable
         sortNewestFirst={ui.sortNewestFirst}
+        {divider}
         collapseKeyPrefix={event.key}
         {defaultExpanded}
       />
