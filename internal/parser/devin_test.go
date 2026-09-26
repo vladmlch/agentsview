@@ -1330,3 +1330,44 @@ func TestParseDevinSessionPrefersMessageNodesOverFullTranscript(t *testing.T) {
 	assert.Equal(t, "post-compaction work", msgs[5].Content)
 	assert.Equal(t, 1, sess.UserMessageCount)
 }
+
+func TestParseDevinSessionRecoversMultiGenerationCompactedRoots(t *testing.T) {
+	const sessionID = "session-multi-compact"
+	fixture := newDevinTestFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Multi-generation compact",
+		WorkingDirectory: "/tmp/multi-compact",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103500)),
+		MainChainID:      new(int64(302)),
+	})
+
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 100, ChatMessage: `{"message_id":"m-100","role":"system","content":"era 1 system"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 101, ParentNodeID: new(int64(100)), ChatMessage: `{"message_id":"m-101","role":"user","content":"original user prompt"}`, CreatedAt: 1704103202},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 102, ParentNodeID: new(int64(101)), ChatMessage: `{"message_id":"m-102","role":"assistant","content":"era one work"}`, CreatedAt: 1704103203},
+
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 200, ChatMessage: `{"message_id":"m-200","role":"system","content":"era 2 system"}`, CreatedAt: 1704103301},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 201, ParentNodeID: new(int64(200)), ChatMessage: `{"message_id":"m-201","role":"system","content":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: era 1"}`, CreatedAt: 1704103302, MetadataJSON: `{"summarized_from": 102}`},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 202, ParentNodeID: new(int64(201)), ChatMessage: `{"message_id":"m-202","role":"assistant","content":"era two work"}`, CreatedAt: 1704103303},
+
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 300, ChatMessage: `{"message_id":"m-300","role":"system","content":"era 3 system"}`, CreatedAt: 1704103401},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 301, ParentNodeID: new(int64(300)), ChatMessage: `{"message_id":"m-301","role":"system","content":"You are continuing work from a previous conversation thread. Below is a summary of the previous conversation thread:\nSummary: era 2"}`, CreatedAt: 1704103402, MetadataJSON: `{"summarized_from": 202}`},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 302, ParentNodeID: new(int64(301)), ChatMessage: `{"message_id":"m-302","role":"assistant","content":"era three work"}`, CreatedAt: 1704103403},
+	)
+
+	sess, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+
+	require.Len(t, msgs, 9)
+	assert.Equal(t, "original user prompt", msgs[1].Content)
+	assert.Equal(t, "era one work", msgs[2].Content)
+	assert.True(t, msgs[4].IsCompactBoundary)
+	assert.Equal(t, "era two work", msgs[5].Content)
+	assert.True(t, msgs[7].IsCompactBoundary)
+	assert.Equal(t, "era three work", msgs[8].Content)
+	assert.Equal(t, "original user prompt", sess.FirstMessage)
+	assert.Equal(t, 1, sess.UserMessageCount)
+}
