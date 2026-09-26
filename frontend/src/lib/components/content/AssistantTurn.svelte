@@ -6,9 +6,8 @@
   import type { DbTurnTiming as TurnTiming } from "../../api/generated/index.js";
   import type { AssistantTurnItem, TurnEvent } from "../../utils/assistant-turns.js";
   import { enrichSegments, parseContent } from "../../utils/content-parser.js";
-  import { formatTimestamp, formatTokenUsage } from "../../utils/format.js";
+  import { formatNumber, formatTimestamp, formatTokenUsage } from "../../utils/format.js";
   import { formatDuration } from "../../utils/duration.js";
-  import { formatNumber } from "../../utils/format.js";
   import { sessionTiming } from "../../stores/sessionTiming.svelte.js";
   import { liveTick } from "../../stores/liveTick.svelte.js";
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
@@ -44,14 +43,16 @@
           event.message.role === "user" ? "user" : "assistant",
         );
       case "system":
-        return true;
+        return inSessionSearch.isBlockEffectivelyVisible("system");
       default: {
         const roleVisible = inSessionSearch.isBlockEffectivelyVisible(
           event.message.role === "user" ? "user" : "assistant",
         );
-        const codeVisible = inSessionSearch.isBlockEffectivelyVisible("code");
-        return (event.segments ?? []).some((segment) =>
-          segment.type === "code" ? codeVisible : roleVisible,
+        // Mirror isTranscriptBlockVisible in session-scope.ts: a filtered
+        // code fence still renders its manually expandable placeholder, so
+        // a code segment keeps the event visible regardless of the filter.
+        return (event.segments ?? []).some(
+          (segment) => segment.type === "code" || roleVisible,
         );
       }
     }
@@ -101,11 +102,20 @@
   });
 
   let outputVisible = $derived(
-    turn.finalOutput !== null &&
-      inSessionSearch.isBlockEffectivelyVisible("assistant"),
+    turn.finalOutput !== null && isEventVisible(turn.finalOutput),
   );
-  /** The header is the disclosure for the child rows; when filters hide every
-   *  child, the always-visible final output stands alone without it. */
+  /** Copy/Pin/Fork land on the first rendered child row of each source
+   *  message. A collapsed turn mounts no child rows, so the always-visible
+   *  output row carries its own message's actions then; while expanded the
+   *  child row keeps them. */
+  let outputOwnsSourceActions = $derived.by(() => {
+    const output = turn.finalOutput;
+    if (output === null) return false;
+    if (!expanded) return true;
+    return !orderedEvents.some((event) => event.message.id === output.message.id);
+  });
+  /** The header is the disclosure for the child rows; it renders whenever
+   *  at least one child event survives the block filters. */
   let headerVisible = $derived(visibleEvents.length > 0);
 
   /** Context tokens are cumulative per message, so the member maximum is the
@@ -140,7 +150,7 @@
     const total = memberTurns.reduce((sum, timing) => sum + (timing.duration_ms ?? 0), 0);
     const last = memberTurns[memberTurns.length - 1]!;
     if (sessionTiming.timing?.running && last.duration_ms == null) {
-      const startMs = new Date(last.started_at ?? turn.timestamp).getTime();
+      const startMs = new Date(last.started_at).getTime();
       const elapsed = Number.isNaN(startMs) ? 0 : Math.max(0, liveTick.now - startMs);
       return m.message_content_running_duration({ duration: formatDuration(elapsed) });
     }
@@ -154,7 +164,11 @@
       <button
         class="turn-header"
         aria-expanded={expanded}
-        onclick={() => turnCollapse.setTurnExpanded(turn.key, !expanded)}
+        onclick={() => {
+          const sel = window.getSelection();
+          if (sel && sel.toString().length > 0) return;
+          turnCollapse.setTurnExpanded(turn.key, !expanded);
+        }}
       >
         <span class="turn-chevron" class:open={expanded}>
           <ChevronRightIcon size="10" strokeWidth="2.4" aria-hidden="true" />
@@ -197,6 +211,7 @@
     {#if outputVisible && turn.finalOutput}
       <AssistantTurnOutput
         event={turn.finalOutput}
+        ownsSourceActions={outputOwnsSourceActions}
         {session}
         {allowMutations}
       />

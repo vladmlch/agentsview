@@ -125,7 +125,7 @@
     const ct = callByToolUseID.get(callId ?? "");
     if (ct?.duration_ms != null) return formatDuration(ct.duration_ms);
     if (sessionTiming.timing?.running && toolTurn != null && toolTurn.duration_ms == null) {
-      const startMs = new Date(toolTurn.started_at ?? event.message.timestamp).getTime();
+      const startMs = new Date(toolTurn.started_at).getTime();
       const elapsed = Number.isNaN(startMs) ? 0 : Math.max(0, liveTick.now - startMs);
       return m.message_content_running_duration({ duration: formatDuration(elapsed) });
     }
@@ -144,7 +144,11 @@
       <button
         class="event-toggle"
         aria-expanded={expanded}
-        onclick={() => turnCollapse.setEventExpanded(event.key, !expanded)}
+        onclick={() => {
+          const sel = window.getSelection();
+          if (sel && sel.toString().length > 0) return;
+          turnCollapse.setEventExpanded(event.key, !expanded);
+        }}
       >
         <span class="event-chevron" class:open={expanded}>
           <ChevronRightIcon size="10" strokeWidth="2.4" aria-hidden="true" />
