@@ -1051,6 +1051,11 @@ func TestCurrentDataVersionDevinMultiGenerationCompaction(t *testing.T) {
 		"Devin multi-generation compaction context recovery requires re-parsing sessions to unwind disconnected root trees")
 }
 
+func TestCurrentDataVersionCodexContinuationHistory(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 122,
+		"Codex continuation history stitching requires re-parsing paginated rollouts to recover full history")
+}
+
 func TestCurrentDataVersionPositAssistantProviderIdentity(t *testing.T) {
 	assert.GreaterOrEqual(t, CurrentDataVersion(), 95,
 		"Posit Assistant provider identity requires re-parsing usage rows")

@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-09-11
+last_edited: 2026-09-26
 ---
 
 # Session Format Source Inventory
@@ -458,6 +458,20 @@ fixtures retain this field; missing identities remain source-local.
   markers; Agentsview maps those to `tool_calls.file_path` and emits one tool
   call per file. `custom_tool_call` items carry the same patch text under
   `input` instead of a JSON `patch` argument.
+
+- **Paginated rollout continuation stitching (2026-09-26):** Codex sessions
+  interrupted or resumed across multiple rollout files record
+  `history_mode: "paginated"` with a `history_base` object in `session_meta`.
+  `history_base.thread_id` identifies the predecessor segment, either by
+  direct rollout UUID or by segment suffix (`_<segment_id>.jsonl`), and
+  `history_base.end_ordinal_exclusive` defines the slice boundary that excludes
+  interrupted or aborted turns (`turn_aborted`). Agentsview stitches ancestor
+  segments up through the root segment into a unified session with continuous
+  message ordinals `0..N`, preserving the root `FirstMessage` and `StartedAt`
+  while taking `EndedAt` from the leaf segment. Rollout filename matching in
+  discovery and source resolution recognizes both unsegmented
+  `rollout-*-{uuid}.jsonl` and segmented `rollout-*-{uuid}_{segment_uuid}.jsonl`
+  patterns, and provider source preference resolves to the newest leaf rollout.
 
 - **Evidence:** `source`.
 

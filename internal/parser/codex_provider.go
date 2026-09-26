@@ -937,7 +937,9 @@ func (s codexSourceSet) discoverSessionPaths(sessionsDir string) []string {
 // findSourceFile resolves a Codex session file by UUID under sessionsDir.
 // It prefers the standard year/month/day live path when present, then falls
 // back to a flat archived directory entry, matching the lookup precedence the
-// package-level entrypoint provided before the fold.
+// package-level entrypoint provided before the fold. When multiple files match
+// the same session UUID (e.g. paginated continuation segments), it prefers the
+// latest file.
 func (s codexSourceSet) findSourceFile(sessionsDir, sessionID string) string {
 	if !IsValidSessionID(sessionID) {
 		return ""
@@ -955,17 +957,16 @@ func (s codexSourceSet) findSourceFile(sessionsDir, sessionID string) string {
 				continue
 			}
 			if extractUUIDFromRollout(name) == sessionID {
-				archived = filepath.Join(sessionsDir, name)
-				break
+				path := filepath.Join(sessionsDir, name)
+				if archived == "" || path > archived {
+					archived = path
+				}
 			}
 		}
 	}
 
 	var live string
 	walkCodexDayDirs(sessionsDir, func(dayPath string) bool {
-		if live != "" {
-			return false
-		}
 		dayEntries, err := os.ReadDir(dayPath)
 		if err != nil {
 			return true
@@ -979,8 +980,10 @@ func (s codexSourceSet) findSourceFile(sessionsDir, sessionID string) string {
 				continue
 			}
 			if extractUUIDFromRollout(name) == sessionID {
-				live = filepath.Join(dayPath, name)
-				return false
+				path := filepath.Join(dayPath, name)
+				if live == "" || path > live {
+					live = path
+				}
 			}
 		}
 		return true
@@ -989,6 +992,75 @@ func (s codexSourceSet) findSourceFile(sessionsDir, sessionID string) string {
 		return live
 	}
 	return archived
+}
+
+// isMatchingCodexContinuationFile reports whether filename matches threadID,
+// either by a segment suffix "_<threadID>.jsonl" (Pattern A) or by direct UUID match (Pattern B).
+func isMatchingCodexContinuationFile(filename, threadID string) bool {
+	if !isCodexSessionFilename(filename) {
+		return false
+	}
+	if strings.HasSuffix(filename, "_"+threadID+".jsonl") {
+		return true
+	}
+	return extractUUIDFromRollout(filename) == threadID
+}
+
+// findContinuationParentFile locates the predecessor rollout segment for a given
+// continuation thread ID (history_base.thread_id).
+func (s codexSourceSet) findContinuationParentFile(currentPath, threadID string) string {
+	if !IsValidSessionID(threadID) {
+		return ""
+	}
+
+	// 1. Check directory of current file first (fast path for same-day continuation).
+	dir := filepath.Dir(currentPath)
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, f := range entries {
+			if !f.IsDir() && isMatchingCodexContinuationFile(f.Name(), threadID) {
+				return filepath.Join(dir, f.Name())
+			}
+		}
+	}
+
+	// 2. Search across configured roots (handles cross-midnight rollouts or multi-root setups).
+	for _, root := range s.roots {
+		if strings.HasPrefix(root, "s3://") {
+			continue
+		}
+		var found string
+		walkCodexDayDirs(root, func(dayPath string) bool {
+			if found != "" {
+				return false
+			}
+			if dayPath == dir {
+				return true
+			}
+			dayEntries, err := os.ReadDir(dayPath)
+			if err != nil {
+				return true
+			}
+			for _, f := range dayEntries {
+				if !f.IsDir() && isMatchingCodexContinuationFile(f.Name(), threadID) {
+					found = filepath.Join(dayPath, f.Name())
+					return false
+				}
+			}
+			return true
+		})
+		if found != "" {
+			return found
+		}
+		entries, err := os.ReadDir(root)
+		if err == nil {
+			for _, f := range entries {
+				if !f.IsDir() && isMatchingCodexContinuationFile(f.Name(), threadID) {
+					return filepath.Join(root, f.Name())
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func (s codexSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
@@ -1285,7 +1357,7 @@ func preferCodexSource(candidate, current SourceRef) bool {
 	if cand.Layout != curr.Layout {
 		return cand.Layout == CodexLayoutDated
 	}
-	return candidate.DisplayPath < current.DisplayPath
+	return candidate.DisplayPath > current.DisplayPath
 }
 
 func codexProviderUserMessageCount(messages []ParsedMessage) int {
