@@ -12,6 +12,7 @@ const virtualizerMock = vi.hoisted(() => ({
   options: { count: 0 },
   scrollOffset: 0,
   scrollRect: { height: 500 },
+  hiddenIndexes: [] as number[],
   getVirtualItems: vi.fn(() => [] as { index: number; key: string; start: number; end: number }[]),
   getTotalSize: vi.fn(() => 1000),
   measureElement: vi.fn(),
@@ -29,7 +30,7 @@ vi.mock("../../virtual/createVirtualizer.svelte.js", () => ({
           key: `search-row-${index}`,
           start: index * 120,
           end: (index + 1) * 120,
-        })),
+        })).filter((item) => !virtualizerMock.hiddenIndexes.includes(item.index)),
       );
       return virtualizerMock;
     },
@@ -83,6 +84,7 @@ async function settleReveal() {
 beforeEach(() => {
   vi.useFakeTimers();
   vi.clearAllMocks();
+  virtualizerMock.hiddenIndexes = [];
   inSessionSearch.close();
   inSessionSearch.clearQuery();
   messages.clear();
@@ -244,6 +246,44 @@ describe("MessageList search visibility", () => {
     expect(turnCollapse.isEventExpanded(`search-list:${msg2Id}:skill:1`, false)).toBe(true);
     expect(turnCollapse.isEventExpanded(`search-list:${msg2Id}:skill:0`, false)).toBe(false);
     expect(document.querySelector('[data-search-block="2:skill:1"]')).not.toBeNull();
+  });
+
+  it("centers the final-output row for a match in the output event", async () => {
+    // Chronological rows place the output's static preview event row
+    // directly before the final-output row, and both claim the output
+    // ordinal — mounting the match must center the row that actually
+    // renders the search block, not the preview that claims it first.
+    messages.messages = [
+      message(0, "prompt", { role: "user" }),
+      message(1, "[Thinking]\nplan\n[/Thinking]\nintermediate", {
+        has_thinking: true,
+      }),
+      message(2, "", {
+        has_tool_use: true,
+        tool_calls: [{ category: "", tool_name: "Read", result_content: "data" }],
+      }),
+      message(3, "needle final answer"),
+    ];
+    messages.messageCount = 4;
+    // Keep the final-output row out of the rendered window wherever it
+    // lands (collapsed index 2; expanded index 4 once the search overlay
+    // hides the thinking/tool events) so the reveal must mount it; the
+    // preview event row stays mounted and owns no blocks.
+    virtualizerMock.hiddenIndexes = [2, 4];
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    await search();
+    await settleReveal();
+
+    // Expanded chronological order under the search overlay:
+    // [user, header, msg1 event, msg3 preview event, final output]
+    const outputIndex = 4;
+    const previewIndex = 3;
+    expect(virtualizerMock.scrollToIndex).toHaveBeenCalledWith(outputIndex, {
+      align: "center",
+    });
+    expect(virtualizerMock.scrollToIndex).not.toHaveBeenCalledWith(previewIndex, expect.anything());
   });
 
   it("opens a truncated prompt's disclosure so a tail match mounts and highlights", async () => {

@@ -238,6 +238,10 @@ test.describe("Mixed content rendering", () => {
   test("response text remains after toggling thinking off", async ({ page }) => {
     const sid = await selectSession(page);
     await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
+    // Mount a thinking block inside the first turn so toggling its filter
+    // below is exercised rather than vacuous on a collapsed turn.
+    await expandTurn(page, 0);
+    await expect(page.locator(".thinking-block").first()).toBeVisible();
 
     // Open block filter dropdown and toggle thinking off
     await page.locator('button[aria-label="Filter block types"]').click();

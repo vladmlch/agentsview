@@ -5,7 +5,7 @@ function setup() {
   const virtualizer = {
     options: { count: 3 },
     getVirtualItems: vi.fn(() => [] as { index: number }[]),
-    getOffsetForIndex: vi.fn(() => undefined as [number, "start" | "end"] | undefined),
+    getOffsetForIndex: vi.fn(() => undefined as [number, "start" | "end" | "center"] | undefined),
     scrollToOffset: vi.fn(),
     scrollToIndex: vi.fn(),
   };
@@ -77,6 +77,16 @@ describe("settleVirtualScroll", () => {
     expect(await settleVirtualScroll(options)).toBe(false);
     expect(options.nextFrame).toHaveBeenCalledTimes(1);
     expect(virtualizer.scrollToOffset).not.toHaveBeenCalled();
+  });
+
+  it("passes center alignment through to offset resolution", async () => {
+    const { options, virtualizer } = setup();
+    options.align = "center";
+    virtualizer.getVirtualItems.mockReturnValue([{ index: 1 }]);
+    virtualizer.getOffsetForIndex.mockReturnValue([200, "center"]);
+    expect(await settleVirtualScroll(options)).toBe(true);
+    expect(virtualizer.getOffsetForIndex).toHaveBeenCalledWith(1, "center");
+    expect(virtualizer.scrollToOffset).toHaveBeenCalledWith(200, { align: "start" });
   });
 
   it("does not double-apply end alignment to an already aligned offset", async () => {
