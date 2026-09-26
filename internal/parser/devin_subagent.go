@@ -59,6 +59,7 @@ func partitionDevinSubagentMessageNodes(
 
 	indexByNodeID := make(map[int64]int, len(rows))
 	childrenByParent := make(map[int64][]int64, len(rows))
+	treeIndexByPromptMessageID := make(map[string]int)
 	for i, row := range rows {
 		indexByNodeID[row.NodeID] = i
 		if row.ParentNodeID.Valid {
@@ -107,13 +108,56 @@ func partitionDevinSubagentMessageNodes(
 			partition.ExcludedNodeIDs[rows[rowIndex].NodeID] = struct{}{}
 		}
 		if kind == devinMessageNodeRootSubagent && len(treeRows) > 1 {
-			partition.Trees = append(partition.Trees, devinSubagentNodeTree{
+			tree := devinSubagentNodeTree{
 				RootNodeID: rootNodeID,
 				Rows:       treeRows,
-			})
+			}
+			promptMessageID := devinSubagentTreePromptMessageID(treeRows)
+			if promptMessageID == "" {
+				partition.Trees = append(partition.Trees, tree)
+				continue
+			}
+			if existingIndex, exists := treeIndexByPromptMessageID[promptMessageID]; exists {
+				existing := partition.Trees[existingIndex]
+				if len(tree.Rows) > len(existing.Rows) ||
+					(len(tree.Rows) == len(existing.Rows) && tree.RootNodeID > existing.RootNodeID) {
+					partition.Trees[existingIndex] = tree
+				}
+				continue
+			}
+			treeIndexByPromptMessageID[promptMessageID] = len(partition.Trees)
+			partition.Trees = append(partition.Trees, tree)
 		}
 	}
+	sort.Slice(partition.Trees, func(i, j int) bool {
+		return partition.Trees[i].RootNodeID < partition.Trees[j].RootNodeID
+	})
 	return partition, nil
+}
+
+// devinSubagentTreePromptMessageID identifies copies of the same logical
+// subagent transcript. Devin can persist multiple disconnected roots for one
+// task; those copies retain the message_id of their first user prompt while
+// receiving different root node IDs.
+func devinSubagentTreePromptMessageID(rows []devinMessageNodeRow) string {
+	var (
+		messageID   string
+		firstNodeID int64
+	)
+	for _, row := range rows {
+		if gjson.Get(row.ChatMessage, "role").Str != "user" {
+			continue
+		}
+		candidate := strings.TrimSpace(devinNodeMessageID(row.ChatMessage))
+		if candidate == "" {
+			continue
+		}
+		if messageID == "" || row.NodeID < firstNodeID {
+			messageID = candidate
+			firstNodeID = row.NodeID
+		}
+	}
+	return messageID
 }
 
 type devinMessageNodeRoot int
