@@ -45,8 +45,7 @@ export interface SessionScopeInput {
 export interface SessionScope {
   /**
    * Transcript nodes for the selected mode with full group membership.
-   * Staged for the turn-collapse rendering tasks; nothing consumes it in
-   * production yet.
+   * `MessageList` flattens these into virtual transcript rows.
    */
   items: TranscriptNode[];
   /** Display items the current transcript mode and filters render. */
