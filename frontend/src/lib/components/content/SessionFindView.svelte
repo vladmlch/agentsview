@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
-  import type { DisplayItem } from "../../utils/display-items.js";
+  import type { TranscriptRow } from "../../utils/transcript-rows.js";
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
   import FindResultsList from "./FindResultsList.svelte";
   import FindOverviewRail from "./FindOverviewRail.svelte";
@@ -8,12 +8,13 @@
 
   interface Props {
     children: Snippet;
-    items: DisplayItem[];
+    /** Virtual transcript rows in display order — the same sequence the
+     *  virtualizer positions. */
+    rows: TranscriptRow[];
     totalSize: number;
-    newestFirst: boolean;
     rowOffset: (index: number) => number;
   }
-  let { children, items, totalSize, newestFirst, rowOffset }: Props = $props();
+  let { children, rows, totalSize, rowOffset }: Props = $props();
 </script>
 
 <SessionFindBar />
@@ -23,7 +24,7 @@
 <div class="find-viewport" class:has-find={inSessionSearch.isActive}>
   {@render children()}
   {#if inSessionSearch.isActive}
-    <FindOverviewRail {items} {totalSize} {newestFirst} {rowOffset} />
+    <FindOverviewRail {rows} {totalSize} {rowOffset} />
   {/if}
 </div>
 

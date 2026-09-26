@@ -5,6 +5,7 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
 import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
 import { messages } from "../../stores/messages.svelte.js";
 import { sessions } from "../../stores/sessions.svelte.js";
+import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 
 const virtualizerMock = vi.hoisted(() => ({
@@ -100,6 +101,10 @@ beforeEach(() => {
     ui.setBlockVisible(type, false);
   }
   ui.setTranscriptMode("normal");
+  // Expanded turns mount each revealed block's event row directly; the
+  // collapsed-header reveal path is covered by the turn-collapse tests.
+  ui.setAutoCollapseAssistantTurns(false);
+  turnCollapse.activateSession(null);
   ui.messageLayout = "skim";
   ui.sortNewestFirst = false;
   ui.followLatest = false;
@@ -119,6 +124,8 @@ afterEach(async () => {
   sessions.activeSessionId = null;
   ui.showAllBlocks();
   ui.setTranscriptMode("normal");
+  ui.setAutoCollapseAssistantTurns(true);
+  turnCollapse.activateSession(null);
   ui.messageLayout = "default";
   ui.sortNewestFirst = false;
   document.body.innerHTML = "";
@@ -148,7 +155,8 @@ describe("MessageList search visibility", () => {
     expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(true);
     expect(inSessionSearch.revealedBlockTypes.has("tool")).toBe(true);
     // …so the filtered rows and blocks mount without touching preferences.
-    expect(document.querySelectorAll(".virtual-row").length).toBe(3);
+    // The expanded turn adds a header row plus one row per revealed event.
+    expect(document.querySelectorAll(".virtual-row").length).toBe(4);
     expect(document.querySelectorAll(".thinking-header").length).toBeGreaterThan(0);
     expect(document.querySelector(".tool-block")).not.toBeNull();
     expect([...ui.visibleBlocks]).toEqual(filters);
