@@ -179,7 +179,7 @@ func devinMessageNodeRootKind(
 	if message.Get("role").Str != "system" {
 		return devinMessageNodeRootNone
 	}
-	content, _, _, _, _, _ := ExtractTextContent(ctx, message.Get("content"))
+	content, _, _, _, _, _, _ := ExtractTextContent(ctx, message.Get("content"))
 	switch {
 	case strings.Contains(content, devinSubagentRootMarker):
 		return devinMessageNodeRootSubagent

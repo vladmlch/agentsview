@@ -674,6 +674,9 @@ func BuildSessionBaseFilterSQL(
 		"message_count > 0",
 		"deleted_at IS NULL",
 	}
+	if dialect.name == "sqlite" {
+		preds = append(preds, "source_missing_at IS NULL")
+	}
 	if f.IncludeEmpty {
 		preds = preds[1:]
 	}
@@ -772,6 +775,9 @@ func buildSessionFilterWithBuilder(
 		q("message_count") + " > 0",
 		q("deleted_at") + " IS NULL",
 	}
+	if b.dialect.name == "sqlite" {
+		basePreds = append(basePreds, q("source_missing_at")+" IS NULL")
+	}
 	if f.IncludeEmpty {
 		basePreds = basePreds[1:]
 	}
@@ -843,6 +849,9 @@ func SessionTreeMemberPredicate(
 ) string {
 	f = f.withAnnotationSelection()
 	pred := sessionAlias + ".message_count > 0 AND " + sessionAlias + ".deleted_at IS NULL"
+	if dialect.name == "sqlite" {
+		pred += " AND " + sessionAlias + ".source_missing_at IS NULL"
+	}
 	if scope := dialect.AutomatedScopePredicate(NormalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated), sessionAlias+".is_automated"); scope != "" {
 		pred += " AND " + scope
 	}
