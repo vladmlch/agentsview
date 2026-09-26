@@ -142,7 +142,7 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 	var dbErr error
 	if ext == ".db" {
 		var dbResult antigravityStepLoadResult
-		dbResult, dbErr = loadAntigravityCLIDBSteps(ctx, path)
+		dbResult, dbErr = loadAntigravityCLIDBSteps(ctx, path, antigravityCLIIDPrefix)
 		sourceVersion = dbResult.sourceVersion
 		hasGenMetadata = dbResult.hasGenMetadata
 		// gen_metadata token usage describes the session's actual
@@ -440,10 +440,10 @@ func normalizeAntigravityCLIWorkspace(workspace string) string {
 }
 
 func loadAntigravityCLIDBSteps(ctx context.Context,
-	path string,
+	path string, sessionIDPrefix string,
 ) (antigravityStepLoadResult, error) {
 	result, err := loadAntigravityCLIDBStepsWithOptions(
-		ctx, path, sqliteReadOptions{},
+		ctx, path, sqliteReadOptions{}, sessionIDPrefix,
 	)
 	if err != nil && !sqliteWALHasFrames(path+"-wal") {
 		// When a WAL database has been cleanly checkpointed and closed by
@@ -453,6 +453,7 @@ func loadAntigravityCLIDBSteps(ctx context.Context,
 		// retry once with immutable=1 (stableSnapshot).
 		if retry, retryErr := loadAntigravityCLIDBStepsWithOptions(
 			ctx, path, sqliteReadOptions{stableSnapshot: true},
+			sessionIDPrefix,
 		); retryErr == nil {
 			return retry, nil
 		}
@@ -464,6 +465,7 @@ func loadAntigravityCLIDBStepsWithOptions(
 	ctx context.Context,
 	path string,
 	opts sqliteReadOptions,
+	sessionIDPrefix string,
 ) (antigravityStepLoadResult, error) {
 	db, err := openSQLiteReadOnly(path, opts)
 	if err != nil {
@@ -479,7 +481,9 @@ func loadAntigravityCLIDBStepsWithOptions(
 	// back to the trajectory sidecar (antigravitySourceVersion returns "" when
 	// the schema itself is unreadable, so an undecodable .db is never labeled).
 	sourceVersion := antigravitySourceVersion(ctx, db)
-	result, err := loadAntigravityStepsWithRawCount(ctx, db)
+	result, err := loadAntigravityStepsWithRawCount(
+		ctx, db, sessionIDPrefix,
+	)
 	result.sourceVersion = sourceVersion
 	if err != nil {
 		return result, err

@@ -107,8 +107,9 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 	root := filepath.Dir(filepath.Dir(path))
 
 	// Open read-only (falling back to immutable=1 when a checkpointed WAL DB
-	// lives on a read-only mount without a .db-shm file).
-	dbResult, err := loadAntigravityCLIDBSteps(ctx, path)
+	// lives on a read-only mount without a .db-shm file). The IDE prefix
+	// stamps subagent spawn edges with the same ids this provider writes.
+	dbResult, err := loadAntigravityCLIDBSteps(ctx, path, antigravityIDPrefix)
 	sourceVersion := dbResult.sourceVersion
 	if err != nil {
 		// Fail closed on an unreadable steps table, deliberately: a
@@ -253,6 +254,22 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 			Mtime: mtime,
 		},
 	}
+	// Subagent link precedence: the brain descriptor is authoritative,
+	// then the agy-reader sidecar's parentCascadeId (mirroring the CLI
+	// convention: parser sets ParentSessionID with the provider prefix).
+	// The descriptor also supplies the session name from the subagent
+	// role.
+	if d, ok := p.sources.subagentDescriptor(root, id); ok {
+		sess.ParentSessionID = antigravityIDPrefix + d.parentID
+		sess.RelationshipType = RelSubagent
+		if name := d.sessionName(); name != "" {
+			sess.SessionName = name
+		}
+	} else if tErr == nil && tRes.parentCascadeID != "" &&
+		!strings.EqualFold(tRes.parentCascadeID, id) {
+		sess.ParentSessionID = antigravityIDPrefix + tRes.parentCascadeID
+		sess.RelationshipType = RelSubagent
+	}
 	accumulateMessageTokenUsage(sess, messages)
 	applyUsageEventTokenTotals(sess, usageEvents)
 	// gen_metadata rows with zero decoded usage events flag a possible
@@ -379,7 +396,7 @@ func roleForAntigravityStepKind(kind antigravityStepKind) RoleType {
 }
 
 func loadAntigravityStepsWithRawCount(ctx context.Context,
-	db *sql.DB,
+	db *sql.DB, sessionIDPrefix string,
 ) (antigravityStepLoadResult, error) {
 	generations := loadAntigravityGenerationMetadata(ctx, db)
 	executors := loadAntigravityExecutorMetadata(ctx, db)
@@ -409,14 +426,16 @@ func loadAntigravityStepsWithRawCount(ctx context.Context,
 		parsedStep, parsed := newAntigravityStep(idx, stepType, payload)
 		var msg ParsedMessage
 		var decoded bool
+		var fields []agProtoField
 		kind := antigravityStepKind(stepType)
 		if parsed {
 			kind = parsedStep.kind
+			fields = parsedStep.fields
 			msg, decoded = decodeAntigravityParsedStep(parsedStep)
 		}
 		stepPositions[idx] = len(steps)
 		steps = append(steps, antigravityLoadedStep{
-			idx: idx, kind: kind, msg: msg, decoded: decoded,
+			idx: idx, kind: kind, fields: fields, msg: msg, decoded: decoded,
 		})
 		result.rawStepCount++
 	}
@@ -457,6 +476,12 @@ func loadAntigravityStepsWithRawCount(ctx context.Context,
 			step.idx, generation.data, step.msg, step.decoded, executorModel,
 		)
 	}
+	// Spawn edges need sequence context (the result steps after an
+	// invoke_subagent call), so they are resolved on the loaded step
+	// list rather than inside single-step decode. The caller's session
+	// id prefix stamps SubagentSessionID with the same ids the parse
+	// writes, matching how Codex emits codex: links.
+	linkAntigravitySubagentSpawnEdges(steps, sessionIDPrefix)
 	for _, step := range steps {
 		if step.decoded {
 			result.messages = append(result.messages, step.msg)
@@ -469,6 +494,7 @@ func loadAntigravityStepsWithRawCount(ctx context.Context,
 type antigravityLoadedStep struct {
 	idx     int
 	kind    antigravityStepKind
+	fields  []agProtoField
 	msg     ParsedMessage
 	decoded bool
 }
