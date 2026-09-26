@@ -1046,6 +1046,11 @@ func TestCurrentDataVersionDevinMessageNodeThinking(t *testing.T) {
 		"Devin message_nodes thinking objects require re-parsing to restore dropped thinking text")
 }
 
+func TestCurrentDataVersionDevinMultiGenerationCompaction(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 124,
+		"Devin multi-generation compaction context recovery requires re-parsing sessions to unwind disconnected root trees")
+}
+
 func TestCurrentDataVersionPositAssistantProviderIdentity(t *testing.T) {
 	assert.GreaterOrEqual(t, CurrentDataVersion(), 95,
 		"Posit Assistant provider identity requires re-parsing usage rows")

@@ -503,7 +503,7 @@ func parseDevinSessionFromMessageNodesWithSubagents(
 	}
 
 	chain := devinMainChainRows(rows, meta)
-	ordered := append(devinRecoveredEraRows(rows, chain, meta), chain...)
+	ordered := devinDedupeNodeIDs(append(devinRecoveredEraRows(rows, chain, meta), chain...))
 	ordered = devinMessageNodesWithout(
 		ordered, partition.ExcludedNodeIDs,
 	)
@@ -603,12 +603,25 @@ func devinMainChainRows(
 	return reversed
 }
 
+func devinDedupeNodeIDs(nodes []devinMessageNodeRow) []devinMessageNodeRow {
+	seen := make(map[int64]bool, len(nodes))
+	out := make([]devinMessageNodeRow, 0, len(nodes))
+	for _, node := range nodes {
+		if !seen[node.NodeID] {
+			seen[node.NodeID] = true
+			out = append(out, node)
+		}
+	}
+	return out
+}
+
 type devinMessageNodeRow struct {
 	RowID        int64
 	NodeID       int64
 	ParentNodeID sql.NullInt64
 	ChatMessage  string
 	CreatedAt    int64
+	Metadata     string
 }
 
 func listDevinMessageNodes(ctx context.Context, dbPath, rawSessionID string) ([]devinMessageNodeRow, error) {
@@ -633,16 +646,39 @@ func listDevinMessageNodes(ctx context.Context, dbPath, rawSessionID string) ([]
 		return nil, nil
 	}
 
-	rows, err := db.QueryContext(ctx, `
+	var hasMetadata int
+	_ = db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		  FROM pragma_table_info('message_nodes')
+		 WHERE name = 'metadata'
+	`).Scan(&hasMetadata)
+
+	selectQuery := `
 		SELECT row_id,
 		       node_id,
 		       parent_node_id,
 		       chat_message,
-		       created_at
+		       created_at,
+		       '' AS metadata
 		  FROM message_nodes
 		 WHERE session_id = ?
 		 ORDER BY created_at ASC, row_id ASC
-	`, rawSessionID)
+	`
+	if hasMetadata > 0 {
+		selectQuery = `
+		SELECT row_id,
+		       node_id,
+		       parent_node_id,
+		       chat_message,
+		       created_at,
+		       COALESCE(metadata, '') AS metadata
+		  FROM message_nodes
+		 WHERE session_id = ?
+		 ORDER BY created_at ASC, row_id ASC
+		`
+	}
+
+	rows, err := db.QueryContext(ctx, selectQuery, rawSessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -651,7 +687,7 @@ func listDevinMessageNodes(ctx context.Context, dbPath, rawSessionID string) ([]
 	var nodes []devinMessageNodeRow
 	for rows.Next() {
 		var row devinMessageNodeRow
-		if err := rows.Scan(&row.RowID, &row.NodeID, &row.ParentNodeID, &row.ChatMessage, &row.CreatedAt); err != nil {
+		if err := rows.Scan(&row.RowID, &row.NodeID, &row.ParentNodeID, &row.ChatMessage, &row.CreatedAt, &row.Metadata); err != nil {
 			return nil, err
 		}
 		nodes = append(nodes, row)
@@ -1039,6 +1075,115 @@ func devinNodeMessageID(chatMessage string) string {
 	return gjson.Get(chatMessage, "message_id").Str
 }
 
+func devinNodeSummarizedFrom(metadata string) int64 {
+	if metadata == "" {
+		return 0
+	}
+	res := gjson.Get(metadata, "summarized_from")
+	if !res.Exists() || res.Type == gjson.Null {
+		return 0
+	}
+	return res.Int()
+}
+
+func devinRecoverErasFromSummarizedFrom(
+	rows []devinMessageNodeRow,
+	chain []devinMessageNodeRow,
+) []devinMessageNodeRow {
+	byNodeID := make(map[int64]devinMessageNodeRow, len(rows))
+	for _, r := range rows {
+		byNodeID[r.NodeID] = r
+	}
+
+	findSummary := func(nodes []devinMessageNodeRow) (int64, bool) {
+		for i := range nodes {
+			if devinNodeContinuationSummary(nodes[i].ChatMessage) {
+				sf := devinNodeSummarizedFrom(nodes[i].Metadata)
+				if sf > 0 {
+					return sf, true
+				}
+			}
+		}
+		return 0, false
+	}
+
+	targetID, ok := findSummary(chain)
+	if !ok {
+		return nil
+	}
+
+	walkUp := func(leafID int64) []devinMessageNodeRow {
+		var path []devinMessageNodeRow
+		visited := make(map[int64]bool)
+		curID := leafID
+		for {
+			if visited[curID] {
+				break
+			}
+			visited[curID] = true
+			node, exists := byNodeID[curID]
+			if !exists {
+				break
+			}
+			path = append(path, node)
+			if !node.ParentNodeID.Valid {
+				break
+			}
+			curID = node.ParentNodeID.Int64
+		}
+		for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+			path[i], path[j] = path[j], path[i]
+		}
+		return path
+	}
+
+	var priorEras [][]devinMessageNodeRow
+	visitedTargets := make(map[int64]bool)
+	for targetID > 0 && !visitedTargets[targetID] {
+		visitedTargets[targetID] = true
+		era := walkUp(targetID)
+		if len(era) == 0 {
+			break
+		}
+		priorEras = append(priorEras, era)
+		nextTarget, hasNext := findSummary(era)
+		if !hasNext {
+			break
+		}
+		targetID = nextTarget
+	}
+
+	if len(priorEras) == 0 {
+		return nil
+	}
+
+	for i, j := 0, len(priorEras)-1; i < j; i, j = i+1, j-1 {
+		priorEras[i], priorEras[j] = priorEras[j], priorEras[i]
+	}
+
+	seenNodeIDs := make(map[int64]bool, len(rows))
+	seenMessageIDs := make(map[string]bool, len(rows))
+	var out []devinMessageNodeRow
+
+	for _, era := range priorEras {
+		for _, node := range era {
+			if seenNodeIDs[node.NodeID] {
+				continue
+			}
+			mid := devinNodeMessageID(node.ChatMessage)
+			if mid != "" && seenMessageIDs[mid] {
+				continue
+			}
+			seenNodeIDs[node.NodeID] = true
+			if mid != "" {
+				seenMessageIDs[mid] = true
+			}
+			out = append(out, node)
+		}
+	}
+	return out
+}
+
 // devinRecoveredEraRows returns pre-continuation message nodes that live on
 // sibling branches of the main chain, ordered era-by-era root-to-leaf.
 //
@@ -1065,6 +1210,10 @@ func devinRecoveredEraRows(
 		// No resolvable main chain: devinMainChainRows fell back to the
 		// flat node list, so nothing is missing to recover.
 		return nil
+	}
+
+	if recovered := devinRecoverErasFromSummarizedFrom(rows, chain); len(recovered) > 0 {
+		return recovered
 	}
 
 	inChain := make(map[int64]bool, len(chain))
