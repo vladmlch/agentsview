@@ -165,6 +165,70 @@ function findFinalOutput(events: TurnEvent[]): TurnEvent | null {
   return null;
 }
 
+/**
+ * The turn the transcript opens on, without event construction. A
+ * loadOlder prepend re-anchors this turn to an earlier message id,
+ * changing its key, so the pagination seam needs the leading turn's
+ * key and member ids from the *unfiltered normal-mode* item list
+ * regardless of the transcript mode currently rendered.
+ */
+export interface LeadingTurnAnchor {
+  key: string;
+  firstMessageId: number;
+  /** `DbMessage.id` of every member — detects that a re-anchored turn is
+   *  still the same turn (its old first message stayed inside). */
+  memberIds: number[];
+}
+
+/**
+ * Mirrors `buildTranscriptNodes`' leading-run classification and stops
+ * at the first boundary or prompt — never parses segments, so callers
+ * can run it on every projection cheaply. Returns `null` when the
+ * leading items cannot form a turn (a prompt or standalone card first,
+ * or a run with no assistant/tool anchor).
+ */
+export function leadingTurnAnchor(
+  items: readonly DisplayItem[],
+  sessionId: string,
+): LeadingTurnAnchor | null {
+  let anchor: Message | undefined;
+  const memberIds: number[] = [];
+
+  for (const item of items) {
+    if (item.kind === "tool-group") {
+      const [firstTool] = item.messages;
+      if (!firstTool) continue;
+      for (const message of item.messages) memberIds.push(message.id);
+      anchor ??= firstTool;
+      continue;
+    }
+
+    const message = item.message;
+    if (message.is_compact_boundary) break;
+    // Hidden system rows skip the same way buildTranscriptNodes skips
+    // them — the open run stays intact instead of splitting.
+    if (isSystemMessage(message)) continue;
+    if (isSystemBoundaryMessage(message)) {
+      if (isMidTurnSystemMessage(message)) {
+        memberIds.push(message.id);
+        continue;
+      }
+      break;
+    }
+    if (message.role === "user" && !message.is_sidechain) break;
+
+    memberIds.push(message.id);
+    if (message.role === "assistant") anchor ??= message;
+  }
+
+  if (memberIds.length === 0 || anchor === undefined) return null;
+  return {
+    key: `${sessionId}:turn:${anchor.id}`,
+    firstMessageId: anchor.id,
+    memberIds,
+  };
+}
+
 export function buildTranscriptNodes(
   items: readonly DisplayItem[],
   sessionId: string,

@@ -38,16 +38,13 @@
     type BlockType,
   } from "../../stores/ui.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
-  import { messages } from "../../stores/messages.svelte.js";
-  import { settings } from "../../stores/settings.svelte.js";
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
   import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
-  import {
-    keepsAnswerBeforeTrailingTools,
-    projectSessionScope,
-  } from "../../search/session-scope.js";
+  import { collectSearchBlocks } from "../../search/block-text.js";
   import { isTurnEventVisible } from "../../utils/turn-visibility.js";
+  import { enrichSegments, parseContent } from "../../utils/content-parser.js";
   import type { TurnEvent } from "../../utils/assistant-turns.js";
+  import type { DbToolCall } from "../../api/generated/index.js";
   import { sync } from "../../stores/sync.svelte.js";
   import { router, type Route } from "../../stores/router.svelte.js";
   import {
@@ -199,7 +196,7 @@
   );
 
   /** Event kinds that own an `isEventExpanded` disclosure. Rollups and
-   *  system rows do not, so they cannot hold back a "collapse all" label. */
+   *  system rows do not; the rollup's member disclosures still count. */
   const DISCLOSURE_EVENT_KINDS = new Set<TurnEvent["kind"]>([
     "message",
     "thinking",
@@ -207,28 +204,127 @@
     "tool",
   ]);
 
+  /** Result statuses that default a tool output drawer open. */
+  const TOOL_ERROR_STATUSES = new Set(["error", "errored", "failed"]);
+  const toolErrorResult = (call: DbToolCall | undefined): boolean =>
+    (call?.result_events ?? []).some((event) =>
+      TOOL_ERROR_STATUSES.has(event.status),
+    );
+
+  /** Mirror ToolBlock: `collapseKey` tops an `isEventExpanded`
+   *  disclosure, the `:output` drawer renders for result_content, and
+   *  `:history` renders for result_events. Checking all three keys keeps
+   *  the label honest after a single manual fold. */
+  function toolBlockExpanded(
+    key: string,
+    call: DbToolCall | undefined,
+    defaultExpanded: boolean,
+  ): boolean {
+    if (!turnCollapse.isEventExpanded(key, defaultExpanded)) return false;
+    if (
+      call?.result_content &&
+      !turnCollapse.isToolSectionExpanded(`${key}:output`, toolErrorResult(call))
+    ) {
+      return false;
+    }
+    if (
+      (call?.result_events?.length ?? 0) > 0 &&
+      !turnCollapse.isToolSectionExpanded(`${key}:history`, false)
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  /** The disclosures nested inside one `tool` event beyond its own
+   *  event key: solo call sections, parallel members, or legacy
+   *  `:seg${i}` blocks — matching the ToolBlock tree the row mounts. */
+  function toolEventNestedExpanded(
+    event: TurnEvent,
+    defaultExpanded: boolean,
+  ): boolean {
+    const calls = event.toolCalls ?? [];
+    if (calls.length === 1) {
+      // The solo ToolBlock shares the event's collapse key; only its
+      // sections add keys.
+      return toolBlockExpanded(event.key, calls[0], defaultExpanded);
+    }
+    if (calls.length > 1) {
+      return calls.every((call, index) =>
+        toolBlockExpanded(`${event.key}:${index}`, call, defaultExpanded),
+      );
+    }
+    // Same filter the row applies for its `:seg${i}` member keys.
+    return (event.segments ?? [])
+      .filter((segment) => segment.type === "tool")
+      .every((segment, index) =>
+        toolBlockExpanded(`${event.key}:seg${index}`, segment.toolCall, defaultExpanded),
+      );
+  }
+
+  /** A tool rollup mounts a ToolCallGroup whose member keys derive as
+   *  `${event.key}:${message.id}` plus the call/segment index — the same
+   *  shape the component builds. */
+  function rollupMembersExpanded(
+    event: TurnEvent,
+    defaultExpanded: boolean,
+  ): boolean {
+    for (const message of event.toolMessages ?? []) {
+      const scope = `${event.key}:${message.id}`;
+      if (inSessionSearch.isBlockEffectivelyVisible("thinking")) {
+        for (const block of collectSearchBlocks(message)) {
+          if (block.kind !== "thinking") continue;
+          // ToolCallGroup reuses the block key's trailing segment index.
+          const key = `${scope}:thinking:${block.key.split(":").pop()}`;
+          if (!turnCollapse.isEventExpanded(key, defaultExpanded)) {
+            return false;
+          }
+        }
+      }
+      const calls = message.tool_calls ?? [];
+      if (calls.length === 1) {
+        if (!toolBlockExpanded(`${scope}:0`, calls[0], defaultExpanded)) {
+          return false;
+        }
+      } else if (calls.length > 1) {
+        for (const [index, call] of calls.entries()) {
+          if (!toolBlockExpanded(`${scope}:${index}`, call, defaultExpanded)) {
+            return false;
+          }
+        }
+      } else {
+        const toolSegments = enrichSegments(
+          parseContent(
+            message.content,
+            message.has_tool_use,
+            message.id,
+            message.content_length,
+          ),
+          message.tool_calls,
+        ).filter((segment) => segment.type === "tool");
+        for (const [index, segment] of toolSegments.entries()) {
+          if (
+            !toolBlockExpanded(`${scope}:seg${index}`, segment.toolCall, defaultExpanded)
+          ) {
+            return false;
+          }
+        }
+      }
+    }
+    return true;
+  }
+
   /** True when every assistant turn that renders rows — and every
-   *  expandable child event inside it — currently resolves expanded.
-   *  Derived from the same projection the transcript renders, plus the
-   *  session bulk baseline; never enumerated from the DOM. */
+   *  expandable disclosure inside it, down to tool output/history
+   *  drawers and rollup members — currently resolves expanded. Reads the
+   *  shared in-session scope the find index already projects; only
+   *  evaluated while the normal-mode toggle renders. */
   const allTurnRowsExpanded = $derived.by(() => {
-    const scope = projectSessionScope({
-      messages: messages.messages,
-      sessionId: messages.sessionId ?? undefined,
-      transcriptMode: "normal",
-      visibleBlocks: ui.visibleBlocks,
-      hasBlockFilters: ui.hasBlockFilters,
-      revealedBlocks: inSessionSearch.revealedBlockTypes,
-      keepAnswerBeforeTrailingTools: keepsAnswerBeforeTrailingTools(
-        settings.sessionProviders,
-        sessions.activeSession?.agent,
-      ),
-    });
     const defaultExpanded = !ui.autoCollapseAssistantTurns;
     const effectivelyVisible = (type: BlockType) =>
       inSessionSearch.isBlockEffectivelyVisible(type);
     let eligible = false;
-    for (const node of scope.items) {
+    for (const node of inSessionSearch.scope?.items ?? []) {
       if (node.kind !== "assistant-turn") continue;
       const visible = node.events.filter((event) =>
         isTurnEventVisible(event, effectivelyVisible),
@@ -239,8 +335,18 @@
         return false;
       }
       for (const event of visible) {
+        if (event.kind === "tool-rollup") {
+          if (!rollupMembersExpanded(event, defaultExpanded)) return false;
+          continue;
+        }
         if (!DISCLOSURE_EVENT_KINDS.has(event.kind)) continue;
         if (!turnCollapse.isEventExpanded(event.key, defaultExpanded)) {
+          return false;
+        }
+        if (
+          event.kind === "tool" &&
+          !toolEventNestedExpanded(event, defaultExpanded)
+        ) {
           return false;
         }
       }

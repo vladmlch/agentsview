@@ -19,7 +19,12 @@
  */
 import type { DbMessage as Message } from "../api/generated/index.js";
 import type { BlockType } from "../stores/ui.svelte.js";
-import { buildTranscriptNodes, type TranscriptNode } from "../utils/assistant-turns.js";
+import {
+  buildTranscriptNodes,
+  leadingTurnAnchor,
+  type LeadingTurnAnchor,
+  type TranscriptNode,
+} from "../utils/assistant-turns.js";
 import { hasVisibleSegments } from "../utils/content-parser.js";
 import { buildDisplayItems, type DisplayItem } from "../utils/display-items.js";
 import { isSystemMessage } from "../utils/messages.js";
@@ -54,6 +59,12 @@ export interface SessionScope {
   normalItems: DisplayItem[];
   /** Messages eligible for the current mode regardless of block filters. */
   messages: Message[];
+  /**
+   * The assistant turn normal mode opens on — key, anchor id, and member
+   * ids — always projected from the unfiltered `baseItems` so pagination
+   * re-anchor detection works whatever mode is currently rendered.
+   */
+  leadingTurn: LeadingTurnAnchor | null;
   /** Whether an included message's block kind survives the saved filter. */
   allowsBlock(message: Message, kind: SearchBlockKind): boolean;
 }
@@ -123,6 +134,10 @@ export function projectSessionScope(input: SessionScopeInput): SessionScope {
           keepAnswerBeforeTrailingTools: input.keepAnswerBeforeTrailingTools,
         });
   const items = buildTranscriptNodes(scopedItems, sessionId);
+  // The leading normal-mode turn comes from unfiltered baseItems: it is
+  // the same anchor `items` carries in normal mode, and it stays stable
+  // when focused mode or block filters reshape the rendered projection.
+  const leadingTurn = leadingTurnAnchor(baseItems, sessionId);
 
   const normalItems = hasBlockFilters ? filteredItems.filter(itemVisible) : baseItems;
   let displayItems: DisplayItem[];
@@ -153,6 +168,7 @@ export function projectSessionScope(input: SessionScopeInput): SessionScope {
     displayItems,
     normalItems,
     messages,
+    leadingTurn,
     allowsBlock: (message, kind) =>
       included.has(message) && isVisible(blockTypeForKind(kind, message.role)),
   };

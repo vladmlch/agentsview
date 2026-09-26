@@ -1484,6 +1484,36 @@ describe("App transcript keyboard navigation", () => {
     expect(ui.selectedOrdinal).toBe(5);
   });
 
+  it("anchors j/k where a folded-member selection would sort", async () => {
+    component = mount(App, { target: document.body });
+    await flushEffects();
+
+    // Selecting a folded member (e.g. via a collapsed turn header's
+    // ordinals) is not a navigable stop: j moves to the stop after it,
+    // k to the stop before it — never a jump to the first row.
+    ui.selectedOrdinal = 1;
+    key("j");
+    await flushEffects();
+    expect(ui.selectedOrdinal).toBe(2);
+
+    ui.selectedOrdinal = 1;
+    key("k");
+    await flushEffects();
+    expect(ui.selectedOrdinal).toBe(0);
+
+    // A selection beyond every navigable stop moves back to the last
+    // one on k and stays put on j.
+    ui.selectedOrdinal = 99;
+    key("k");
+    await flushEffects();
+    expect(ui.selectedOrdinal).toBe(5);
+
+    ui.selectedOrdinal = 99;
+    key("j");
+    await flushEffects();
+    expect(ui.selectedOrdinal).toBe(99);
+  });
+
   it("keeps Shift+J/K prompt jumps on real user messages", async () => {
     component = mount(App, { target: document.body });
     await flushEffects();
