@@ -19,10 +19,15 @@
   import AssistantTurnOutput from "./AssistantTurnOutput.svelte";
   import type { DbMessage as Message } from "../../api/generated/index.js";
   import type { DisplayItem } from "../../utils/display-items.js";
-  import type { TranscriptNode, TurnEvent } from "../../utils/assistant-turns.js";
+  import type {
+    AssistantTurnItem,
+    TranscriptNode,
+    TurnEvent,
+  } from "../../utils/assistant-turns.js";
   import { isTurnEventVisible } from "../../utils/turn-visibility.js";
   import {
     displayTranscriptRow,
+    findOrdinalOwner,
     flattenTranscriptRows,
     type TranscriptRow,
   } from "../../utils/transcript-rows.js";
@@ -112,6 +117,74 @@
   const isEventVisible = (event: TurnEvent): boolean =>
     isTurnEventVisible(event, isEffectivelyVisible);
 
+  /** An eventless assistant turn is the pre-first-token streaming
+   *  window: its header may render when any member's role is visible —
+   *  the same rule `hasVisibleSegments` applies to an empty message. */
+  const isEmptyTurnVisible = (turn: AssistantTurnItem): boolean =>
+    turn.messages.some((message) =>
+      hasVisibleSegments(message, isTranscriptBlockVisible));
+
+  /** The child event that renders `blockKey` inside `turn`. One source
+   *  ordinal can span several events of the same message (thinking,
+   *  text, tool segments), so a search match resolves by block kind and
+   *  segment index rather than the first ordinal hit. Returns `null`
+   *  when no event maps. */
+  function blockOwnerEvent(
+    turn: AssistantTurnItem,
+    ordinal: number,
+    blockKey: string,
+  ): TurnEvent | null {
+    const parts = blockKey.split(":");
+    const kind = parts[1] ?? "";
+    const segmentIndex = Number(parts[2]);
+    const candidates = turn.events.filter((event) =>
+      event.ordinals.includes(ordinal),
+    );
+    const byKinds = (...kinds: TurnEvent["kind"][]) =>
+      candidates.find((event) => kinds.includes(event.kind)) ?? null;
+    const bySegmentIndex = (kind: TurnEvent["kind"]) =>
+      candidates.find(
+        (event) => event.kind === kind && event.segmentIndex === segmentIndex,
+      ) ?? null;
+    switch (kind) {
+      case "text":
+      case "code":
+        return bySegmentIndex("message") ?? byKinds("message");
+      case "thinking":
+        return bySegmentIndex("thinking") ?? byKinds("thinking");
+      case "skill":
+        return byKinds("skill");
+      case "tool-input":
+      case "tool-output":
+      case "tool-history":
+        // The nested input/output/history sections share the owning
+        // tool event's row; the reveal only needs the row mounted —
+        // `searchCollapsed` discloses the matching section itself.
+        return byKinds("tool", "tool-rollup");
+      default:
+        return null;
+    }
+  }
+
+  /** Expand the owning turn — and the child event disclosure when one
+   *  keys it — so a scroll target folded inside a turn has a mountable
+   *  row before the destination index is computed. `blockKey` picks the
+   *  exact event when one ordinal spans several of them. */
+  function expandOrdinalTarget(ordinal: number, blockKey?: string): void {
+    if (ui.transcriptMode !== "normal") return;
+    const owner = findOrdinalOwner(sessionScope.items, ordinal);
+    if (!owner) return;
+    turnCollapse.setTurnExpanded(owner.turn.key, true);
+    const event = blockKey
+      ? (blockOwnerEvent(owner.turn, ordinal, blockKey) ?? owner.event)
+      : owner.event;
+    // Rollups and system rows own no `isEventExpanded` disclosure; their
+    // member blocks self-disclose through the search-collapsed path.
+    if (event && event.kind !== "tool-rollup" && event.kind !== "system") {
+      turnCollapse.setEventExpanded(event.key, true);
+    }
+  }
+
   /**
    * Virtual rows in display order. Normal mode flattens the assistant-turn
    * tree; focused mode keeps the flat message-level projection. Both row
@@ -128,6 +201,7 @@
       isTurnExpanded,
       isEventVisible,
       ui.sortNewestFirst,
+      isEmptyTurnVisible,
     );
   });
 
@@ -327,7 +401,7 @@
       // the viewport count. Every other row counts its progress ordinals
       // outright — a collapsed turn header's empty list adds nothing.
       const ordinals = transcriptRow.progressOrdinals.length > 1
-        ? (visibleMarkedOrdinals(row.index) ?? [])
+        ? (visibleMarkedOrdinals(row.index) ?? transcriptRow.progressOrdinals)
         : transcriptRow.progressOrdinals;
       for (const ordinal of ordinals) {
         visibleOrdinals.add(ordinal);
@@ -641,6 +715,9 @@
     const reqId = ++lastScrollRequest;
     activeFollowScrollRequest = null;
 
+    // Expanding the owning turn/event re-derives transcriptRows, so it
+    // must happen before the destination index is looked up.
+    expandOrdinalTarget(ordinal);
     const rowIndex = findRowIndex(ordinal);
     if (rowIndex >= 0) {
       scrollToDisplayIndex(rowIndex, 0, 0, reqId);
@@ -658,6 +735,7 @@
     await raf();
     if (reqId !== lastScrollRequest) return;
 
+    expandOrdinalTarget(ordinal);
     const loadedRowIndex = findRowIndex(ordinal);
     if (loadedRowIndex < 0) return;
     scrollToDisplayIndex(loadedRowIndex, 0, 0, reqId);
@@ -795,6 +873,30 @@
     turnCollapse.activateSession(messages.sessionId);
   });
 
+  // The leading partial turn re-anchors to an earlier message id when an
+  // older page is prepended, which changes its key. Carrying the turn's
+  // manual expansion override to the new key keeps a turn the user opened
+  // open across loadOlder/re-anchoring.
+  let leadingTurnAnchor: { key: string; firstMessageId: number } | null = null;
+  $effect(() => {
+    const first = sessionScope.items[0];
+    const next =
+      ui.transcriptMode === "normal" && first?.kind === "assistant-turn"
+        ? { key: first.key, firstMessageId: first.firstMessageId }
+        : null;
+    const previous = leadingTurnAnchor;
+    leadingTurnAnchor = next;
+    if (
+      previous !== null &&
+      next !== null &&
+      previous.key !== next.key &&
+      first?.kind === "assistant-turn" &&
+      first.messages.some((message) => message.id === previous.firstMessageId)
+    ) {
+      turnCollapse.migrateTurnKey(previous.key, next.key);
+    }
+  });
+
   let searchRevealKey = $derived.by(() => {
     const match = inSessionSearch.resolvedCurrent;
     return match ? `${match.ordinal}:${match.blockKey}:${match.occurrence}` : "";
@@ -810,6 +912,9 @@
         inSessionSearch.isActive,
       ensureLoaded: (ordinal) => messages.ensureOrdinalLoaded(ordinal),
       mountMessage: () => {
+        // The match can live inside a folded turn/event: expand before
+        // the destination row index is computed.
+        expandOrdinalTarget(match.ordinal, match.blockKey);
         const index = findRowIndex(match.ordinal);
         if (index < 0) return Promise.resolve(false);
         return scrollToDisplayIndex(index, 0, 0, reqId);

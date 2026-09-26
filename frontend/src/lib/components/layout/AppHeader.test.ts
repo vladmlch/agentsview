@@ -17,12 +17,16 @@ vi.mock("../../utils/clipboard.js", () => ({
 }));
 
 import { sessions } from "../../stores/sessions.svelte.js";
+import { messages } from "../../stores/messages.svelte.js";
 import { sync } from "../../stores/sync.svelte.js";
 import { settings } from "../../stores/settings.svelte.js";
+import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 import { router } from "../../stores/router.svelte.js";
 import { setLocale } from "../../i18n/index.js";
 import type { Session } from "../../api/types.js";
+import type { DbMessage as Message } from "../../api/generated/index.js";
 
 // @ts-ignore
 import AppHeader from "./AppHeader.svelte";
@@ -325,5 +329,190 @@ describe("AppHeader export actions", () => {
     expect(document.body.textContent).toContain("会话");
     expect(document.body.textContent).toContain("用量");
     expect(document.body.textContent).toContain("活动");
+  });
+});
+
+function headerMessage(
+  ordinal: number,
+  role: Message["role"],
+  content: string,
+  overrides: Partial<Message> = {},
+): Message {
+  return {
+    id: 2000 + ordinal,
+    session_id: "sess-123",
+    ordinal,
+    role,
+    content,
+    content_length: content.length,
+    timestamp: `2026-06-13T12:00:${String(ordinal).padStart(2, "0")}Z`,
+    has_thinking: false,
+    thinking_text: "",
+    has_tool_use: false,
+    model: "",
+    context_tokens: 0,
+    output_tokens: 0,
+    has_context_tokens: false,
+    has_output_tokens: false,
+    is_system: false,
+    is_sidechain: false,
+    ...overrides,
+  } as Message;
+}
+
+describe("AppHeader transcript controls", () => {
+  let component: ReturnType<typeof mount> | undefined;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessions.activeSessionId = "sess-123";
+    sessions.sessions = [testSession()];
+    sync.serverVersion = null;
+    settings.loaded = true;
+    settings.readOnly = false;
+    settings.error = null;
+    ui.isMobileViewport = false;
+    ui.sidebarOpen = true;
+    ui.followLatest = false;
+    router.route = "sessions";
+    setLocale("en");
+
+    messages.clear();
+    messages.sessionId = "sess-123";
+    messages.loading = false;
+    messages.hasOlder = false;
+    messages.messages = [
+      headerMessage(0, "user", "ask"),
+      headerMessage(1, "assistant", "working"),
+      headerMessage(2, "assistant", "done"),
+    ];
+    ui.setTranscriptMode("normal");
+    ui.setAutoCollapseAssistantTurns(true);
+    ui.showAllBlocks();
+    ui.sortNewestFirst = false;
+    inSessionSearch.close();
+    inSessionSearch.clearQuery();
+    turnCollapse.activateSession("sess-123");
+  });
+
+  afterEach(() => {
+    if (component) {
+      unmount(component);
+      component = undefined;
+    }
+    document.body.innerHTML = "";
+    inSessionSearch.close();
+    inSessionSearch.clearQuery();
+    turnCollapse.activateSession(null);
+    messages.clear();
+    ui.setTranscriptMode("normal");
+    ui.setAutoCollapseAssistantTurns(true);
+    ui.showAllBlocks();
+    ui.isMobileViewport = false;
+    ui.sidebarOpen = true;
+    router.route = "sessions";
+    settings.loaded = false;
+  });
+
+  function bulkButton() {
+    return document.querySelector<HTMLButtonElement>(".pill-bulk");
+  }
+
+  it("toggles session-wide expand/collapse and labels it from row state", async () => {
+    component = mount(AppHeader, { target: document.body });
+    await tick();
+
+    // Collapsed-by-default turns make the toggle offer expansion.
+    expect(bulkButton()).not.toBeNull();
+    expect(bulkButton()!.getAttribute("aria-label")).toBe("Expand all");
+
+    bulkButton()!.click();
+    await tick();
+    expect(turnCollapse.bulkBaseline).toBe("expand");
+    expect(bulkButton()!.getAttribute("aria-label")).toBe("Collapse all");
+
+    // A single manually collapsed event flips the label back — the label
+    // is derived from every row's effective expansion, not the baseline.
+    turnCollapse.setEventExpanded("sess-123:2001:message:0", false);
+    await tick();
+    expect(bulkButton()!.getAttribute("aria-label")).toBe("Expand all");
+
+    bulkButton()!.click();
+    await tick();
+    expect(turnCollapse.bulkBaseline).toBe("expand");
+    expect(bulkButton()!.getAttribute("aria-label")).toBe("Collapse all");
+
+    bulkButton()!.click();
+    await tick();
+    expect(turnCollapse.bulkBaseline).toBe("collapse");
+    expect(bulkButton()!.getAttribute("aria-label")).toBe("Expand all");
+  });
+
+  it("hides the bulk toggle in focused mode", async () => {
+    ui.setTranscriptMode("focused");
+    component = mount(AppHeader, { target: document.body });
+    await tick();
+
+    expect(bulkButton()).toBeNull();
+    const focusedPill = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Focused transcript mode"]',
+    );
+    expect(focusedPill?.classList.contains("active")).toBe(true);
+  });
+
+  it("checks search-revealed block types and reports manual hides", async () => {
+    messages.messages = [
+      headerMessage(0, "user", "ask"),
+      headerMessage(1, "assistant", "[Thinking]\nneedle\n[/Thinking]\nworking", {
+        has_thinking: true,
+      }),
+      headerMessage(2, "assistant", "done"),
+    ];
+    ui.setBlockVisible("thinking", false);
+    // Flush between the saved-filter change and opening search, the way a
+    // real hide-then-open sequence would land in separate tasks.
+    await tick();
+    inSessionSearch.isOpen = true;
+    inSessionSearch.query = "needle";
+    inSessionSearch.debouncedQuery = "needle";
+
+    component = mount(AppHeader, { target: document.body });
+    await tick();
+
+    // The hidden type that owns a match is temporarily revealed, and the
+    // checkbox displays the effective state.
+    expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(true);
+
+    const funnel = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Filter block types"]',
+    );
+    expect(funnel).not.toBeNull();
+    funnel!.click();
+    await tick();
+
+    const items = () =>
+      Array.from(document.querySelectorAll<HTMLButtonElement>(".block-filter-item"));
+    const thinkingItem = items().find((button) => button.textContent?.includes("Thinking"));
+    expect(thinkingItem).toBeDefined();
+    expect(thinkingItem!.classList.contains("active")).toBe(true);
+
+    // Hiding the revealed type suppresses its temporary reveal without
+    // changing the saved filter semantics elsewhere.
+    thinkingItem!.click();
+    await tick();
+    expect(inSessionSearch.revealedBlockTypes.has("thinking")).toBe(false);
+    expect(ui.isBlockVisible("thinking")).toBe(false);
+    expect(thinkingItem!.classList.contains("active")).toBe(false);
+
+    // Show all restores every type and lifts the suppression.
+    const showAll = document.querySelector<HTMLButtonElement>(".block-filter-reset");
+    expect(showAll).not.toBeNull();
+    showAll!.click();
+    await tick();
+    expect(ui.hasBlockFilters).toBe(false);
+    expect(inSessionSearch.isBlockEffectivelyVisible("thinking")).toBe(true);
+    for (const item of items()) {
+      expect(item.classList.contains("active")).toBe(true);
+    }
   });
 });

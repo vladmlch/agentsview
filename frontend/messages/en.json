@@ -64,6 +64,8 @@
   "header_transcript_filter_label": "Filter block types",
   "header_transcript_visibility": "Block Visibility",
   "header_transcript_show_all": "Show all",
+  "transcript_expand_all": "Expand all",
+  "transcript_collapse_all": "Collapse all",
   "header_transcript_blocks_user": "User messages",
   "header_transcript_blocks_assistant": "Assistant text",
   "header_transcript_blocks_thinking": "Thinking blocks",

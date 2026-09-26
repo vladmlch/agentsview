@@ -81,12 +81,16 @@ export function displayTranscriptRow(item: DisplayItem): TranscriptRow {
  *
  * A turn that would render nothing — no visible events and no visible
  * final output — is skipped entirely so no blank virtual row remains.
+ * The exception is a still-empty streaming turn: it owns no events yet,
+ * but `isTurnVisible` may keep its collapsed header mounted so the
+ * pending reply does not vanish before the first token.
  */
 export function flattenTranscriptRows(
   nodes: readonly TranscriptNode[],
   isTurnExpanded: (key: string) => boolean,
   isEventVisible: (event: TurnEvent) => boolean,
   newestFirst: boolean,
+  isTurnVisible: (turn: AssistantTurnItem) => boolean = () => false,
 ): TranscriptRow[] {
   const rows: TranscriptRow[] = [];
   const ordered = newestFirst ? [...nodes].reverse() : nodes;
@@ -102,8 +106,13 @@ export function flattenTranscriptRows(
     const visibleEvents = turn.events.filter(isEventVisible);
     // The final output is itself a member event, so it can only render
     // when at least one event is visible — meaning an empty visible set
-    // guarantees there is nothing to draw and the turn is skipped.
-    if (visibleEvents.length === 0) continue;
+    // guarantees there is nothing to draw and the turn is skipped. An
+    // eventless turn (the pre-first-token streaming window) is the one
+    // exception the caller may keep: its collapsed header still marks
+    // the pending reply.
+    if (visibleEvents.length === 0 && (turn.events.length > 0 || !isTurnVisible(turn))) {
+      continue;
+    }
 
     const output =
       turn.finalOutput !== null && isEventVisible(turn.finalOutput) ? turn.finalOutput : null;
