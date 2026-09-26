@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vite-plus/test";
-import { parseContent, isToolOnly, enrichSegments, hasVisibleSegments } from "./content-parser.js";
+import {
+  parseContent,
+  isToolOnly,
+  enrichSegments,
+  hasVisibleSegments,
+  splitPromptAttachments,
+} from "./content-parser.js";
 import type { DbMessage as Message, DbToolCall as ToolCall } from "../api/generated/index.js";
 
 let nextId = 1;
@@ -1287,5 +1293,46 @@ describe("hasVisibleSegments", () => {
     });
     const noTool = visibilityFrom(new Set(["user", "assistant", "thinking", "code"]));
     expect(hasVisibleSegments(m, noTool)).toBe(true);
+  });
+});
+
+describe("splitPromptAttachments", () => {
+  it("lifts line-anchored markers and markdown images out of the body", () => {
+    const { body, attachments } = splitPromptAttachments(
+      "please review\n[audio]\n[document notes.pdf]\n![shot](asset://i.png)\ndone",
+    );
+    expect(attachments).toEqual(["[audio]", "[document notes.pdf]", "![shot](asset://i.png)"]);
+    // An image marker keeps its paragraph break where a bare marker's line
+    // is removed entirely.
+    expect(body).toBe("please review\n\ndone");
+  });
+
+  it("extracts payload-bearing inline markers anywhere in the text", () => {
+    const { body, attachments } = splitPromptAttachments(
+      "look [Image #2] and [Attachment: report.pdf] here",
+    );
+    expect(attachments).toEqual(["[Image #2]", "[Attachment: report.pdf]"]);
+    expect(body).toBe("look  and  here");
+  });
+
+  it("leaves bare marker words inside prose", () => {
+    const { body, attachments } = splitPromptAttachments("see [file] here\nsee [image] there");
+    expect(attachments).toEqual([]);
+    expect(body).toBe("see [file] here\nsee [image] there");
+  });
+
+  it("keeps a marker-looking markdown link as link text", () => {
+    const { body, attachments } = splitPromptAttachments(
+      "see [file](https://example.com)\n[file](https://example.com)",
+    );
+    expect(attachments).toEqual([]);
+    expect(body).toBe("see [file](https://example.com)\n[file](https://example.com)");
+  });
+
+  it("leaves markers inside inline code spans and fenced blocks in the body", () => {
+    const content = "before `[file]`\n\n```\n[audio]\n```\nafter";
+    const { body, attachments } = splitPromptAttachments(content);
+    expect(attachments).toEqual([]);
+    expect(body).toBe(content);
   });
 });

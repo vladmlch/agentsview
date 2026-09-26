@@ -108,8 +108,10 @@ export function projectSessionScope(input: SessionScopeInput): SessionScope {
   // applies the same saved-or-revealed rule inside message components.
   const isEffectivelyVisible = (type: BlockType): boolean =>
     isVisible(type) || (revealedBlocks?.has(type) ?? false);
-  // A filtered code fence still renders its manually expandable placeholder.
-  // Keep the row in the transcript without adding its code to the search index.
+  // A filtered code fence still renders its manually expandable placeholder,
+  // so `itemVisible`/`hasVisibleSegments` count code as transcript-visible
+  // even while the effective filter hides it. Its content stays in the
+  // search index and can be temporarily revealed.
   const isTranscriptBlockVisible = (type: BlockType): boolean =>
     type === "code" || isEffectivelyVisible(type);
   const hasBlockFilters = (input.hasBlockFilters ?? false) || (revealedBlocks?.size ?? 0) > 0;

@@ -2,7 +2,14 @@
   import type { Session } from "../../api/types.js";
   import type { DbMessage as Message } from "../../api/generated/index.js";
   import type { DbCallTiming as CallTiming, DbTurnTiming as TurnTiming } from "../../api/generated/index.js";
-  import { parseContent, enrichSegments, type ContentSegment } from "../../utils/content-parser.js";
+  import {
+    parseContent,
+    enrichSegments,
+    splitPromptAttachments,
+    PROMPT_TRUNCATE_POINTS,
+    PROMPT_PREVIEW_POINTS,
+    type ContentSegment,
+  } from "../../utils/content-parser.js";
   import { formatTimestamp, formatTokenUsage } from "../../utils/format.js";
   import { formatDuration } from "../../utils/duration.js";
   import { sessionAncestryMatches } from "../../utils/session-ancestry.js";
@@ -130,46 +137,26 @@
     inSessionSearch.isBlockEffectivelyVisible(isUser ? "user" : "assistant"),
   );
 
-  /** User prompts longer than this many Unicode code points collapse to a
-   *  code-point-safe preview behind a disclosure control. */
-  const PROMPT_TRUNCATE_POINTS = 600;
-  const PROMPT_PREVIEW_POINTS = 500;
-
-  /** Attachment references lifted out of a collapsed user prompt so they
-   *  keep rendering outside the disclosure: inline markdown images plus the
-   *  bracketed markers parsers write for pasted files and images. */
-  const PROMPT_ATTACHMENT_RE =
-    /!\[[^\]\n]*\]\([^)\n]*\)|\[(?:[Ii]mage(?::[^\]\n]*| #\d+| attached)?|[Aa]ttachment:[^\]\n]*|file|binary content)\]/g;
-
-  function promptAttachments(content: string): string {
-    const attachments: string[] = [];
-    content.replace(PROMPT_ATTACHMENT_RE, (match) => {
-      attachments.push(match);
-      return "";
-    });
-    return attachments.join("\n");
-  }
-
-  function stripPromptAttachments(content: string): string {
-    return content.replace(PROMPT_ATTACHMENT_RE, "");
-  }
-
   let promptPoints = $derived(Array.from(message.content));
   let promptTruncated = $derived(
     isUser && eventSegments === undefined && promptPoints.length > PROMPT_TRUNCATE_POINTS,
   );
   let promptExpanded = $derived(turnCollapse.isUserPromptExpanded(message.id));
   let promptCollapsed = $derived(promptTruncated && !promptExpanded);
-  let promptAttachmentText = $derived(promptAttachments(message.content));
-  // The 500-point slice is stripped of attachment references too — they
-  // already render in the attachment region below, once per prompt.
+  // Attachment references lift out of the collapsed prompt so they keep
+  // rendering outside the disclosure; code-aware splitting leaves markers
+  // inside code spans and fenced blocks in the body. The preview slices the
+  // body after extraction so markers render once, in the attachment region.
+  let promptSplit = $derived(splitPromptAttachments(message.content));
+  let promptAttachmentText = $derived(promptSplit.attachments.join("\n\n"));
   let promptPreview = $derived(
-    stripPromptAttachments(promptPoints.slice(0, PROMPT_PREVIEW_POINTS).join("")).trimEnd(),
+    Array.from(promptSplit.body).slice(0, PROMPT_PREVIEW_POINTS).join("").trimEnd(),
   );
   let promptSearchKey = $derived.by(() => {
     if (activeSearchOrdinal === undefined) return undefined;
     const textIndex = segments.findIndex((segment) => segment.type === "text");
-    return blockKey(activeSearchOrdinal, "text", textIndex < 0 ? 0 : textIndex);
+    if (textIndex < 0) return undefined;
+    return blockKey(activeSearchOrdinal, "text", textIndex);
   });
   let accentColor = $derived(isUser ? "var(--accent-blue)" : "var(--accent-purple)");
   let accentForeground = $derived(isUser ? "var(--accent-blue-foreground)" : "var(--accent-purple-foreground)");
@@ -246,6 +233,9 @@
         </div>
       {/if}
     {/if}
+    <!-- A collapsed prompt renders only its preview, attachments, and the
+      disclosure toggle; every parsed segment stays folded behind it. -->
+    {#if !promptCollapsed}
     {#each segments as segment, segmentIndex}
       <!-- `sourceIndex` recovers the segment's index in the source message so
         search keys stay stable when `eventSegments` carries a subset. -->
@@ -303,7 +293,7 @@
       {:else if segment.type === "skill"}
         {#if showText}<SkillBlock content={segment.content} name={segment.label} {searchKey} />{/if}
       {:else}
-        {#if showText && !promptCollapsed}
+        {#if showText}
           <div class="text-content markdown" {@attach searchBlock(searchKey)}
             use:highlightCodeFences={{ content: segment.content }} use:loadAssetImages={segment.content}>
             {@html renderMarkdown(segment.content, { renderUnknownXmlBlocksAsPreformatted: ui.renderUnknownXmlBlocksAsPreformatted })}
@@ -311,6 +301,7 @@
         {/if}
       {/if}
     {/each}
+    {/if}
     {#if promptTruncated && showText}
       <Button
         class="prompt-toggle"
@@ -332,8 +323,9 @@
     {/if}
     <!-- Tool segments and structured calls render through the trailing tool
       block in standalone mode; event rows render their own tool events, so
-      a segment subset must not re-emit them here. -->
-    {#if eventSegments === undefined && inSessionSearch.isBlockEffectivelyVisible("tool")}
+      a segment subset must not re-emit them here. A collapsed prompt folds
+      them behind the disclosure too. -->
+    {#if !promptCollapsed && eventSegments === undefined && inSessionSearch.isBlockEffectivelyVisible("tool")}
       {@const turn = turnByMessage.get(message.id)}
       {@const structuredCalls = message.tool_calls ?? []}
       {#if structuredCalls.length === 1}
