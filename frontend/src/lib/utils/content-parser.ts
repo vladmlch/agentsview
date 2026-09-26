@@ -582,3 +582,81 @@ export function hasVisibleSegments(
     return isVisible(s.type);
   });
 }
+
+// --- Prompt disclosure -------------------------------------------------------
+// User prompts longer than PROMPT_TRUNCATE_POINTS collapse behind a
+// disclosure; the preview renders the first PROMPT_PREVIEW_POINTS code
+// points. Counted in Unicode code points, not UTF-16 code units, so emoji
+// and CJK text never split mid-glyph.
+export const PROMPT_TRUNCATE_POINTS = 600;
+export const PROMPT_PREVIEW_POINTS = 500;
+
+export function promptIsTruncated(content: string): boolean {
+  return Array.from(content).length > PROMPT_TRUNCATE_POINTS;
+}
+
+// Stored messages carry attached media as literal marker text (no separate
+// attachment field exists), so a collapsed preview lifts the markers out of
+// the body and renders them beside it. Two vocabularies exist:
+//
+// - Bare bracket words parsers write on their own line — `[image]`,
+//   `[Image]`, `[file]`, `[binary content]`, `[audio]`, `[document]`,
+//   `[document name]`. They count only when the line holds nothing else,
+//   so prose like `see [file] here` keeps its bracket.
+// - Payload-bearing forms that may sit inline — `![alt](src)` markdown
+//   images, `[Image #2]`, `[Image attached]`, `[Image: ...]`,
+//   `[image: ...]`, `[Attachment: ...]`.
+//
+// A trailing `(` keeps a bracket as markdown link text (`[file](url)` stays
+// a link), and nothing inside inline code spans or fenced code blocks counts
+// as a marker.
+const PROMPT_ATTACHMENT_LINE_RE =
+  /(?:^|\n)[ \t]*(\[(?:image|file|binary content|audio|document(?: [^\]\n]*)?|Image)\])[ \t]*(?=\n|$)/g;
+const PROMPT_ATTACHMENT_INLINE_RE =
+  /!\[[^\]\n]*\]\([^)\n]*\)|\[(?:Image #\d+|Image attached|[Ii]mage:[^\]\n]*|[Aa]ttachment:[^\]\n]*)\](?!\()/g;
+
+/** Split user prompt text into body text and embedded attachment markers.
+ *  Markers inside inline code spans or fenced code blocks are left in the
+ *  body so they render as code like any other literal. */
+export function splitPromptAttachments(text: string): {
+  body: string;
+  attachments: string[];
+} {
+  const codeSpans = scanInlineCodeSpans(text);
+  const fenceRanges = codeBlockMatches(text).map((match) => [match.start, match.end] as const);
+  const insideCode = (start: number, end: number): boolean =>
+    codeSpans.some(([s, e]) => start < e && end > s) ||
+    fenceRanges.some(([s, e]) => start < e && end > s);
+
+  const hits: { start: number; end: number; marker: string }[] = [];
+  for (const match of text.matchAll(PROMPT_ATTACHMENT_LINE_RE)) {
+    const marker = match[1]!;
+    const markerStart = match.index! + match[0].indexOf(marker);
+    if (insideCode(markerStart, markerStart + marker.length)) continue;
+    // Remove the marker's whole line so no empty paragraph remains.
+    hits.push({
+      start: match.index!,
+      end: match.index! + match[0].length,
+      marker,
+    });
+  }
+  for (const match of text.matchAll(PROMPT_ATTACHMENT_INLINE_RE)) {
+    const start = match.index!;
+    const end = start + match[0].length;
+    if (insideCode(start, end)) continue;
+    hits.push({ start, end, marker: match[0] });
+  }
+
+  hits.sort((a, b) => a.start - b.start);
+  const attachments: string[] = [];
+  let body = "";
+  let pos = 0;
+  for (const hit of hits) {
+    if (hit.start < pos) continue;
+    body += text.slice(pos, hit.start);
+    attachments.push(hit.marker);
+    pos = hit.end;
+  }
+  body += text.slice(pos);
+  return { body: body.replace(/\n{3,}/g, "\n\n").trim(), attachments };
+}

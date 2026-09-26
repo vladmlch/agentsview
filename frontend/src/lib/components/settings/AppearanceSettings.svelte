@@ -1,7 +1,7 @@
 <script lang="ts">
   import { Button, Checkbox, SegmentedControl, Typeahead } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
-  import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+  import { inSessionSearch, toggleBlockFilter } from "../../stores/inSessionSearch.svelte.js";
   import { settings } from "../../stores/settings.svelte.js";
   import {
     ui,
@@ -54,9 +54,7 @@
    *  open, record the manual choice first so a temporary reveal is
    *  suppressed, then save the persistent visibility choice. */
   function handleBlockToggle(type: BlockType) {
-    const next = !inSessionSearch.isBlockEffectivelyVisible(type);
-    inSessionSearch.noteManualBlockFilterChange(type, next);
-    ui.setBlockVisible(type, next);
+    toggleBlockFilter(type);
   }
 </script>
 
