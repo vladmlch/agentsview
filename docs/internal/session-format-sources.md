@@ -2949,14 +2949,28 @@ schemas keep their existing ordering behavior.
   [Antigravity format notes](https://github.com/getagentseal/codeburn/blob/3472885629c41725b40c19c0780ecce148b067bf/docs/providers/antigravity.md)
   and
   [parser](https://github.com/getagentseal/codeburn/blob/3472885629c41725b40c19c0780ecce148b067bf/src/providers/antigravity.ts).
+  Spawned subagents are linked by
+  `brain/<parent>/.system_generated/subagents/<child>.json` descriptors
+  (fields: `conversationId` equal to the filename's child UUID,
+  `subagentDescriptor.role`/`typeName`, `state`, `spawnStepIndex`), which
+  are authoritative regardless of `state` (killed children still link).
+  The descriptor's `spawnStepIndex` names the result step carrying the
+  `Created the following subagents` marker whose payload echoes each
+  spawned `conversationId`; one `invoke_subagent` call can spawn a batch
+  of children sharing that step, while `manage_subagents` and
+  `define_subagent` results also quote `conversationId` without the
+  marker and are not spawn edges. Without a descriptor, the
+  `.trajectory.json` sidecar's `agyReader.parentCascadeId` supplies the
+  parent.
 - **Usage and cost:** Heuristically decoded generation metadata or sidecars
   provide uncached input, output (including thinking), cache-read, and model
   data. There is no separate reliable reasoning counter or reported USD cost;
   Agentsview catalog-prices tokens. Decode failures are surfaced explicitly.
 - **Agentsview:** `internal/parser/antigravity.go`,
   `internal/parser/antigravity_proto.go`,
-  `internal/parser/antigravity_brain_transcript.go`, and
-  `internal/parser/antigravity_provider.go`; field decoding is deliberately
+  `internal/parser/antigravity_brain_transcript.go`,
+  `internal/parser/antigravity_provider.go`, and
+  `internal/parser/antigravity_subagents.go`; field decoding is deliberately
   marked as reverse engineering. The brain transcript needs no such decoding:
   it is line-delimited JSON with named fields, verified 2026-09-26 against
   transcripts two Antigravity builds wrote, and it is read as untrusted
@@ -2966,6 +2980,10 @@ schemas keep their existing ordering behavior.
   surviving source. Copies with the same conversation UUID across configured
   roots share that ID. An unreadable database still reports an error instead
   of replacing archived content with a potentially incomplete transcript.
+  Because `tool_calls` stores one subagent id per call, Agentsview keeps only
+  the first `conversationId` echoed per `invoke_subagent` call for the inline
+  subagent link; the descriptor edge still links every spawned child to its
+  parent session.
 
 ## Antigravity CLI (`antigravity-cli`)
 
