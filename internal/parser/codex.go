@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1771,6 +1772,129 @@ func (p *codexProvider) parseSessionSnapshotWithCursor(
 	)
 }
 
+type codexContinuationSegment struct {
+	path                string
+	endOrdinalExclusive int64
+}
+
+func readCodexSessionMetaHeader(path string) (gjson.Result, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return gjson.Result{}, err
+	}
+	defer f.Close()
+
+	reader := bufio.NewReader(f)
+	line, err := reader.ReadBytes('\n')
+	if err != nil && len(line) == 0 {
+		return gjson.Result{}, err
+	}
+	if gjson.Get(string(line), "type").Str == codexTypeSessionMeta {
+		return gjson.Get(string(line), "payload"), nil
+	}
+	return gjson.Result{}, nil
+}
+
+func (p *codexProvider) resolveContinuationChain(
+	ctx context.Context, leafPath, initialThreadID string, initialEndOrdinal int64,
+) ([]codexContinuationSegment, error) {
+	var chain []codexContinuationSegment
+	visited := map[string]struct{}{
+		filepath.Clean(leafPath): {},
+	}
+
+	currThreadID := initialThreadID
+	currEndOrd := initialEndOrdinal
+	currPath := leafPath
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		parentPath := p.sources.findContinuationParentFile(currPath, currThreadID)
+		if parentPath == "" {
+			break
+		}
+		cleanParent := filepath.Clean(parentPath)
+		if _, seen := visited[cleanParent]; seen {
+			break
+		}
+		visited[cleanParent] = struct{}{}
+
+		chain = append(chain, codexContinuationSegment{
+			path:                parentPath,
+			endOrdinalExclusive: currEndOrd,
+		})
+
+		parentHeader, err := readCodexSessionMetaHeader(parentPath)
+		if err != nil {
+			break
+		}
+		if parentHeader.Get("history_mode").Str != "paginated" {
+			break
+		}
+		pBase := parentHeader.Get("history_base")
+		if !pBase.Exists() || pBase.Type == gjson.Null {
+			break
+		}
+		nextThreadID := strings.TrimSpace(pBase.Get("thread_id").Str)
+		if nextThreadID == "" {
+			break
+		}
+		currThreadID = nextThreadID
+		currEndOrd = pBase.Get("end_ordinal_exclusive").Int()
+		currPath = parentPath
+	}
+
+	slices.Reverse(chain)
+	return chain, nil
+}
+
+func (p *codexProvider) feedContinuationSegment(
+	ctx context.Context,
+	seg codexContinuationSegment,
+	b *codexSessionBuilder,
+	malformedLines *int,
+) error {
+	f, err := os.Open(seg.path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil
+	}
+
+	lr := newLineReaderContext(ctx, io.LimitReader(f, info.Size()), maxLineSize)
+	defer releaseLineReader(lr)
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		line, ok := lr.next()
+		if !ok {
+			break
+		}
+		if !gjson.Valid(line) {
+			if malformedLines != nil {
+				*malformedLines++
+			}
+			continue
+		}
+		if seg.endOrdinalExclusive > 0 {
+			ordResult := gjson.Get(line, "ordinal")
+			if ordResult.Exists() && ordResult.Int() >= seg.endOrdinalExclusive {
+				break
+			}
+		}
+		b.processLine(ctx, line)
+	}
+	return lr.Err()
+}
+
 // parseCodexSessionSnapshotStreaming decodes one snapshot, emitting every
 // normalized operation into the caller's sink instead of accumulating a
 // full message slice inside the parser. The returned message slice comes
@@ -1793,6 +1917,7 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 		ctx, includeExec, p.parentTurnResolver(ctx, path), sink,
 	)
 	malformedLines := 0
+	continuationLoaded := false
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -1815,6 +1940,29 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 				malformedLines++
 			}
 			continue
+		}
+		if !continuationLoaded && gjson.Get(line, "type").Str == codexTypeSessionMeta {
+			continuationLoaded = true
+			payload := gjson.Get(line, "payload")
+			if payload.Get("history_mode").Str == "paginated" {
+				historyBase := payload.Get("history_base")
+				if historyBase.Exists() && historyBase.Type != gjson.Null {
+					threadID := strings.TrimSpace(historyBase.Get("thread_id").Str)
+					if threadID != "" {
+						chain, chainErr := p.resolveContinuationChain(
+							ctx, path, threadID, historyBase.Get("end_ordinal_exclusive").Int(),
+						)
+						if chainErr != nil {
+							return nil, nil, codexCursorState{}, false, nil, "", "", chainErr
+						}
+						for _, seg := range chain {
+							if err := p.feedContinuationSegment(ctx, seg, b, &malformedLines); err != nil {
+								return nil, nil, codexCursorState{}, false, nil, "", "", err
+							}
+						}
+					}
+				}
+			}
 		}
 		if b.processLine(ctx, line) {
 			return nil, nil, codexCursorState{}, false, nil, "", "", nil

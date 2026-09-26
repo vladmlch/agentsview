@@ -469,6 +469,10 @@ func TestExtractUUIDFromRollout(t *testing.T) {
 			"rollout-20240115-abc12345-1234-5678-9abc-def012345678-suffix.jsonl",
 			"",
 		},
+		{
+			"rollout-2026-09-25T23-54-13-01a0da77-5113-7a91-a159-a02da927e59f_01a0da8f-d2a9-7fa1-85e4-d0ee0f72587d.jsonl",
+			"01a0da77-5113-7a91-a159-a02da927e59f",
+		},
 	}
 
 	for _, tt := range tests {
