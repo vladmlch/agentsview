@@ -503,7 +503,11 @@ func parseDevinSessionFromMessageNodesWithSubagents(
 	}
 
 	chain := devinMainChainRows(rows, meta)
-	ordered := devinDedupeNodeIDs(append(devinRecoveredEraRows(rows, chain, meta), chain...))
+	recovered := devinRecoveredEraRows(rows, chain, meta)
+	if len(recovered) > 0 {
+		chain = devinTrimLeadingContinuationBoilerplate(chain)
+	}
+	ordered := devinDedupeNodeIDs(append(recovered, chain...))
 	ordered = devinMessageNodesWithout(
 		ordered, partition.ExcludedNodeIDs,
 	)
@@ -1165,7 +1169,10 @@ func devinRecoverErasFromSummarizedFrom(
 	seenMessageIDs := make(map[string]bool, len(rows))
 	var out []devinMessageNodeRow
 
-	for _, era := range priorEras {
+	for eraIdx, era := range priorEras {
+		if eraIdx > 0 {
+			era = devinTrimLeadingContinuationBoilerplate(era)
+		}
 		for _, node := range era {
 			if seenNodeIDs[node.NodeID] {
 				continue
@@ -1181,6 +1188,59 @@ func devinRecoverErasFromSummarizedFrom(
 			out = append(out, node)
 		}
 	}
+	return out
+}
+
+// devinIsBoilerplateSystemPrompt reports whether chatMessage is a standard Devin
+// system prompt (e.g. agent instructions, subagent profiles, model notice,
+// tool calling rules, skills, rules) that Devin repeats upon context compaction.
+func devinIsBoilerplateSystemPrompt(chatMessage string) bool {
+	if gjson.Get(chatMessage, "role").Str != "system" {
+		return false
+	}
+	text := strings.TrimSpace(devinNodeText(chatMessage))
+	text = strings.Trim(text, "'\"")
+	text = strings.TrimSpace(text)
+	prefixes := []string{
+		"You are Devin, an interactive command line agent",
+		"Available subagent profiles for",
+		"You are powered by",
+		"## Parallel tool calls",
+		"<available_skills>",
+		"<system_info>",
+		"<rules",
+		"<planning_guidance>",
+		"## Mode: Plan",
+		"The session mode has changed:",
+	}
+	for _, p := range prefixes {
+		if strings.HasPrefix(text, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// devinTrimLeadingContinuationBoilerplate trims repetitive Devin CLI boilerplate
+// system prompt nodes that precede the continuation summary in a continuation era.
+func devinTrimLeadingContinuationBoilerplate(nodes []devinMessageNodeRow) []devinMessageNodeRow {
+	summaryIdx := -1
+	for i, n := range nodes {
+		if devinNodeContinuationSummary(n.ChatMessage) {
+			summaryIdx = i
+			break
+		}
+	}
+	if summaryIdx <= 0 {
+		return nodes
+	}
+	out := make([]devinMessageNodeRow, 0, len(nodes))
+	for i := 0; i < summaryIdx; i++ {
+		if !devinIsBoilerplateSystemPrompt(nodes[i].ChatMessage) {
+			out = append(out, nodes[i])
+		}
+	}
+	out = append(out, nodes[summaryIdx:]...)
 	return out
 }
 
