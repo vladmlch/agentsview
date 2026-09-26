@@ -208,6 +208,7 @@ afterEach(async () => {
   state.searching = false;
   uiState.showAllBlocks();
   uiState.autoCollapseAssistantTurns = true;
+  uiState.sortNewestFirst = false;
 });
 
 describe("AssistantTurn", () => {
@@ -426,5 +427,152 @@ describe("AssistantTurn", () => {
     expect(document.querySelector(".assistant-turn-events .system-boundary")).not.toBeNull();
     expect(text(".turn-header")).toContain("2 tool calls");
     expect(text(".turn-header")).toContain("4 messages");
+  });
+
+  it.each([
+    { hidden: "thinking", expected: ["message", "message", "tool", "system", "message"] },
+    { hidden: "tool", expected: ["thinking", "message", "message", "system", "message"] },
+    { hidden: "system", expected: ["thinking", "message", "message", "tool", "message"] },
+    { hidden: "assistant", expected: ["thinking", "tool", "system"], output: false },
+  ])(
+    "hides the matching event rows when the $hidden block type is filtered",
+    async ({ hidden, expected, output = true }) => {
+      uiState.hideBlock(hidden);
+      const bashCall: ToolCall = {
+        tool_use_id: "c1",
+        tool_name: "Bash",
+        category: "Bash",
+        input_json: '{"command":"ls"}',
+      };
+      const turn = turnFor([
+        userMsg(10, 0, "go"),
+        asstMsg(11, 1, "[Thinking]\nplan\n[/Thinking]\n\nWorking.", { has_thinking: true }),
+        asstMsg(12, 2, "Checking.", { has_tool_use: true, tool_calls: [bashCall] }),
+        boundaryMsg(13, 3, "task_notification", "<task-notification>done</task-notification>"),
+        asstMsg(14, 4, "Final answer."),
+      ]);
+      await render(turn);
+      turnCollapse.setTurnExpanded(turn.key, true);
+      await tick();
+
+      expect(rowKinds()).toEqual(expected);
+      expect(document.querySelector(".turn-output") !== null).toBe(output);
+    },
+  );
+
+  it("keeps a code-only message event rendered through the fence placeholder", async () => {
+    uiState.hideBlock("code");
+    uiState.hideBlock("assistant");
+    const turn = turnFor([
+      userMsg(10, 0, "go"),
+      asstMsg(11, 1, ["```ts", "const n = 1;", "```"].join("\n")),
+    ]);
+    await render(turn);
+    turnCollapse.setTurnExpanded(turn.key, true);
+    await tick();
+
+    // The code fence stays transcript-visible so the collapsed
+    // placeholder renders — for the child row and the final output alike.
+    expect(rowKinds()).toEqual(["message"]);
+    expect(document.querySelector('[data-event-kind="message"] .event-preview')?.textContent).toBe(
+      "```ts",
+    );
+    expect(document.querySelector(".turn-output .code-fence-toggle")).not.toBeNull();
+    expect(document.querySelector(".turn-output .code-content")).toBeNull();
+
+    await click('[data-event-kind="message"] .event-toggle');
+    expect(document.querySelector(".assistant-turn-events .code-fence-toggle")).not.toBeNull();
+    expect(document.querySelector(".assistant-turn-events .code-content")).toBeNull();
+  });
+
+  it("moves source actions to the next rendered sibling when the first event is filtered", async () => {
+    state.sessions = [session()];
+    const content = "[Thinking]\nplan\n[/Thinking]\n\nVisible answer.";
+    const turn = turnFor([
+      userMsg(10, 0, "go"),
+      asstMsg(11, 1, content, { has_thinking: true }),
+      asstMsg(12, 2, "Final answer."),
+    ]);
+    await render(turn);
+    turnCollapse.setTurnExpanded(turn.key, true);
+    await tick();
+
+    const pinCounts = () =>
+      Array.from(
+        document.querySelectorAll(".turn-event"),
+        (row) => row.querySelectorAll(".pin-btn:not(.fork-btn)").length,
+      );
+    expect(pinCounts()).toEqual([1, 0, 1]);
+    const first = components.pop()!;
+    await unmount(first);
+    document.body.replaceChildren();
+
+    uiState.hideBlock("thinking");
+    await render(turn);
+    turnCollapse.setTurnExpanded(turn.key, true);
+    await tick();
+
+    expect(rowKinds()).toEqual(["message", "message"]);
+    expect(pinCounts()).toEqual([1, 1]);
+  });
+
+  it("reverses child event order when the session sorts newest first", async () => {
+    uiState.sortNewestFirst = true;
+    const turn = turnFor([
+      userMsg(10, 0, "go"),
+      asstMsg(11, 1, "[Thinking]\nplan\n[/Thinking]\n\nFirst answer.", { has_thinking: true }),
+      asstMsg(12, 2, "Final answer."),
+    ]);
+    await render(turn);
+    turnCollapse.setTurnExpanded(turn.key, true);
+    await tick();
+
+    expect(rowKinds()).toEqual(["message", "message", "thinking"]);
+    const previews = Array.from(
+      document.querySelectorAll('[data-event-kind="message"] .event-preview'),
+      (node) => node.textContent?.trim(),
+    );
+    expect(previews).toEqual(["Final answer.", "First answer."]);
+  });
+
+  it("carries the final output's source actions while the turn is collapsed", async () => {
+    state.sessions = [session()];
+    const turn = turnFor([
+      userMsg(10, 0, "go"),
+      asstMsg(11, 1, "Working on it."),
+      asstMsg(12, 2, "Final answer."),
+    ]);
+    await render(turn);
+
+    // The collapsed turn mounts no child rows, so the output row carries
+    // the Copy/Pin/Fork controls for its own message.
+    expect(document.querySelector(".assistant-turn-events")).toBeNull();
+    const output = document.querySelector(".turn-output");
+    expect(output?.querySelector('button[aria-label="Copy message"]')).not.toBeNull();
+    expect(output?.querySelector(".pin-btn:not(.fork-btn)")).not.toBeNull();
+    expect(output?.querySelector(".fork-btn")).not.toBeNull();
+
+    await click(output!.querySelector<HTMLElement>(".pin-btn:not(.fork-btn)")!);
+    expect(pinMock).toHaveBeenCalledWith("s1", 12, 2);
+  });
+
+  it("keeps the final output's source actions on its child event row when expanded", async () => {
+    state.sessions = [session()];
+    const turn = turnFor([
+      userMsg(10, 0, "go"),
+      asstMsg(11, 1, "Working on it."),
+      asstMsg(12, 2, "Final answer."),
+    ]);
+    await render(turn);
+    turnCollapse.setTurnExpanded(turn.key, true);
+    await tick();
+
+    const pins = Array.from(
+      document.querySelectorAll(".turn-event"),
+      (row) => row.querySelectorAll(".pin-btn:not(.fork-btn)").length,
+    );
+    expect(pins).toEqual([1, 1]);
+    expect(document.querySelector(".turn-output .pin-btn")).toBeNull();
+    expect(document.querySelector('.turn-output button[aria-label="Copy message"]')).toBeNull();
   });
 });

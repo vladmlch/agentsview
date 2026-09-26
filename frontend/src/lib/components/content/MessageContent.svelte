@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Session } from "../../api/types.js";
-import type { DbMessage as Message } from "../../api/generated/index.js";
+  import type { DbMessage as Message } from "../../api/generated/index.js";
   import type { DbCallTiming as CallTiming, DbTurnTiming as TurnTiming } from "../../api/generated/index.js";
   import { parseContent, enrichSegments, type ContentSegment } from "../../utils/content-parser.js";
   import { formatTimestamp, formatTokenUsage } from "../../utils/format.js";
@@ -44,8 +44,17 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
     /** Suppress the message header; the event row owns actions and metadata. */
     hideMessageHeader?: boolean;
   }
-  let { message, session, isSubagentContext = false, searchOrdinal, compact = false, allowMutations = true,
-    eventSegments, eventSegmentStart = 0, hideMessageHeader = false }: Props = $props();
+  let {
+    message,
+    session,
+    isSubagentContext = false,
+    searchOrdinal,
+    compact = false,
+    allowMutations = true,
+    eventSegments,
+    eventSegmentStart = 0,
+    hideMessageHeader = false,
+  }: Props = $props();
   let allSegments = $derived(enrichSegments(
     parseContent(message.content, message.has_tool_use, message.id, message.content_length),
     message.tool_calls,
