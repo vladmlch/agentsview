@@ -38,7 +38,7 @@
     type BlockType,
   } from "../../stores/ui.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
-  import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+  import { inSessionSearch, toggleBlockFilter } from "../../stores/inSessionSearch.svelte.js";
   import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
   import { collectSearchBlocks } from "../../search/block-text.js";
   import { isTurnEventVisible } from "../../utils/turn-visibility.js";
@@ -358,9 +358,7 @@
    *  reveal; the note is a no-op when the find view is closed. The toggle
    *  flips the *effective* state the checkbox displays. */
   function handleBlockToggle(type: BlockType) {
-    const next = !inSessionSearch.isBlockEffectivelyVisible(type);
-    inSessionSearch.noteManualBlockFilterChange(type, next);
-    ui.setBlockVisible(type, next);
+    toggleBlockFilter(type);
   }
 
   /** Show every block type and lift any search-time suppressions. */

@@ -2348,7 +2348,7 @@
   "appearance_render_unknown_xml_blocks": "不明なXMLブロックを整形済みテキストとして表示",
   "appearance_auto_collapse_assistant_turns": "アシスタントのターンを既定で折りたたむ",
   "message_content_show_full_prompt": "プロンプト全体を表示",
-  "message_content_show_less": "あまり見せない",
+  "message_content_show_less": "折りたたむ",
   "assistant_turn_event_message": "メッセージ",
   "assistant_turn_message_count": [
     {
