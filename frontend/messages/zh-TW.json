@@ -2275,6 +2275,9 @@
   ],
   "settings_image_cleanup_compact_note": "刪除有效載荷會改寫儲存的資料列。在執行 agentsview db compact 之前，封存檔大小保持不變。",
   "appearance_render_unknown_xml_blocks": "將未知 XML 區塊以預格式化文字呈現",
+  "appearance_auto_collapse_assistant_turns": "預設摺疊助手回合",
+  "message_content_show_full_prompt": "顯示完整提示",
+  "message_content_show_less": "收起",
   "assistant_turn_event_message": "訊息",
   "assistant_turn_message_count": [
     {

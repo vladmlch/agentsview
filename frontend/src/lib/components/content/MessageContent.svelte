@@ -20,6 +20,7 @@
   import { ui } from "../../stores/ui.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+  import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
   import { blockKey } from "../../search/block-text.js";
   import { searchBlock } from "../../search/session-block.svelte.js";
   import { highlightCodeFences } from "../../utils/highlight-fences.js";
@@ -128,6 +129,48 @@
   let showText = $derived(
     inSessionSearch.isBlockEffectivelyVisible(isUser ? "user" : "assistant"),
   );
+
+  /** User prompts longer than this many Unicode code points collapse to a
+   *  code-point-safe preview behind a disclosure control. */
+  const PROMPT_TRUNCATE_POINTS = 600;
+  const PROMPT_PREVIEW_POINTS = 500;
+
+  /** Attachment references lifted out of a collapsed user prompt so they
+   *  keep rendering outside the disclosure: inline markdown images plus the
+   *  bracketed markers parsers write for pasted files and images. */
+  const PROMPT_ATTACHMENT_RE =
+    /!\[[^\]\n]*\]\([^)\n]*\)|\[(?:[Ii]mage(?::[^\]\n]*| #\d+| attached)?|[Aa]ttachment:[^\]\n]*|file|binary content)\]/g;
+
+  function promptAttachments(content: string): string {
+    const attachments: string[] = [];
+    content.replace(PROMPT_ATTACHMENT_RE, (match) => {
+      attachments.push(match);
+      return "";
+    });
+    return attachments.join("\n");
+  }
+
+  function stripPromptAttachments(content: string): string {
+    return content.replace(PROMPT_ATTACHMENT_RE, "");
+  }
+
+  let promptPoints = $derived(Array.from(message.content));
+  let promptTruncated = $derived(
+    isUser && eventSegments === undefined && promptPoints.length > PROMPT_TRUNCATE_POINTS,
+  );
+  let promptExpanded = $derived(turnCollapse.isUserPromptExpanded(message.id));
+  let promptCollapsed = $derived(promptTruncated && !promptExpanded);
+  let promptAttachmentText = $derived(promptAttachments(message.content));
+  // The 500-point slice is stripped of attachment references too — they
+  // already render in the attachment region below, once per prompt.
+  let promptPreview = $derived(
+    stripPromptAttachments(promptPoints.slice(0, PROMPT_PREVIEW_POINTS).join("")).trimEnd(),
+  );
+  let promptSearchKey = $derived.by(() => {
+    if (activeSearchOrdinal === undefined) return undefined;
+    const textIndex = segments.findIndex((segment) => segment.type === "text");
+    return blockKey(activeSearchOrdinal, "text", textIndex < 0 ? 0 : textIndex);
+  });
   let accentColor = $derived(isUser ? "var(--accent-blue)" : "var(--accent-purple)");
   let accentForeground = $derived(isUser ? "var(--accent-blue-foreground)" : "var(--accent-purple-foreground)");
   let roleBg = $derived(isUser ? "var(--user-bg)" : "var(--assistant-bg)");
@@ -192,6 +235,17 @@
     </div>
   {/if}
   <div class="message-body">
+    {#if promptCollapsed && showText}
+      <div class="text-content markdown" {@attach searchBlock(promptSearchKey)}
+        use:highlightCodeFences={{ content: promptPreview }} use:loadAssetImages={promptPreview}>
+        {@html renderMarkdown(promptPreview, { renderUnknownXmlBlocksAsPreformatted: ui.renderUnknownXmlBlocksAsPreformatted })}
+      </div>
+      {#if promptAttachmentText}
+        <div class="prompt-attachments markdown" use:loadAssetImages={promptAttachmentText}>
+          {@html renderMarkdown(promptAttachmentText, { renderUnknownXmlBlocksAsPreformatted: ui.renderUnknownXmlBlocksAsPreformatted })}
+        </div>
+      {/if}
+    {/if}
     {#each segments as segment, segmentIndex}
       <!-- `sourceIndex` recovers the segment's index in the source message so
         search keys stay stable when `eventSegments` carries a subset. -->
@@ -249,7 +303,7 @@
       {:else if segment.type === "skill"}
         {#if showText}<SkillBlock content={segment.content} name={segment.label} {searchKey} />{/if}
       {:else}
-        {#if showText}
+        {#if showText && !promptCollapsed}
           <div class="text-content markdown" {@attach searchBlock(searchKey)}
             use:highlightCodeFences={{ content: segment.content }} use:loadAssetImages={segment.content}>
             {@html renderMarkdown(segment.content, { renderUnknownXmlBlocksAsPreformatted: ui.renderUnknownXmlBlocksAsPreformatted })}
@@ -257,6 +311,25 @@
         {/if}
       {/if}
     {/each}
+    {#if promptTruncated && showText}
+      <Button
+        class="prompt-toggle"
+        size="sm"
+        surface="soft"
+        ariaExpanded={promptExpanded}
+        label={promptExpanded ? m.message_content_show_less() : m.message_content_show_full_prompt()}
+        title={promptExpanded ? m.message_content_show_less() : m.message_content_show_full_prompt()}
+        onclick={() => turnCollapse.setUserPromptExpanded(message.id, !promptExpanded)}
+      >
+        {#snippet trailing()}
+          {#if promptExpanded}
+            <ChevronDownIcon size="14" strokeWidth="2" aria-hidden="true" />
+          {:else}
+            <ChevronRightIcon size="14" strokeWidth="2" aria-hidden="true" />
+          {/if}
+        {/snippet}
+      </Button>
+    {/if}
     <!-- Tool segments and structured calls render through the trailing tool
       block in standalone mode; event rows render their own tool events, so
       a segment subset must not re-emit them here. -->
@@ -326,6 +399,14 @@
   }
 
   .message-body { display: flex; flex-direction: column; gap: 8px; }
+  .prompt-attachments {
+    font-size: 13px;
+    color: var(--text-secondary);
+    border-left: 2px solid var(--border-muted);
+    padding-left: 10px;
+  }
+  .prompt-attachments :global(img) { max-width: 240px; display: block; }
+  :global(.prompt-toggle) { align-self: flex-start; max-width: 100%; }
   .markdown :global(p) { margin: 0.5em 0; }
   .markdown :global(p:first-child) { margin-top: 0; }
   .markdown :global(p:last-child) { margin-bottom: 0; }

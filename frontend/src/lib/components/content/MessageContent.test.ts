@@ -7,6 +7,7 @@ import type {
   DbSessionTiming as SessionTiming,
 } from "../../api/generated/index.js";
 import { setLocale } from "../../i18n/index.js";
+import { turnCollapse } from "../../stores/turn-collapse.svelte.js";
 import MessageContent from "./MessageContent.svelte";
 
 const timingState = vi.hoisted(() => ({ timing: null as SessionTiming | null }));
@@ -162,6 +163,7 @@ afterEach(async () => {
   state.remote = false;
   state.searching = false;
   uiState.showAllBlocks();
+  turnCollapse.activateSession(null);
 });
 
 describe("MessageContent", () => {
@@ -719,5 +721,100 @@ describe("MessageContent event segments", () => {
     expect(text(".text-content")).toContain("Working.");
     expect(document.querySelector(".tool-block")).toBeNull();
     expect(document.querySelector(".parallel-group")).toBeNull();
+  });
+});
+
+describe("MessageContent user prompt disclosure", () => {
+  const toggle = () => document.querySelector<HTMLButtonElement>("button.prompt-toggle");
+
+  it("renders a 600-code-point prompt in full without a disclosure", async () => {
+    const content = "a".repeat(600);
+    await render(message({ role: "user", content }));
+    expect(toggle()).toBeNull();
+    expect(text(".text-content")).toBe(content);
+  });
+
+  it("previews a 601-code-point prompt at exactly 500 code points", async () => {
+    const content = "a".repeat(500) + "b".repeat(101);
+    await render(message({ role: "user", content }));
+
+    expect(text(".text-content")).toBe("a".repeat(500));
+    expect(toggle()).not.toBeNull();
+    expect(toggle()!.textContent).toContain("Show full prompt");
+    expect(toggle()!.getAttribute("aria-expanded")).toBe("false");
+
+    await click("button.prompt-toggle");
+    expect(text(".text-content")).toBe(content);
+    expect(toggle()!.textContent).toContain("Show less");
+    expect(toggle()!.getAttribute("aria-expanded")).toBe("true");
+
+    await click("button.prompt-toggle");
+    expect(text(".text-content")).toBe("a".repeat(500));
+  });
+
+  it("counts an emoji-only 601-point prompt without splitting surrogate pairs", async () => {
+    const content = "🙂".repeat(601); // 601 code points, 1202 UTF-16 units
+    await render(message({ role: "user", content }));
+
+    expect(toggle()).not.toBeNull();
+    expect(text(".text-content")).toBe("🙂".repeat(500));
+
+    await click("button.prompt-toggle");
+    expect(text(".text-content")).toBe(content);
+  });
+
+  it("renders a 600-emoji prompt in full without a disclosure", async () => {
+    const content = "🙂".repeat(600);
+    await render(message({ role: "user", content }));
+    expect(toggle()).toBeNull();
+    expect(text(".text-content")).toBe(content);
+  });
+
+  it("keeps attachment references visible outside the collapsed disclosure", async () => {
+    const content = `${"p".repeat(601)}\n\n![shot](asset://img-1.png)\n\n[Image #1]`;
+    await render(message({ role: "user", content }));
+
+    expect(text(".text-content")).toBe("p".repeat(500));
+    const attachments = document.querySelector(".prompt-attachments");
+    expect(attachments).not.toBeNull();
+    expect(attachments!.querySelector("img")?.getAttribute("alt")).toBe("shot");
+    expect(attachments!.textContent).toContain("[Image #1]");
+
+    // Expanded, the references render in place like any other prompt.
+    await click("button.prompt-toggle");
+    expect(text(".text-content")).toContain("p".repeat(601));
+    expect(document.querySelector(".prompt-attachments")).toBeNull();
+    expect(document.querySelector(".text-content img")?.getAttribute("alt")).toBe("shot");
+    expect(text(".text-content")).toContain("[Image #1]");
+  });
+
+  it("does not truncate assistant messages or assistant event segments", async () => {
+    const content = "a".repeat(601);
+    await render(message({ role: "assistant", content }));
+    expect(toggle()).toBeNull();
+    expect(text(".text-content")).toBe(content);
+
+    document.body.replaceChildren();
+    await render(message({ role: "assistant", content }), {
+      eventSegments: [{ type: "text", content }],
+      hideMessageHeader: true,
+    });
+    expect(toggle()).toBeNull();
+    expect(text(".text-content")).toBe(content);
+  });
+
+  it("ignores the Expand all bulk baseline for prompt disclosures", async () => {
+    const content = "a".repeat(601);
+    const source = message({ role: "user", content });
+    await render(source);
+
+    turnCollapse.expandAll();
+    await tick();
+    expect(text(".text-content")).toBe("a".repeat(500));
+    expect(turnCollapse.isUserPromptExpanded(source.id)).toBe(false);
+
+    turnCollapse.setUserPromptExpanded(source.id, true);
+    await tick();
+    expect(text(".text-content")).toBe(content);
   });
 });

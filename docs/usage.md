@@ -593,6 +593,26 @@ Toggle between Normal and Focused mode using the transcript mode button in the
 session header. The header adjusts responsively to fit the available space. The
 mode preference is saved in localStorage.
 
+### Assistant Turns
+
+In Normal mode, each assistant reply group collapses into a turn header that
+summarizes its message and tool-call counts. The turn's final output stays
+visible below the header, so a long transcript reads as prompts and answers.
+Click the header to expand the turn and reveal its intermediate events:
+messages, thinking, skill output, and grouped tool calls. Each event row
+expands individually, and tool calls inside a rollup keep their own
+expand/collapse state.
+
+The **Expand all** button in the session header opens every turn, event row,
+and tool section at once; once everything is open it becomes **Collapse all**.
+Per-turn and per-event toggles take precedence over the bulk action. Expansion
+state is kept in memory only; it resets when you switch sessions or reload.
+
+Turns start collapsed by default. To keep them expanded instead, open
+Settings > Appearance and clear **Collapse assistant turns by default**. The
+preference is saved in localStorage in the current browser or desktop
+profile.
+
 ### Message Display
 
 Each message has a colored left border indicating role:
@@ -615,6 +635,13 @@ into a temporary prompt, starting `claude` in the session working directory, and
 removing the temporary prompt after launch. In read-only local mode the action
 copies the command instead of launching it; remote sessions cannot be forked
 from the browser.
+
+Long user prompts collapse to a preview. When a prompt runs past 600 Unicode
+code points, only the first 500 code points render, followed by a **Show full
+prompt** button; expanded prompts offer **Show less**. Attachment references
+such as images and pasted-file markers stay visible outside the collapsed
+region. The disclosure is per message, resets with the session, and is not
+changed by Expand all / Collapse all.
 
 ### Thinking Blocks
 
@@ -771,15 +798,19 @@ transcript shows where matches appear throughout the session.
 
 ![In-session search results and overview rail](/docs/assets/generated/screenshots/in-session-search-results.png)
 
-Search follows the transcript's active scope. Block-type filters (see
-[Block-Type Filtering](#block-type-filtering)) and Focused mode both narrow what
-search can find: a hidden category contributes no matches, counts, badges, or
-highlights, and re-showing a category or returning to Normal mode makes that
-content searchable again without retyping the query. Folded content is still
-searched — collapsed tool output, thinking blocks, `<details>` sections, and
-rows that are not currently scrolled into view all match; only the current
-occurrence expands and scrolls into view. The match count, result list, and
-overview rail read the same filtered index, so they update immediately when a
+Search indexes every block in the transcript regardless of the active
+block-type filters (see
+[Block-Type Filtering](#block-type-filtering)). When a match lands in a hidden
+category, that category is temporarily revealed for the open search so its
+blocks, matches, counts, badges, and highlights all appear; the saved filter
+set is not changed. Hiding a category manually while the search bar is open
+suppresses its temporary reveal instead, and closing search drops every reveal
+and restores the saved filters. Focused mode still narrows which messages are
+indexed before any of this applies. Folded content is still searched —
+collapsed turns and events, tool output, thinking blocks, `<details>`
+sections, and rows that are not currently scrolled into view all match; only
+the current occurrence expands and scrolls into view. The match count, result
+list, and overview rail read the same index, so they update immediately when a
 filter toggles during an active query.
 
 ### Token Usage
@@ -1244,7 +1275,7 @@ organized into sections:
 | Section            | What You Can Configure                                                                                   |
 | ------------------ | -------------------------------------------------------------------------------------------------------- |
 | Language           | Interface language (Azerbaijani, English, French, Japanese, Korean, Spanish, Simplified Chinese, or Traditional Chinese)       |
-| Appearance         | Theme (light/dark), high-contrast mode, chart colors, message layout, zoom, block visibility             |
+| Appearance         | Theme (light/dark), high-contrast mode, chart colors, message layout, zoom, block visibility, assistant-turn collapse |
 | Date ranges        | Browser-local checkbox for linking date selections across Sessions, Usage, Activity, Trends, and Quality |
 | Session Providers  | Enable session providers, inspect their session directories, and add alternate agent homes               |
 | Archive content    | Choose whether future imports keep, drop, or offload tool-result images                                  |
@@ -1262,10 +1293,11 @@ Spanish is available in builds from `main` after version 0.44.0.
 
 ![Chart color palette setting](/docs/assets/generated/screenshots/settings-chart-colors.png)
 
-Language, theme, high contrast, message layout, zoom, block visibility, and
-Date ranges preferences use local storage in the current browser or desktop
-webview profile. Each profile keeps its own choices. The optional `zoom_level`
-setting supplies a default when no local zoom or text-size preference exists.
+Language, theme, high contrast, message layout, zoom, block visibility,
+assistant-turn collapse, and Date ranges preferences use local storage in the
+current browser or desktop webview profile. Each profile keeps its own
+choices. The optional `zoom_level` setting supplies a default when no local
+zoom or text-size preference exists.
 
 Chart colors use the server-wide `chart_palette` setting in
 `~/.agentsview/config.toml`. Agent directory overrides, terminal settings, the

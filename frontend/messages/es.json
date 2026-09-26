@@ -2360,6 +2360,9 @@
   ],
   "settings_image_cleanup_compact_note": "Quitar las cargas útiles reescribe las filas almacenadas. El archivo de almacenamiento conserva su tamaño hasta que ejecutes agentsview db compact.",
   "appearance_render_unknown_xml_blocks": "Mostrar los bloques XML desconocidos como texto preformateado",
+  "appearance_auto_collapse_assistant_turns": "Contraer los turnos del asistente de forma predeterminada",
+  "message_content_show_full_prompt": "Mostrar el prompt completo",
+  "message_content_show_less": "Mostrar menos",
   "assistant_turn_event_message": "Mensaje",
   "assistant_turn_message_count": [
     {

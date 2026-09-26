@@ -2358,6 +2358,9 @@
   ],
   "settings_image_cleanup_compact_note": "Removing payloads rewrites the stored rows. The archive file keeps its size until you run agentsview db compact.",
   "appearance_render_unknown_xml_blocks": "Render unknown XML blocks as preformatted text",
+  "appearance_auto_collapse_assistant_turns": "Collapse assistant turns by default",
+  "message_content_show_full_prompt": "Show full prompt",
+  "message_content_show_less": "Show less",
   "assistant_turn_event_message": "Message",
   "assistant_turn_message_count": [
     {
