@@ -256,6 +256,9 @@ test.describe("Appearance accessibility", () => {
     await page.addInitScript(() => {
       localStorage.setItem("theme", "dark");
       localStorage.setItem("agentsview-high-contrast", "true");
+      // Focused mode renders flat message rows with role icons; normal mode
+      // folds assistant work into turn headers without them.
+      localStorage.setItem("agentsview-transcript-mode", "focused");
     });
     const sp = new SessionsPage(page);
     await sp.goto();

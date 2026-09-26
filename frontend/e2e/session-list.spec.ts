@@ -2,7 +2,11 @@ import { createRequire } from "node:module";
 import { test, expect } from "@playwright/test";
 import { SessionsPage } from "./pages/sessions-page";
 import { clickNavTab } from "./helpers/nav";
-import { createMockSessions, handleSessionsRoute, sessionsRoutePattern } from "./helpers/mock-sessions";
+import {
+  createMockSessions,
+  handleSessionsRoute,
+  sessionsRoutePattern,
+} from "./helpers/mock-sessions";
 
 type RenderLintModule = {
   renderLintSnippet: (scopeSelector: string, options?: Record<string, unknown>) => string;
@@ -10,9 +14,7 @@ type RenderLintModule = {
 
 const require = createRequire(import.meta.url);
 const renderLintPath = process.env.PR_RENDER_LINT_PATH;
-const renderLint = renderLintPath
-  ? (require(renderLintPath) as RenderLintModule)
-  : undefined;
+const renderLint = renderLintPath ? (require(renderLintPath) as RenderLintModule) : undefined;
 
 // Test-fixture assumptions: project-alpha has 2 sessions,
 // project-beta has 3, project-duration has 1 (the duration UX
@@ -47,7 +49,10 @@ test("session previews hide a leading system-reminder envelope", async ({ page }
     first_message:
       '<system-reminder data-role="user-context">ctx</system-reminder>\nrefactor the auth guard',
   };
-  await page.route(sessionsRoutePattern, handleSessionsRoute([{ sessions: [session], project: null }]));
+  await page.route(
+    sessionsRoutePattern,
+    handleSessionsRoute([{ sessions: [session], project: null }]),
+  );
   await page.route("**/api/v1/projects*", (route) =>
     route.fulfill({ json: { projects: [{ name: "project-preview", session_count: 1 }] } }),
   );
@@ -128,7 +133,9 @@ test.describe("Session list", () => {
 
     await sp.messageRows.first().click();
     await page.keyboard.press("ArrowDown");
-    await expect(sp.messageRows.nth(1)).toHaveClass(/selected/);
+    // j/k stops at content rows only: the prompt's next ordinal is rendered
+    // by the collapsed turn's final-output row, past its header.
+    await expect(sp.messageRows.nth(2)).toHaveClass(/selected/);
   });
 
   const filterCases = [

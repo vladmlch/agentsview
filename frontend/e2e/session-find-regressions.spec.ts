@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import type { Message } from "../src/lib/api/types.js";
+import type { DbMessage as Message } from "../src/lib/api/generated/index.js";
 
 const SESSION_ID = "test-session-xlarge-5500";
 function message(ordinal: number, content: string, extra: Partial<Message> = {}): Message {
@@ -17,6 +17,8 @@ function message(ordinal: number, content: string, extra: Partial<Message> = {})
     model: "",
     context_tokens: 0,
     output_tokens: 0,
+    has_context_tokens: false,
+    has_output_tokens: false,
     is_system: false,
     ...extra,
   };
@@ -112,15 +114,16 @@ test.describe("session find audit regressions", () => {
       await expect(current).toHaveAttribute("data-search-block", "0:thinking:0");
       await expect(current).toBeVisible();
       await page.keyboard.press("Escape");
-      // Thinking stays rendered by its filter; only the search expansion ends.
+      // Thinking stays rendered by its filter; only the search expansion
+      // ends. The thinking block lives inside the tool rollup, whose
+      // members self-disclose ephemerally rather than through turn state.
       await expect(page.locator(".thinking-header")).toHaveCount(1);
       await expect(page.locator(".thinking-content")).toHaveCount(0);
+      await expect(page.locator("[data-search-current]")).toHaveCount(0);
     });
   }
 
-  test("excludes tool output hidden at start and follows a live filter change", async ({
-    page,
-  }) => {
+  test("keeps hidden tool output indexed and follows a live filter change", async ({ page }) => {
     await installMessages(
       page,
       [
@@ -133,21 +136,36 @@ test.describe("session find audit regressions", () => {
       { hidden: ["tool", "code", "system"] },
     );
     await find(page);
-    await expect(page.locator(".search-announcement")).toHaveText("Match 1 of 1");
-    await expect(page.locator('[data-search-current="true"]')).toHaveAttribute(
-      "data-search-block",
-      "1:text:0",
-    );
-    await expect(page.locator(".tool-block")).toHaveCount(0);
-
-    await toggleBlockFilter(page, "Tool calls");
-    await expect(page.locator(".search-announcement")).toHaveText(/^Match \d+ of 2$/);
-    await page.keyboard.press("F3");
+    // The hidden tool match stays indexed and is temporarily revealed.
+    await expect(page.locator(".search-announcement")).toHaveText("Match 1 of 2");
     await expect(page.locator('[data-search-current="true"]')).toHaveAttribute(
       "data-search-block",
       "0:tool-output:0",
     );
     await expect(page.locator('[data-search-current="true"]')).toBeVisible();
+    await expect(page.locator(".tool-block")).toHaveCount(1);
+
+    // Manually hiding the revealed type suppresses it; the index is
+    // unchanged while its block unmounts.
+    await toggleBlockFilter(page, "Tool calls");
+    await expect(page.locator(".search-announcement")).toHaveText("Match 1 of 2");
+    await expect(page.locator(".tool-block")).toHaveCount(0);
+    await expect(page.locator("[data-search-current]")).toHaveCount(0);
+
+    // Re-enabling restores the saved filter and the same current match.
+    await toggleBlockFilter(page, "Tool calls");
+    await expect(page.locator(".tool-block")).toHaveCount(1);
+    await expect(page.locator('[data-search-current="true"]')).toHaveAttribute(
+      "data-search-block",
+      "0:tool-output:0",
+    );
+    await expect(page.locator('[data-search-current="true"]')).toBeVisible();
+    await page.keyboard.press("F3");
+    await expect(page.locator(".search-announcement")).toHaveText("Match 2 of 2");
+    await expect(page.locator('[data-search-current="true"]')).toHaveAttribute(
+      "data-search-block",
+      "1:text:0",
+    );
   });
 
   for (const earlyHit of [true, false]) {
@@ -217,7 +235,7 @@ test("searches the displayed image placeholder rather than serialized result met
   await installMessages(page, [
     message(0, "", {
       has_tool_use: true,
-      tool_calls: [{ tool_name: "view_image", result_content: result }],
+      tool_calls: [{ tool_name: "view_image", category: "view_image", result_content: result }],
     }),
   ]);
   const input = await find(page);
