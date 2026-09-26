@@ -2526,21 +2526,24 @@ schemas keep their existing ordering behavior.
   message nodes in creation order. When Devin continues a compacted session,
   it re-roots the context: the new chain starts at a fresh snapshot whose
   system node opens with "You are continuing work from a previous
-  conversation thread", and the earlier thread remains only on sibling
-  subtrees branching off that shared prefix. The parser recovers those
-  pre-continuation eras: sibling subtrees headed by a system node that hang
-  off chain nodes preceding an on-chain summary are linearized into messages
-  (sibling nodes sharing one `message_id` are pending/committed duplicates
-  resolved to the higher `node_id`; forks with distinct message_ids resolve
-  toward the deepest subtree, the era's surviving line), while user- or
-  assistant-headed siblings are edits and abandoned retries and stay
-  excluded. Continuation-summary nodes are surfaced as `compact_boundary`
-  markers, matching the Claude compact-boundary convention. Exported
-  transcripts open with the same summary step and likewise drop
-  pre-continuation steps; when an export is the fallback source, earlier eras
-  can still be recovered from the node forest unless the export carries real
-  content before the boundary. Verified against a live Devin CLI database
-  2026-09-25.
+  conversation thread", and earlier threads remain on disconnected root trees
+  linked via `metadata.summarized_from` on each continuation summary node, or
+  on sibling subtrees branching off a shared prefix. The parser recovers those
+  pre-continuation eras: across multi-generation compactions,
+  `metadata.summarized_from` recursively unwinds each prior era from its leaf
+  node back to its root; for structures lacking `summarized_from`, sibling
+  subtrees headed by a system node that hang off chain nodes preceding an
+  on-chain summary are linearized into messages (sibling nodes sharing one
+  `message_id` are pending/committed duplicates resolved to the higher
+  `node_id`; forks with distinct message_ids resolve toward the deepest subtree,
+  the era's surviving line), while user- or assistant-headed siblings are edits
+  and abandoned retries and stay excluded. Continuation-summary nodes are
+  surfaced as `compact_boundary` markers, matching the Claude compact-boundary
+  convention. Exported transcripts open with the same summary step and likewise
+  drop pre-continuation steps; when an export is the fallback source,
+  earlier eras can still be recovered from the node forest unless the export
+  carries real content before the boundary. Verified against a live Devin CLI
+  database 2026-09-26.
   A valid `message_nodes` representation is preferred over an export because
   the explicit export can lag the live session. Export JSON is used when the
   node table cannot provide an ordered chain, the session has no nodes, or a
