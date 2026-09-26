@@ -472,17 +472,16 @@ describe("AssistantTurn", () => {
     await tick();
 
     // The code fence stays transcript-visible so the collapsed
-    // placeholder renders — for the child row and the final output alike.
+    // placeholder renders in the always-visible output row. The final
+    // output's own child row stays a static preview with no toggle —
+    // expanding it would only duplicate the output row's content.
     expect(rowKinds()).toEqual(["message"]);
     expect(document.querySelector('[data-event-kind="message"] .event-preview')?.textContent).toBe(
       "```ts",
     );
+    expect(document.querySelector('[data-event-kind="message"] button.event-toggle')).toBeNull();
     expect(document.querySelector(".turn-output .code-fence-toggle")).not.toBeNull();
     expect(document.querySelector(".turn-output .code-content")).toBeNull();
-
-    await click('[data-event-kind="message"] .event-toggle');
-    expect(document.querySelector(".assistant-turn-events .code-fence-toggle")).not.toBeNull();
-    expect(document.querySelector(".assistant-turn-events .code-content")).toBeNull();
   });
 
   it("moves source actions to the next rendered sibling when the first event is filtered", async () => {
@@ -574,5 +573,46 @@ describe("AssistantTurn", () => {
     expect(pins).toEqual([1, 1]);
     expect(document.querySelector(".turn-output .pin-btn")).toBeNull();
     expect(document.querySelector('.turn-output button[aria-label="Copy message"]')).toBeNull();
+  });
+
+  it("keeps the final output's own event row as a static collapsed preview", async () => {
+    const turn = turnFor([
+      userMsg(10, 0, "go"),
+      asstMsg(11, 1, "Working on it."),
+      asstMsg(12, 2, "Final answer."),
+    ]);
+    await render(turn);
+    turnCollapse.setTurnExpanded(turn.key, true);
+    await tick();
+
+    // The final message's event row is a non-interactive preview: no
+    // toggle, no expanded body, and no duplicate source text. The output
+    // row owns the only mounted copy of the message's search blocks.
+    const outputEventRow = document.querySelector(
+      '.turn-event[data-event-kind="message"][data-message-ordinal="2"]',
+    );
+    expect(outputEventRow).not.toBeNull();
+    expect(outputEventRow!.querySelector("button.event-toggle")).toBeNull();
+    expect(outputEventRow!.querySelector(".event-body")).toBeNull();
+    expect(outputEventRow!.querySelector(".event-preview")).not.toBeNull();
+
+    const key = '[data-search-block="2:text:0"]';
+    expect(document.querySelectorAll(key)).toHaveLength(1);
+    expect(document.querySelector(`.turn-output ${key}`)).not.toBeNull();
+
+    // A search reveal that expands the event's disclosure cannot change
+    // that: the preview row ignores expansion state entirely.
+    turnCollapse.setEventExpanded(turn.finalOutput!.key, true);
+    await tick();
+    expect(outputEventRow!.querySelector("button.event-toggle")).toBeNull();
+    expect(outputEventRow!.querySelector(".event-body")).toBeNull();
+    expect(document.querySelectorAll(key)).toHaveLength(1);
+    expect(document.querySelector(`.turn-output ${key}`)).not.toBeNull();
+
+    // Sibling message events keep their normal toggle disclosure.
+    const otherRow = document.querySelector(
+      '.turn-event[data-event-kind="message"][data-message-ordinal="1"]',
+    );
+    expect(otherRow?.querySelector("button.event-toggle")).not.toBeNull();
   });
 });

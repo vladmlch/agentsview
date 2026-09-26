@@ -13,10 +13,12 @@ const LOC = {
   row: ".virtual-row",
 } as const;
 
+// displayRows counts the flattened transcript rows: each user prompt is one
+// row and each collapsed assistant turn adds a header/final-output pair.
 const SESSIONS = {
-  ALPHA_5: { project: "project-alpha", count: 3, displayRows: 5 },
-  ALPHA_2: { project: "project-alpha", count: 2, displayRows: 2 },
-  BETA_6: { project: "project-beta", count: 3, displayRows: 5 },
+  ALPHA_5: { project: "project-alpha", count: 3, displayRows: 7 },
+  ALPHA_2: { project: "project-alpha", count: 2, displayRows: 3 },
+  BETA_6: { project: "project-beta", count: 3, displayRows: 7 },
   DELTA_5500: { project: "project-delta", count: 2750 },
 };
 
