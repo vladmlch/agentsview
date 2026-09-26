@@ -64,6 +64,8 @@
   "header_transcript_filter_label": "블록 유형 필터",
   "header_transcript_visibility": "블록 표시 여부",
   "header_transcript_show_all": "모두 표시",
+  "transcript_expand_all": "모두 펼치기",
+  "transcript_collapse_all": "모두 접기",
   "header_transcript_blocks_user": "사용자 메시지",
   "header_transcript_blocks_assistant": "어시스턴트 텍스트",
   "header_transcript_blocks_thinking": "사고 블록",

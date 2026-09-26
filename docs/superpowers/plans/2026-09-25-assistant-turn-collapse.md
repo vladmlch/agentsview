@@ -780,7 +780,7 @@ Paraglide JS, Playwright.
   buttons and affect every assistant turn/event/nested output across unloaded
   pages and current filters. Hide these buttons in focused mode.
 
-- [ ] **Step 1: Write failing search-reveal integration tests**
+- [x] **Step 1: Write failing search-reveal integration tests**
 
   Update `MessageList-search.test.ts`: with only user blocks visible, normal
   mode search for a thinking/tool-output needle must return its match,
@@ -790,7 +790,7 @@ Paraglide JS, Playwright.
   is active; assert the manual choice hides it immediately and remains after
   closing search.
 
-- [ ] **Step 2: Run the focused search test and verify RED**
+- [x] **Step 2: Run the focused search test and verify RED**
 
   ```bash
   ./node_modules/.bin/vp test run \
@@ -800,14 +800,14 @@ Paraglide JS, Playwright.
   Expected: FAIL because current search indexing excludes filter-hidden blocks
   and the virtualizer cannot expand a parent turn.
 
-- [ ] **Step 3: Expand the owning turn before ordinal navigation**
+- [x] **Step 3: Expand the owning turn before ordinal navigation**
 
   In `scrollToOrdinal`, search reveal, external pending-scroll, and `j`/`k`
   navigation, look up the source message's `AssistantTurnItem`. Set that turn's
   event state to expanded before computing the destination virtual-row index.
   Preserve existing delayed-load and request-cancellation checks.
 
-- [ ] **Step 4: Add older-page key migration and streaming assertions**
+- [x] **Step 4: Add older-page key migration and streaming assertions**
 
   On each new `TranscriptNode` projection, compare the prior and current leading
   partial turn keys. Call `turnCollapse.migrateTurnKey(oldKey, newKey)` when
@@ -815,14 +815,14 @@ Paraglide JS, Playwright.
   stays expanded after `loadOlder` and the active final-output row updates as
   `content_length` grows while the turn stays collapsed by default.
 
-- [ ] **Step 5: Add `j`/`k` and prompt-jump tests**
+- [x] **Step 5: Add `j`/`k` and prompt-jump tests**
 
   In `App.test.ts`, assert that multiple child events from one `DbMessage`
   still contribute one navigation ordinal; a collapsed event target expands its
   turn; turn-header rows are not navigation stops; and Shift+J/K continues to
   skip system-boundary rows and respect the user-block filter.
 
-- [ ] **Step 6: Add transcript-strip bulk controls and filter interaction**
+- [x] **Step 6: Add transcript-strip bulk controls and filter interaction**
 
   In `AppHeader.svelte`, add one toggle button to `.transcript-strip` in normal
   mode only. Label it `Expand all` unless every visible eligible assistant
@@ -837,7 +837,7 @@ Paraglide JS, Playwright.
   manual filter override in `AppHeader.test.ts` and
   `MessageList-search.test.ts`.
 
-- [ ] **Step 7: Add localized bulk-action labels**
+- [x] **Step 7: Add localized bulk-action labels**
 
   Add `transcript_expand_all` and `transcript_collapse_all` to every locale
   using the source copy `Expand all` and `Collapse all`. Run:
@@ -848,7 +848,7 @@ Paraglide JS, Playwright.
 
   Expected: Paraglide compilation completes with no missing-key error.
 
-- [ ] **Step 8: Run search, list, navigation, and header tests**
+- [x] **Step 8: Run search, list, navigation, and header tests**
 
   ```bash
   ./node_modules/.bin/vp test run \
@@ -867,7 +867,7 @@ Paraglide JS, Playwright.
   restoration/persistence, ordinal navigation, pagination migration,
   streaming, focused-mode controls, and bulk actions.
 
-- [ ] **Step 9: Commit the interaction task**
+- [x] **Step 9: Commit the interaction task**
 
   ```bash
   git add \
