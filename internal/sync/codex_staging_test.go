@@ -231,15 +231,16 @@ func TestSyncSingleSessionStagedPublishesRealContent(t *testing.T) {
 	found := false
 	for _, m := range msgs {
 		for _, tc := range m.ToolCalls {
-			if tc.ToolUseID != "call_a" || len(tc.ResultEvents) == 0 {
+			if tc.ToolUseID != "call_a" {
 				continue
 			}
 			found = true
-			require.NotContains(t, tc.ResultEvents[0].Content, "staged:",
+			require.NotContains(t, tc.ResultContent, "staged:",
 				"the single-session path must publish real output, "+
 					"not staged placeholders")
-			require.Contains(t, tc.ResultEvents[0].Content,
+			require.Contains(t, tc.ResultContent,
 				"build passed")
+			require.Empty(t, tc.ResultEvents)
 		}
 	}
 	require.True(t, found, "call_a output must be stored")
@@ -474,10 +475,10 @@ func TestCodexStagedToolResultSummaryStorage(t *testing.T) {
 		wantDisplay string
 		wantEvents  int
 	}{
-		{"single event", []string{"command finished"}, "", "command finished", 1},
-		{"duplicate event", []string{"command finished", "command finished"}, "", "command finished", 1},
+		{"single event", []string{"command finished"}, "command finished", "command finished", 0},
+		{"duplicate event", []string{"command finished", "command finished"}, "command finished", "command finished", 0},
 		{"multiple events", []string{"working", "command finished"}, "command finished", "command finished", 2},
-		{"sanitized single event", []string{"before\x00after"}, "", "beforeafter", 1},
+		{"sanitized single event", []string{"before\x00after"}, "beforeafter", "beforeafter", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			const uuid = "019eb791-cf7d-75c1-8439-9ed74c122d01"

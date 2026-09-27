@@ -11546,8 +11546,7 @@ func TestSyncAllReparsesCursorLegacyToolResultsFromVersion101(t *testing.T) {
 	require.Len(t, messages, 1)
 	require.Len(t, messages[0].ToolCalls, 1)
 	call := messages[0].ToolCalls[0]
-	require.Len(t, call.ResultEvents, 1)
-	assert.Equal(t, "file1.go", call.ResultEvents[0].Content)
+	require.Empty(t, call.ResultEvents)
 	assert.Equal(t, "file1.go", call.ResultContent)
 }
 

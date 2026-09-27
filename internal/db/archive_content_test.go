@@ -891,9 +891,7 @@ func TestCopyOrphanedDataProjectsArchiveContent(t *testing.T) {
 		assert.Empty(t, call.InputJSON)
 		assert.Empty(t, call.ResultContent)
 		assert.Equal(t, 9, call.ResultContentLength)
-		require.Len(t, call.ResultEvents, 1)
-		assert.Empty(t, call.ResultEvents[0].Content)
-		assert.Equal(t, "ok", call.ResultEvents[0].Status)
+		require.Empty(t, call.ResultEvents)
 		require.Len(t, messages[2].ToolCalls, 1)
 		assert.Equal(t, "child", messages[2].ToolCalls[0].SubagentSessionID)
 		assert.Empty(t, messages[2].ToolCalls[0].InputJSON)
@@ -1328,15 +1326,16 @@ func TestArchiveProjectionOfLateToolResults(t *testing.T) {
 			}
 			require.Len(t, msgs[0].ToolCalls, 1)
 			call := msgs[0].ToolCalls[0]
-			require.Len(t, call.ResultEvents, 1)
-			assert.Equal(t, "ok", call.ResultEvents[0].Status)
-			assert.Equal(t, 11, call.ResultEvents[0].ContentLength)
 			if policy.OmitsToolContent() {
 				assert.Empty(t, call.ResultContent)
+				require.Len(t, call.ResultEvents, 1)
+				assert.Equal(t, "ok", call.ResultEvents[0].Status)
+				assert.Equal(t, 11, call.ResultEvents[0].ContentLength)
 				assert.Empty(t, call.ResultEvents[0].Content)
 			} else {
 				assert.Equal(t, "tool output", call.ResultContent)
-				assert.Equal(t, "tool output", call.ResultEvents[0].Content)
+				assert.Equal(t, 11, call.ResultContentLength)
+				require.Empty(t, call.ResultEvents)
 			}
 		})
 	}

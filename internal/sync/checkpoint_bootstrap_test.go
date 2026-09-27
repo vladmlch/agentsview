@@ -123,6 +123,12 @@ func TestCodexCheckpointAdoptionIsLazyForUpgradedArchive(t *testing.T) {
 		for j := range expected[i].ToolCalls {
 			// Rendering is parser input to the write projection, not a stored field.
 			expected[i].ToolCalls[j].Rendering = ""
+			if db.ResultContentDuplicatesSingleEvent(
+				expected[i].ToolCalls[j].ResultContent,
+				expected[i].ToolCalls[j].ResultEvents,
+			) {
+				expected[i].ToolCalls[j].ResultEvents = nil
+			}
 		}
 	}
 	require.Equal(t, expected, stored)

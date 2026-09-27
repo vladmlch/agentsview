@@ -167,6 +167,32 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 		// go and the inserted events are scanned with their real indexes.
 		events := q.InsertedResultEvents(u.Position)
 		if len(events) == 0 {
+			if fact.ResultContent != "" {
+				deleteKeys = append(deleteKeys, db.FindingDeleteKey{
+					MessageOrdinal: fact.MessageOrdinal,
+					CallIndex:      fact.CallIndex,
+					LocationKind:   "tool_result",
+				})
+				secretScanBytes.Add(int64(len(fact.ResultContent)))
+				matches := secrets.ScanDefinite(fact.ResultContent)
+				for _, match := range matches {
+					callIdx := fact.CallIndex
+					insertFindings = append(insertFindings, db.SecretFinding{
+						SessionID:      m.sessionID,
+						RuleName:       match.Rule,
+						Confidence:     match.Confidence,
+						LocationKind:   "tool_result",
+						MessageOrdinal: fact.MessageOrdinal,
+						CallIndex:      &callIdx,
+						EventIndex:     nil,
+						MatchStart:     match.Start,
+						MatchEnd:       match.End,
+						MatchIndex:     match.Index,
+						RedactedMatch:  match.Redacted,
+						RulesVersion:   secrets.DefiniteRulesVersion(),
+					})
+				}
+			}
 			continue
 		}
 		deleteKeys = append(deleteKeys, db.FindingDeleteKey{

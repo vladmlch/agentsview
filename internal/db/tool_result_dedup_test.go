@@ -18,9 +18,10 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
 		wantStored    string
 		wantStoredLen int
 		wantLoaded    string
+		wantEvents    int
 	}{
 		{
-			name: "single event summary is not stored",
+			name: "single event summary is stored directly",
 			call: ToolCall{
 				ToolName:            "Bash",
 				Category:            "Bash",
@@ -35,12 +36,13 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
 					ContentLength: len("total 4\ndrwxr-xr-x"),
 				}},
 			},
-			wantStored:    "",
+			wantStored:    "total 4\ndrwxr-xr-x",
 			wantStoredLen: len("total 4\ndrwxr-xr-x"),
 			wantLoaded:    "total 4\ndrwxr-xr-x",
+			wantEvents:    0,
 		},
 		{
-			name: "timed event summary is not stored",
+			name: "timed event summary is stored with its events",
 			call: ToolCall{
 				ToolName: "Bash", Category: "Bash", ToolUseID: "call_timed",
 				ResultContent: "output", ResultContentLength: len("output"),
@@ -49,7 +51,10 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
 					{ToolUseID: "call_timed", Source: "tool_execution", Status: "completed", Content: "output", ContentLength: len("output")},
 				},
 			},
-			wantStored: "", wantStoredLen: len("output"), wantLoaded: "output",
+			wantStored:    "output",
+			wantStoredLen: len("output"),
+			wantLoaded:    "output",
+			wantEvents:    2,
 		},
 		{
 			name: "multi event summary is stored",
@@ -83,6 +88,7 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
 			wantStored:    "agent-1:\nfirst\n\nagent-2:\nsecond",
 			wantStoredLen: len("agent-1:\nfirst\n\nagent-2:\nsecond"),
 			wantLoaded:    "agent-1:\nfirst\n\nagent-2:\nsecond",
+			wantEvents:    2,
 		},
 		{
 			name: "single event summary that differs is stored",
@@ -104,6 +110,7 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
 			wantStored:    "agent-1:\nonly",
 			wantStoredLen: len("agent-1:\nonly"),
 			wantLoaded:    "agent-1:\nonly",
+			wantEvents:    1,
 		},
 		{
 			name: "blocked category keeps its blanked shape",
@@ -124,6 +131,7 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
 			wantStored:    "",
 			wantStoredLen: 4096,
 			wantLoaded:    "",
+			wantEvents:    1,
 		},
 		{
 			name: "empty summary over a blank event stays empty",
@@ -144,6 +152,7 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
 			wantStored:    "",
 			wantStoredLen: 0,
 			wantLoaded:    "",
+			wantEvents:    1,
 		},
 	}
 
@@ -185,7 +194,7 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
 				msgs[0].ToolCalls[0].ResultContent,
 				"loaded ToolCall.ResultContent")
 			assert.Len(t, msgs[0].ToolCalls[0].ResultEvents,
-				len(call.ResultEvents), "result events survive")
+				tt.wantEvents, "result events count")
 			tx, err := d.getWriter().Begin(t.Context())
 			require.NoError(t, err)
 			defer func() { require.NoError(t, tx.Rollback()) }()
@@ -376,7 +385,7 @@ func TestSubagentLinkKeepsDedupedSummary(t *testing.T) {
 	}
 
 	content, length := stored()
-	require.Empty(t, content, "insert must dedup the single-event summary")
+	require.Equal(t, "agent finished", content, "insert must store the single-event summary directly")
 	require.Equal(t, len("agent finished"), length)
 
 	link := func(result string) {
@@ -397,7 +406,7 @@ func TestSubagentLinkKeepsDedupedSummary(t *testing.T) {
 
 	link("agent finished")
 	content, length = stored()
-	assert.Empty(t, content, "link repeating the event must stay deduped")
+	assert.Equal(t, "agent finished", content, "link repeating the event stays stored directly")
 	assert.Equal(t, len("agent finished"), length)
 
 	msgs, err := d.GetMessages(t.Context(), "s-link", 0, 10, true)
@@ -406,6 +415,7 @@ func TestSubagentLinkKeepsDedupedSummary(t *testing.T) {
 	require.Len(t, msgs[0].ToolCalls, 1)
 	assert.Equal(t, "agent finished", msgs[0].ToolCalls[0].ResultContent)
 	assert.Equal(t, "agent-child", msgs[0].ToolCalls[0].SubagentSessionID)
+	assert.Empty(t, msgs[0].ToolCalls[0].ResultEvents, "no redundant single event stored")
 
 	link("agent finished with a longer final report")
 	content, length = stored()
@@ -463,7 +473,7 @@ func TestOmittedResultContentLengthRoundTrips(t *testing.T) {
 			Content: "running", HasToolUse: true,
 			ToolCalls: []ToolCall{call("call_nolen")},
 		}}))
-		got := loaded(t, d, "s-nolen", 1)
+		got := loaded(t, d, "s-nolen", 0)
 		assert.Equal(t, summary, got.ResultContent)
 		assert.Equal(t, len(summary), got.ResultContentLength)
 	})
@@ -484,7 +494,7 @@ func TestOmittedResultContentLengthRoundTrips(t *testing.T) {
 			ReplaceMessages: true,
 		}})
 		require.NoError(t, err)
-		got := loaded(t, d, "s-batch-nolen", 1)
+		got := loaded(t, d, "s-batch-nolen", 0)
 		assert.Equal(t, summary, got.ResultContent)
 		assert.Equal(t, len(summary), got.ResultContentLength)
 	})
@@ -500,7 +510,7 @@ func TestOmittedResultContentLengthRoundTrips(t *testing.T) {
 			Content: "running", HasToolUse: true,
 			ToolCalls: []ToolCall{wrong},
 		}}))
-		got := loaded(t, d, "s-wrong", 1)
+		got := loaded(t, d, "s-wrong", 0)
 		assert.Equal(t, summary, got.ResultContent)
 		assert.Equal(t, len(summary), got.ResultContentLength)
 	})

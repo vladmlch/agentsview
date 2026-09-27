@@ -705,7 +705,7 @@ func TestIncrementalSignalMaintainerParityWithFullResync(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.Len(t, findings, 1, "the AWS key in the output must be found")
-	assert.Equal(t, "tool_result_event", findings[0].LocationKind)
+	assert.Equal(t, "tool_result", findings[0].LocationKind)
 
 	assert.Equal(t, 1, sess.ToolFailureSignalCount, "failure detection reads the deduplicated event content")
 	incrementalSignals := snapshotSessionSignals(sess)

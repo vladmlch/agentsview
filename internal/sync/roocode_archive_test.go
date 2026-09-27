@@ -98,11 +98,10 @@ func TestSyncRooCodeLateCommandResultUpdatesStoredToolCall(t *testing.T) {
 	require.Len(t, msgs, 2,
 		"the paired output must not appear as an extra message")
 	require.Len(t, msgs[1].ToolCalls, 1)
-	events := msgs[1].ToolCalls[0].ResultEvents
-	require.Len(t, events, 1,
-		"the stored tool call must carry the late result event")
-	assert.Equal(t, "errored", events[0].Status)
-	assert.Contains(t, events[0].Content, "exit code 1")
+	call := msgs[1].ToolCalls[0]
+	require.Empty(t, call.ResultEvents,
+		"the single late result event is stored directly in result_content")
+	assert.Contains(t, call.ResultContent, "exit code 1")
 }
 
 // SyncAllSince must exclude unchanged RooCode tasks on stat information
