@@ -105,7 +105,7 @@ func TestCodexCheckpointIncrementalResumeAdvancesCheckpoint(t *testing.T) {
 	require.Len(t, msgs, 2)
 	require.Len(t, msgs[1].ToolCalls, 1)
 	assert.Equal(t, "done", msgs[1].ToolCalls[0].ResultContent)
-	require.Len(t, msgs[1].ToolCalls[0].ResultEvents, 1)
+	require.Empty(t, msgs[1].ToolCalls[0].ResultEvents)
 	assert.Equal(t, 100_000, msgs[1].ContextTokens)
 	assert.Equal(t, 250, msgs[1].OutputTokens)
 	assert.NotEmpty(t, msgs[1].TokenUsage,

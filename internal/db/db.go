@@ -633,7 +633,10 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // are now stitched across history_base ancestor chains into the leaf
 // segment's session, restoring the initial prompt and complete conversation
 // history in the leaf page's transcript.)
-const dataVersion = 154
+// (155: inverted tool result storage: single-event results are stored directly
+// in tool_calls.result_content with 0 rows in tool_result_events, eliminating
+// duplicate output/history drawers across all providers.)
+const dataVersion = 155
 
 const archiveOnlyVersionBase = 1 << 20
 

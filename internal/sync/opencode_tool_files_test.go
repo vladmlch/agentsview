@@ -76,7 +76,7 @@ func TestOpenCodeV2ToolFilesSurviveSync(t *testing.T) {
 				require.NoError(t, database.Reader().QueryRowContext(t.Context(),
 					`SELECT COALESCE(result_content, '') FROM tool_calls WHERE session_id = ? AND tool_use_id = ?`,
 					"opencode:ses_files", call.ToolUseID).Scan(&storedSummary))
-				assert.Empty(t, storedSummary, "timing and payload events keep only one stored copy")
+				assert.Equal(t, stored, storedSummary, "summary is stored directly on the tool call")
 				var blocks []map[string]any
 				require.NoError(t, json.Unmarshal([]byte(stored), &blocks))
 				if i == 0 {

@@ -70,9 +70,9 @@ type codexStagingSink struct {
 	findingPos     []stagedFindingPos
 	eventByCallKey map[string]int64
 	eventSeq       int64
-	// A sole event is also its call summary. Keep only its display length
+	// A sole event is also its call summary. Keep only its content
 	// and failure verdict so publishing need not load the payload again.
-	singleSummaryLengths map[string]int
+	singleSummaries map[string]string
 	// contentFailures records per-call content-failure verdicts captured
 	// during ingestion for sole events or publication for multi-event
 	// summaries, so the engine can reuse them in the signal pass.
@@ -603,14 +603,14 @@ func (s *codexStagingSink) AppendToolResultEvent(ctx context.Context,
 	s.eventByCallKey[stageKey]++
 	s.addEventFindings(stageKey, eventIndex, storedContent)
 	if blanked == 0 && eventIndex == 0 {
-		if s.singleSummaryLengths == nil {
-			s.singleSummaryLengths = make(map[string]int)
+		if s.singleSummaries == nil {
+			s.singleSummaries = make(map[string]string)
 		}
 		summary := storedContent
 		if !summaryParticipates {
 			summary = ""
 		}
-		s.singleSummaryLengths[stageKey] = len(summary)
+		s.singleSummaries[stageKey] = summary
 		s.recordContentOutcome(stageKey, summary, ev.Status, signals.IsUnknownResultContent(storedContent))
 		if !s.disableSignals {
 			if s.contentFailures == nil {
@@ -623,7 +623,7 @@ func (s *codexStagingSink) AppendToolResultEvent(ctx context.Context,
 			s.contentFailures[stageKey] = verdict
 		}
 	} else {
-		delete(s.singleSummaryLengths, stageKey)
+		delete(s.singleSummaries, stageKey)
 		delete(s.contentFailures, stageKey)
 	}
 
@@ -696,13 +696,13 @@ func (s *codexStagingSink) PublishToolResultImages(ctx context.Context) error {
 		}
 	}
 
-	s.singleSummaryLengths = make(map[string]int)
+	s.singleSummaries = make(map[string]string)
 	s.contentFailures = make(map[string]db.StagedToolVerdict)
 	s.findings = nil
 	s.findingPos = nil
 	s.eventByCallKey = make(map[string]int64)
 	type singleSummaryCandidate struct {
-		length  int
+		summary string
 		failure bool
 		outcome string
 	}
@@ -739,7 +739,7 @@ func (s *codexStagingSink) PublishToolResultImages(ctx context.Context) error {
 			if participates == 0 {
 				summary = ""
 			}
-			candidate := singleSummaryCandidate{length: len(summary), outcome: string(signals.ClassifyToolOutcome(signals.ToolCallRow{ToolName: s.toolNameByCallKey[callKey], Category: s.categoryByCallKey[callKey], ResultContent: summary, ResultContentLength: len(summary), EventStatus: s.statusByCallKey[callKey], ResultContentUnknown: signals.IsUnknownResultContent(summary)}))}
+			candidate := singleSummaryCandidate{summary: summary, outcome: string(signals.ClassifyToolOutcome(signals.ToolCallRow{ToolName: s.toolNameByCallKey[callKey], Category: s.categoryByCallKey[callKey], ResultContent: summary, ResultContentLength: len(summary), EventStatus: s.statusByCallKey[callKey], ResultContentUnknown: signals.IsUnknownResultContent(summary)}))}
 			if !s.disableSignals {
 				candidate.failure = signals.IsFailure(signals.ToolCallRow{
 					Category:      s.categoryByCallKey[callKey],
@@ -761,7 +761,7 @@ func (s *codexStagingSink) PublishToolResultImages(ctx context.Context) error {
 		return s.stageErr
 	}
 	for callKey, candidate := range candidates {
-		s.singleSummaryLengths[callKey] = candidate.length
+		s.singleSummaries[callKey] = candidate.summary
 		if !s.disableSignals {
 			s.contentFailures[callKey] = db.StagedToolVerdict{Failure: candidate.failure, Outcome: candidate.outcome}
 		}
@@ -794,6 +794,37 @@ func (s *codexStagingSink) addEventFindings(
 	}
 }
 
+func (s *codexStagingSink) isCollapsedSingleEvent(ctx context.Context, stageKey string) bool {
+	if s.scratch == nil {
+		return false
+	}
+	var eventCount int
+	var soleContent string
+	var hasMetadata int
+	var participates int
+	var blanked int
+	err := s.scratch.QueryRowContext(ctx, `
+		SELECT COUNT(*),
+		       COALESCE(MIN(content), ''),
+		       MAX(CASE WHEN COALESCE(agent_id, '') != '' OR COALESCE(subagent_session_id, '') != '' THEN 1 ELSE 0 END),
+		       MIN(summary_participates),
+		       MAX(blanked)
+		FROM stage_events
+		WHERE call_key = ?
+	`, stageKey).Scan(&eventCount, &soleContent, &hasMetadata, &participates, &blanked)
+	if err != nil || eventCount != 1 || hasMetadata != 0 || participates != 1 || blanked != 0 {
+		return false
+	}
+	if s.blocked[s.categoryByCallKey[stageKey]] {
+		return false
+	}
+	summary, _, err := s.ResolveSummary(ctx, stageKey)
+	if err != nil || summary == "" || summary != soleContent {
+		return false
+	}
+	return true
+}
+
 // Findings returns the staged event findings with session, ordinal, and
 // call coordinates stamped from the final message model.
 func (s *codexStagingSink) Findings(
@@ -801,15 +832,22 @@ func (s *codexStagingSink) Findings(
 	positions map[string]db.StagedToolCallPosition,
 ) []db.SecretFinding {
 	out := make([]db.SecretFinding, len(s.findings))
+	ctx := context.Background()
 	for i, f := range s.findings {
 		f.SessionID = sessionID
-		pos, ok := positions[s.findingPos[i].stageKey]
+		stageKey := s.findingPos[i].stageKey
+		pos, ok := positions[stageKey]
 		if ok {
 			f.MessageOrdinal = pos.Ordinal
 			callIdx := pos.CallIndex
-			evIdx := s.findingPos[i].eventIndex
 			f.CallIndex = &callIdx
-			f.EventIndex = &evIdx
+			if s.isCollapsedSingleEvent(ctx, stageKey) {
+				f.LocationKind = "tool_result"
+				f.EventIndex = nil
+			} else {
+				evIdx := s.findingPos[i].eventIndex
+				f.EventIndex = &evIdx
+			}
 		}
 		out[i] = f
 	}
@@ -831,6 +869,25 @@ func (s *codexStagingSink) InsertEventsTx(
 		return s.stageErr
 	}
 	for stageKey, pos := range messageOrdinals {
+		var eventCount int
+		var soleStoredContent string
+		if err := s.scratch.QueryRowContext(ctx, `
+			SELECT COUNT(*),
+			       COALESCE(MIN(CASE WHEN blanked = 1 THEN '' ELSE content END), '')
+			FROM stage_events
+			WHERE call_key = ?
+		`, stageKey).Scan(&eventCount, &soleStoredContent); err != nil {
+			return fmt.Errorf(
+				"counting staged events for %s/%s: %w",
+				sessionID, pos.ToolUseID, err,
+			)
+		}
+		if eventCount == 0 {
+			continue
+		}
+		if s.isCollapsedSingleEvent(ctx, stageKey) {
+			continue
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO tool_result_events (
 				session_id, tool_call_message_ordinal, call_index,
@@ -876,9 +933,7 @@ func (s *codexStagingSink) InsertEventsTx(
 // is one call's aggregate output (the summary string itself), not the
 // whole transcript. While the summary is in hand it also records the
 // call's content-failure verdict (see ContentFailures), so the engine's
-// post-publish signal fold never resolves summaries a second time. Once that
-// verdict is recorded, a summary identical to its sole event is omitted
-// from storage while contentLength retains the displayed length.
+// post-publish signal fold never resolves summaries a second time.
 func (s *codexStagingSink) ResolveSummary(
 	ctx context.Context, stageKey string,
 ) (summary string, contentLength int, err error) {
@@ -888,8 +943,8 @@ func (s *codexStagingSink) ResolveSummary(
 	if err := ctx.Err(); err != nil {
 		return "", 0, err
 	}
-	if length, ok := s.singleSummaryLengths[stageKey]; ok {
-		return "", length, nil
+	if summary, ok := s.singleSummaries[stageKey]; ok {
+		return summary, len(summary), nil
 	}
 	blocked := s.blocked[s.categoryByCallKey[stageKey]]
 	if blocked {

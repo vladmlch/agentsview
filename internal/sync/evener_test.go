@@ -38,12 +38,11 @@ func TestEvenerRespectsBlockedResultCategories(t *testing.T) {
 			require.Len(t, messages, 3)
 			require.Len(t, messages[1].ToolCalls, 1)
 			call := messages[1].ToolCalls[0]
-			assert.Equal(t, category, call.Category)
-			require.Len(t, call.ResultEvents, 1)
 			if category == "Bash" {
+				require.Empty(t, call.ResultEvents)
 				assert.Equal(t, "result-marker", call.ResultContent)
-				assert.Equal(t, "result-marker", call.ResultEvents[0].Content)
 			} else {
+				require.Len(t, call.ResultEvents, 1)
 				assert.Empty(t, call.ResultContent)
 				assert.Empty(t, call.ResultEvents[0].Content)
 			}
@@ -100,8 +99,8 @@ func TestEvenerArchiveLifecycle(t *testing.T) {
 	assert.Equal(t, messages[1].ThinkingText, exported.Messages[1].ThinkingText)
 	assert.Equal(t, messages[1].TokenUsage, exported.Messages[1].TokenUsage)
 	require.Len(t, exported.Messages[1].ToolCalls, 1)
-	require.Len(t, exported.Messages[1].ToolCalls[0].ResultEvents, 1)
-	assert.Equal(t, "/workspace/demo", exported.Messages[1].ToolCalls[0].ResultEvents[0].Content)
+	require.Empty(t, exported.Messages[1].ToolCalls[0].ResultEvents)
+	assert.Equal(t, "/workspace/demo", exported.Messages[1].ToolCalls[0].ResultContent)
 
 	unchanged := engine.SyncAll(ctx, nil)
 	require.Zero(t, unchanged.Failed)

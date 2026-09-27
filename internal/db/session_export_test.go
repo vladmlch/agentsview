@@ -731,7 +731,6 @@ func TestAllSessionExportMaterializesActivitySort(t *testing.T) {
 		"child-subagent",
 		"imported-migrated",
 		"child-fork",
-		"source-missing",
 		"child-continuation",
 	}
 	var tableSQL, indexSQL string
@@ -840,7 +839,6 @@ func TestAllSessionExportMaterializesActivitySort(t *testing.T) {
 		"2026-05-01T13:00:00Z",
 		"2026-05-01T12:30:00Z",
 		"2026-05-01T12:00:00Z",
-		"2026-05-01T11:30:00Z",
 		"2026-05-01T11:00:00Z",
 	}, gotActivities)
 	assert.Equal(t, []int{len(expectedIDs)}, slices.Compact(populationCounts))

@@ -64,12 +64,13 @@ func TestStagedMultiAgentToolObservationParity(t *testing.T) {
 func TestStagedSingleEventSummaryThenAdditionalEvent(t *testing.T) {
 	for _, tc := range []struct {
 		name, content string
+		wantSummary   string
 		length        int
 		failure       bool
 	}{
-		{"anonymous", "command not found", 17, true},
-		{"whitespace", " \n", 0, false},
-		{"sanitized", "ok\x00", 2, false},
+		{"anonymous", "command not found", "command not found", 17, true},
+		{"whitespace", " \n", "", 0, false},
+		{"sanitized", "ok\x00", "ok", 2, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sink, err := newCodexStagingSink(t.Context(), t.TempDir(), nil)
@@ -85,7 +86,7 @@ func TestStagedSingleEventSummaryThenAdditionalEvent(t *testing.T) {
 			key := db.StagedToolCallKey("call", 0)
 			summary, length, err := sink.ResolveSummary(t.Context(), key)
 			require.NoError(t, err)
-			require.Empty(t, summary)
+			require.Equal(t, tc.wantSummary, summary)
 			require.Equal(t, tc.length, length)
 			require.Equal(t, tc.failure, sink.ContentFailures()[key].Failure)
 			sink.AppendToolResultEvent(t.Context(), "call", nil, parser.ParsedToolResultEvent{
@@ -120,7 +121,7 @@ func BenchmarkStagedSingleEventSummary(b *testing.B) {
 			for b.Loop() {
 				summary, length, err := sink.ResolveSummary(b.Context(), key)
 				require.NoError(b, err)
-				require.Empty(b, summary)
+				require.Equal(b, strings.Repeat("x", size), summary)
 				require.Equal(b, size, length)
 			}
 		})
