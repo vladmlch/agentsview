@@ -312,15 +312,16 @@ func TestEngineImagePolicyDeduplicatesLateProjectedResult(t *testing.T) {
 		}},
 	}))
 
-	var storedSummary, storedEvent string
+	var storedSummary string
 	require.NoError(t, database.Reader().QueryRowContext(
 		t.Context(), "SELECT COALESCE(result_content, '') FROM tool_calls WHERE session_id = ?", "late-result",
 	).Scan(&storedSummary))
+	var eventCount int
 	require.NoError(t, database.Reader().QueryRowContext(
-		t.Context(), "SELECT content FROM tool_result_events WHERE session_id = ?", "late-result",
-	).Scan(&storedEvent))
-	assert.Empty(t, storedSummary)
-	assert.Equal(t, want, storedEvent)
+		t.Context(), "SELECT COUNT(*) FROM tool_result_events WHERE session_id = ?", "late-result",
+	).Scan(&eventCount))
+	assert.Equal(t, want, storedSummary)
+	assert.Zero(t, eventCount)
 }
 
 func TestReadOnlyResyncReplacementCarriesImagePolicy(t *testing.T) {
@@ -357,10 +358,16 @@ func TestReadOnlyResyncReplacementCarriesImagePolicy(t *testing.T) {
 					ToolCalls: []db.ToolCall{{
 						ToolUseID:     "copied-call",
 						ResultContent: copiedContent,
-						ResultEvents: []db.ToolResultEvent{{
-							ToolUseID: "copied-call", Source: "tool",
-							Status: "completed", Content: copiedContent,
-						}},
+						ResultEvents: []db.ToolResultEvent{
+							{
+								ToolUseID: "copied-call", Source: "tool",
+								Status: "completed", Content: copiedContent,
+							},
+							{
+								ToolUseID: "copied-call", Source: "tool",
+								Status: "completed", Content: copiedContent,
+							},
+						},
 					}},
 				}}))
 			}
@@ -399,10 +406,16 @@ func TestReadOnlyResyncReplacementCarriesImagePolicy(t *testing.T) {
 				messages[0].ToolCalls = []db.ToolCall{{
 					ToolUseID:     "call-image",
 					ResultContent: content,
-					ResultEvents: []db.ToolResultEvent{{
-						ToolUseID: "call-image", Source: "tool",
-						Status: "completed", Content: content,
-					}},
+					ResultEvents: []db.ToolResultEvent{
+						{
+							ToolUseID: "call-image", Source: "tool",
+							Status: "completed", Content: content,
+						},
+						{
+							ToolUseID: "call-image", Source: "tool",
+							Status: "completed", Content: content,
+						},
+					},
 				}}
 				return database.ReplaceSessionMessages(t.Context(), "keep0", messages)
 			}
@@ -426,7 +439,7 @@ func TestReadOnlyResyncReplacementCarriesImagePolicy(t *testing.T) {
 				require.Len(t, messages, 1)
 				require.Len(t, messages[0].ToolCalls, 1)
 				assert.NotContains(t, messages[0].ToolCalls[0].ResultContent, "input_image")
-				require.Len(t, messages[0].ToolCalls[0].ResultEvents, 1)
+				require.Len(t, messages[0].ToolCalls[0].ResultEvents, 2)
 				assert.NotContains(t, messages[0].ToolCalls[0].ResultEvents[0].Content,
 					"input_image",
 				)
@@ -546,7 +559,7 @@ func TestCodexImageRetentionAcrossFullAndLateResults(t *testing.T) {
 						} else {
 							assert.Contains(t, calls[0].ResultContent, `"image_ref":"asset://`)
 						}
-						count := 1
+						count := 0
 						if late {
 							count = 2
 						}
@@ -634,13 +647,14 @@ func TestToolResultImagesOffloadFullIngest(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, messages, 1)
 	require.Len(t, messages[0].ToolCalls, 1)
-	require.Len(t, messages[0].ToolCalls[0].ResultEvents, 1)
-	require.Contains(t, messages[0].ToolCalls[0].ResultEvents[0].Content, `"image_ref":"asset://`)
+	require.Empty(t, messages[0].ToolCalls[0].ResultEvents)
+	require.Contains(t, messages[0].ToolCalls[0].ResultContent, `"image_ref":"asset://`)
 	page, err := database.ListSecretFindings(t.Context(), db.SecretFindingFilter{})
 	require.NoError(t, err)
 	require.Len(t, page.Findings, 1)
 	finding := page.Findings[0]
-	content := messages[0].ToolCalls[0].ResultEvents[0].Content
+	assert.Equal(t, "tool_result", finding.LocationKind)
+	content := messages[0].ToolCalls[0].ResultContent
 	require.LessOrEqual(t, finding.MatchEnd, len(content))
 	assert.Equal(t, "AKIA7QHWN2DKR4FYPLJM", content[finding.MatchStart:finding.MatchEnd],
 		"secret offsets must address the stored content after image offload")

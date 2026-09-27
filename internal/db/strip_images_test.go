@@ -155,7 +155,28 @@ func TestStripToolImagesRejectsInvalidBefore(t *testing.T) {
 func TestStripToolImagesUpdatesDeduplicatedCallLength(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "deduped", "project")
-	insertMessages(t, d, testImageMessage("deduped"))
+	content := testInlineImageContent()
+	require.NoError(t, d.InsertMessages(t.Context(), []Message{{
+		SessionID: "deduped",
+		Ordinal:   0,
+		Role:      "assistant",
+		Content:   "answer",
+		ToolCalls: []ToolCall{{
+			ToolName:            "Read",
+			Category:            "Read",
+			ToolUseID:           "call-1",
+			ResultContent:       "",
+			ResultContentLength: len(content),
+		}},
+	}}))
+	_, err := d.getWriter().Exec(t.Context(), `
+		INSERT INTO tool_result_events (
+			session_id, tool_call_message_ordinal, call_index,
+			tool_use_id, source, status, content, content_length, event_index
+		) VALUES ('deduped', 0, 0, 'call-1', 'tool', 'completed', ?, ?, 0)`,
+		content, len(content),
+	)
+	require.NoError(t, err)
 
 	var storedCall string
 	var beforeLength int
@@ -167,7 +188,7 @@ func TestStripToolImagesUpdatesDeduplicatedCallLength(t *testing.T) {
 	assert.Empty(t, storedCall)
 	assert.Positive(t, beforeLength)
 
-	_, err := d.StripToolImages(t.Context(), StripImagesFilter{})
+	_, err = d.StripToolImages(t.Context(), StripImagesFilter{})
 	require.NoError(t, err)
 
 	var callContent, eventContent string
@@ -348,7 +369,7 @@ func TestStripToolImagesRollsBackWhenEventUpdateFails(t *testing.T) {
 	}, report)
 	var committedContent string
 	require.NoError(t, d.getReader().QueryRow(t.Context(), `
-		SELECT content FROM tool_result_events WHERE session_id = 'committed'`,
+		SELECT result_content FROM tool_calls WHERE session_id = 'committed'`,
 	).Scan(&committedContent))
 	assert.Contains(t, committedContent, "agentsview_image")
 	assert.NotContains(t, committedContent, "input_image")
@@ -412,7 +433,7 @@ func TestStripToolImagesRefreshesSecretFindings(t *testing.T) {
 	message := testImageMessage("secrets")
 	message.Content = "message key: " + key
 	content := `[{"type":"input_image","image_url":"data:image/png;base64,AAEC"},{"type":"text","text":"` + key + `"}]`
-	message.ToolCalls[0].ResultContent = content
+	message.ToolCalls[0].ResultContent = "summary"
 	message.ToolCalls[0].ResultEvents[0].Content = content
 	insertMessages(t, d, message)
 	// Seed the existing event finding at its pre-strip offset. The rescan must
@@ -463,7 +484,7 @@ func TestStripToolImagesRescansStoredEventCoordinates(t *testing.T) {
 			key := "AKIA" + "7QHWN2DKR4FYPLJA"
 			content := message.ToolCalls[0].ResultEvents[0].Content
 			content = strings.TrimSuffix(content, "]") + `,{"type":"text","text":"` + key + `"}]`
-			message.ToolCalls[0].ResultContent = content
+			message.ToolCalls[0].ResultContent = "summary"
 			message.ToolCalls[0].ResultEvents[0].Content = content
 			insertMessages(t, d, message)
 			// Copied archives keep stored event IDs, including rows with no call.
@@ -566,7 +587,7 @@ func TestStripPublicationSequence(t *testing.T) {
 	const wantStripped = `[{"type":"text","text":"before"},{"byte_size":3,"media_type":"image/png","sha256":"","text":"[Image: image/png, 3 bytes]","type":"agentsview_image","version":1},{"type":"text","text":"after"}]`
 	var eventContent string
 	require.NoError(t, d.getReader().QueryRow(t.Context(),
-		"SELECT content FROM tool_result_events WHERE session_id = ?", "pub-unchanged",
+		"SELECT result_content FROM tool_calls WHERE session_id = ?", "pub-unchanged",
 	).Scan(&eventContent))
 	assert.Equal(t, wantStripped, eventContent, "post-strip content preserves text around the placeholder")
 

@@ -18,9 +18,9 @@ import (
 // memory, so neither the event contents nor the summaries ever live as one
 // full in-memory session slice.
 type StagedToolResults interface {
-	// ResolveSummary returns the stored result summary and its length for
-	// one tool call. A summary identical to its sole event is omitted,
-	// while its length and the content-failure verdict retain the full text.
+	// ResolveSummary returns the result summary and its length for one tool
+	// call. Single-event results return the full summary to be stored
+	// directly in tool_calls.result_content.
 	ResolveSummary(
 		ctx context.Context, toolUseID string,
 	) (string, int, error)

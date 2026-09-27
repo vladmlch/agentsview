@@ -189,8 +189,8 @@ func TestLateResultRequiresMetadataForArchivedEvents(t *testing.T) {
 		HasToolUse: true, ToolCalls: []ToolCall{{
 			SessionID: "s1",
 			ToolName:  "exec_command", Category: "Bash", ToolUseID: "call",
-			ResultContent: "old",
-			ResultEvents:  []ToolResultEvent{{ToolUseID: "call", Content: "old", ContentLength: 3}},
+			ResultContentLength: 3,
+			ResultEvents:        []ToolResultEvent{{ToolUseID: "call", Content: "old", ContentLength: 3}},
 		}},
 	})
 	missing, err := d.HasMissingToolResultMetadata(t.Context(), "s1", []ToolCallPosition{{}})

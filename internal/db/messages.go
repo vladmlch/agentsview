@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -3689,15 +3690,25 @@ func applyToolCallSubagentLinkTx(ctx context.Context,
 			resultContent, resultContentLen,
 		)
 		// A linked result carries no events of its own, but the call it
-		// targets may already have one stored. Re-storing a summary the
-		// event repeats would undo the dedup on every incremental pass.
+		// targets may already have one stored. If the linked result repeats
+		// that single stored event, delete the redundant event row so the
+		// call conforms to the single-event storage model.
 		sole, err := soleToolResultEventTx(ctx,
 			tx, sessionID, messageOrdinal, callIndex, imagePolicy,
 		)
 		if err != nil {
 			return false, err
 		}
-		resultContent = DedupToolCallResultSummary(resultContent, sole)
+		if ResultContentDuplicatesSingleEvent(resultContent, sole) {
+			if _, err := tx.ExecContext(ctx,
+				`DELETE FROM tool_result_events
+				 WHERE session_id = ? AND tool_call_message_ordinal = ?
+				   AND call_index = ?`,
+				sessionID, messageOrdinal, callIndex,
+			); err != nil {
+				return false, fmt.Errorf("deleting redundant single event: %w", err)
+			}
+		}
 	}
 	if currentSubagent == storedSubagent &&
 		currentResultContentLen == resultContentLen &&
@@ -3726,9 +3737,12 @@ func applyToolCallResultUpdateTx(ctx context.Context,
 
 	position := update.Position
 	var toolCallID int64
-	var category string
+	var category, currentResultContent string
+	var currentResultContentLen int
 	if err := tx.QueryRowContext(ctx,
-		`SELECT tc.id, tc.category
+		`SELECT tc.id, tc.category,
+		        COALESCE(tc.result_content, ''),
+		        COALESCE(tc.result_content_length, 0)
 		 FROM tool_calls tc
 		 JOIN messages m ON m.id = tc.message_id
 		 WHERE tc.session_id = ? AND m.session_id = tc.session_id AND m.ordinal = ?
@@ -3736,7 +3750,7 @@ func applyToolCallResultUpdateTx(ctx context.Context,
 		   AND COALESCE(tc.tool_use_id, '') = ?`,
 		sessionID, position.MessageOrdinal, position.CallIndex,
 		update.ToolUseID,
-	).Scan(&toolCallID, &category); err != nil {
+	).Scan(&toolCallID, &category, &currentResultContent, &currentResultContentLen); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil, nil
 		}
@@ -3770,16 +3784,16 @@ func applyToolCallResultUpdateTx(ctx context.Context,
 			return false, nil, err
 		}
 	}
-	var nextEventIndex int
+
+	var eventCount int
 	if err := tx.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(event_index), -1) + 1
-		 FROM tool_result_events
+		`SELECT COUNT(*) FROM tool_result_events
 		 WHERE session_id = ? AND tool_call_message_ordinal = ?
 		   AND call_index = ?`,
 		sessionID, position.MessageOrdinal, position.CallIndex,
-	).Scan(&nextEventIndex); err != nil {
+	).Scan(&eventCount); err != nil {
 		return false, nil, fmt.Errorf(
-			"reading next event index for %s/%s: %w",
+			"counting tool result events for %s/%s: %w",
 			sessionID, update.ToolUseID, err,
 		)
 	}
@@ -3814,6 +3828,66 @@ func applyToolCallResultUpdateTx(ctx context.Context,
 		toolCall := ToolCall{ResultEvents: incoming}
 		_ = SanitizeToolCall(&toolCall)
 		incoming = toolCall.ResultEvents
+	}
+
+	if eventCount == 0 && (currentResultContent != "" || currentResultContentLen > 0) {
+		if !blocked && len(incoming) == 1 {
+			candidate := incoming[0]
+			if candidate.ContentLength == currentResultContentLen &&
+				candidate.Content == currentResultContent &&
+				candidate.AgentID == "" && candidate.SubagentSessionID == "" {
+				storedDigest := sha256.Sum256([]byte(currentResultContent))
+				if bytes.Equal(candidate.RawContentDigest, storedDigest[:]) {
+					return false, nil, nil
+				}
+			}
+		}
+		var agentID string
+		_ = tx.QueryRowContext(ctx,
+			`SELECT agent_id FROM tool_call_occurrence_agent_state
+			 WHERE session_id = ? AND message_ordinal = ? AND call_index = ?
+			 LIMIT 1`,
+			sessionID, position.MessageOrdinal, position.CallIndex,
+		).Scan(&agentID)
+		ev0Event := ToolResultEvent{
+			ToolUseID:     update.ToolUseID,
+			AgentID:       agentID,
+			Source:        "function_call_output",
+			Status:        "completed",
+			Content:       currentResultContent,
+			ContentLength: currentResultContentLen,
+			EventIndex:    0,
+		}
+		if blocked {
+			ev0Event.Content = ""
+		}
+		PrepareToolResultEvent(&ev0Event)
+		ev0Row := toolResultEventRow{
+			SessionID:      sessionID,
+			MessageOrdinal: position.MessageOrdinal,
+			CallIndex:      position.CallIndex,
+			Event:          ev0Event,
+		}
+		if err := insertToolResultEventsTx(tx, []toolResultEventRow{ev0Row}); err != nil {
+			return false, nil, err
+		}
+		if err := upsertToolCallAgentStateRows(tx, []toolResultEventRow{ev0Row}); err != nil {
+			return false, nil, err
+		}
+	}
+
+	var nextEventIndex int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(event_index), -1) + 1
+		 FROM tool_result_events
+		 WHERE session_id = ? AND tool_call_message_ordinal = ?
+		   AND call_index = ?`,
+		sessionID, position.MessageOrdinal, position.CallIndex,
+	).Scan(&nextEventIndex); err != nil {
+		return false, nil, fmt.Errorf(
+			"reading next event index for %s/%s: %w",
+			sessionID, update.ToolUseID, err,
+		)
 	}
 
 	insertRows := make([]toolResultEventRow, 0, len(incoming))
@@ -3876,6 +3950,16 @@ func applyToolCallResultUpdateTx(ctx context.Context,
 		})
 	}
 	if len(insertRows) == 0 {
+		if eventCount == 0 {
+			if _, err := tx.ExecContext(ctx,
+				`DELETE FROM tool_result_events
+				 WHERE session_id = ? AND tool_call_message_ordinal = ?
+				   AND call_index = ?`,
+				sessionID, position.MessageOrdinal, position.CallIndex,
+			); err != nil {
+				return false, nil, err
+			}
+		}
 		return metadataChanged, nil, nil
 	}
 	if err := insertToolResultEventsTx(tx, insertRows); err != nil {
@@ -3909,15 +3993,26 @@ func applyToolCallResultUpdateTx(ctx context.Context,
 				resultLength = len(summary)
 			}
 		}
+		storedSummary = summary
+	}
 
-		sole, err := soleToolResultEventTx(ctx,
-			tx, sessionID, position.MessageOrdinal, position.CallIndex,
-			imagePolicy,
-		)
-		if err != nil {
-			return false, nil, err
+	sole, err := soleToolResultEventTx(ctx,
+		tx, sessionID, position.MessageOrdinal, position.CallIndex,
+		imagePolicy,
+	)
+	if err != nil {
+		return false, nil, err
+	}
+	if ResultContentDuplicatesSingleEvent(storedSummary, sole) {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM tool_result_events
+			 WHERE session_id = ? AND tool_call_message_ordinal = ?
+			   AND call_index = ?`,
+			sessionID, position.MessageOrdinal, position.CallIndex,
+		); err != nil {
+			return false, nil, fmt.Errorf("deleting redundant single event: %w", err)
 		}
-		storedSummary = DedupToolCallResultSummary(summary, sole)
+		inserted = nil
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE tool_calls
@@ -4148,6 +4243,9 @@ func resolveToolResultEvents(msgs []Message) []toolResultEventRow {
 	var rows []toolResultEventRow
 	for _, m := range msgs {
 		for callIndex, tc := range m.ToolCalls {
+			if !ShouldPersistToolResultEvents(tc.ResultContent, tc.ResultEvents) {
+				continue
+			}
 			for eventIndex, ev := range tc.ResultEvents {
 				ev.EventIndex = eventIndex
 				ev.ContentLength = ResolveResultContentLength(
