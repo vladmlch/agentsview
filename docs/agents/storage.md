@@ -414,19 +414,24 @@ content clears them for a fresh scan.
 
 ### Tool result summaries
 
-`tool_calls.result_content` is a display summary derived from the call's
-`tool_result_events` rows at sync time. When a call has exactly one event and
-the summary equals that event's content, the summary is not stored: the column
-is empty while `result_content_length` still records the summary's size. That
-pair, an empty column with a non-zero length, tells a reader to take the text
-from the single event. Multi-event summaries, single-event summaries that differ
-from their event, calls with no events, and blocked categories store exactly
-what the parser produced. Load tool calls through the message loaders, which
-refill the summary once events are attached; a query that selects the column
-directly must apply the same fallback, and PostgreSQL and DuckDB apply the same
-write rule so their tool-call fingerprints match SQLite. Anyone reading the
-archive or a mirror by hand sees the empty column and must join the events table
-to recover the text.
+`tool_calls.result_content` stores the tool call result summary. When a tool call
+has only 1 result event and its content matches the tool call's result summary /
+output, single-event results are stored directly in `tool_calls.result_content`
+with 0 rows in `tool_result_events`. Only genuine multi-event tool calls (e.g.
+streaming or multiple subagents where events > 1 or event content differs from
+summary) have rows in `tool_result_events`. This eliminates duplicate Output and
+History sections in the UI across all providers while preserving full event
+history for streaming and multi-event agent executions.
+
+For backward compatibility with pre-v123 archives where `result_content` was
+cleared for single-event calls, `RestoreToolCallResultContent` and
+`ToolCallResultContentSQL` continue to refill `result_content` from
+`tool_result_events` when loading older records.
+
+Replicas (PostgreSQL, DuckDB, ClickHouse): the SQLite storage model change is
+implemented first. Replicas are not altered yet and will continue to replicate
+tool call result summaries without breaking. Future replication migrations can
+align mirror tables to drop redundant single-event rows accordingly.
 
 ## DuckDB Mirror
 

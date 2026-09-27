@@ -4213,7 +4213,7 @@ func TestWriteSessionIncrementalToolCallResultUpdate(t *testing.T) {
 		WHERE session_id = ? AND tool_use_id = ?`,
 		"s1", "call_cmd",
 	).Scan(&result, &resultLen))
-	assert.Empty(t, result, "the sole event already stores the summary")
+	assert.Equal(t, "command finished", result, "single event summary stored directly in tool_calls")
 	loaded, err := d.GetAllMessages(t.Context(), "s1")
 	require.NoError(t, err)
 	require.Len(t, loaded, 1)
@@ -4221,18 +4221,14 @@ func TestWriteSessionIncrementalToolCallResultUpdate(t *testing.T) {
 	assert.Equal(t, "command finished", loaded[0].ToolCalls[0].ResultContent)
 	assert.Equal(t, len("command finished"), resultLen)
 
-	var source, content, timestamp string
-	var eventIndex, eventCount int
+	var eventCount int
 	require.NoError(t, d.Reader().QueryRow(t.Context(), `
-		SELECT source, content, COALESCE(timestamp, ''), event_index
+		SELECT COUNT(*)
 		FROM tool_result_events
 		WHERE session_id = ? AND tool_use_id = ?`,
 		"s1", "call_cmd",
-	).Scan(&source, &content, &timestamp, &eventIndex))
-	assert.Equal(t, "function_call_output", source)
-	assert.Equal(t, "command finished", content)
-	assert.Equal(t, "2026-08-02T09:00:00Z", timestamp)
-	assert.Zero(t, eventIndex)
+	).Scan(&eventCount))
+	assert.Zero(t, eventCount, "single event matching summary has 0 tool_result_events rows")
 
 	_, werr = d.WriteSessionIncremental(t.Context(), "s1", nil, update)
 	require.NoError(t, werr,
@@ -4242,7 +4238,7 @@ func TestWriteSessionIncrementalToolCallResultUpdate(t *testing.T) {
 		WHERE session_id = ? AND tool_use_id = ?`,
 		"s1", "call_cmd",
 	).Scan(&eventCount))
-	assert.Equal(t, 1, eventCount)
+	assert.Zero(t, eventCount, "replayed single event still has 0 tool_result_events rows")
 
 	sess, err := d.GetSession(t.Context(), "s1")
 	require.NoError(t, err)
@@ -4305,7 +4301,7 @@ func TestWriteSessionIncrementalTargetsDuplicateCallIDOccurrence(t *testing.T) {
 		SELECT COUNT(*) FROM tool_result_events
 		WHERE session_id = ? AND tool_call_message_ordinal = ?
 		  AND call_index = ?`, "s1", 1, 0).Scan(&eventCount))
-	assert.Equal(t, 1, eventCount)
+	assert.Zero(t, eventCount)
 
 	write(ToolCallPosition{MessageOrdinal: 0, CallIndex: 0}, "first")
 	var stateOccurrences int

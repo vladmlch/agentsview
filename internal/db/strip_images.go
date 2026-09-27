@@ -217,16 +217,6 @@ func (db *DB) rewriteStoredToolResultRows(
 		return false, fmt.Errorf("iterating tool result events: %w", err)
 	}
 	eventRows.Close()
-	for i := range calls {
-		if calls[i].content == "" {
-			continue
-		}
-		eventsForCall := eventContents[calls[i].key]
-		if len(eventsForCall) == 1 && calls[i].content == eventsForCall[0] {
-			calls[i].length = len(calls[i].content)
-			calls[i].content = ""
-		}
-	}
 	callIndexes := make(map[int64]int, len(calls))
 	for i := range calls {
 		callIndexes[calls[i].id] = i

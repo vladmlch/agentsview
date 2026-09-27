@@ -546,7 +546,10 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // (122: Codex rollout continuation segments with history_mode: "paginated"
 // are now stitched across history_base ancestor chains into a single session,
 // restoring the initial prompt and complete conversation history.)
-const dataVersion = 122
+// (123: inverted tool result storage: single-event results are stored directly
+// in tool_calls.result_content with 0 rows in tool_result_events, eliminating
+// duplicate output/history drawers across all providers.)
+const dataVersion = 123
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 

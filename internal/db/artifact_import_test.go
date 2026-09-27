@@ -629,8 +629,7 @@ func TestApplyArtifactImportedSessionProjectsToolResultImages(t *testing.T) {
 	require.Len(t, messages, 1)
 	call := messages[0].ToolCalls[0]
 	assertOffloadedImage(t, call.ResultContent, database.AssetsDir())
-	require.Len(t, call.ResultEvents, 1)
-	assertOffloadedImage(t, call.ResultEvents[0].Content, database.AssetsDir())
+	require.Empty(t, call.ResultEvents)
 }
 
 func TestArtifactImportedManifestHashesChunksWithinSQLiteVariableLimit(

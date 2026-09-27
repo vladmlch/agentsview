@@ -1,6 +1,11 @@
 package db
 
-import "fmt"
+import (
+	"bytes"
+	"crypto/sha256"
+	"fmt"
+	"strings"
+)
 
 // Tool-result summaries used to be stored twice: once as
 // tool_calls.result_content and once as the tool_result_events row the
@@ -8,31 +13,60 @@ import "fmt"
 // roughly 40% of the file, because the overwhelming majority of calls have a
 // single result event and the summary is that event's content byte for byte.
 //
-// Such a summary is no longer stored at all. result_content_length still
-// records the summary's size, so a cleared column with a non-zero length is
-// the signal that the read side must re-derive the summary from the call's
-// single event. A call whose summary is genuinely empty keeps length zero and
-// is left alone, and a blocked category (whose event content is blanked as
-// well) re-derives an empty string, which is exactly what it stores today.
+// In the current model, single-event results are stored directly in
+// tool_calls.result_content with 0 rows in tool_result_events when the event
+// content matches the tool call's result summary. Genuine multi-event calls
+// (events > 1 or event content differs from summary) persist rows in
+// tool_result_events.
+//
+// For legacy pre-v123 data where result_content was cleared and a single event
+// was stored in tool_result_events, RestoreToolCallResultContent and
+// ToolCallResultContentSQL retain backward compatibility.
 
 // ResultContentDuplicatesSingleEvent reports whether a summary repeats the
-// content of the call's only result event verbatim.
+// content of the call's only result event verbatim without dropping subagent,
+// multi-agent, or distinct raw provider identity.
 func ResultContentDuplicatesSingleEvent(
 	summary string, events []ToolResultEvent,
 ) bool {
-	return summary != "" && len(events) == 1 &&
-		events[0].Content == summary
+	if summary == "" || len(events) != 1 ||
+		events[0].Content != summary ||
+		events[0].SubagentSessionID != "" ||
+		events[0].AgentID != "" {
+		return false
+	}
+	if len(events[0].RawContentDigest) > 0 {
+		digest := sha256.Sum256([]byte(summary))
+		if !bytes.Equal(events[0].RawContentDigest, digest[:]) {
+			if !strings.Contains(summary, "agentsview_image") &&
+				!strings.Contains(summary, "asset://") {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// ShouldPersistToolResultEvents reports whether a call's result events must be
+// persisted to tool_result_events. Single-event results whose content matches
+// the call's result summary are stored directly on the tool call, leaving 0 rows
+// in tool_result_events. Only multi-event calls or single events whose content
+// diverges from the summary are persisted.
+func ShouldPersistToolResultEvents(
+	summary string, events []ToolResultEvent,
+) bool {
+	if ResultContentDuplicatesSingleEvent(summary, events) {
+		return false
+	}
+	return len(events) > 0
 }
 
 // DedupToolCallResultSummary returns the result summary to persist for a call
-// with the given result events: empty when the events already carry the same
-// bytes, and the summary itself otherwise.
+// with the given result events: in the current storage model, the summary is
+// always stored directly on the tool call.
 func DedupToolCallResultSummary(
 	summary string, events []ToolResultEvent,
 ) string {
-	if ResultContentDuplicatesSingleEvent(summary, events) {
-		return ""
-	}
 	return summary
 }
 

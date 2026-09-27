@@ -980,7 +980,8 @@ func TestSyncEngineVisualStudioCopilotPreservesToolResultsWhenTraceShrinks(t *te
 	msgs := fetchMessages(t, database, sessionID)
 	require.Len(t, msgs, 1)
 	require.Len(t, msgs[0].ToolCalls, 1)
-	require.Len(t, msgs[0].ToolCalls[0].ResultEvents, 1)
+	require.Empty(t, msgs[0].ToolCalls[0].ResultEvents)
+	assert.Equal(t, "Build succeeded.", msgs[0].ToolCalls[0].ResultContent)
 
 	require.NoError(t, os.WriteFile(tracePath, []byte(toolSpan("")), 0o644))
 	later := time.Unix(1781293700, 0)
@@ -992,10 +993,10 @@ func TestSyncEngineVisualStudioCopilotPreservesToolResultsWhenTraceShrinks(t *te
 	msgs = fetchMessages(t, database, sessionID)
 	require.Len(t, msgs, 1)
 	require.Len(t, msgs[0].ToolCalls, 1)
-	require.Len(t, msgs[0].ToolCalls[0].ResultEvents, 1,
-		"archived tool result event must be preserved")
+	require.Empty(t, msgs[0].ToolCalls[0].ResultEvents)
 	assert.Equal(t, "Build succeeded.",
-		msgs[0].ToolCalls[0].ResultEvents[0].Content)
+		msgs[0].ToolCalls[0].ResultContent,
+		"archived tool result event must be preserved")
 }
 
 // TestSyncEngineVisualStudioCopilotMergesRicherMatchedMessageWhenTraceShrinks
@@ -1077,10 +1078,10 @@ func TestSyncEngineVisualStudioCopilotMergesRicherMatchedMessageWhenTraceShrinks
 		"archived-only sibling message must be retained")
 	assert.Equal(t, strings.TrimSpace(firstPrompt), msgs[0].Content)
 	require.Len(t, msgs[1].ToolCalls, 1)
-	require.Len(t, msgs[1].ToolCalls[0].ResultEvents, 1,
-		"richer same-key tool result must be merged into archive")
+	require.Empty(t, msgs[1].ToolCalls[0].ResultEvents)
 	assert.Equal(t, "Build succeeded.",
-		msgs[1].ToolCalls[0].ResultEvents[0].Content)
+		msgs[1].ToolCalls[0].ResultContent,
+		"richer same-key tool result must be merged into archive")
 	assert.Equal(t, strings.TrimSpace(lastPrompt), msgs[2].Content)
 
 	assertSessionState(t, database, sessionID, func(sess *db.Session) {
@@ -1146,7 +1147,8 @@ func TestSyncEngineVisualStudioCopilotMergesUpdateAndPreservesIncompleteSameCoun
 	msgs := fetchMessages(t, database, sessionID)
 	require.Len(t, msgs, 2)
 	require.Empty(t, msgs[0].ToolCalls[0].ResultEvents)
-	require.Len(t, msgs[1].ToolCalls[0].ResultEvents, 1)
+	require.Empty(t, msgs[1].ToolCalls[0].ResultEvents)
+	assert.Equal(t, strings.TrimSpace(longResult), msgs[1].ToolCalls[0].ResultContent)
 
 	reparse := strings.Join([]string{
 		toolSpan("tool_build", "call_build", "dotnet build",
@@ -1164,14 +1166,14 @@ func TestSyncEngineVisualStudioCopilotMergesUpdateAndPreservesIncompleteSameCoun
 	))
 	msgs = fetchMessages(t, database, sessionID)
 	require.Len(t, msgs, 2)
-	require.Len(t, msgs[0].ToolCalls[0].ResultEvents, 1,
-		"same-count richer message must be merged")
+	require.Empty(t, msgs[0].ToolCalls[0].ResultEvents)
 	assert.Equal(t, "Build succeeded.",
-		msgs[0].ToolCalls[0].ResultEvents[0].Content)
-	require.Len(t, msgs[1].ToolCalls[0].ResultEvents, 1,
-		"same-count incomplete message must keep archived result")
+		msgs[0].ToolCalls[0].ResultContent,
+		"same-count richer message must be merged")
+	require.Empty(t, msgs[1].ToolCalls[0].ResultEvents)
 	assert.Equal(t, strings.TrimSpace(longResult),
-		msgs[1].ToolCalls[0].ResultEvents[0].Content)
+		msgs[1].ToolCalls[0].ResultContent,
+		"same-count incomplete message must keep archived result")
 }
 
 func TestSyncEngineVisualStudioCopilotMergeDerivesFirstMessageFromMergedRows(t *testing.T) {
@@ -1465,9 +1467,9 @@ func TestSyncEngineVisualStudioCopilotDoesNotAppendRotatedDuplicateToolCall(t *t
 		msgs[0].Content)
 	require.Len(t, msgs[0].ToolCalls, 1)
 	assert.Equal(t, "call_build", msgs[0].ToolCalls[0].ToolUseID)
-	require.Len(t, msgs[0].ToolCalls[0].ResultEvents, 1)
+	require.Empty(t, msgs[0].ToolCalls[0].ResultEvents)
 	assert.Equal(t, "Build succeeded.",
-		msgs[0].ToolCalls[0].ResultEvents[0].Content)
+		msgs[0].ToolCalls[0].ResultContent)
 	assert.Equal(t, "Archived prompt.", msgs[1].Content)
 }
 

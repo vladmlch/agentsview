@@ -264,7 +264,7 @@ func ScanSecretsFromMessages(
 			ci := callIndex
 			add(message.SessionID, "tool_input", message.Ordinal, &ci, nil,
 				call.InputJSON)
-			if len(call.ResultEvents) > 0 {
+			if len(call.ResultEvents) > 0 && db.ShouldPersistToolResultEvents(call.ResultContent, call.ResultEvents) {
 				for eventIndex := range call.ResultEvents {
 					ei := eventIndex
 					add(message.SessionID, "tool_result_event", message.Ordinal,

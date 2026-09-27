@@ -15214,9 +15214,7 @@ func TestIncrementalSync_CodexExecAppendRetainsEvents(t *testing.T) {
 	call := msgs[1].ToolCalls[0]
 	assert.Equal(t, "exec_command", call.ToolName, "tool name")
 	assert.Equal(t, "done", call.ResultContent, "result_content")
-	require.Len(t, call.ResultEvents, 1)
-	assert.Equal(t, "function_call_output", call.ResultEvents[0].Source)
-	assert.Equal(t, "done", call.ResultEvents[0].Content)
+	require.Empty(t, call.ResultEvents)
 	afterIncremental, err := env.db.GetSessionFull(
 		t.Context(), "codex:inc-cx-exec",
 	)

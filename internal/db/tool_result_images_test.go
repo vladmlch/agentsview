@@ -189,6 +189,12 @@ func TestIngestWithDropRemovesInlineImagesFromBothTables(t *testing.T) {
 	d.SetToolResultImages(config.ToolResultImagesDrop)
 	insertSession(t, d, "ingest", "project")
 	message := testImageMessage("ingest")
+	message.ToolCalls[0].ResultEvents = append(message.ToolCalls[0].ResultEvents, ToolResultEvent{
+		ToolUseID: "call-1",
+		Source:    "tool",
+		Status:    "completed",
+		Content:   message.ToolCalls[0].ResultContent,
+	})
 	original := message
 	insertMessages(t, d, message)
 	assert.Equal(t, original.ToolCalls[0].ResultContent, message.ToolCalls[0].ResultContent)
@@ -295,16 +301,16 @@ func TestToolResultImagesDedupAndLengths(t *testing.T) {
 	insertSession(t, d, "lengths", "project")
 	require.NoError(t, d.InsertMessages(t.Context(), []Message{testImageMessage("lengths")}))
 
-	var summaryLength, eventLength int
+	var summaryLength int
 	require.NoError(t, d.getReader().QueryRow(t.Context(),
 		"SELECT result_content_length FROM tool_calls WHERE session_id = ?", "lengths",
 	).Scan(&summaryLength))
+	var eventCount int
 	require.NoError(t, d.getReader().QueryRow(t.Context(),
-		"SELECT content_length FROM tool_result_events WHERE session_id = ?", "lengths",
-	).Scan(&eventLength))
+		"SELECT COUNT(*) FROM tool_result_events WHERE session_id = ?", "lengths",
+	).Scan(&eventCount))
 	assert.Positive(t, summaryLength)
-	assert.Positive(t, eventLength)
-	assert.Equal(t, eventLength, summaryLength)
+	assert.Zero(t, eventCount)
 }
 
 func TestDropImagesPreservesEmptySummaryMeaning(t *testing.T) {
@@ -591,9 +597,7 @@ func TestToolResultImagesOffloadWriteRoutes(t *testing.T) {
 			require.Len(t, stored, 1)
 			call := stored[0].ToolCalls[0]
 			assertOffloadedImage(t, call.ResultContent, d.AssetsDir())
-			require.Len(t, call.ResultEvents, 1)
-			assertOffloadedImage(t, call.ResultEvents[0].Content, d.AssetsDir())
-			assert.Equal(t, len(call.ResultEvents[0].Content), call.ResultEvents[0].ContentLength)
+			require.Empty(t, call.ResultEvents)
 			assert.Equal(t, testInlineImageContent(), messages[0].ToolCalls[0].ResultEvents[0].Content)
 		})
 	}
@@ -707,11 +711,11 @@ func TestToolResultImagesOffloadPublishesBeforeInsert(t *testing.T) {
 		}, false)
 	}))
 	require.NoError(t, conn.Close())
-	_, err = d.getWriter().Exec(t.Context(), `CREATE TEMP TRIGGER require_asset BEFORE INSERT ON tool_result_events WHEN NOT asset_published(NEW.content) BEGIN SELECT RAISE(ABORT, 'asset missing before insert'); END`)
+	_, err = d.getWriter().Exec(t.Context(), `CREATE TEMP TRIGGER require_asset BEFORE INSERT ON tool_calls WHEN NOT asset_published(NEW.result_content) BEGIN SELECT RAISE(ABORT, 'asset missing before insert'); END`)
 	require.NoError(t, err)
 	require.NoError(t, d.InsertMessages(t.Context(), []Message{testImageMessage("ordered")}))
 	var count int
-	require.NoError(t, d.getReader().QueryRow(t.Context(), "SELECT COUNT(*) FROM tool_result_events WHERE session_id = 'ordered'").Scan(&count))
+	require.NoError(t, d.getReader().QueryRow(t.Context(), "SELECT COUNT(*) FROM tool_calls WHERE session_id = 'ordered'").Scan(&count))
 	assert.Equal(t, 1, count)
 }
 
@@ -729,8 +733,7 @@ func TestOffloadLinkedSummaryKeepsReferenceWithOlderInlineEvent(t *testing.T) {
 	require.Len(t, messages[0].ToolCalls, 1)
 	call := messages[0].ToolCalls[0]
 	assertOffloadedImage(t, call.ResultContent, d.AssetsDir())
-	require.Len(t, call.ResultEvents, 1)
-	assert.Equal(t, testInlineImageContent(), call.ResultEvents[0].Content)
+	require.Empty(t, call.ResultEvents)
 	assert.Equal(t, len(call.ResultContent), call.ResultContentLength)
 }
 

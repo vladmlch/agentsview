@@ -100,7 +100,7 @@ func TestMigrateLeavesBlockInlineWhenPutFails(t *testing.T) {
 
 	var beforeContent string
 	require.NoError(t, d.getReader().QueryRow(t.Context(),
-		"SELECT content FROM tool_result_events WHERE session_id = ?", "fail-put",
+		"SELECT result_content FROM tool_calls WHERE session_id = ?", "fail-put",
 	).Scan(&beforeContent))
 	assert.Contains(t, beforeContent, "input_image")
 
@@ -109,7 +109,7 @@ func TestMigrateLeavesBlockInlineWhenPutFails(t *testing.T) {
 
 	var afterContent string
 	require.NoError(t, d.getReader().QueryRow(t.Context(),
-		"SELECT content FROM tool_result_events WHERE session_id = ?", "fail-put",
+		"SELECT result_content FROM tool_calls WHERE session_id = ?", "fail-put",
 	).Scan(&afterContent))
 	// Boundary: 0 rows carrying image_ref after failure.
 	assert.Equal(t, beforeContent, afterContent)
@@ -132,7 +132,7 @@ func TestMigratePartialFailurePreservesReport(t *testing.T) {
 	// Snapshot second session content before migration.
 	var secondBefore string
 	require.NoError(t, d.getReader().QueryRow(t.Context(),
-		"SELECT content FROM tool_result_events WHERE session_id = ?", "pf-second",
+		"SELECT result_content FROM tool_calls WHERE session_id = ?", "pf-second",
 	).Scan(&secondBefore))
 
 	calls := 0
@@ -160,7 +160,7 @@ func TestMigratePartialFailurePreservesReport(t *testing.T) {
 	// First session's row is migrated.
 	var firstAfter string
 	require.NoError(t, d.getReader().QueryRow(t.Context(),
-		"SELECT content FROM tool_result_events WHERE session_id = ?", "pf-first",
+		"SELECT result_content FROM tool_calls WHERE session_id = ?", "pf-first",
 	).Scan(&firstAfter))
 	assert.Contains(t, firstAfter, "image_ref")
 	assert.Contains(t, firstAfter, "asset://")
@@ -168,7 +168,7 @@ func TestMigratePartialFailurePreservesReport(t *testing.T) {
 	// Second session's row is unchanged.
 	var secondAfter string
 	require.NoError(t, d.getReader().QueryRow(t.Context(),
-		"SELECT content FROM tool_result_events WHERE session_id = ?", "pf-second",
+		"SELECT result_content FROM tool_calls WHERE session_id = ?", "pf-second",
 	).Scan(&secondAfter))
 	assert.Equal(t, secondBefore, secondAfter)
 	assert.NotContains(t, secondAfter, "image_ref")
@@ -207,13 +207,13 @@ func TestMigrateCancellationPreservesReport(t *testing.T) {
 
 	var firstContent string
 	require.NoError(t, d.getReader().QueryRow(context.WithoutCancel(ctx),
-		"SELECT content FROM tool_result_events WHERE session_id = ?", "cancel-first",
+		"SELECT result_content FROM tool_calls WHERE session_id = ?", "cancel-first",
 	).Scan(&firstContent))
 	assert.Contains(t, firstContent, "image_ref")
 
 	var secondContent string
 	require.NoError(t, d.getReader().QueryRow(context.WithoutCancel(ctx),
-		"SELECT content FROM tool_result_events WHERE session_id = ?", "cancel-second",
+		"SELECT result_content FROM tool_calls WHERE session_id = ?", "cancel-second",
 	).Scan(&secondContent))
 	assert.Contains(t, secondContent, "input_image")
 }
@@ -289,7 +289,7 @@ func TestMigratedReferenceMatchesStoredFile(t *testing.T) {
 
 			var storedContent string
 			require.NoError(t, d.getReader().QueryRow(t.Context(),
-				"SELECT content FROM tool_result_events WHERE session_id = ?", "ref-match",
+				"SELECT result_content FROM tool_calls WHERE session_id = ?", "ref-match",
 			).Scan(&storedContent))
 			assert.NotContains(t, storedContent, "input_image")
 			assert.Contains(t, storedContent, `"text":"before"`)
@@ -326,21 +326,16 @@ func TestMigratedReferenceMatchesStoredFile(t *testing.T) {
 			assert.Equal(t, storedContent, call.ResultContent)
 			assert.NotContains(t, call.ResultContent, "input_image")
 
-			var summaryLength, eventLength int
+			var summaryLength int
 			require.NoError(t, d.getReader().QueryRow(t.Context(), `
-				SELECT tc.result_content_length, ev.content_length
+				SELECT tc.result_content_length
 				FROM tool_calls tc
-				JOIN messages m ON m.id = tc.message_id
-				JOIN tool_result_events ev
-				  ON ev.session_id = tc.session_id
-				 AND ev.tool_call_message_ordinal = m.ordinal
-				 AND ev.call_index = tc.call_index
 				WHERE tc.session_id = ? AND tc.tool_use_id = ?`,
 				"ref-match", "call-1",
-			).Scan(&summaryLength, &eventLength))
-			assert.Equal(t, len(storedContent), eventLength)
-			assert.Equal(t, eventLength, summaryLength)
-			assert.Equal(t, eventLength, call.ResultContentLength)
+			).Scan(&summaryLength))
+			assert.Equal(t, len(storedContent), summaryLength)
+			assert.Equal(t, summaryLength, call.ResultContentLength)
+			assert.Empty(t, call.ResultEvents)
 		})
 	}
 }
@@ -699,7 +694,7 @@ func TestMigrateDeduplicatesAcrossSessions(t *testing.T) {
 	for _, id := range []string{"dedup-a", "dedup-b"} {
 		var content string
 		require.NoError(t, d.getReader().QueryRow(t.Context(),
-			"SELECT content FROM tool_result_events WHERE session_id = ?", id,
+			"SELECT result_content FROM tool_calls WHERE session_id = ?", id,
 		).Scan(&content))
 		var blocks []json.RawMessage
 		require.NoError(t, json.Unmarshal([]byte(content), &blocks))
@@ -970,9 +965,29 @@ func TestMigrateDeduplicatedSummaryKeepsCollapse(t *testing.T) {
 	d := testDB(t)
 	assetsDir := t.TempDir()
 	put := realPut(assetsDir)
-	seedArtifactOrigin(t, d)
 	insertSession(t, d, "dedup-collapse", "project")
-	insertMessages(t, d, testImageMessage("dedup-collapse"))
+	content := testInlineImageContent()
+	require.NoError(t, d.InsertMessages(t.Context(), []Message{{
+		SessionID: "dedup-collapse",
+		Ordinal:   0,
+		Role:      "assistant",
+		Content:   "answer",
+		ToolCalls: []ToolCall{{
+			ToolName:            "Read",
+			Category:            "Read",
+			ToolUseID:           "call-1",
+			ResultContent:       "",
+			ResultContentLength: len(content),
+		}},
+	}}))
+	_, err := d.getWriter().Exec(t.Context(), `
+		INSERT INTO tool_result_events (
+			session_id, tool_call_message_ordinal, call_index,
+			tool_use_id, source, status, content, content_length, event_index
+		) VALUES ('dedup-collapse', 0, 0, 'call-1', 'tool', 'completed', ?, ?, 0)`,
+		content, len(content),
+	)
+	require.NoError(t, err)
 	clearArtifactExportQueue(t, d)
 
 	// Verify the dedup invariant: result_content is empty, result_content_length
