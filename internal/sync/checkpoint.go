@@ -369,6 +369,10 @@ func (e *Engine) buildCodexFullParseCheckpoint(
 	// stat: the cursor, hash state, and anchor describe the bytes the
 	// parser read, and pairing them with a fresher stat could bless a
 	// concurrent rewrite as the parsed content.
+	nextOrdinal := pw.sess.MessageCount
+	if len(pw.msgs) > 0 {
+		nextOrdinal = pw.msgs[len(pw.msgs)-1].Ordinal + 1
+	}
 	cp := &db.ParserCheckpoint{
 		SessionID:        pw.sess.ID,
 		Agent:            string(pw.sess.Agent),
@@ -380,7 +384,7 @@ func (e *Engine) buildCodexFullParseCheckpoint(
 		Offset:           pw.sess.File.Size,
 		TailAnchorDigest: pw.checkpointAnchorDigest,
 		Hash:             hash,
-		NextOrdinal:      pw.sess.MessageCount,
+		NextOrdinal:      nextOrdinal,
 		Version:          codexCheckpointVersion,
 	}
 	return cp, &db.ParserCheckpointBlobs{
