@@ -226,3 +226,82 @@ func TestCodexCheckpointInPlaceRewriteSameSizeSameMtimeIsRejected(t *testing.T) 
 	assert.Equal(t, int64(len(initial)), cp.Offset,
 		"the rewritten bytes are the same length, so the checkpoint offset stays")
 }
+
+func TestClaudeCheckpointFullParseAndIncrementalResume(t *testing.T) {
+	env := setupTestEnv(t)
+	ctx := t.Context()
+	claudeID := "claude-cp-session"
+	u1 := "uuid-c1"
+	u2 := "uuid-c2"
+	u3 := "uuid-c3"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.ClaudeEntryJSON("user", "hello claude", "2024-01-01T10:00:00Z", u1, ""),
+		testjsonl.ClaudeEntryJSON("assistant", "hello human", "2024-01-01T10:00:01Z", u2, u1),
+	)
+	path := env.writeClaudeSession(t, "test-proj", claudeID+".jsonl", initial)
+
+	stats := env.engine.SyncAll(ctx, nil)
+	require.Equal(t, 1, stats.Synced)
+
+	cp, ok, err := env.db.GetParserCheckpoint(ctx, claudeID)
+	require.NoError(t, err)
+	require.True(t, ok, "full Claude parse must persist a checkpoint")
+	blobs, ok, err := env.db.GetParserCheckpointBlobs(ctx, claudeID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, int64(len(initial)), cp.Offset)
+	assert.Equal(t, []byte(u2), blobs.Cursor)
+	assert.NotEmpty(t, blobs.HashState)
+	assert.NotEmpty(t, cp.TailAnchorDigest)
+	assert.NotEmpty(t, cp.Hash)
+	assert.Equal(t, 2, cp.NextOrdinal)
+	assert.Equal(t, db.ParserCheckpointVersion, cp.Version)
+
+	// Incremental append: append a third message continuing the DAG trunk
+	appended := testjsonl.JoinJSONL(
+		testjsonl.ClaudeEntryJSON("user", "tell me more", "2024-01-01T10:00:02Z", u3, u2),
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(appended)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	stats = env.engine.SyncAll(ctx, nil)
+	require.Equal(t, 1, stats.Synced)
+
+	sess, err := env.db.GetSessionFull(ctx, claudeID)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	assert.True(t, sess.LastWriteIncremental, "incremental Claude append must stay incremental")
+
+	after, ok, err := env.db.GetParserCheckpoint(ctx, claudeID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	afterBlobs, ok, err := env.db.GetParserCheckpointBlobs(ctx, claudeID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, int64(len(initial)+len(appended)), after.Offset)
+	assert.Equal(t, []byte(u3), afterBlobs.Cursor)
+	assert.Equal(t, 3, after.NextOrdinal)
+
+	// Unchanged sweep: syncing without edits skips without re-hashing
+	stats = env.engine.SyncAll(ctx, nil)
+	assert.Equal(t, 0, stats.Synced)
+
+	// DAG fork: append an entry branching off u1 instead of u3
+	forked := testjsonl.JoinJSONL(
+		testjsonl.ClaudeEntryJSON("user", "rewound branch", "2024-01-01T10:00:03Z", "uuid-fork", u1),
+	)
+	f, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(forked)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	stats = env.engine.SyncAll(ctx, nil)
+	require.Equal(t, 1, stats.Synced)
+	sess, err = env.db.GetSessionFull(ctx, claudeID)
+	require.NoError(t, err)
+	assert.False(t, sess.LastWriteIncremental, "DAG fork must trigger full parse replacement")
+}

@@ -312,12 +312,16 @@ func (p *claudeProvider) ParseIncremental(
 	if req.Fingerprint.Size == req.Offset {
 		return IncrementalOutcome{}, IncrementalNoNewData, nil
 	}
+	lastUUID := req.LastEntryUUID
+	if lastUUID == "" && len(req.Seed) > 0 {
+		lastUUID = string(req.Seed)
+	}
 	newMsgs, links, endedAt, consumed, err := claudeParseSessionFrom(
 		path,
 		req.Offset,
 		claudeIncrementalScan{
 			startOrdinal:  req.StartOrdinal,
-			lastEntryUUID: req.LastEntryUUID,
+			lastEntryUUID: lastUUID,
 			stored: claudeStoredIdentity{
 				agentLabel:  req.StoredAgentLabel,
 				entrypoint:  req.StoredEntrypoint,
@@ -342,20 +346,37 @@ func (p *claudeProvider) ParseIncremental(
 	}
 	if len(newMsgs) == 0 {
 		if consumed > 0 {
+			var nextCursor []byte
+			if lastUUID != "" {
+				nextCursor = []byte(lastUUID)
+			}
 			return IncrementalOutcome{
 				SessionID:     req.SessionID,
 				SubagentLinks: links,
+				NextCursor:    nextCursor,
 				EndedAt:       endedAt,
 				ConsumedBytes: consumed,
 			}, IncrementalApplied, nil
 		}
 		return IncrementalOutcome{}, IncrementalNoNewData, nil
 	}
+	nextUUID := lastUUID
+	for i := len(newMsgs) - 1; i >= 0; i-- {
+		if newMsgs[i].SourceUUID != "" {
+			nextUUID = strings.TrimSuffix(newMsgs[i].SourceUUID, ":ide-context")
+			break
+		}
+	}
+	var nextCursor []byte
+	if nextUUID != "" {
+		nextCursor = []byte(nextUUID)
+	}
 	totalOut, peakCtx, hasTotalOut, hasPeakCtx := claudeProviderTokenTotals(newMsgs)
 	return IncrementalOutcome{
 		SessionID:            req.SessionID,
 		Messages:             newMsgs,
 		SubagentLinks:        links,
+		NextCursor:           nextCursor,
 		EndedAt:              endedAt,
 		ConsumedBytes:        consumed,
 		MessageCount:         len(newMsgs),

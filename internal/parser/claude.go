@@ -155,7 +155,8 @@ func claudeParseFile(
 		parentSessionID = lineage.parentSessionID
 	}
 
-	lr := newLineReaderContext(ctx, f, maxLineSize)
+	tee := newCodexHashAnchorTee(io.LimitReader(f, info.Size()))
+	lr := newLineReaderContext(ctx, tee, maxLineSize)
 	defer releaseLineReader(lr)
 	lastLineFailed := false
 	for {
@@ -399,6 +400,19 @@ func claudeParseFile(
 		}
 	}
 
+	if err := lr.Err(); err != nil {
+		return nil, nil, fmt.Errorf("reading claude %s: %w", path, err)
+	}
+	if tee.total < info.Size() {
+		if _, err := io.Copy(io.Discard, tee); err != nil {
+			return nil, nil, fmt.Errorf("reading remainder of %s: %w", path, err)
+		}
+	}
+	fullHash, err := tee.HashDigest()
+	if err != nil {
+		return nil, nil, err
+	}
+
 	// Detect truncation: last line is non-empty, invalid JSON,
 	// AND the file did not end with a newline. A newline-
 	// terminated invalid line is just a complete malformed
@@ -417,10 +431,16 @@ func claudeParseFile(
 		return nil, nil, err
 	}
 
+	inode, device := sourceFileIdentityForFile(f, info)
+	changeTime, _ := codexIndexChangeTimeForFile(f, info)
 	fileInfo := FileInfo{
-		Path:  path,
-		Size:  info.Size(),
-		Mtime: info.ModTime().UnixNano(),
+		Path:       path,
+		Size:       info.Size(),
+		Mtime:      info.ModTime().UnixNano(),
+		Inode:      int64(inode),
+		Device:     int64(device),
+		ChangeTime: changeTime,
+		Hash:       fullHash,
 	}
 	if opts.compatibleTitleEvents {
 		displayName = firstNonEmptyJSONLString(
@@ -526,6 +546,21 @@ func claudeParseFile(
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
+	}
+	var lastEntryUUID string
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].uuid != "" {
+			lastEntryUUID = entries[i].uuid
+			break
+		}
+	}
+	if !opts.uploadIdentity && lineage == nil && !lastLineFailed && len(kept) == 1 && lastEntryUUID != "" {
+		hashState, stateErr := tee.HashState()
+		if stateErr == nil {
+			kept[0].Checkpoint = []byte(lastEntryUUID)
+			kept[0].CheckpointHashState = hashState
+			kept[0].CheckpointAnchorDigest = tee.AnchorDigest()
+		}
 	}
 	return kept, excluded, nil
 }

@@ -962,3 +962,57 @@ func claudeProviderFixture(firstMessage string) string {
 		testjsonl.ClaudeAssistantJSON("Done.", tsEarlyS1),
 	)
 }
+
+func TestClaudeProvider_ParseCarriesSinglePassCheckpoint(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "-Users-dev-code-demo", "cp-test.jsonl")
+	u1 := "uuid-1"
+	u2 := "uuid-2"
+	u3 := "uuid-3"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.ClaudeEntryJSON("user", "first question", tsEarly, u1, ""),
+		testjsonl.ClaudeEntryJSON("assistant", "first answer", tsEarlyS1, u2, u1),
+	)
+	writeSourceFile(t, sourcePath, initial)
+
+	provider, ok := NewProvider(AgentClaude, ProviderConfig{
+		Roots:   []string{root},
+		Machine: "devbox",
+	})
+	require.True(t, ok)
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
+		RawSessionID: "cp-test",
+	})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	res := outcome.Results[0].Result
+
+	assert.Equal(t, []byte(u2), res.Checkpoint)
+	assert.NotEmpty(t, res.CheckpointHashState)
+	assert.NotEmpty(t, res.CheckpointAnchorDigest)
+	assert.NotEmpty(t, res.Session.File.Hash)
+
+	// Incremental parse advances the cursor
+	appended := testjsonl.JoinJSONL(
+		testjsonl.ClaudeEntryJSON("user", "second question", tsEarlyS5, u3, u2),
+	)
+	writeSourceFile(t, sourcePath, initial+"\n"+appended)
+
+	incOutcome, status, err := provider.ParseIncremental(t.Context(), IncrementalRequest{
+		Source:        source,
+		SessionID:     "cp-test",
+		Offset:        int64(len(initial) + 1), // including newline
+		StartOrdinal:  2,
+		Seed:          res.Checkpoint,
+		LastEntryUUID: u2,
+		Fingerprint:   SourceFingerprint{Key: sourcePath, Size: int64(len(initial) + 1 + len(appended))},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, IncrementalApplied, status)
+	assert.Equal(t, []byte(u3), incOutcome.NextCursor)
+	assert.Len(t, incOutcome.Messages, 1)
+}

@@ -3845,8 +3845,7 @@ func applyToolCallResultUpdateTx(ctx context.Context,
 				candidate.Content == currentResultContent &&
 				candidate.AgentID == "" && candidate.SubagentSessionID == "" {
 				storedDigest := sha256.Sum256([]byte(currentResultContent))
-				if bytes.Equal(candidate.RawContentDigest, storedDigest[:]) ||
-					imagePolicy != config.ToolResultImagesKeep {
+				if bytes.Equal(candidate.RawContentDigest, storedDigest[:]) {
 					return false, nil, nil
 				}
 			}
