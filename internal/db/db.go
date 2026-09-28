@@ -4976,7 +4976,7 @@ func (db *DB) RebuildBulkImportIndexes(ctx context.Context) error {
 
 // checkFTSModuleLoads fails when messages_fts is in the schema but this
 // executable's SQLite cannot load its virtual table module. Writes to
-// messages fire triggers into messages_fts, so such an archive is
+// messages synchronize messages_fts, so such an archive is
 // read-only for this build no matter how the open succeeds.
 func (db *DB) checkFTSModuleLoads(
 	ctx context.Context, w *writerHandle,
@@ -5117,6 +5117,14 @@ func (db *DB) init(ctx context.Context, progress OpenProgressFunc) error {
 			}
 		} else if err := refreshDialogueFTS(ctx, w, progress); err != nil {
 			return err
+		}
+	}
+
+	// Drop legacy row-level FTS triggers if present from earlier schema versions
+	// to avoid per-row trigger overhead during message writes.
+	for _, tr := range []string{"messages_ai", "messages_au", "messages_ad"} {
+		if _, err := w.ExecContext(ctx, "DROP TRIGGER IF EXISTS "+tr); err != nil {
+			return fmt.Errorf("dropping legacy trigger %s: %w", tr, err)
 		}
 	}
 
