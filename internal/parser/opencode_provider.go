@@ -951,41 +951,42 @@ func openCodeSQLiteSessionWatermarkOnly(
 	if err := ctx.Err(); err != nil {
 		return 0, false, false, err
 	}
-	db, err := openOpenCodeDB(dbPath)
-	if err != nil {
-		return 0, false, false, err
-	}
-	defer db.Close()
-	composite, err = openCodeCompositeMtimeSupportedCached(ctx, db, dbPath)
-	if err != nil {
-		return 0, false, false, err
-	}
-	table, err := openCodeSessionTableCached(ctx, db, dbPath, sessionID)
-	if err != nil {
-		return 0, false, false, err
-	}
-	from, err := openCodeSessionFromCached(ctx, db, dbPath, table)
-	if err != nil {
-		return 0, false, false, err
-	}
+	err = withOpenCodeDB(ctx, dbPath, func(db *sql.DB) error {
+		var qErr error
+		composite, qErr = openCodeCompositeMtimeSupportedCached(ctx, db, dbPath)
+		if qErr != nil {
+			return qErr
+		}
+		table, qErr := openCodeSessionTableCached(ctx, db, dbPath, sessionID)
+		if qErr != nil {
+			return qErr
+		}
+		from, qErr := openCodeSessionFromCached(ctx, db, dbPath, table)
+		if qErr != nil {
+			return qErr
+		}
 
-	query := "SELECT s.time_updated FROM " + from + " s WHERE s.id = ?"
-	if composite {
-		query = "SELECT " + openCodeSessionRowWatermarkExpr +
-			" FROM " + from + " s" + openCodeSessionCompositeMtimeJoins +
-			" WHERE s.id = ?"
-	}
-	err = db.QueryRowContext(ctx, query, sessionID).Scan(&watermark)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, composite, false, nil
-	}
-	if err != nil {
-		return 0, composite, false, fmt.Errorf(
-			"loading opencode session watermark %s#%s: %w",
-			dbPath, sessionID, err,
-		)
-	}
-	return watermark, composite, true, nil
+		query := "SELECT s.time_updated FROM " + from + " s WHERE s.id = ?"
+		if composite {
+			query = "SELECT " + openCodeSessionRowWatermarkExpr +
+				" FROM " + from + " s" + openCodeSessionCompositeMtimeJoins +
+				" WHERE s.id = ?"
+		}
+		rowErr := db.QueryRowContext(ctx, query, sessionID).Scan(&watermark)
+		if errors.Is(rowErr, sql.ErrNoRows) {
+			found = false
+			return nil
+		}
+		if rowErr != nil {
+			return fmt.Errorf(
+				"loading opencode session watermark %s#%s: %w",
+				dbPath, sessionID, rowErr,
+			)
+		}
+		found = true
+		return nil
+	})
+	return watermark, composite, found, err
 }
 
 var errOpenCodeCanonicalSourceFound = errors.New("opencode canonical source found")

@@ -561,3 +561,46 @@ func windsurfVSCodeSessionJSON(sessionID, user, assistant string) string {
 		}]
 	}`
 }
+
+func TestWindsurf_FallbackOnBusy(t *testing.T) {
+	root, dbPath := windsurfProviderFixture(t, windsurfVSCodeSessionJSON(
+		"windsurf-locked-1",
+		"How do I add support?",
+		"Use the existing parser.",
+	))
+
+	writer, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer writer.Close()
+	writer.SetMaxOpenConns(1)
+
+	_, err = writer.ExecContext(t.Context(), "PRAGMA journal_mode=WAL")
+	require.NoError(t, err)
+	_, err = writer.ExecContext(t.Context(), "PRAGMA locking_mode=EXCLUSIVE")
+	require.NoError(t, err)
+
+	tx, err := writer.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(t.Context(), "INSERT INTO ItemTable VALUES ('dummy', 'dummy')")
+	require.NoError(t, err)
+
+	provider := newTestWindsurfProvider(root)
+
+	sources, err := provider.Discover(t.Context())
+	require.NoError(t, err, "Discover must succeed via scratch fallback when locked")
+	require.Len(t, sources, 1)
+
+	fp, err := provider.Fingerprint(t.Context(), sources[0])
+	require.NoError(t, err, "Fingerprint must succeed via scratch fallback when locked")
+
+	out, err := provider.Parse(t.Context(), ParseRequest{
+		Source:      sources[0],
+		Fingerprint: fp,
+		Machine:     "machine-a",
+	})
+	require.NoError(t, err, "Parse must succeed via scratch fallback when locked")
+	require.Len(t, out.Results, 1)
+	assert.Equal(t, "windsurf:windsurf-locked-1", out.Results[0].Result.Session.ID)
+}

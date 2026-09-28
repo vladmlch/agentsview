@@ -1914,7 +1914,29 @@ func (e *Engine) classifyPaths(
 	seen := make(map[string]int, len(paths))
 	files := make([]parser.DiscoveredFile, 0, len(paths))
 	var classificationErr error
+	pathSet := make(map[string]struct{}, len(paths))
 	for _, p := range paths {
+		if strings.HasSuffix(p, "-shm") {
+			continue
+		}
+		pathSet[p] = struct{}{}
+	}
+	seenPaths := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		if strings.HasSuffix(p, "-shm") {
+			continue
+		}
+		if strings.HasSuffix(p, "-wal") {
+			mainDB := strings.TrimSuffix(p, "-wal")
+			if _, hasMain := pathSet[mainDB]; hasMain {
+				continue
+			}
+		}
+		if _, already := seenPaths[p]; already {
+			continue
+		}
+		seenPaths[p] = struct{}{}
+
 		// Codex resolved-index events map to potentially several session
 		// sources and must classify even when the event path was deleted, so
 		// they are handled by classifyCodexIndexPath. All other changed paths,

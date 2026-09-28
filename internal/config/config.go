@@ -1241,7 +1241,7 @@ func Default() (Config, error) {
 		AgentDirs:                      agentDirs,
 		agentDirSource:                 agentDirSource,
 		SourceMachines:                 make(map[parser.AgentType]map[string]string),
-		WatchExcludePatterns:           []string{".git", "node_modules", "__pycache__", ".venv", "venv", "vendor", ".next", "*.lock*"},
+		WatchExcludePatterns:           []string{".git", "node_modules", "__pycache__", ".venv", "venv", "vendor", ".next", "*.lock*", "*-shm"},
 		ResultContentBlockedCategories: []string{"Read", "Glob"},
 		EventsCoalesceInterval:         10 * time.Second,
 		DaemonIdleTimeout:              20 * time.Minute,

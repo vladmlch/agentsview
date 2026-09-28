@@ -730,29 +730,30 @@ func readWindsurfChatValues(ctx context.Context, dbPath string) ([]windsurfChatV
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		return nil, nil
 	}
-	db, err := openWindsurfDB(dbPath)
+	var values []windsurfChatValue
+	err := withWindsurfDB(ctx, dbPath, func(db *sql.DB) error {
+		values = make([]windsurfChatValue, 0, len(windsurfChatDataKeys))
+		for _, key := range windsurfChatDataKeys {
+			var value string
+			err := db.QueryRowContext(ctx,
+				`SELECT value FROM ItemTable WHERE key = ?`,
+				key,
+			).Scan(&value)
+			if err == sql.ErrNoRows {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("read windsurf chat data: %w", err)
+			}
+			values = append(values, windsurfChatValue{
+				Key:   key,
+				Value: value,
+			})
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	defer db.Close()
-
-	values := make([]windsurfChatValue, 0, len(windsurfChatDataKeys))
-	for _, key := range windsurfChatDataKeys {
-		var value string
-		err := db.QueryRowContext(ctx,
-			`SELECT value FROM ItemTable WHERE key = ?`,
-			key,
-		).Scan(&value)
-		if err == sql.ErrNoRows {
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("read windsurf chat data: %w", err)
-		}
-		values = append(values, windsurfChatValue{
-			Key:   key,
-			Value: value,
-		})
 	}
 	return values, nil
 }
@@ -764,33 +765,30 @@ func forEachWindsurfSessionRecord(
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		return nil
 	}
-	db, err := openWindsurfDB(dbPath)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	for _, key := range windsurfChatDataKeys {
-		if err := ctx.Err(); err != nil {
-			return err
+	return withWindsurfDB(ctx, dbPath, func(db *sql.DB) error {
+		for _, key := range windsurfChatDataKeys {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			var exists int
+			err := db.QueryRowContext(ctx,
+				`SELECT 1 FROM ItemTable WHERE key = ?`, key,
+			).Scan(&exists)
+			if err == sql.ErrNoRows {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("read windsurf chat data: %w", err)
+			}
+			reader := &windsurfSQLiteValueReader{ctx: ctx, db: db, key: key}
+			if err := forEachWindsurfRecordFromReader(
+				ctx, reader, windsurfFallbackSessionID(dbPath), yield,
+			); err != nil {
+				return err
+			}
 		}
-		var exists int
-		err := db.QueryRowContext(ctx,
-			`SELECT 1 FROM ItemTable WHERE key = ?`, key,
-		).Scan(&exists)
-		if err == sql.ErrNoRows {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("read windsurf chat data: %w", err)
-		}
-		reader := &windsurfSQLiteValueReader{ctx: ctx, db: db, key: key}
-		if err := forEachWindsurfRecordFromReader(
-			ctx, reader, windsurfFallbackSessionID(dbPath), yield,
-		); err != nil {
-			return err
-		}
-	}
-	return nil
+		return nil
+	})
 }
 
 const windsurfSQLiteReadChunk = 64 * 1024
@@ -1047,6 +1045,10 @@ func openWindsurfDB(dbPath string) (*sql.DB, error) {
 		return nil, fmt.Errorf("open windsurf db %s: %w", dbPath, err)
 	}
 	return db, nil
+}
+
+func withWindsurfDB(ctx context.Context, dbPath string, fn func(db *sql.DB) error) error {
+	return WithSQLiteReadOnly(ctx, dbPath, sqliteReadOptions{busyTimeoutMS: 3000}, fn)
 }
 
 func windsurfRecordsFromValue(

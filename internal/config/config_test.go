@@ -1097,6 +1097,7 @@ func TestDefaultWatchExcludesTransientLockFiles(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Contains(t, cfg.WatchExcludePatterns, "*.lock*")
+	assert.Contains(t, cfg.WatchExcludePatterns, "*-shm")
 }
 
 func TestAgentDirsEnvBeatsExplicitEmptyArray(t *testing.T) {

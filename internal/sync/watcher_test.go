@@ -496,6 +496,25 @@ func TestPendingWatchBatchOverflowsByEntryCount(t *testing.T) {
 	assert.Empty(t, batch.Paths)
 }
 
+func TestPendingWatchBatch_FiltersShmAndFoldsWal(t *testing.T) {
+	pending := newPendingWatchBatch(10, 1_000)
+
+	// -shm should be ignored completely
+	pending.Add("/data/opencode.db-shm")
+	assert.True(t, pending.Empty())
+
+	// -wal should fold into .db
+	pending.Add("/data/opencode.db-wal")
+	assert.False(t, pending.Empty())
+
+	// adding both .db and .wal should produce only a single entry for .db
+	pending.Add("/data/opencode.db")
+
+	batch, ok := pending.Take()
+	require.True(t, ok)
+	assert.Equal(t, []string{"/data/opencode.db"}, batch.Paths)
+}
+
 func TestWatchBatchAccumulatorMergesAndSortsPublicWork(t *testing.T) {
 	accumulator := NewWatchBatchAccumulator(nil)
 	rename := WatchRename{

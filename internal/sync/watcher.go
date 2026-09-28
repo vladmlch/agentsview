@@ -156,7 +156,22 @@ func (p *pendingWatchBatch) Empty() bool {
 		len(p.backendRenames) == 0 && len(p.roots) == 0 && len(p.lifecycle) == 0
 }
 
+func isSQLiteSHMPath(path string) bool {
+	return strings.HasSuffix(path, "-shm")
+}
+
 func (p *pendingWatchBatch) Add(path string) {
+	if isSQLiteSHMPath(path) {
+		return
+	}
+	if strings.HasSuffix(path, "-wal") {
+		mainDB := strings.TrimSuffix(path, "-wal")
+		if _, exists := p.paths[mainDB]; exists {
+			return
+		}
+	} else {
+		delete(p.paths, path+"-wal")
+	}
 	if _, exists := p.paths[path]; exists {
 		return
 	}
@@ -172,6 +187,17 @@ func (p *pendingWatchBatch) Add(path string) {
 // caller stops enumerating. Unrelated pending work can still exhaust even the
 // reserve, in which case the existing full-sync overflow contract applies.
 func (p *pendingWatchBatch) AddCreatedSubtreePath(path, root string) bool {
+	if isSQLiteSHMPath(path) {
+		return true
+	}
+	if strings.HasSuffix(path, "-wal") {
+		mainDB := strings.TrimSuffix(path, "-wal")
+		if _, exists := p.paths[mainDB]; exists {
+			return true
+		}
+	} else {
+		delete(p.paths, path+"-wal")
+	}
 	if p.fullSync {
 		return false
 	}
@@ -239,6 +265,9 @@ func (p *pendingWatchBatch) AddBackendEvent(event backendEvent) bool {
 		p.AddReconcileRoot(root)
 	}
 	if event.Op&backendOpRename != 0 {
+		if isSQLiteSHMPath(event.Path) {
+			return wasFullSync || !p.fullSync
+		}
 		rename := pendingBackendRename{
 			Path:     event.Path,
 			Root:     event.Root,

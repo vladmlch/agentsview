@@ -383,3 +383,55 @@ func nullString(s string) any {
 	}
 	return s
 }
+
+func TestZed_FallbackOnBusy(t *testing.T) {
+	rootDir := t.TempDir()
+	dbPath := filepath.Join(rootDir, "threads", "threads.db")
+	require.NoError(t, os.MkdirAll(filepath.Dir(dbPath), 0o755))
+	createZedThreadsDBAt(t, dbPath, []zedTestThread{{
+		id:        "thread-1",
+		summary:   "Locked Thread",
+		updatedAt: "2026-06-21T07:27:31.522Z",
+		dataType:  "json",
+		data:      []byte(`{"messages":[{"role":"user","text":"hello"}]}`),
+	}})
+
+	writer, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer writer.Close()
+	writer.SetMaxOpenConns(1)
+
+	_, err = writer.ExecContext(t.Context(), "PRAGMA journal_mode=WAL")
+	require.NoError(t, err)
+	_, err = writer.ExecContext(t.Context(), "PRAGMA locking_mode=EXCLUSIVE")
+	require.NoError(t, err)
+
+	tx, err := writer.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(t.Context(), "INSERT INTO threads (id, summary, updated_at, data_type, data) VALUES ('dummy', 'dummy', '', 'json', X'')")
+	require.NoError(t, err)
+
+	exists := ZedSQLiteSessionExists(t.Context(), dbPath, "thread-1")
+	assert.True(t, exists, "ZedSQLiteSessionExists must succeed via scratch fallback when locked")
+
+	provider, ok := NewProvider(AgentZed, ProviderConfig{
+		Roots: []string{rootDir},
+	})
+	require.True(t, ok)
+
+	sources, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+
+	fingerprint, err := provider.Fingerprint(t.Context(), sources[0])
+	require.NoError(t, err)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
+		Source: sources[0], Machine: "devbox", Fingerprint: fingerprint,
+	})
+	require.NoError(t, err, "provider.Parse must succeed via scratch fallback when locked")
+	require.Len(t, outcome.Results, 1)
+	assert.Equal(t, "zed:thread-1", outcome.Results[0].Result.Session.ID)
+}

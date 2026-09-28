@@ -10473,6 +10473,31 @@ func TestEngine_ClassifyPathsOpenCodeSQLiteWALFile(
 	assert.Equal(t, parser.AgentOpenCode, files[0].Agent)
 }
 
+func TestClassifyPaths_FiltersShmAndFoldsWal(t *testing.T) {
+	database := openTestDB(t)
+	opencodeDir := t.TempDir()
+	engine := NewEngine(t.Context(), database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentOpenCode: {opencodeDir},
+		},
+		Machine: "local",
+	})
+
+	dbPath := filepath.Join(opencodeDir, "opencode.db")
+	seedOpenCodeSQLiteWALSession(t, dbPath, "ses_wal")
+	walPath := filepath.Join(opencodeDir, "opencode.db-wal")
+	shmPath := filepath.Join(opencodeDir, "opencode.db-shm")
+
+	// Classifying only shmPath should produce zero discovered files.
+	shmFiles := requireClassifyPaths(t, engine, []string{shmPath})
+	assert.Empty(t, shmFiles)
+
+	// Classifying dbPath, walPath, and shmPath together should deduplicate into exactly one discovered file.
+	combinedFiles := requireClassifyPaths(t, engine, []string{dbPath, walPath, shmPath})
+	require.Len(t, combinedFiles, 1)
+	assert.Equal(t, parser.OpenCodeSQLiteVirtualPath(dbPath, "ses_wal"), combinedFiles[0].Path)
+}
+
 // seedOpenCodeSQLiteWALSession creates a minimal OpenCode-shaped SQLite
 // database and keeps its writer open with the session commit held in the WAL.
 // This exercises the same uncheckpointed state produced by a live OpenCode

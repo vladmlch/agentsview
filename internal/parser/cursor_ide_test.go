@@ -1128,3 +1128,54 @@ func TestParseCursorIDEComposer_TypelessBubbleFallsBackToHeaderType(t *testing.T
 	assert.Equal(t, RoleAssistant, result.Messages[1].Role)
 	assert.Equal(t, "answer", result.Messages[1].Content)
 }
+
+func TestCursorIDE_FallbackOnBusy(t *testing.T) {
+	composerID := "locked-composer-0000"
+	dbPath := createCursorIDEDB(t, []cursorIDETestComposer{{
+		id:        composerID,
+		name:      "locked session",
+		createdAt: 1718954851522,
+		bubbles: []cursorIDETestBubble{
+			{id: "b1", bubbleType: cursorIDEBubbleTypeUser, text: "hello", createdAt: "2026-06-21T07:27:31.522Z"},
+		},
+	}})
+
+	writer, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer writer.Close()
+	writer.SetMaxOpenConns(1)
+
+	_, err = writer.ExecContext(t.Context(), "PRAGMA journal_mode=WAL")
+	require.NoError(t, err)
+	_, err = writer.ExecContext(t.Context(), "PRAGMA locking_mode=EXCLUSIVE")
+	require.NoError(t, err)
+
+	tx, err := writer.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(t.Context(), "INSERT INTO cursorDiskKV VALUES ('dummy', 'dummy')")
+	require.NoError(t, err)
+
+	exists := CursorIDEComposerExists(t.Context(), dbPath, composerID)
+	assert.True(t, exists, "CursorIDEComposerExists must succeed via scratch fallback when locked")
+
+	provider, ok := NewProvider(AgentCursorIDE, ProviderConfig{
+		Roots: []string{filepath.Dir(dbPath)},
+	})
+	require.True(t, ok)
+
+	sources, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+
+	fingerprint, err := provider.Fingerprint(t.Context(), sources[0])
+	require.NoError(t, err)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
+		Source: sources[0], Machine: "devbox", Fingerprint: fingerprint,
+	})
+	require.NoError(t, err, "provider.Parse must succeed via scratch fallback when locked")
+	require.Len(t, outcome.Results, 1)
+	assert.Equal(t, cursorIDEIDPrefix+composerID, outcome.Results[0].Result.Session.ID)
+}

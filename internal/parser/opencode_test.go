@@ -2551,3 +2551,42 @@ func TestOpenCodeStorageFingerprintMissingDetectsContentRewrite(
 	assert.True(t, OpenCodeStorageFingerprintMissing(stored, current),
 		"expected content rewrite to invalidate fingerprint")
 }
+
+func TestOpenCode_FallbackOnBusy(t *testing.T) {
+	dbPath, seeder, writer := newTestDB(t)
+
+	seeder.AddProject("proj-1", "/work/proj")
+	seeder.AddSession("sess-1", "proj-1", "", "Locked Session", 1000, 2000)
+	seeder.AddMessage("msg-1", "sess-1", 1001, 1001, `{"role":"user","content":"hello"}`)
+	seeder.AddPart("part-1", "msg-1", "sess-1", 1001, 1001, `{"type":"text","text":"hello world"}`)
+
+	writer.SetMaxOpenConns(1)
+	_, err := writer.ExecContext(t.Context(), "PRAGMA journal_mode=WAL")
+	require.NoError(t, err)
+	_, err = writer.ExecContext(t.Context(), "PRAGMA locking_mode=EXCLUSIVE")
+	require.NoError(t, err)
+
+	tx, err := writer.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(t.Context(), "INSERT INTO project (id, worktree) VALUES ('dummy', '/tmp')")
+	require.NoError(t, err)
+
+	exists := OpenCodeSQLiteSessionExists(t.Context(), dbPath, "sess-1")
+	assert.True(t, exists, "OpenCodeSQLiteSessionExists must succeed via scratch fallback when locked")
+
+	var metas []OpenCodeSessionMeta
+	err = ForEachOpenCodeSessionMeta(t.Context(), dbPath, func(m OpenCodeSessionMeta) error {
+		metas = append(metas, m)
+		return nil
+	})
+	require.NoError(t, err, "ForEachOpenCodeSessionMeta must succeed via scratch fallback when locked")
+	require.Len(t, metas, 1)
+
+	sess, msgs, err := parseOpenCodeDBSessionContext(t.Context(), dbPath, "sess-1", "test-machine")
+	require.NoError(t, err, "parseOpenCodeDBSessionContext must succeed via scratch fallback when locked")
+	require.NotNil(t, sess)
+	assert.Equal(t, "opencode:sess-1", sess.ID)
+	require.Len(t, msgs, 1)
+}

@@ -67,25 +67,31 @@ func OpenCodeSQLiteSessionExists(ctx context.Context, dbPath, sessionID string) 
 	if err != nil || info.IsDir() {
 		return false
 	}
-	db, err := openOpenCodeDB(dbPath)
-	if err != nil {
-		return false
-	}
-	defer db.Close()
-	table, err := openCodeSessionTableCached(ctx, db, dbPath, sessionID)
-	if err != nil {
-		return false
-	}
-	from, err := openCodeSessionFromCached(ctx, db, dbPath, table)
-	if err != nil {
-		return false
-	}
-	var found int
-	err = db.QueryRowContext(ctx,
-		"SELECT 1 FROM "+from+" WHERE id = ? LIMIT 1",
-		sessionID,
-	).Scan(&found)
-	return err == nil
+	var found bool
+	err = withOpenCodeDB(ctx, dbPath, func(db *sql.DB) error {
+		table, err := openCodeSessionTableCached(ctx, db, dbPath, sessionID)
+		if err != nil {
+			return err
+		}
+		from, err := openCodeSessionFromCached(ctx, db, dbPath, table)
+		if err != nil {
+			return err
+		}
+		var one int
+		err = db.QueryRowContext(ctx,
+			"SELECT 1 FROM "+from+" WHERE id = ? LIMIT 1",
+			sessionID,
+		).Scan(&one)
+		if err == nil {
+			found = true
+			return nil
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	})
+	return err == nil && found
 }
 
 // ListOpenCodeSessionMeta returns lightweight metadata for
@@ -177,67 +183,63 @@ func ForEachOpenCodeSessionWatermarkMeta(
 		return nil
 	}
 
-	db, err := openOpenCodeDB(dbPath)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	composite, err := openCodeCompositeMtimeSupportedCached(ctx, db, dbPath)
-	if err != nil {
-		return err
-	}
-	// Ordered by id so the virtual paths ("<db>#<id>") stream in ascending
-	// byte order: the changed-path merge walks a paged stored-freshness
-	// cursor in step with this stream, and both sides must share one order.
-	tables, idle, migration, err := openCodeSessionTablesCached(ctx, db, dbPath)
-	if err != nil {
-		return err
-	}
-	var queries []string
-	for _, table := range tables {
-		from := openCodeSessionFrom(table, idle, migration)
-		query := "SELECT s.id, s.time_updated FROM " + from + " s"
-		if composite {
-			query = "SELECT s.id, " + openCodeSessionRowWatermarkExpr +
-				" FROM " + from + " s" + openCodeSessionCompositeMtimeJoins
-		}
-
-		if table == "session" && len(tables) == 2 {
-			query += " WHERE NOT EXISTS (SELECT 1 FROM session_v2 WHERE id = s.id)"
-		}
-		queries = append(queries, query)
-	}
-	query := strings.Join(queries, " UNION ALL ") + " ORDER BY 1"
-
-	rows, err := db.QueryContext(ctx, query)
-	if err != nil {
-		return fmt.Errorf(
-			"listing opencode session watermarks: %w", err,
-		)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var id string
-		var watermark int64
-		if err := rows.Scan(&id, &watermark); err != nil {
-			return fmt.Errorf(
-				"scanning opencode session watermark: %w", err,
-			)
-		}
-		observeStreamingDiscoveryBuffer(ctx, 1)
-		if err := yield(OpenCodeSessionMeta{
-			SessionID:      id,
-			VirtualPath:    dbPath + "#" + id,
-			FileMtime:      watermark * 1_000_000,
-			CompositeMtime: composite,
-			WatermarkOnly:  composite,
-		}); err != nil {
+	return withOpenCodeDB(ctx, dbPath, func(db *sql.DB) error {
+		composite, err := openCodeCompositeMtimeSupportedCached(ctx, db, dbPath)
+		if err != nil {
 			return err
 		}
-	}
-	return rows.Err()
+		// Ordered by id so the virtual paths ("<db>#<id>") stream in ascending
+		// byte order: the changed-path merge walks a paged stored-freshness
+		// cursor in step with this stream, and both sides must share one order.
+		tables, idle, migration, err := openCodeSessionTablesCached(ctx, db, dbPath)
+		if err != nil {
+			return err
+		}
+		var queries []string
+		for _, table := range tables {
+			from := openCodeSessionFrom(table, idle, migration)
+			query := "SELECT s.id, s.time_updated FROM " + from + " s"
+			if composite {
+				query = "SELECT s.id, " + openCodeSessionRowWatermarkExpr +
+					" FROM " + from + " s" + openCodeSessionCompositeMtimeJoins
+			}
+
+			if table == "session" && len(tables) == 2 {
+				query += " WHERE NOT EXISTS (SELECT 1 FROM session_v2 WHERE id = s.id)"
+			}
+			queries = append(queries, query)
+		}
+		query := strings.Join(queries, " UNION ALL ") + " ORDER BY 1"
+
+		rows, err := db.QueryContext(ctx, query)
+		if err != nil {
+			return fmt.Errorf(
+				"listing opencode session watermarks: %w", err,
+			)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var id string
+			var watermark int64
+			if err := rows.Scan(&id, &watermark); err != nil {
+				return fmt.Errorf(
+					"scanning opencode session watermark: %w", err,
+				)
+			}
+			observeStreamingDiscoveryBuffer(ctx, 1)
+			if err := yield(OpenCodeSessionMeta{
+				SessionID:      id,
+				VirtualPath:    dbPath + "#" + id,
+				FileMtime:      watermark * 1_000_000,
+				CompositeMtime: composite,
+				WatermarkOnly:  composite,
+			}); err != nil {
+				return err
+			}
+		}
+		return rows.Err()
+	})
 }
 
 // ForEachOpenCodeSessionMeta streams lightweight session rows directly from
@@ -252,80 +254,76 @@ func ForEachOpenCodeSessionMeta(
 		return nil
 	}
 
-	db, err := openOpenCodeDB(dbPath)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	composite, err := openCodeCompositeMtimeSupportedCached(ctx, db, dbPath)
-	if err != nil {
-		return err
-	}
-	tables, idle, migration, err := openCodeSessionTablesCached(ctx, db, dbPath)
-	if err != nil {
-		return err
-	}
-	var queries []string
-	for _, table := range tables {
-		from := openCodeSessionFrom(table, idle, migration)
-		query := "SELECT s.id, s.time_updated, s.time_updated, 0, 0, 0, '', '', 0, 0, '' " +
-			"FROM " + from + " s"
-		if composite {
-			openCodeContainerChildScans.Add(1)
-			v2, err := openCodeProjectionFormatCached(ctx, db, dbPath)
-			if err != nil {
-				return err
-			}
-			columns, joins := openCodeV2AggregateSQL(v2, false)
-			watermark, counts, baseJoins := openCodeCompositeMtimeExpr, openCodeCompositeCountsExpr, openCodeCompositeMtimeJoins
-			if table == "session_v2" {
-				watermark, counts, baseJoins = openCodeSessionRowWatermarkExpr, openCodeV2BaseCountsExpr, openCodeSessionCompositeMtimeJoins
-			}
-			query = "SELECT s.id, " + watermark + ", " + counts + columns +
-				" FROM " + from + " s" + baseJoins + joins
-		}
-
-		if table == "session" && len(tables) == 2 {
-			query += " WHERE NOT EXISTS (SELECT 1 FROM session_v2 WHERE id = s.id)"
-		}
-		queries = append(queries, query)
-	}
-	query := strings.Join(queries, " UNION ALL ") + " ORDER BY 1"
-
-	rows, err := db.QueryContext(ctx, query)
-	if err != nil {
-		return fmt.Errorf(
-			"listing opencode sessions: %w", err,
-		)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var id string
-		var agg openCodeChildAggregate
-		if err := rows.Scan(
-			&id, &agg.watermark, &agg.sessionTime, &agg.projectTime,
-			&agg.messages, &agg.parts,
-			&agg.messageIdent, &agg.partIdent,
-			&agg.projectionTime, &agg.projections, &agg.projectionIdent,
-		); err != nil {
-			return fmt.Errorf(
-				"scanning opencode session meta: %w", err,
-			)
-		}
-		observeStreamingDiscoveryBuffer(ctx, 1)
-		if err := yield(OpenCodeSessionMeta{
-			SessionID:      id,
-			VirtualPath:    dbPath + "#" + id,
-			FileMtime:      max(agg.watermark, agg.projectionTime) * 1_000_000,
-			CompositeMtime: composite,
-			ChildDigest:    agg.digest(composite),
-		}); err != nil {
+	return withOpenCodeDB(ctx, dbPath, func(db *sql.DB) error {
+		composite, err := openCodeCompositeMtimeSupportedCached(ctx, db, dbPath)
+		if err != nil {
 			return err
 		}
-	}
-	return rows.Err()
+		tables, idle, migration, err := openCodeSessionTablesCached(ctx, db, dbPath)
+		if err != nil {
+			return err
+		}
+		var queries []string
+		for _, table := range tables {
+			from := openCodeSessionFrom(table, idle, migration)
+			query := "SELECT s.id, s.time_updated, s.time_updated, 0, 0, 0, '', '', 0, 0, '' " +
+				"FROM " + from + " s"
+			if composite {
+				openCodeContainerChildScans.Add(1)
+				v2, err := openCodeProjectionFormatCached(ctx, db, dbPath)
+				if err != nil {
+					return err
+				}
+				columns, joins := openCodeV2AggregateSQL(v2, false)
+				watermark, counts, baseJoins := openCodeCompositeMtimeExpr, openCodeCompositeCountsExpr, openCodeCompositeMtimeJoins
+				if table == "session_v2" {
+					watermark, counts, baseJoins = openCodeSessionRowWatermarkExpr, openCodeV2BaseCountsExpr, openCodeSessionCompositeMtimeJoins
+				}
+				query = "SELECT s.id, " + watermark + ", " + counts + columns +
+					" FROM " + from + " s" + baseJoins + joins
+			}
+
+			if table == "session" && len(tables) == 2 {
+				query += " WHERE NOT EXISTS (SELECT 1 FROM session_v2 WHERE id = s.id)"
+			}
+			queries = append(queries, query)
+		}
+		query := strings.Join(queries, " UNION ALL ") + " ORDER BY 1"
+
+		rows, err := db.QueryContext(ctx, query)
+		if err != nil {
+			return fmt.Errorf(
+				"listing opencode sessions: %w", err,
+			)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var id string
+			var agg openCodeChildAggregate
+			if err := rows.Scan(
+				&id, &agg.watermark, &agg.sessionTime, &agg.projectTime,
+				&agg.messages, &agg.parts,
+				&agg.messageIdent, &agg.partIdent,
+				&agg.projectionTime, &agg.projections, &agg.projectionIdent,
+			); err != nil {
+				return fmt.Errorf(
+					"scanning opencode session meta: %w", err,
+				)
+			}
+			observeStreamingDiscoveryBuffer(ctx, 1)
+			if err := yield(OpenCodeSessionMeta{
+				SessionID:      id,
+				VirtualPath:    dbPath + "#" + id,
+				FileMtime:      max(agg.watermark, agg.projectionTime) * 1_000_000,
+				CompositeMtime: composite,
+				ChildDigest:    agg.digest(composite),
+			}); err != nil {
+				return err
+			}
+		}
+		return rows.Err()
+	})
 }
 
 // openCodeSessionCompositeMtime returns one session's composite change signal
@@ -542,57 +540,60 @@ func parseOpenCodeDBSessionContext(
 		)
 	}
 
-	db, err := openOpenCodeDB(dbPath)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer db.Close()
+	var parsedSess *ParsedSession
+	var parsedMsgs []ParsedMessage
+	err := withOpenCodeDB(ctx, dbPath, func(db *sql.DB) error {
+		projects, err := loadOpenCodeProjectsCached(ctx, db, dbPath)
+		if err != nil {
+			return fmt.Errorf(
+				"loading opencode projects: %w", err,
+			)
+		}
 
-	projects, err := loadOpenCodeProjectsCached(ctx, db, dbPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"loading opencode projects: %w", err,
+		table, err := openCodeSessionTableCached(ctx, db, dbPath, sessionID)
+		if err != nil {
+			return err
+		}
+		hasDirectory, err := openCodeSessionHasDirectoryCached(ctx, db, dbPath, table)
+		if err != nil {
+			return fmt.Errorf("probing opencode session schema: %w", err)
+		}
+		from, err := openCodeSessionFromCached(ctx, db, dbPath, table)
+		if err != nil {
+			return err
+		}
+		s, err := loadOneOpenCodeSession(ctx, db, from, sessionID, hasDirectory)
+		if err != nil {
+			return fmt.Errorf(
+				"loading opencode session %s: %w",
+				sessionID, err,
+			)
+		}
+
+		projectWorktree := strings.TrimSpace(projects[s.projectID])
+		cwd := resolveOpenCodeWorktree(s.directory, projectWorktree)
+		if cwd == "" &&
+			(strings.TrimSpace(s.directory) == "" ||
+				strings.TrimSpace(s.directory) == string(filepath.Separator) ||
+				strings.TrimSpace(s.directory) == "/") &&
+			(strings.TrimSpace(projectWorktree) == string(filepath.Separator) ||
+				strings.TrimSpace(projectWorktree) == "/") {
+			// SQLite's global project uses / as its declared worktree. Preserve
+			// that source value; file-backed metadata applies the stricter policy.
+			cwd = "/"
+		}
+		if !openCodeUsableWorktree(projectWorktree) {
+			projectWorktree = cwd
+		}
+		parsedSess, parsedMsgs, err = buildOpenCodeSessionContext(
+			ctx, db, s, cwd, projectWorktree, dbPath, machine,
 		)
-	}
-
-	table, err := openCodeSessionTableCached(ctx, db, dbPath, sessionID)
+		return err
+	})
 	if err != nil {
 		return nil, nil, err
 	}
-	hasDirectory, err := openCodeSessionHasDirectoryCached(ctx, db, dbPath, table)
-	if err != nil {
-		return nil, nil, fmt.Errorf("probing opencode session schema: %w", err)
-	}
-	from, err := openCodeSessionFromCached(ctx, db, dbPath, table)
-	if err != nil {
-		return nil, nil, err
-	}
-	s, err := loadOneOpenCodeSession(ctx, db, from, sessionID, hasDirectory)
-	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"loading opencode session %s: %w",
-			sessionID, err,
-		)
-	}
-
-	projectWorktree := strings.TrimSpace(projects[s.projectID])
-	cwd := resolveOpenCodeWorktree(s.directory, projectWorktree)
-	if cwd == "" &&
-		(strings.TrimSpace(s.directory) == "" ||
-			strings.TrimSpace(s.directory) == string(filepath.Separator) ||
-			strings.TrimSpace(s.directory) == "/") &&
-		(strings.TrimSpace(projectWorktree) == string(filepath.Separator) ||
-			strings.TrimSpace(projectWorktree) == "/") {
-		// SQLite's global project uses / as its declared worktree. Preserve
-		// that source value; file-backed metadata applies the stricter policy.
-		cwd = "/"
-	}
-	if !openCodeUsableWorktree(projectWorktree) {
-		projectWorktree = cwd
-	}
-	return buildOpenCodeSessionContext(
-		ctx, db, s, cwd, projectWorktree, dbPath, machine,
-	)
+	return parsedSess, parsedMsgs, nil
 }
 
 // resolveOpenCodeWorktree picks the session working directory used for
@@ -732,6 +733,10 @@ func openOpenCodeDB(dbPath string) (*sql.DB, error) {
 		)
 	}
 	return db, nil
+}
+
+func withOpenCodeDB(ctx context.Context, dbPath string, fn func(db *sql.DB) error) error {
+	return WithSQLiteReadOnly(ctx, dbPath, sqliteReadOptions{busyTimeoutMS: 3000}, fn)
 }
 
 // openCodeProject is a row from the opencode project table.
@@ -2226,15 +2231,16 @@ func openCodeSQLiteSessionMtimeComposite(ctx context.Context,
 		)
 	}
 
-	db, err := openOpenCodeDB(dbPath)
-	if err != nil {
-		return 0, "", false, err
-	}
-	defer db.Close()
-
-	timeUpdated, digest, composite, err := openCodeSessionCompositeMtime(ctx,
-		db, dbPath, sessionID,
-	)
+	var timeUpdated int64
+	var digest string
+	var composite bool
+	err := withOpenCodeDB(ctx, dbPath, func(db *sql.DB) error {
+		var mtimeErr error
+		timeUpdated, digest, composite, mtimeErr = openCodeSessionCompositeMtime(ctx,
+			db, dbPath, sessionID,
+		)
+		return mtimeErr
+	})
 	if err != nil {
 		return 0, "", false, err
 	}
@@ -2256,13 +2262,12 @@ func openCodeSQLiteSessionMtime(ctx context.Context,
 		)
 	}
 
-	db, err := openOpenCodeDB(dbPath)
-	if err != nil {
-		return 0, err
-	}
-	defer db.Close()
-
-	timeUpdated, _, err := openCodeSessionWatermark(ctx, db, dbPath, sessionID)
+	var timeUpdated int64
+	err := withOpenCodeDB(ctx, dbPath, func(db *sql.DB) error {
+		var watermarkErr error
+		timeUpdated, _, watermarkErr = openCodeSessionWatermark(ctx, db, dbPath, sessionID)
+		return watermarkErr
+	})
 	if err != nil {
 		return 0, err
 	}

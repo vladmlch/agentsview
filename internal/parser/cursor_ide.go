@@ -61,6 +61,10 @@ func openCursorIDEDB(dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
+func withCursorIDEDB(ctx context.Context, dbPath string, fn func(conn *sql.DB) error) error {
+	return WithSQLiteReadOnly(ctx, dbPath, sqliteReadOptions{busyTimeoutMS: 3000}, fn)
+}
+
 // cursorIDEQuerier is the shared read surface of *sql.DB and *sql.Tx: the
 // composer readers accept it so one snapshot transaction can serve the
 // composer document, its bubbles, and the content digest together.
@@ -92,17 +96,23 @@ func CursorIDEComposerExists(ctx context.Context, dbPath, composerID string) boo
 	if dbPath == "" || composerID == "" || !IsValidSessionID(composerID) {
 		return false
 	}
-	conn, err := openCursorIDEDB(dbPath)
-	if err != nil {
-		return false
-	}
-	defer conn.Close()
-	var one int
-	err = conn.QueryRowContext(ctx,
-		`SELECT 1 FROM cursorDiskKV WHERE key = ? LIMIT 1`,
-		cursorIDEComposerKeyPrefix+composerID,
-	).Scan(&one)
-	return err == nil
+	var found bool
+	err := withCursorIDEDB(ctx, dbPath, func(conn *sql.DB) error {
+		var one int
+		err := conn.QueryRowContext(ctx,
+			`SELECT 1 FROM cursorDiskKV WHERE key = ? LIMIT 1`,
+			cursorIDEComposerKeyPrefix+composerID,
+		).Scan(&one)
+		if err == nil {
+			found = true
+			return nil
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	})
+	return err == nil && found
 }
 
 // cursorIDEComposerHeader is one entry of fullConversationHeadersOnly: the
