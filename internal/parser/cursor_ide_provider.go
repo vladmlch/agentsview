@@ -2,6 +2,7 @@ package parser
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -130,12 +131,13 @@ func cursorIDEFingerprintSource(
 		}, nil
 	}
 
-	conn, err := openCursorIDEDB(src.Container)
-	if err != nil {
-		return SourceFingerprint{}, err
-	}
-	defer conn.Close()
-	meta, ok, err := loadCursorIDEComposerMeta(ctx, conn, src.MemberID)
+	var meta cursorIDEComposerMeta
+	var ok bool
+	err = withCursorIDEDB(ctx, src.Container, func(conn *sql.DB) error {
+		var loadErr error
+		meta, ok, loadErr = loadCursorIDEComposerMeta(ctx, conn, src.MemberID)
+		return loadErr
+	})
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
@@ -234,15 +236,16 @@ func cursorIDEBatchMemberPresent(ctx context.Context,
 ) map[string]bool {
 	present := make(map[string]bool, len(members))
 	existing := make(map[string]struct{})
-	conn, err := openCursorIDEDB(container.Container)
-	if err == nil {
-		defer conn.Close()
+	err := withCursorIDEDB(ctx, container.Container, func(conn *sql.DB) error {
 		ids, listErr := listCursorIDEComposerIDs(ctx, conn)
-		err = listErr
+		if listErr != nil {
+			return listErr
+		}
 		for _, id := range ids {
 			existing[id] = struct{}{}
 		}
-	}
+		return nil
+	})
 	for _, member := range members {
 		if err != nil {
 			present[member.Path] = true
@@ -286,14 +289,18 @@ func cursorIDEParseMember(
 	if !IsValidSessionID(src.MemberID) {
 		return nil, nil
 	}
-	conn, err := openCursorIDEDB(src.Container)
+	var res *ParseResult
+	err = withCursorIDEDB(ctx, src.Container, func(conn *sql.DB) error {
+		var parseErr error
+		res, parseErr = parseCursorIDEComposer(
+			ctx, conn, src.Container, src.MemberID, req.Machine, dbInfo,
+		)
+		return parseErr
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-	return parseCursorIDEComposer(
-		ctx, conn, src.Container, src.MemberID, req.Machine, dbInfo,
-	)
+	return res, nil
 }
 
 // cursorIDEParseContainerEach yields each composer as it is parsed, so the
@@ -309,33 +316,30 @@ func cursorIDEParseContainerEach(
 		}
 		return err
 	}
-	conn, err := openCursorIDEDB(src.Container)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	ids, err := listCursorIDEComposerIDs(ctx, conn)
-	if err != nil {
-		return err
-	}
-	for _, id := range ids {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		result, err := parseCursorIDEComposer(
-			ctx, conn, src.Container, id, req.Machine, dbInfo,
-		)
+	return withCursorIDEDB(ctx, src.Container, func(conn *sql.DB) error {
+		ids, err := listCursorIDEComposerIDs(ctx, conn)
 		if err != nil {
 			return err
 		}
-		if result == nil {
-			continue
+		for _, id := range ids {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			result, err := parseCursorIDEComposer(
+				ctx, conn, src.Container, id, req.Machine, dbInfo,
+			)
+			if err != nil {
+				return err
+			}
+			if result == nil {
+				continue
+			}
+			if err := yield(*result); err != nil {
+				return err
+			}
 		}
-		if err := yield(*result); err != nil {
-			return err
-		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // parseCursorIDEVirtualPath splits a Cursor IDE virtual source path into its

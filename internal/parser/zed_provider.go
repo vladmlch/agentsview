@@ -44,18 +44,15 @@ func zedDiscoverEach(
 		return nil
 	}
 	dbPath := containers[0]
-	conn, err := OpenZedDB(dbPath)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	shape, err := inspectZedSchema(ctx, conn)
-	if err != nil {
-		return wrapZedListingError(err)
-	}
-	return forEachZedThreadMeta(ctx, conn, dbPath, shape, func(meta ZedThreadMeta) error {
-		return yield(multiSessionMatch{
-			Path: meta.VirtualPath, Container: dbPath, MemberID: meta.RawID,
+	return withZedDB(ctx, dbPath, func(conn *sql.DB) error {
+		shape, err := inspectZedSchema(ctx, conn)
+		if err != nil {
+			return wrapZedListingError(err)
+		}
+		return forEachZedThreadMeta(ctx, conn, dbPath, shape, func(meta ZedThreadMeta) error {
+			return yield(multiSessionMatch{
+				Path: meta.VirtualPath, Container: dbPath, MemberID: meta.RawID,
+			})
 		})
 	})
 }
@@ -179,18 +176,22 @@ func zedParseMember(
 	if !IsValidSessionID(src.MemberID) {
 		return nil, fmt.Errorf("invalid Zed session ID: %s", src.MemberID)
 	}
-	conn, err := OpenZedDB(src.Container)
+	var res *ParseResult
+	err = withZedDB(ctx, src.Container, func(conn *sql.DB) error {
+		shape, err := inspectZedSchema(ctx, conn)
+		if err != nil {
+			return wrapZedLoadingError(src.MemberID, err)
+		}
+		var parseErr error
+		res, parseErr = parseZedThreadFromDBWithSchema(
+			ctx, conn, src.Container, src.MemberID, req.Machine, dbInfo, shape,
+		)
+		return parseErr
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-	shape, err := inspectZedSchema(ctx, conn)
-	if err != nil {
-		return nil, wrapZedLoadingError(src.MemberID, err)
-	}
-	return parseZedThreadFromDBWithSchema(
-		ctx, conn, src.Container, src.MemberID, req.Machine, dbInfo, shape,
-	)
+	return res, nil
 }
 
 func zedParseContainer(
@@ -203,43 +204,41 @@ func zedParseContainer(
 		}
 		return nil, fmt.Errorf("stat %s: %w", src.Container, err)
 	}
-	conn, err := OpenZedDB(src.Container)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	shape, err := inspectZedSchema(ctx, conn)
-	if err != nil {
-		return nil, wrapZedListingError(err)
-	}
-	var metas []ZedThreadMeta
-	err = forEachZedThreadMeta(ctx, conn, src.Container, shape, func(meta ZedThreadMeta) error {
-		metas = append(metas, meta)
+	var results []ParseResult
+	err = withZedDB(ctx, src.Container, func(conn *sql.DB) error {
+		shape, err := inspectZedSchema(ctx, conn)
+		if err != nil {
+			return wrapZedListingError(err)
+		}
+		var metas []ZedThreadMeta
+		err = forEachZedThreadMeta(ctx, conn, src.Container, shape, func(meta ZedThreadMeta) error {
+			metas = append(metas, meta)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		dbHash, _ := hashJSONLSourceFile(src.Container)
+		results = make([]ParseResult, 0, len(metas))
+		for _, meta := range metas {
+			result, err := parseZedThreadFromDBWithSchema(
+				ctx, conn, src.Container, meta.RawID, req.Machine, dbInfo, shape,
+			)
+			if err != nil {
+				return err
+			}
+			if result == nil {
+				continue
+			}
+			if dbHash != "" {
+				result.Session.File.Hash = dbHash
+			}
+			results = append(results, *result)
+		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
-	}
-	// Zed has no per-thread content digest; stamp the physical DB hash on every
-	// fanned-out thread row, mirroring the legacy fan-out. Computed here rather
-	// than via the base's hash stamping because the value is the DB's own hash,
-	// not the request fingerprint.
-	dbHash, _ := hashJSONLSourceFile(src.Container)
-	results := make([]ParseResult, 0, len(metas))
-	for _, meta := range metas {
-		result, err := parseZedThreadFromDBWithSchema(
-			ctx, conn, src.Container, meta.RawID, req.Machine, dbInfo, shape,
-		)
-		if err != nil {
-			return nil, err
-		}
-		if result == nil {
-			continue
-		}
-		if dbHash != "" {
-			result.Session.File.Hash = dbHash
-		}
-		results = append(results, *result)
 	}
 	return results, nil
 }

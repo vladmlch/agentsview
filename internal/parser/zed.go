@@ -28,18 +28,24 @@ func ZedSQLiteSessionExists(ctx context.Context, dbPath, sessionID string) bool 
 	if !IsRegularFile(dbPath) {
 		return false
 	}
-	db, err := openZedDB(dbPath)
-	if err != nil {
-		return false
-	}
-	defer db.Close()
-	shape, err := inspectZedSchema(ctx, db)
-	if err != nil {
-		return false
-	}
-	var found int
-	err = db.QueryRowContext(ctx, fmt.Sprintf(`SELECT 1 FROM threads WHERE id = ? %s LIMIT 1`, shape.parentFilter()), sessionID).Scan(&found)
-	return err == nil
+	var found bool
+	err := withZedDB(ctx, dbPath, func(db *sql.DB) error {
+		shape, err := inspectZedSchema(ctx, db)
+		if err != nil {
+			return err
+		}
+		var one int
+		err = db.QueryRowContext(ctx, fmt.Sprintf(`SELECT 1 FROM threads WHERE id = ? %s LIMIT 1`, shape.parentFilter()), sessionID).Scan(&one)
+		if err == nil {
+			found = true
+			return nil
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	})
+	return err == nil && found
 }
 
 // ZedSQLiteSourceMtime resolves the per-thread updated_at timestamp
@@ -53,17 +59,14 @@ func ZedSQLiteSourceMtimeContext(ctx context.Context, path string) (int64, error
 	if !ok {
 		return 0, fmt.Errorf("not a zed sqlite virtual path: %s", path)
 	}
-	db, err := openZedDB(dbPath)
-	if err != nil {
-		return 0, err
-	}
-	defer db.Close()
-	shape, err := inspectZedSchema(ctx, db)
-	if err != nil {
-		return 0, err
-	}
 	var updatedAt string
-	err = db.QueryRowContext(ctx, fmt.Sprintf(`SELECT COALESCE(updated_at, '') FROM threads WHERE id = ? %s LIMIT 1`, shape.parentFilter()), sessionID).Scan(&updatedAt)
+	err := withZedDB(ctx, dbPath, func(db *sql.DB) error {
+		shape, err := inspectZedSchema(ctx, db)
+		if err != nil {
+			return err
+		}
+		return db.QueryRowContext(ctx, fmt.Sprintf(`SELECT COALESCE(updated_at, '') FROM threads WHERE id = ? %s LIMIT 1`, shape.parentFilter()), sessionID).Scan(&updatedAt)
+	})
 	if err != nil {
 		return 0, fmt.Errorf("loading zed thread mtime %s: %w", sessionID, err)
 	}
@@ -271,6 +274,10 @@ func openZedDB(dbPath string) (*sql.DB, error) {
 		return nil, fmt.Errorf("opening zed db %s: %w", dbPath, err)
 	}
 	return db, nil
+}
+
+func withZedDB(ctx context.Context, dbPath string, fn func(db *sql.DB) error) error {
+	return WithSQLiteReadOnly(ctx, dbPath, sqliteReadOptions{busyTimeoutMS: 3000}, fn)
 }
 
 type zedThreadRow struct {
