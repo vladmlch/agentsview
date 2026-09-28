@@ -16,6 +16,96 @@ The latest release is
   and archive write locks during restarts. The push service exits if no writable
   daemon is running, and the service manager restarts it until the collector
   answers. Reinstalling restarts the service with the new arguments.
+- The web UI reports an anonymous `app_opened` event through the server when it
+  loads and on the first focus of each later UTC day.
+  `AGENTSVIEW_TELEMETRY_ENABLED=0` turns it off with the daemon ping.
+- Upload existing Claude Code, Codex, and other supported local session roots
+  with `agentsview raw-sync backfill` before starting continuous raw sync. The
+  finite command saves resumable progress, reports incomplete work without
+  waiting through retry delays, and reuses completed migration proof without
+  uploading duplicate generations.
+- The web UI reports anonymous search, session-view, export, insight and
+  analytics-page events through the server, each with one value from a fixed
+  list. `AGENTSVIEW_TELEMETRY_ENABLED=0` turns them off.
+- Sessions show the title their agent keeps for them, and a name you chose with
+  `/rename` or the agent's equivalent wins over a generated title. Current
+  Claude Code `/rename` names now appear, and Qwen Code, Gemini CLI, Kimi CLI,
+  and OpenClaw titles appear for the first time. OpenCode, Kilo, MiMo Code, Amp,
+  Copilot CLI, VS Code Copilot, Positron, and Windsurf titles move out of the
+  first-message field, so previews and search show what you first typed. The
+  first sync after upgrading re-reads each session once.
+- Show OMO (oh-my-openagent) sessions as their own agent. AgentsView reads
+  them from `~/.omo/agent/sessions` with the Pi parser. Sessions you indexed
+  earlier by pointing `PI_DIR` at `~/.omo` stay labeled Pi; remove that
+  override so new OMO sessions are not indexed twice.
+- Index JetBrains Junie sessions from `~/.junie/sessions/` with full
+  transcripts: prompts, thinking, replies, tool, terminal, file, and MCP
+  activity, subagent runs, and per-call token usage with Junie's recorded
+  USD costs. `JUNIE_HOME` re-roots the Junie home directory and `JUNIE_DIR`
+  or `agents.junie.dirs` point at custom sessions directories.
+- Verify conversation memory through an opt-in live release gate that records a
+  synthetic decision, starts a fresh Claude Code or Codex session, and requires
+  the client to search, read, answer accurately, and cite the source. Raw
+  traces stay in ignored local artifacts; the aggregate report records models,
+  client versions, tool use, latency, and tokens.
+- Diagnose conversation-memory setup with `agentsview doctor memory`. It reports
+  the selected archive's lexical and semantic readiness separately, then checks
+  the local native plugin, MCP profile, SessionStart hook, and conflicting
+  standalone skills without starting a daemon or changing the installation.
+- Conversation-memory clients can check archive and search readiness through
+  MCP `get_memory_status` or `GET /api/v1/memory/status`, including explicit
+  unknown source telemetry. Search responses carry a compact lexical and
+  semantic coverage snapshot with active vector-generation counts.
+- Install the native AgentsView Memory package in Claude Code or Codex to get
+  the recall skill, focused MCP server, Claude search agent, and a fail-open
+  session-start hook from one package. Local and hosted targets stay in local
+  runtime configuration, and startup reports duplicate standalone skills
+  without changing user-edited files.
+- Native conversation-memory integrations can use
+  `agentsview memory session-start` for local, hosted-contributor, and
+  hosted-reader lifecycle roles. The command wakes the configured ingestion
+  owner or checks the selected read target and returns within two seconds.
+- MCP clients can use `agentsview mcp --profile memory` to advertise only the
+  conversation readiness, evidence search, and read tools, reducing unrelated
+  tool choices while leaving the default full MCP surface unchanged.
+- Mount the writable SQLite server below a reverse-proxy URL prefix with
+  `agentsview serve --base-path`, including background serves. Keep
+  `--public-url` set to the browser origin; AgentsView adds the mount path to
+  assets, API requests, navigation, and its published browser URL.
+- Coding agents can now consult prior conversation evidence proactively when
+  earlier decisions or solutions may help. `agentsview skills install`
+  upgrades the existing recall skill for Claude and Agents/Codex, and Claude
+  also receives a bounded `agentsview-search-conversations` agent. That agent
+  can call only `mcp__agentsview__search_content` and
+  `mcp__agentsview__get_messages`, so a transcript cannot invoke built-in tools
+  or tools from any other MCP server. Register the AgentsView MCP server as
+  `agentsview`. Every generated artifact is listed and protected independently
+  from local edits.
+- Semantic and hybrid search work on a ClickHouse mirror. When `[vector]` is
+  enabled, `agentsview clickhouse push` copies the local embedding generation
+  into ClickHouse and `clickhouse serve` answers `--semantic`/`--hybrid` from
+  it. Set `push_vectors = false` under `[clickhouse]` or pass `--no-vectors`
+  to leave vectors out. See
+  [semantic search: ClickHouse](/docs/semantic-search/#clickhouse).
+- Agents can open recalled evidence against the exact transcript revision that
+  produced it. MCP message reads reject stale citations with `source_changed`,
+  and oversized messages now provide a revision-bound continuation cursor.
+- Choose the agent CLI that a new generated insight starts with. Set
+  `default_agent` under `[insights]` to `claude`, `codex`, `copilot`, `gemini`,
+  or `kiro`; the Web UI picker and generation requests that name no agent use
+  it. Leaving it unset keeps the previous `claude` default, and an unknown name
+  fails configuration validation at startup.
+- Antigravity conversations that have no session database are now
+  stored from the plaintext transcript Antigravity's agent brain wrote beside
+  them, with the user's turns, the model's turns, its reasoning and its tool
+  calls. Until now those conversations were invisible: the only other copy is
+  an encrypted `.pb` stream that needs a key. `~/.gemini/antigravity-ide`, the
+  directory the IDE build uses, is also collected by default now. A
+  conversation that does have a database keeps one session, with the
+  transcript's entries folded into it. Both formats and copies across source
+  directories share the conversation ID. Transcript read failures preserve
+  archived messages. Antigravity sources re-parse once on upgrade to pick the
+  transcripts up.
 
 - When Friction Log review is enabled, AgentsView stores daily digests and
   catches up on completed days missed while offline, including sessions that
