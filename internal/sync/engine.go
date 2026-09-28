@@ -6905,6 +6905,13 @@ func isCodexFormatAgent(agent parser.AgentType) bool {
 	return ingest.IsCodexFormatAgent(agent)
 }
 
+// isCheckpointEligibleAgent reports whether an agent format supports
+// resumable parser checkpoints and incremental tail-appends (Codex formats
+// and Claude Code).
+func isCheckpointEligibleAgent(agent parser.AgentType) bool {
+	return isCodexFormatAgent(agent) || agent == parser.AgentClaude
+}
+
 func reconciliationWatchRoot(
 	path string, watchRoots []parser.WatchRoot, configuredRoots []string,
 ) string {
@@ -12368,7 +12375,7 @@ func (e *Engine) processProviderFile(
 	codexForceFullParse := false
 	codexProvenUnchanged := false
 	codexAuditDeepVerify := e.checkpointAudit.Load() &&
-		isCodexFormatAgent(file.Agent)
+		isCheckpointEligibleAgent(file.Agent)
 	var codexUnchangedMtime int64
 	verifiedCapture, verifiedMtime, verifiedFresh, verifiedStateOK := e.verifiedProviderSourceState(provider, source, file)
 	if !forceSourceCwdParse && !codexForceFullParse &&
@@ -12458,7 +12465,7 @@ func (e *Engine) processProviderFile(
 	// warm-sweep behavior while still proving appends before any full content
 	// fingerprint read. Audit mode deliberately bypasses this optimization and
 	// takes the authoritative full-parse path below.
-	if isCodexFormatAgent(file.Agent) && !codexAuditDeepVerify {
+	if isCheckpointEligibleAgent(file.Agent) && !codexAuditDeepVerify {
 		cpResult, cpErr := e.codexCheckpointFingerprint(ctx, source, file)
 		if cpErr != nil {
 			log.Printf("codex checkpoint %s: %v", file.Path, cpErr)
@@ -18543,7 +18550,7 @@ func (e *Engine) writeBatchWithOutcomeContext(
 			if ctx.Err() != nil {
 				return outcome
 			}
-			if isCodexFormatAgent(pw.sess.Agent) {
+			if isCheckpointEligibleAgent(pw.sess.Agent) {
 				cp, blobs, cpErr := e.buildCodexFullParseCheckpoint(
 					pw.sess.File.Path, pw,
 				)
@@ -19321,7 +19328,7 @@ func (e *Engine) writeBatchBulkWithOutcomeContext(
 		snapshotProject := pw.sess.Project
 		var checkpoint *db.ParserCheckpoint
 		var checkpointBlobs *db.ParserCheckpointBlobs
-		if isCodexFormatAgent(pw.sess.Agent) {
+		if isCheckpointEligibleAgent(pw.sess.Agent) {
 			var checkpointErr error
 			checkpoint, checkpointBlobs, checkpointErr = e.buildCodexFullParseCheckpoint(pw.sess.File.Path, pw)
 			if checkpointErr != nil {
@@ -19890,7 +19897,7 @@ func shouldReplaceFullParseMessages(
 ) bool {
 	return forceReplace || pw.forceReplace || pw.needsRetry || stale ||
 		revivingSourceMissing ||
-		isCodexFormatAgent(pw.sess.Agent) ||
+		isCheckpointEligibleAgent(pw.sess.Agent) ||
 		// Kiro full parses rebuild the complete accepted message projection;
 		// append semantics would retain rows removed or rewritten by the source.
 		pw.sess.Agent == parser.AgentKiro ||
@@ -20341,7 +20348,7 @@ func (e *Engine) writeSessionFullWithResolver(
 		}
 		var checkpoint *db.ParserCheckpoint
 		var checkpointBlobs *db.ParserCheckpointBlobs
-		if isCodexFormatAgent(pw.sess.Agent) {
+		if isCheckpointEligibleAgent(pw.sess.Agent) {
 			var checkpointErr error
 			checkpoint, checkpointBlobs, checkpointErr = e.buildCodexFullParseCheckpoint(pw.sess.File.Path, pw)
 			if checkpointErr != nil {
