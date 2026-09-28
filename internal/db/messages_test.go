@@ -109,7 +109,6 @@ func buildLargeSessionFixtureTemplate(
 		largeSessionMessages(largeSessionFixtureID, largeSessionFixtureToken)...)
 	if withFKPoison {
 		seedCrossSessionFKGrowth(t, d, largeSessionNeighborPrefix)
-		poisonMessagesDeleteTrigger(t, d)
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), largeSessionPerfCeiling)
 	defer cancel()
@@ -188,19 +187,16 @@ func poisonMessagesDeleteTrigger(t *testing.T, d *DB) {
 	}), "poison messages_ad trigger")
 }
 
-func requireMessagesDeleteTriggerRestored(t *testing.T, d *DB) {
+func requireNoFTSMessageTriggers(t *testing.T, d *DB) {
 	t.Helper()
 
-	var triggerSQL string
+	var count int
 	err := d.getReader().QueryRow(t.Context(),
-		`SELECT sql FROM sqlite_master
-		 WHERE type = 'trigger' AND name = 'messages_ad'`,
-	).Scan(&triggerSQL)
-	require.NoError(t, err, "read messages_ad trigger")
-	assert.NotContains(t, triggerSQL, "poison messages_ad fired",
-		"messages_ad trigger was not restored")
-	assert.Contains(t, triggerSQL, "INSERT INTO messages_fts",
-		"messages_ad trigger no longer matches the canonical FTS delete path")
+		`SELECT count(*) FROM sqlite_master
+		 WHERE type = 'trigger' AND name IN ('messages_ai', 'messages_au', 'messages_ad')`,
+	).Scan(&count)
+	require.NoError(t, err, "read FTS triggers")
+	assert.Zero(t, count, "messages table should have no row-level FTS triggers")
 }
 
 func requireMessagesDeleteTriggerPoisoned(t *testing.T, d *DB) {
@@ -582,7 +578,7 @@ func TestWriteSessionBatch_ReplaceMessagesLargeSession(t *testing.T) {
 	require.NoError(t, err, "GetAllMessages after batch replace")
 	require.Len(t, got, len(repl), "after batch replace")
 	assertNoFTSLeak(t, d, largeSessionFixtureToken)
-	requireMessagesDeleteTriggerRestored(t, d)
+	requireNoFTSMessageTriggers(t, d)
 
 	var neighborToolCalls int
 	err = d.getReader().QueryRow(t.Context(),

@@ -1208,6 +1208,23 @@ func insertMessagesTx(
 			)
 		}
 	}
+	if len(ids) > 0 {
+		active, err := activeFTSTablesTx(tx)
+		if err != nil {
+			return nil, err
+		}
+		minID := ids[0]
+		maxID := ids[len(ids)-1]
+		for _, table := range active {
+			if _, err := tx.Exec(
+				`INSERT INTO `+table+`(rowid, content)
+				 SELECT id, content FROM messages WHERE id BETWEEN ? AND ?`,
+				minID, maxID,
+			); err != nil {
+				return nil, fmt.Errorf("bulk-indexing %s entries id=%d..%d: %w", table, minID, maxID, err)
+			}
+		}
+	}
 	return ids, nil
 }
 
@@ -2133,59 +2150,50 @@ func sessionHasCurrentCJKFTSTx(
 	return storedFingerprint == simpleFTSRuntimeConfig.fingerprint, nil
 }
 
+// activeFTSTablesTx returns the names of active FTS tables (standard and CJK)
+// that need to be synchronized when messages are modified.
+func activeFTSTablesTx(tx transactionQueries) ([]string, error) {
+	var active []string
+	hasFTS, err := sessionHasFTSTableTx(tx, "messages_fts")
+	if err != nil {
+		return nil, err
+	}
+	if hasFTS {
+		active = append(active, "messages_fts")
+	}
+	hasCJK, err := sessionHasCurrentCJKFTSTx(tx)
+	if err != nil {
+		return nil, err
+	}
+	if hasCJK {
+		active = append(active, "messages_cjk_fts")
+	}
+	return active, nil
+}
+
 func deleteSessionMessageRowsTx(
 	tx transactionQueries, sessionID string,
 ) error {
-	tables := []struct {
-		name       string
-		deleteName string
-		deleteDDL  string
-	}{
-		{"messages_fts", "messages_ad", messagesADTriggerDDL},
-		{"messages_cjk_fts", "messages_cjk_ad", messagesCJKADTriggerDDL},
-	}
-	active := tables[:0]
-	for _, table := range tables {
-		var exists bool
-		var err error
-		if table.name == "messages_cjk_fts" {
-			exists, err = sessionHasCurrentCJKFTSTx(tx)
-		} else {
-			exists, err = sessionHasFTSTableTx(tx, table.name)
-		}
-		if err != nil {
-			return err
-		}
-		if exists {
-			active = append(active, table)
-		}
+	active, err := activeFTSTablesTx(tx)
+	if err != nil {
+		return err
 	}
 
 	for _, table := range active {
-		// Bulk-delete the FTS entries first so the later row delete
-		// does not re-tokenize large message blobs through delete triggers.
+		// Bulk-delete the FTS entries first so the FTS index is kept
+		// synchronized without per-row delete triggers.
 		if _, err := tx.Exec(
-			`INSERT INTO `+table.name+`(`+table.name+`, rowid, content)
+			`INSERT INTO `+table+`(`+table+`, rowid, content)
 			 SELECT 'delete', id, content FROM messages WHERE session_id = ?`,
 			sessionID,
 		); err != nil {
-			return fmt.Errorf("bulk-deleting %s entries: %w", table.name, err)
-		}
-		if _, err := tx.Exec(
-			"DROP TRIGGER IF EXISTS " + table.deleteName,
-		); err != nil {
-			return fmt.Errorf("dropping %s trigger: %w", table.deleteName, err)
+			return fmt.Errorf("bulk-deleting %s entries: %w", table, err)
 		}
 	}
 	if _, err := tx.Exec(
 		"DELETE FROM messages WHERE session_id = ?", sessionID,
 	); err != nil {
 		return fmt.Errorf("deleting old messages: %w", err)
-	}
-	for _, table := range active {
-		if _, err := tx.Exec(table.deleteDDL); err != nil {
-			return fmt.Errorf("restoring %s trigger: %w", table.deleteName, err)
-		}
 	}
 	return nil
 }
@@ -3704,7 +3712,8 @@ func applyToolCallResultUpdateTx(ctx context.Context,
 				candidate.Content == currentResultContent &&
 				candidate.AgentID == "" && candidate.SubagentSessionID == "" {
 				storedDigest := sha256.Sum256([]byte(currentResultContent))
-				if bytes.Equal(candidate.RawContentDigest, storedDigest[:]) {
+				if bytes.Equal(candidate.RawContentDigest, storedDigest[:]) ||
+					imagePolicy != config.ToolResultImagesKeep {
 					return false, nil, nil
 				}
 			}

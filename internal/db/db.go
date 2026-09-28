@@ -605,33 +605,11 @@ const ClassifierHashKey = "is_automated_classifier_hash"
 //go:embed schema.sql
 var schemaSQL string
 
-// messagesADTriggerDDL is the AFTER DELETE trigger that mirrors row
-// removals into the FTS5 shadow tables. ReplaceSessionMessages drops
-// this trigger inside its transaction (replacing N per-row FTS deletes
-// with a single bulk INSERT...SELECT) and then re-runs this DDL to
-// restore it before commit. Keeping the statement in one place keeps
-// the two installation sites byte-identical.
-const messagesADTriggerDDL = `
-CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, content)
-        VALUES('delete', old.id, old.content);
-END;
-`
-
 const cjkFTSRuntimeMatchesSQL = `EXISTS (
     SELECT 1 FROM main.stats
     WHERE key = '` + cjkFTSFingerprintStatsKey + `'
       AND CAST(value AS TEXT) = agentsview_cjk_fts_fingerprint()
 )`
-
-const messagesCJKADTriggerDDL = `
-CREATE TEMP TRIGGER IF NOT EXISTS messages_cjk_ad
-AFTER DELETE ON main.messages
-WHEN ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
-    INSERT INTO messages_cjk_fts(messages_cjk_fts, rowid, content)
-        VALUES('delete', old.id, old.content);
-END;
-`
 
 const schemaFTS = `
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -640,16 +618,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content_rowid='id',
     tokenize='porter unicode61'
 );
-
-CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
-END;
-` + messagesADTriggerDDL + `
-CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, content)
-        VALUES('delete', old.id, old.content);
-    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
-END;
 `
 
 const schemaCJKFTS = `
@@ -662,19 +630,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_cjk_fts USING fts5(
 `
 
 const schemaCJKFTSTriggers = `
-CREATE TEMP TRIGGER IF NOT EXISTS messages_cjk_ai
-AFTER INSERT ON main.messages
-WHEN ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
-    INSERT INTO messages_cjk_fts(rowid, content) VALUES (new.id, new.content);
-END;
-` + messagesCJKADTriggerDDL + `
-CREATE TEMP TRIGGER IF NOT EXISTS messages_cjk_au
-AFTER UPDATE ON main.messages
-WHEN ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
-    INSERT INTO messages_cjk_fts(messages_cjk_fts, rowid, content)
-        VALUES('delete', old.id, old.content);
-    INSERT INTO messages_cjk_fts(rowid, content) VALUES (new.id, new.content);
-END;
 
 -- The persistent BEFORE triggers mark a session pending without consulting
 -- the extension, because a build without the sidecar cannot evaluate the
@@ -4708,7 +4663,7 @@ func (db *DB) RebuildBulkImportIndexes(ctx context.Context) error {
 
 // checkFTSModuleLoads fails when messages_fts is in the schema but this
 // executable's SQLite cannot load its virtual table module. Writes to
-// messages fire triggers into messages_fts, so such an archive is
+// messages synchronize messages_fts, so such an archive is
 // read-only for this build no matter how the open succeeds.
 func (db *DB) checkFTSModuleLoads(
 	ctx context.Context, w *writerHandle,
@@ -4873,6 +4828,14 @@ func (db *DB) init(ctx context.Context, progress OpenProgressFunc) error {
 				" VALUES('rebuild')",
 		); err != nil {
 			return fmt.Errorf("backfilling FTS: %w", err)
+		}
+	}
+
+	// Drop legacy row-level FTS triggers if present from earlier schema versions
+	// to avoid per-row trigger overhead during message writes.
+	for _, tr := range []string{"messages_ai", "messages_au", "messages_ad"} {
+		if _, err := w.ExecContext(ctx, "DROP TRIGGER IF EXISTS "+tr); err != nil {
+			return fmt.Errorf("dropping legacy trigger %s: %w", tr, err)
 		}
 	}
 
