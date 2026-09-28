@@ -378,7 +378,7 @@ local Amp thread JSON files.
 | Grok                  | `~/.grok/sessions/`                                                                                                                                                                                                                                  |
 | Hermes Agent          | `~/.hermes/sessions/` (macOS and Linux), `~/AppData/Local/hermes/sessions/` (Windows)                                                                                                                                                                |
 | iFlow                 | `~/.iflow/projects/`                                                                                                                                                                                                                                 |
-| Junie                 | `~/.junie/sessions/` (CLI `SessionStore`; IDE-only conversations are not exposed by current JetBrains artifacts)                                                                                                                                     |
+| Junie                 | `~/.junie/sessions/` (or `$JUNIE_HOME/sessions/`; CLI `SessionStore`; IDE-only conversations are not exposed by current JetBrains artifacts)                                                                                                         |
 | Kilo                  | `~/.local/share/kilo/`                                                                                                                                                                                                                               |
 | Kilo (legacy)         | `~/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/` (macOS), `~/.config/Code/User/globalStorage/kilocode.kilo-code/` (Linux)                                                                                                 |
 | Kimi                  | `~/.kimi/sessions/`                                                                                                                                                                                                                                  |
@@ -439,6 +439,15 @@ not available. The project registry lives at
 `%LOCALAPPDATA%\crush\projects.json` (Windows). Set `CRUSH_DIR` or
 `agents.crush.dirs` to one or more Crush data directories, `.crush` directories,
 or `crush.db` files.
+
+Junie sessions are read from `~/.junie/sessions/<id>/events.jsonl`, the
+append-only event stream JetBrains Junie writes per task: user prompts, agent
+thinking, replies, tool, terminal, file-view, and MCP blocks, subagent
+activity, and per-call token usage with recorded costs. Session titles,
+projects, and timestamps come from the `index.jsonl` catalog when present and
+fall back to in-stream metadata. Set `JUNIE_DIR` or `agents.junie.dirs` to one
+or more sessions directories, or `JUNIE_HOME` to a Junie home directory whose
+`sessions/` subdirectory is indexed.
 
 Cline support covers the CLI, not the VS Code extension. Augure Code is tracked
 separately from Codex and resumes through the Augure CLI; its proprietary models

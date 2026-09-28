@@ -3628,109 +3628,59 @@ schemas keep their existing ordering behavior.
   deletes them in AgentsView. A malformed `parts` value fails that session's
   parse rather than degrading silently, matching the goose parser's policy.
 
-## JetBrains Junie (`junie`)
+## Junie (`junie`)
 
-- **Format:** Junie CLI stores one append-only `events.jsonl` stream per session
-  below `${JUNIE_HOME:-~/.junie}/sessions/<session-id>/`. The sibling
-  `sessions/index.jsonl` contains `sessionId`, `createdAt`, `updatedAt`,
-  `projectDir`, `taskName`, and `status` summary records. Event records use a
-  polymorphic `kind` discriminator and a producer-added `timestampMs` Unix
-  millisecond field.
-
+- **Format:** `~/.junie/sessions/<id>/events.jsonl`, an append-only JSONL
+  event stream per task. Event envelopes carry `kind`, `taskId`,
+  `timestampMs` (epoch milliseconds), and a nested `agentEvent` or `agent`
+  object; a few kinds such as `TaskState` and `SystemMessageEvent` appear at
+  the envelope's top level. Observed kinds include `UserPromptEvent`,
+  `UserResponseEvent`, `AgentThoughtBlockUpdatedEvent`,
+  `ResultBlockUpdatedEvent`, `ToolBlockUpdatedEvent`,
+  `TerminalBlockUpdatedEvent`, `ViewFilesBlockUpdatedEvent`,
+  `McpBlockUpdatedEvent`, `CustomAgentBlockUpdatedEvent`,
+  `SubagentSpawnedEvent`, `AgentPatchCreatedEvent`,
+  `LlmResponseMetadataEvent`, `SessionCostTrajectorySnapshotEvent`,
+  `TaskState`, and `AgentTaskNameUpdatedEvent`. `*UpdatedEvent` records are
+  incremental snapshots keyed by `stepId` whose `status` progresses from
+  `IN_PROGRESS` to `COMPLETED`, `CANCELLED`, or `FAILED`; the last update
+  wins. Nested agents appear inline with `agent.id` (`agent-1`, ...) and
+  `agent.name`, with rendered Markdown copies under `subagents/*.md`.
+  Per-session sidecars include `state.json`, `summary.json` (lifecycle plus
+  aggregate `modelUsage`), `transcript.md`, `checkpoints/`, and
+  `task-*/terminal-output/*.txt`. An optional `<root>/index.jsonl` catalog
+  carries `sessionId`, `taskName`, `projectDir`, `createdAt`, and
+  `updatedAt` (epoch ms); the catalog is incomplete — observed session
+  directories exist without index rows.
 - **Evidence:** `no-public-source`.
-
-- **Upstream:** The first-party
-  [Junie CLI Quickstart](https://junie.jetbrains.com/docs/junie-cli.html),
-  [slash-command reference](https://junie.jetbrains.com/docs/slash-commands.html),
-  and
-  [JetBrains Marketplace listing](https://plugins.jetbrains.com/plugin/26104-junie-the-ai-coding-agent-by-jetbrains)
-  were searched 2026-09-24; no public persistence source or authoritative
-  event schema was found. Use the public
-  [Linux amd64 archive for release 2285.4](https://github.com/JetBrains/junie/releases/download/2285.4/junie-release-2285.4-linux-amd64.zip)
-  to reproduce this entry. Its `junie-app/lib/app/junie-release-2285.4.jar`
-  has SHA-256
-  `e7f7fdccb50ca32981c58f671ed60622f29790f4fa9f65d5b9644f8624b7b75a`. Storage
-  paths, index replacement, model usage, and shared step IDs were reverified
-  from this artifact on 2026-09-28. Extract the jar with `jar xf`, read
-  `agent-skills/junie-cli-docs/junie-cli-user-disk-storage.md`, and inspect
-  `com.intellij.ml.llm.matterhorn.ej.app.cli.standalone.tui.app.state.SessionStore`,
-  `SessionSummary`, `SessionEvent`,
-  `org.jetbrains.a2ux.api.LlmResponseMetadataEvent`, and
-  `org.jetbrains.a2ux.api.ModelUsage` with CFR 0.152 or `javap -p -c`. The
-  bundled storage document defines `JUNIE_HOME`; `SessionStore` bytecode
-  defines `sessions/index.jsonl`, `sessions/<sessionId>/events.jsonl`, and the
-  timestamp append. `SessionStore` atomically replaces the complete index
-  rather than appending changed rows, so the filesystem event does not
-  identify which summary row changed.
-
-    The initial investigation used an installed CLI 26.7.13 jar with the same
-    filename and SHA-256
-    `51548cbe893b5e69e53ff49d5deaa1aa0ac6ebff8017b4ffc228a41681811323`. Its
-    distribution archive was not recorded, so the reason for the different bytes
-    is unknown. That hash is historical evidence; use the public Linux artifact
-    above for reproduction. The initial producer serializers generated
-    representative `UserPromptEvent`, `UserResponseEvent`,
-    `UserAsyncResponseEvent`, `SessionTitleSetEvent`, and nested
-    `SessionA2uxEvent` records.
-
-    Decompile `com.intellij.ml.llm.matterhorn.a2ux.server.steps.StepEventData`
-    with CFR 0.152: `post` emits `MarkdownBlockUpdatedEvent` for `details`, but
-    emits `ResultBlockUpdatedEvent` instead when `result` is set. Both use the
-    same `stepId`. `JunieSessionSteps.post` also keys active blocks by `stepId`,
-    rather than event kind.
-
-- **Conversation mapping:** `UserPromptEvent` prefers `presentablePrompt` over
-  its internal prompt. Synchronous and asynchronous user-response events
-  become user messages. History committed, dropped, and failed records
-  reconcile queued prompts by `requestId`. Nested A2UX
-  `MarkdownBlockUpdatedEvent` and `ResultBlockUpdatedEvent` records become
-  assistant messages; repeated block updates replace the prior content with
-  the same `stepId`, so active streaming text remains visible without
-  duplicating the final answer. A result replaces earlier markdown for that
-  step, matching the producer's block model; markdown with a different step ID
-  remains a separate message. The index supplies session creation and update
-  times; events supply message times. Tool calls, tool results, and file edits
-  are not imported. Malformed event lines are counted and skipped, including a
-  truncated final line, so complete earlier messages remain available.
-  Agentsview rejects event streams and index snapshots containing a record
-  over 64 MiB, preserving the archived session and cached index. This is an
-  Agentsview limit, not a producer limit. When the index is absent, both full
-  and direct session syncs remove cached index metadata and use event data.
-
-- **IDE boundary:** The JetBrains ACP registry and local `junie-chronicles.csv`
-  files were inspected on 2026-09-24. Chronicles contain project edit
-  activity, not conversations, and no separate IDE transcript source was
-  found. This provider therefore ingests the shared Junie CLI `SessionStore`
-  only. It does not claim support for IDE-only conversations until JetBrains
-  exposes a reproducible conversation artifact.
-
-- **Usage and cost:** Nested A2UX `LlmResponseMetadataEvent.modelUsage` records
-  persist the model, producer-reported USD cost, uncached input, cache-read,
-  cache-creation, and output tokens for each model response. Agentsview emits
-  one aggregate usage row per record and uses the producer-reported cost
-  rather than catalog pricing. `SessionCostTrajectorySnapshotEvent` totals and
-  `completion.taskCostUsd` overlap those response records, so they are not
-  emitted separately. An invalid reported cost rejects the session parse,
-  matching the Goose policy; it is not silently replaced with zero or an
-  estimate.
-
+- **Upstream:** JetBrains publishes Junie product pages and IDE help
+  documentation, but no event-stream schema, field reference, or serializer
+  source. JetBrains documentation was checked 2026-09-28; repository and
+  code searches for `junie session format`, `junie persistence`,
+  `junie token usage cost`, `events.jsonl`, and `SessionA2uxEvent` were
+  searched 2026-09-28 and found no public producer. Format details verified
+  against locally observed session directories under `~/.junie/sessions/`.
+- **Usage and cost:** `LlmResponseMetadataEvent.modelUsage[]` carries one
+  entry per LLM call with `model`, `inputTokens`, `outputTokens`,
+  `cacheInputTokens`, `cacheCreateTokens`, and a provider-reported `cost` in
+  USD. Agentsview maps `cacheInputTokens` to cache-read input and
+  `cacheCreateTokens` to cache-creation input and preserves the recorded USD
+  cost rather than catalog-pricing. `SessionCostTrajectorySnapshotEvent`
+  holds cumulative session totals (including `reasoningTokens`, which is not
+  persisted per call) and is used only as a test cross-check, not emitted as
+  a usage record.
 - **Agentsview:** `internal/parser/junie.go` and
-  `internal/parser/junie_provider.go` discover only direct
-  `sessions/<session-id>/events.jsonl` members, use content hashing for
-  freshness, normalize final messages and model usage, and treat discovery as
-  authoritative for provider membership. Missing roots do not block discovery
-  in other configured roots. A corrupt index keeps its last complete cached
-  snapshot and does not block healthy roots. Without a cached snapshot, that
-  root's sessions wait for a valid index; their archived data remains intact.
-  Direct session lookups and index watcher updates still report invalid
-  indexes. With an in-memory baseline, index watcher events select only
-  changed sessions. A fresh engine selects every session listed in the index.
-  Remote delta imports create a fresh planning engine each time, so an index
-  change re-hashes all listed transcripts even if only one summary changed.
-  The local daemon's startup sync establishes its baseline first. Failed
-  metadata-only updates recover on the next full sync (normally within 15
-  minutes) or transcript write. Direct session lookups refresh metadata
-  without consuming the watcher baseline.
+  `internal/parser/junie_provider.go`. Discovery scans `*/events.jsonl`
+  without requiring an index row and skips startup-stub directories;
+  `index.jsonl` supplies title, project, and timestamps when present, with
+  `AgentTaskNameUpdatedEvent` and `state.json` as fallbacks. Repeated
+  `stepId` updates deduplicate last-wins; assistant blocks group into one
+  message per `taskId`. Subagent sessions synthesize as `<parent>--agent-N`
+  children from the parent stream's nested `agent.id` blocks, falling back
+  to `subagents/*.md`; `terminal-output/*.txt` fills in terminal results
+  only when no inline `output` exists. `checkpoints/` and `transcript.md`
+  are not transcript sources. `JUNIE_HOME` reroots `~/.junie`;
+  `JUNIE_DIR`/`agents.junie.dirs` override the sessions root.
 
 [evener-source-1]: https://github.com/prime-radiant-inc/evener/blob/da7c06396c9848abfae362dcffce3861a6a0c95a/agent/transcript/transcript.go
 [evener-source-2]: https://github.com/prime-radiant-inc/evener/blob/da7c06396c9848abfae362dcffce3861a6a0c95a/agent/schema/turn.go
