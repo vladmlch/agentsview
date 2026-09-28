@@ -11,6 +11,11 @@ The latest published release is
 
 **New features**
 
+- Index JetBrains Junie sessions from `~/.junie/sessions/` with full
+  transcripts: prompts, thinking, replies, tool, terminal, file, and MCP
+  activity, subagent runs, and per-call token usage with Junie's recorded
+  USD costs. `JUNIE_HOME` re-roots the Junie home directory and `JUNIE_DIR`
+  or `agents.junie.dirs` point at custom sessions directories.
 - Verify conversation memory through an opt-in live release gate that records a
   synthetic decision, starts a fresh Claude Code or Codex session, and requires
   the client to search, read, answer accurately, and cite the source. Raw
