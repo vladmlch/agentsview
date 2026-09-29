@@ -2,8 +2,10 @@ package parser
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -475,8 +477,10 @@ func (b *codexSessionBuilder) handleSessionMeta(
 		if git := payload.Get("git"); git.Exists() {
 			b.gitRemote = export.SanitizeGitRemoteForStorage(git.Get("repository_url").Str)
 		}
+	}
+	if b.cwd != "" {
 		if proj := ExtractProjectFromCwdWithBranchContext(
-			b.projectContext, cwd, branch,
+			b.projectContext, b.cwd, b.gitBranch,
 		); proj != "" {
 			b.project = proj
 		} else {
@@ -1692,6 +1696,22 @@ func IsCodexExecSessionFile(path string) bool {
 			return true
 		}
 	}
+	if fresh, openErr := openCodexRolloutLines(path); openErr == nil {
+		defer fresh.Close()
+		dec := json.NewDecoder(fresh)
+		var raw json.RawMessage
+		if decErr := dec.Decode(&raw); decErr == nil {
+			trimmed := bytes.TrimSpace(raw)
+			if bytes.HasPrefix(trimmed, []byte("[")) {
+				var items []json.RawMessage
+				if err := json.Unmarshal(trimmed, &items); err == nil && len(items) > 0 {
+					return gjson.Get(string(items[0]), "payload.originator").Str == codexOriginatorExec
+				}
+			} else {
+				return gjson.Get(string(raw), "payload.originator").Str == codexOriginatorExec
+			}
+		}
+	}
 	return false
 }
 
@@ -1986,6 +2006,23 @@ func readCodexSessionMetaHeader(path string) (gjson.Result, error) {
 	if gjson.Get(string(line), "type").Str == codexTypeSessionMeta {
 		return gjson.Get(string(line), "payload"), nil
 	}
+	if _, seekErr := f.Seek(0, io.SeekStart); seekErr == nil {
+		dec := json.NewDecoder(f)
+		var raw json.RawMessage
+		if decErr := dec.Decode(&raw); decErr == nil {
+			trimmed := bytes.TrimSpace(raw)
+			if bytes.HasPrefix(trimmed, []byte("[")) {
+				var items []json.RawMessage
+				if err := json.Unmarshal(trimmed, &items); err == nil && len(items) > 0 {
+					if gjson.Get(string(items[0]), "type").Str == codexTypeSessionMeta {
+						return gjson.Get(string(items[0]), "payload"), nil
+					}
+				}
+			} else if gjson.Get(string(raw), "type").Str == codexTypeSessionMeta {
+				return gjson.Get(string(raw), "payload"), nil
+			}
+		}
+	}
 	return gjson.Result{}, nil
 }
 
@@ -2169,6 +2206,97 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 		return nil, nil,
 			codexCursorState{}, false, nil, "", "",
 			fmt.Errorf("reading codex %s: %w", path, err)
+	}
+
+	if b.sessionID == "" && malformedLines > 0 {
+		if _, seekErr := f.Seek(0, io.SeekStart); seekErr == nil {
+			tee = newCodexHashAnchorTee(io.LimitReader(f, info.Size()))
+			b = newCodexSessionBuilder(
+				ctx, p.spec.agent, includeExec, p.parentTurnResolver(ctx, path), sink,
+			)
+			malformedLines = 0
+			continuationLoaded = false
+
+			dec := json.NewDecoder(tee)
+			for {
+				if err := ctx.Err(); err != nil {
+					return nil, nil, codexCursorState{}, false, nil, "", "", err
+				}
+				var raw json.RawMessage
+				if err := dec.Decode(&raw); err != nil {
+					if errors.Is(err, io.EOF) {
+						break
+					}
+					malformedLines++
+					break
+				}
+				trimmed := bytes.TrimSpace(raw)
+				if bytes.HasPrefix(trimmed, []byte("[")) {
+					var items []json.RawMessage
+					if err := json.Unmarshal(trimmed, &items); err == nil {
+						for _, item := range items {
+							line := string(item)
+							if !continuationLoaded && gjson.Get(line, "type").Str == codexTypeSessionMeta {
+								continuationLoaded = true
+								payload := gjson.Get(line, "payload")
+								if payload.Get("history_mode").Str == "paginated" {
+									historyBase := payload.Get("history_base")
+									if historyBase.Exists() && historyBase.Type != gjson.Null {
+										threadID := strings.TrimSpace(historyBase.Get("thread_id").Str)
+										if threadID != "" {
+											chain, chainErr := p.resolveContinuationChain(
+												ctx, path, threadID, historyBase.Get("end_ordinal_exclusive").Int(),
+											)
+											if chainErr == nil {
+												for _, seg := range chain {
+													_ = p.feedContinuationSegment(ctx, seg, b, &malformedLines)
+												}
+											}
+										}
+									}
+								}
+							}
+							skip, lineErr := b.processLine(ctx, line)
+							if lineErr != nil {
+								return nil, nil, codexCursorState{}, false, nil, "", "", lineErr
+							}
+							if skip {
+								return nil, nil, codexCursorState{}, false, nil, "", "", nil
+							}
+						}
+					}
+					continue
+				}
+				line := string(raw)
+				if !continuationLoaded && gjson.Get(line, "type").Str == codexTypeSessionMeta {
+					continuationLoaded = true
+					payload := gjson.Get(line, "payload")
+					if payload.Get("history_mode").Str == "paginated" {
+						historyBase := payload.Get("history_base")
+						if historyBase.Exists() && historyBase.Type != gjson.Null {
+							threadID := strings.TrimSpace(historyBase.Get("thread_id").Str)
+							if threadID != "" {
+								chain, chainErr := p.resolveContinuationChain(
+									ctx, path, threadID, historyBase.Get("end_ordinal_exclusive").Int(),
+								)
+								if chainErr == nil {
+									for _, seg := range chain {
+										_ = p.feedContinuationSegment(ctx, seg, b, &malformedLines)
+									}
+								}
+							}
+						}
+					}
+				}
+				skip, lineErr := b.processLine(ctx, line)
+				if lineErr != nil {
+					return nil, nil, codexCursorState{}, false, nil, "", "", lineErr
+				}
+				if skip {
+					return nil, nil, codexCursorState{}, false, nil, "", "", nil
+				}
+			}
+		}
 	}
 
 	if err := b.flushPendingAgentResultsContext(ctx); err != nil {
@@ -2423,6 +2551,30 @@ func codexSessionIndexPath(sessionPath string) string {
 	return ""
 }
 
+func loadCodexSessionIndexSQLite(dbPath string) (map[string]string, error) {
+	db, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT id, title FROM threads WHERE id != '' AND title != ''")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	titles := make(map[string]string)
+	for rows.Next() {
+		var id, title string
+		if err := rows.Scan(&id, &title); err != nil {
+			return nil, err
+		}
+		titles[id] = title
+	}
+	return titles, rows.Err()
+}
+
 func loadCodexSessionIndex(indexPath string) (map[string]string, error) {
 	info, err := os.Stat(indexPath)
 	if err != nil {
@@ -2443,15 +2595,25 @@ func loadCodexSessionIndex(indexPath string) (map[string]string, error) {
 	}
 	codexSessionIndexCache.mu.Unlock()
 
-	f, err := os.Open(indexPath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
+	var titles map[string]string
+	if strings.HasSuffix(indexPath, ".sqlite") || strings.HasSuffix(indexPath, ".db") {
+		var sqErr error
+		titles, sqErr = loadCodexSessionIndexSQLite(indexPath)
+		if sqErr != nil {
+			return nil, sqErr
+		}
+	} else {
+		f, err := os.Open(indexPath)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
 
-	titles, err := ParseCodexSessionIndexTitles(f)
-	if err != nil {
-		return nil, err
+		var parseErr error
+		titles, parseErr = ParseCodexSessionIndexTitles(f)
+		if parseErr != nil {
+			return nil, parseErr
+		}
 	}
 
 	codexSessionIndexCache.mu.Lock()

@@ -73,7 +73,13 @@ func ResolveMatch[T any](model string, m map[string]T) Match[T] {
 	if v, pattern, ok := resolveCanonicalMatch(m, model); ok {
 		return Match[T]{Value: v, Pattern: pattern, OK: true}
 	}
-	// 5. Reasoning-effort / speed tier fallback. Agents such as Devin append
+	// 5. Fixed pricing alias fallback
+	if canon := fixedCanonicalModel(model); canon != "" && canon != model {
+		if sub := ResolveMatch(canon, m); sub.OK {
+			return sub
+		}
+	}
+	// 6. Reasoning-effort / speed tier fallback. Agents such as Devin append
 	// a reasoning-effort tier (e.g. "-thinking", "-high", "-medium", "-max")
 	// and sometimes a "-fast" speed tier to a base model that prices
 	// identically regardless of tier. Strip those trailing tiers and retry

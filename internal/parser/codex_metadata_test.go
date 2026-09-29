@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"database/sql"
 	"maps"
 	"os"
 	"path/filepath"
@@ -197,4 +198,30 @@ func TestCodexProvidersKeepIndependentMetadata(t *testing.T) {
 		require.Len(t, result.Results, 1)
 		assert.Equal(t, tc.title, result.Results[0].Result.Session.SessionName)
 	}
+}
+
+func TestCodexMetadata_StateSQLiteIndex(t *testing.T) {
+	primary, _ := aliasedCodexHomes(t)
+	const id = "019f0000-0000-7000-8000-000000000042"
+	session := filepath.Join(primary, "sessions", "2026", "09", "03",
+		"rollout-2026-09-03T10-00-00-"+id+".jsonl")
+
+	dbPath := filepath.Join(primary, "state_5.sqlite")
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = db.Exec("CREATE TABLE threads (id text primary key, title text)")
+	require.NoError(t, err)
+	_, err = db.Exec("INSERT INTO threads (id, title) VALUES (?, ?)", id, "SQLite Title From Threads")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	sessionRoot := filepath.Join(primary, "sessions")
+	metadata := CodexMetadata{roots: map[string][]string{sessionRoot: {primary}}}
+	files := metadata.IndexFiles(sessionRoot)
+	assert.Contains(t, files, dbPath)
+
+	name, ok, err := metadata.ReadThreadName(session, id)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "SQLite Title From Threads", name)
 }
