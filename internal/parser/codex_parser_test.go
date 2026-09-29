@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -4102,4 +4103,139 @@ func TestCodexMultilineJSONMetaNotFirst(t *testing.T) {
 	assert.Equal(t, "feature/branch", sess.GitBranch)
 	assert.Equal(t, "Hello non-first meta", msgs[0].Content)
 	assert.Len(t, msgs, 1)
+}
+
+func TestLoadCodexSessionIndexSQLite_ContentionFallback(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state_1.sqlite")
+
+	writer, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer writer.Close()
+	writer.SetMaxOpenConns(1)
+
+	_, err = writer.ExecContext(t.Context(), `
+		PRAGMA journal_mode=WAL;
+		CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT);
+		INSERT INTO threads VALUES ('019f0000-0000-7000-8000-000000000001', 'Committed Codex Title');
+	`)
+	require.NoError(t, err)
+
+	_, err = writer.ExecContext(t.Context(), "PRAGMA locking_mode=EXCLUSIVE")
+	require.NoError(t, err)
+
+	tx, err := writer.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(t.Context(), "INSERT INTO threads VALUES ('019f0000-0000-7000-8000-000000000002', 'Uncommitted Title')")
+	require.NoError(t, err)
+
+	// loadCodexSessionIndexSQLite must succeed via WithSQLiteReadOnly scratch copy fallback despite lock contention.
+	titles, err := loadCodexSessionIndexSQLite(dbPath)
+	require.NoError(t, err, "loadCodexSessionIndexSQLite must succeed via scratch copy fallback")
+	assert.Equal(t, "Committed Codex Title", titles["019f0000-0000-7000-8000-000000000001"])
+}
+
+func TestCodexContinuationStitching_ChildForkRemapsParentID_PatternA(t *testing.T) {
+	tmpDir := t.TempDir()
+	dayDir := filepath.Join(tmpDir, "2026", "09", "25")
+	require.NoError(t, os.MkdirAll(dayDir, 0o755))
+
+	rootUUID := "01a00000-0000-0000-0000-000000000001"
+	seg1UUID := "01a00000-0000-0000-0000-000000000011"
+	seg2UUID := "01a00000-0000-0000-0000-000000000022"
+
+	seg1Name := fmt.Sprintf("rollout-2026-09-25T10-00-00-%s_%s.jsonl", rootUUID, seg1UUID)
+	seg1Path := filepath.Join(dayDir, seg1Name)
+	seg1Content := strings.Join([]string{
+		fmt.Sprintf(`{"timestamp":"2026-09-25T10:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"%s","history_mode":"paginated","history_base":null}}`, rootUUID),
+		`{"timestamp":"2026-09-25T10:00:01Z","ordinal":1,"type":"turn_context","payload":{"turn_id":"turn-p1"}}`,
+		`{"timestamp":"2026-09-25T10:00:02Z","ordinal":2,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Prompt 1"}]}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(seg1Path, []byte(seg1Content), 0o644))
+
+	seg2Name := fmt.Sprintf("rollout-2026-09-25T11-00-00-%s_%s.jsonl", rootUUID, seg2UUID)
+	seg2Path := filepath.Join(dayDir, seg2Name)
+	seg2Content := strings.Join([]string{
+		fmt.Sprintf(`{"timestamp":"2026-09-25T11:00:00Z","ordinal":3,"type":"session_meta","payload":{"id":"%s","history_mode":"paginated","history_base":{"thread_id":"%s","end_ordinal_exclusive":3}}}`, rootUUID, seg1UUID),
+		`{"timestamp":"2026-09-25T11:00:01Z","ordinal":4,"type":"turn_context","payload":{"turn_id":"turn-p2"}}`,
+		`{"timestamp":"2026-09-25T11:00:02Z","ordinal":5,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Prompt 2"}]}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(seg2Path, []byte(seg2Content), 0o644))
+
+	// Child forks from seg2UUID (an intermediate rollout segment)
+	childUUID := "01a00000-0000-0000-0000-000000000099"
+	childName := fmt.Sprintf("rollout-2026-09-25T12-00-00-%s.jsonl", childUUID)
+	childPath := filepath.Join(dayDir, childName)
+	childContent := strings.Join([]string{
+		fmt.Sprintf(`{"timestamp":"2026-09-25T12:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"%s","forked_from_id":"%s"}}`, childUUID, seg2UUID),
+		`{"timestamp":"2026-09-25T12:00:01Z","ordinal":1,"type":"turn_context","payload":{"turn_id":"turn-p2"}}`,
+		`{"timestamp":"2026-09-25T12:00:02Z","ordinal":2,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Prompt 2"}]}}`,
+		`{"timestamp":"2026-09-25T12:00:03Z","ordinal":3,"type":"turn_context","payload":{"turn_id":"turn-c1"}}`,
+		`{"timestamp":"2026-09-25T12:00:04Z","ordinal":4,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Child fork prompt"}]}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(childPath, []byte(childContent), 0o644))
+
+	provider := newCodexTestProvider(t, tmpDir)
+	source := requireCodexProviderSource(t, provider, childUUID)
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+
+	sess := outcome.Results[0].Result.Session
+	msgs := outcome.Results[0].Result.Messages
+
+	assert.Equal(t, RelFork, sess.RelationshipType)
+	assert.Equal(t, "codex:"+rootUUID, sess.ParentSessionID, "fork parent session ID must be remapped to root UUID")
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "Child fork prompt", msgs[0].Content)
+}
+
+func TestCodexContinuationStitching_ChildForkRemapsParentID_PatternB(t *testing.T) {
+	tmpDir := t.TempDir()
+	dayDir := filepath.Join(tmpDir, "2026", "08", "26")
+	require.NoError(t, os.MkdirAll(dayDir, 0o755))
+
+	parentUUID := "01a03d68-37cf-7030-9390-bb41fd9cc84a"
+	parentName := fmt.Sprintf("rollout-2026-08-26T11-30-35-%s.jsonl", parentUUID)
+	parentPath := filepath.Join(dayDir, parentName)
+	parentContent := strings.Join([]string{
+		fmt.Sprintf(`{"timestamp":"2026-08-26T11:30:35Z","ordinal":0,"type":"session_meta","payload":{"id":"%s"}}`, parentUUID),
+		`{"timestamp":"2026-08-26T11:30:36Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Pattern B Question"}]}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(parentPath, []byte(parentContent), 0o644))
+
+	leafUUID := "01a03d6a-4380-7720-a740-f136201c821f"
+	leafName := fmt.Sprintf("rollout-2026-08-26T11-32-49-%s.jsonl", leafUUID)
+	leafPath := filepath.Join(dayDir, leafName)
+	leafContent := strings.Join([]string{
+		fmt.Sprintf(`{"timestamp":"2026-08-26T11:32:49Z","ordinal":2,"type":"session_meta","payload":{"id":"%s","history_mode":"paginated","history_base":{"thread_id":"%s","end_ordinal_exclusive":2}}}`, leafUUID, parentUUID),
+		`{"timestamp":"2026-08-26T11:32:50Z","ordinal":3,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Followup Question"}]}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(leafPath, []byte(leafContent), 0o644))
+
+	// Child subagent spawned referencing leafUUID as parent_thread_id
+	childUUID := "01a03d6b-5e6f-75f0-ab75-bdcbc99c3de7"
+	childName := fmt.Sprintf("rollout-2026-08-26T11-34-01-%s.jsonl", childUUID)
+	childPath := filepath.Join(dayDir, childName)
+	childContent := strings.Join([]string{
+		fmt.Sprintf(`{"timestamp":"2026-08-26T11:34:01Z","ordinal":0,"type":"session_meta","payload":{"id":"%s","source":{"subagent":{"thread_spawn":{"parent_thread_id":"%s"}}}}}`, childUUID, leafUUID),
+		`{"timestamp":"2026-08-26T11:34:02Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Subagent task"}]}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(childPath, []byte(childContent), 0o644))
+
+	provider := newCodexTestProvider(t, tmpDir)
+	source := requireCodexProviderSource(t, provider, childUUID)
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+
+	sess := outcome.Results[0].Result.Session
+	msgs := outcome.Results[0].Result.Messages
+
+	assert.Equal(t, RelSubagent, sess.RelationshipType)
+	assert.Equal(t, "codex:"+parentUUID, sess.ParentSessionID, "subagent parent session ID must be remapped to root UUID")
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "Subagent task", msgs[0].Content)
 }

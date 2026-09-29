@@ -241,7 +241,8 @@ func (s devinSourceSet) SourcesForChangedPath(
 			continue
 		}
 		if ref, ok := s.sourceRef(root, req.Path, true); ok {
-			return []SourceRef{ref}, nil
+			src := ref.Opaque.(devinSource)
+			return []SourceRef{s.newSourceRef(root, src.DBPath, src.SessionID)}, nil
 		}
 		if dbPath, ok := s.dbPathForEvent(root, req.Path); ok {
 			metas, err := ListDevinSessionMeta(dbPath)
@@ -262,7 +263,7 @@ func (s devinSourceSet) SourcesForChangedPath(
 				if !samePath(src.DBPath, dbPath) {
 					continue
 				}
-				addJSONLSource(ref, &sources, seen)
+				addJSONLSource(s.newSourceRef(root, src.DBPath, src.SessionID), &sources, seen)
 			}
 			sortJSONLSources(sources)
 			return sources, nil
@@ -280,7 +281,7 @@ func (s devinSourceSet) SourcesForChangedPath(
 				}
 				src := ref.Opaque.(devinSource)
 				if src.SessionID == sessionID {
-					return []SourceRef{ref}, nil
+					return []SourceRef{s.newSourceRef(root, src.DBPath, src.SessionID)}, nil
 				}
 			}
 		}
@@ -326,21 +327,35 @@ func (s devinSourceSet) FindSource(
 	if err := ctx.Err(); err != nil {
 		return SourceRef{}, false, err
 	}
+	reqParentSessionID, reqSubagentNodeID, reqIsSubagent := parseDevinSubagentRawSessionID(req.RawSessionID)
+
 	for _, path := range []string{req.StoredFilePath, req.FingerprintKey} {
 		if path == "" {
 			continue
 		}
 		rawSessionID := req.RawSessionID
-		if parentSessionID, _, ok := parseDevinSubagentRawSessionID(rawSessionID); ok {
-			rawSessionID = parentSessionID
-		}
+		parentSessionID := reqParentSessionID
+		subagentNodeID := reqSubagentNodeID
+		isSubagent := reqIsSubagent
+
 		for _, root := range s.roots {
 			ref, ok := s.sourceRef(root, path, true)
 			if !ok {
 				continue
 			}
 			src := ref.Opaque.(devinSource)
-			if rawSessionID != "" && src.SessionID != rawSessionID {
+			if !isSubagent {
+				if _, pathSessionID, nodeID, subOk := parseDevinSubagentVirtualSourcePath(path); subOk {
+					parentSessionID = pathSessionID
+					subagentNodeID = nodeID
+					isSubagent = true
+				}
+			}
+			targetSessionID := rawSessionID
+			if isSubagent {
+				targetSessionID = parentSessionID
+			}
+			if targetSessionID != "" && src.SessionID != targetSessionID {
 				continue
 			}
 			if req.RequireFreshSource {
@@ -352,22 +367,47 @@ func (s devinSourceSet) FindSource(
 					continue
 				}
 			}
+			if isSubagent {
+				exists, err := devinSubagentExists(ctx, src.DBPath, src.SessionID, subagentNodeID)
+				if err != nil {
+					return SourceRef{}, false, err
+				}
+				if !exists {
+					continue
+				}
+			}
 			return ref, true, nil
 		}
 	}
 	rawSessionID := req.RawSessionID
-	if parentSessionID, _, ok := parseDevinSubagentRawSessionID(rawSessionID); ok {
-		rawSessionID = parentSessionID
+	parentSessionID := reqParentSessionID
+	subagentNodeID := reqSubagentNodeID
+	isSubagent := reqIsSubagent
+
+	lookupSessionID := rawSessionID
+	if isSubagent {
+		lookupSessionID = parentSessionID
 	}
-	if rawSessionID == "" {
+	if lookupSessionID == "" {
 		return SourceRef{}, false, nil
 	}
 	for _, root := range s.roots {
-		ref, ok, err := s.findByRawSessionID(ctx, root, rawSessionID, req.RequireFreshSource)
+		ref, ok, err := s.findByRawSessionID(ctx, root, lookupSessionID, req.RequireFreshSource)
 		if err != nil {
 			return SourceRef{}, false, err
 		}
 		if ok {
+			if isSubagent {
+				src := ref.Opaque.(devinSource)
+				exists, err := devinSubagentExists(ctx, src.DBPath, src.SessionID, subagentNodeID)
+				if err != nil {
+					return SourceRef{}, false, err
+				}
+				if !exists {
+					continue
+				}
+				return s.newSubagentSourceRef(root, src.DBPath, src.SessionID, subagentNodeID, ref.DiscoveryMTimeNS), true, nil
+			}
 			return ref, true, nil
 		}
 	}
@@ -559,10 +599,12 @@ func (s devinSourceSet) sourceRef(root, path string, allowMissing bool) (SourceR
 	root = filepath.Clean(root)
 	path = filepath.Clean(path)
 	dbPath, sessionID, ok := ParseVirtualSourcePathForBase(path, devinDBFilename)
+	var rootNodeID int64
+	var isSubagent bool
 	if !ok {
-		dbPath, sessionID, _, ok = parseDevinSubagentVirtualSourcePath(path)
+		dbPath, sessionID, rootNodeID, isSubagent = parseDevinSubagentVirtualSourcePath(path)
 	}
-	if !ok || sessionID == "" {
+	if (!ok && !isSubagent) || sessionID == "" {
 		return SourceRef{}, false
 	}
 	if !samePath(dbPath, filepath.Join(root, "cli", devinDBFilename)) {
@@ -570,6 +612,9 @@ func (s devinSourceSet) sourceRef(root, path string, allowMissing bool) (SourceR
 	}
 	if !allowMissing && !IsRegularFile(dbPath) {
 		return SourceRef{}, false
+	}
+	if isSubagent {
+		return s.newSubagentSourceRef(root, dbPath, sessionID, rootNodeID, 0), true
 	}
 	return s.newSourceRef(root, dbPath, sessionID), true
 }
@@ -646,6 +691,22 @@ func (s devinSourceSet) newSourceRef(root, dbPath, sessionID string) SourceRef {
 
 func (s devinSourceSet) newSourceRefWithMTime(root, dbPath, sessionID string, mtimeNS int64) SourceRef {
 	virtualPath := VirtualSourcePath(dbPath, sessionID)
+	return SourceRef{
+		Provider:         AgentDevin,
+		Key:              virtualPath,
+		DisplayPath:      virtualPath,
+		FingerprintKey:   virtualPath,
+		DiscoveryMTimeNS: mtimeNS,
+		Opaque: devinSource{
+			Root:      root,
+			DBPath:    dbPath,
+			SessionID: sessionID,
+		},
+	}
+}
+
+func (s devinSourceSet) newSubagentSourceRef(root, dbPath, sessionID string, rootNodeID int64, mtimeNS int64) SourceRef {
+	virtualPath := devinSubagentVirtualSourcePath(VirtualSourcePath(dbPath, sessionID), rootNodeID)
 	return SourceRef{
 		Provider:         AgentDevin,
 		Key:              virtualPath,

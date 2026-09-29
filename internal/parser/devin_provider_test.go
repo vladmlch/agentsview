@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -705,4 +706,64 @@ func TestDevinProviderMissingDBSkipsAndPreservesSessions(t *testing.T) {
 	assert.False(t, outcome.ForceReplace)
 	assert.Equal(t, SkipNoSession, outcome.SkipReason)
 	assert.Empty(t, outcome.Results)
+}
+
+func TestDevinProviderFindSourceSubagentValidation(t *testing.T) {
+	t.Parallel()
+
+	const sessionID = "session-subagent-find"
+	fixture := newDevinTestFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Subagent FindSource",
+		WorkingDirectory: "/tmp/devin-subagent",
+		Model:            "claude-opus-4-8-medium",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103210)),
+		MainChainID:      new(int64(1)),
+	})
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"Main task"}`, CreatedAt: 1704103201},
+		// Subagent root node (NodeID 10) with a child (NodeID 11)
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 10, ChatMessage: `{"role":"system","content":"You are a subagent of Devin"}`, CreatedAt: 1704103202},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 11, ParentNodeID: new(int64(10)), ChatMessage: `{"role":"user","content":"Subagent prompt"}`, CreatedAt: 1704103203},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 12, ParentNodeID: new(int64(11)), ChatMessage: `{"role":"assistant","content":"Subagent reply"}`, CreatedAt: 1704103204},
+	)
+
+	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{fixture.Root}})
+	require.True(t, ok)
+
+	parentVirtualPath := VirtualSourcePath(fixture.DBPath, sessionID)
+	subagentVirtualPath := devinSubagentVirtualSourcePath(parentVirtualPath, 10)
+	subagentRawID := fmt.Sprintf("%s:agent-10", sessionID)
+	nonExistentRawID := fmt.Sprintf("%s:agent-9999", sessionID)
+	nonExistentVirtualPath := devinSubagentVirtualSourcePath(parentVirtualPath, 9999)
+
+	// 1. Existing subagent should be found via RawSessionID, FullSessionID, and StoredFilePath
+	sourceRaw, found, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: subagentRawID})
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, subagentVirtualPath, sourceRaw.DisplayPath)
+
+	sourceFull, found, err := provider.FindSource(t.Context(), FindSourceRequest{FullSessionID: "devin:" + subagentRawID})
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, subagentVirtualPath, sourceFull.DisplayPath)
+
+	sourcePath, found, err := provider.FindSource(t.Context(), FindSourceRequest{StoredFilePath: subagentVirtualPath})
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, subagentVirtualPath, sourcePath.DisplayPath)
+
+	// 2. Non-existent subagent must return found=false even if the parent session exists
+	_, found, err = provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: nonExistentRawID})
+	require.NoError(t, err)
+	assert.False(t, found, "non-existent subagent raw ID should not be found")
+
+	_, found, err = provider.FindSource(t.Context(), FindSourceRequest{FullSessionID: "devin:" + nonExistentRawID})
+	require.NoError(t, err)
+	assert.False(t, found, "non-existent subagent full ID should not be found")
+
+	_, found, err = provider.FindSource(t.Context(), FindSourceRequest{StoredFilePath: nonExistentVirtualPath})
+	require.NoError(t, err)
+	assert.False(t, found, "non-existent subagent stored path should not be found")
 }
