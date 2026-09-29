@@ -837,9 +837,9 @@ func (db *DB) searchContentFTS(ctx context.Context, f ContentSearchFilter) (Cont
 		if f.ExcludeSystem {
 			sysPred = "m.is_system = 0 AND " + SystemPrefixSQL("m.content", "m.role")
 		}
-		branch := fmt.Sprintf(`SELECT m.session_id,s.project,s.agent,
-			COALESCE(s.transcript_revision,''),'message',m.role,'',m.ordinal,
-			COALESCE(m.timestamp,''),m.content,0 AS src,m.id AS row_id
+		branch := fmt.Sprintf(`SELECT m.session_id AS session_id,s.project AS project,s.agent AS agent,
+			COALESCE(s.transcript_revision,'') AS transcript_revision,'message' AS location,m.role AS role,'' AS tool_name,m.ordinal AS ordinal,
+			COALESCE(m.timestamp,'') AS ts,m.content AS snippet,0 AS src,m.id AS row_id
 			FROM %s JOIN messages m ON m.id=%s.rowid
 			JOIN sessions s ON s.id=m.session_id
 			WHERE %s MATCH ? AND %s AND m.%s`, prepared.table, prepared.table,
@@ -882,9 +882,9 @@ func (db *DB) searchContentFTS(ctx context.Context, f ContentSearchFilter) (Cont
 		}
 		predicates = append(predicates, `(tc.source_kind<>'call' OR tc.location<>'tool_result' OR tc.tool_use_id='' OR NOT EXISTS
 			(SELECT 1 FROM tool_content ev WHERE ev.source_kind='event' AND ev.session_id=tc.session_id AND ev.tool_use_id=tc.tool_use_id))`)
-		branch := `SELECT tc.session_id,s.project,s.agent,COALESCE(s.transcript_revision,''),
-			tc.location,'assistant',tc.tool_name,tc.ordinal,COALESCE(m.timestamp,''),
-			tc.content,1 AS src,tc.id AS row_id FROM tool_content_fts
+		branch := `SELECT tc.session_id AS session_id,s.project AS project,s.agent AS agent,COALESCE(s.transcript_revision,'') AS transcript_revision,
+			tc.location AS location,'assistant' AS role,tc.tool_name AS tool_name,tc.ordinal AS ordinal,COALESCE(m.timestamp,'') AS ts,
+			tc.content AS snippet,1 AS src,tc.id AS row_id FROM tool_content_fts
 			JOIN tool_content tc ON tc.id=tool_content_fts.rowid
 			LEFT JOIN messages m ON m.id=tc.message_id JOIN sessions s ON s.id=tc.session_id
 			WHERE ` + strings.Join(predicates, " AND ")
