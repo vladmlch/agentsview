@@ -44,6 +44,11 @@ func (*codexSeedSink) InsertOrphanMessage(string, ParsedMessage) bool { return t
 
 func (*codexSeedSink) Finalize() {}
 
+func (s *codexSeedSink) Reset() {
+	s.nextOrdinal = 0
+	s.hadReservation = false
+}
+
 func (*codexSeedSink) Messages() []ParsedMessage { return nil }
 
 func (*codexSeedSink) ToolCallUpdates() []ParsedToolCallUpdate { return nil }

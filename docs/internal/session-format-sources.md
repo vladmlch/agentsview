@@ -878,17 +878,21 @@ fixtures retain this field; missing identities remain source-local.
   [session_index.rs](https://github.com/openai/codex/blob/92bc601ad60542c92bf0bb1e7a2eb70b84ac49d2/codex-rs/rollout/src/session_index.rs)
   and its caller in
   [update_thread_metadata.rs](https://github.com/openai/codex/blob/92bc601ad60542c92bf0bb1e7a2eb70b84ac49d2/codex-rs/thread-store/src/local/update_thread_metadata.rs).
-  A Codex home where no thread was ever renamed has no index, so an absent
-  index is the normal state, not a rename signal. Reverified 2026-09-30: a
-  local `~/.codex` used by codex-cli 0.159.2 had both a
-  `thread_history_1.sqlite` and a `session_index.jsonl` written that day. The
-  TUI also maintains an append-oriented `history.jsonl` whose records contain
-  `session_id`, Unix-seconds `ts`, and submitted prompt `text`; configured
-  size enforcement can rewrite a retained tail in place. Agentsview consumes
-  only the first two fields as a live-activity hint. Subagent rollouts carry a
-  structural `source.subagent` marker and a top-level `parent_thread_id`; that
-  pair defines the parent edge. `thread_source` is a legacy fallback, and
-  `session_id` identifies the root or tree rather than the parent.
+  Thread titles live in `state_*.sqlite` (or `state_*.db`) databases
+  (`threads` table); Agentsview reads and watches both sources. A Codex home
+  where no thread was ever renamed has no index, so an absent index is the
+  normal state, not a rename signal. Reverified 2026-09-30: a local
+  `~/.codex` used by codex-cli 0.159.2 had both a `thread_history_1.sqlite`
+  and a `session_index.jsonl` written that day. Streaming rollouts are
+  parsed line-by-line with a multiline JSON decoder fallback for
+  pretty-printed array rollouts. The TUI also maintains an append-oriented
+  `history.jsonl` whose records contain `session_id`, Unix-seconds `ts`, and
+  submitted prompt `text`; configured size enforcement can rewrite a
+  retained tail in place. Agentsview consumes only the first two fields as a
+  live-activity hint. Subagent rollouts carry a structural `source.subagent`
+  marker and a top-level `parent_thread_id`; that pair defines the parent
+  edge. `thread_source` is a legacy fallback, and `session_id` identifies
+  the root or tree rather than the parent.
 
 - **Launch classification (reverified 2026-10-08):**
   `session_meta.payload.originator=codex_exec` is durable producer evidence of
@@ -3990,11 +3994,12 @@ schemas keep their existing ordering behavior.
 
 ## Antigravity IDE (`antigravity`)
 
-- **Format:** Per-session SQLite databases, optionally supplemented by
-  trajectory JSON sidecars, plus the agent brain's plaintext
-  `brain/<uuid>/.system_generated/logs/transcript.jsonl`, which is the session
-  itself for a conversation with no database.
-
+- **Format:** Per-session SQLite databases (`conversations/<id>.db`),
+  supplemented by global workspace directory `conversation_summaries.db`
+  (extracting workspace URIs, thread titles, and cwd), native execution logs
+  (`brain/<id>/.system_generated/logs/transcript.jsonl` for full-fidelity
+  thinking traces and tool result interleaving — the session itself for a
+  conversation with no database), and trajectory JSON sidecars.
 - **Evidence:** `no-public-source`.
 
 - **Upstream:** Google's first-party Antigravity product and documentation
@@ -4887,13 +4892,15 @@ schemas keep their existing ordering behavior.
   `timestampMs` (epoch milliseconds), and a nested `agentEvent` or `agent`
   object; a few kinds such as `TaskState` and `SystemMessageEvent` appear at
   the envelope's top level. Observed kinds include `UserPromptEvent`,
-  `UserResponseEvent`, `AgentThoughtBlockUpdatedEvent`,
-  `ResultBlockUpdatedEvent`, `ToolBlockUpdatedEvent`,
-  `TerminalBlockUpdatedEvent`, `ViewFilesBlockUpdatedEvent`,
-  `McpBlockUpdatedEvent`, `CustomAgentBlockUpdatedEvent`,
-  `SubagentSpawnedEvent`, `AgentPatchCreatedEvent`,
-  `LlmResponseMetadataEvent`, `SessionCostTrajectorySnapshotEvent`,
-  `TaskState`, and `AgentTaskNameUpdatedEvent`. `*UpdatedEvent` records are
+  `UserResponseEvent`, `UserAsyncResponseEvent`,
+  `AgentThoughtBlockUpdatedEvent`, `ResultBlockUpdatedEvent`,
+  `ToolBlockUpdatedEvent`, `TerminalBlockUpdatedEvent`,
+  `ViewFilesBlockUpdatedEvent`, `McpBlockUpdatedEvent`,
+  `CustomAgentBlockUpdatedEvent`, `SubagentSpawnedEvent`,
+  `AgentPatchCreatedEvent`, `LlmResponseMetadataEvent`,
+  `CancelAgentEvent`, `AgentTaskFailedEvent`,
+  `SessionCostTrajectorySnapshotEvent`, `TaskState`, and
+  `AgentTaskNameUpdatedEvent`. `*UpdatedEvent` records are
   incremental snapshots keyed by `stepId` whose `status` progresses from
   `IN_PROGRESS` to `COMPLETED`, `CANCELLED`, or `FAILED`; the last update
   wins. Nested agents appear inline with `agent.id` (`agent-1`, ...) and
@@ -4928,11 +4935,14 @@ schemas keep their existing ordering behavior.
   `AgentTaskNameUpdatedEvent` and `state.json` as fallbacks. Repeated
   `stepId` updates deduplicate last-wins; assistant blocks group into one
   message per `taskId`. Subagent sessions synthesize as `<parent>--agent-N`
-  children from the parent stream's nested `agent.id` blocks, falling back
-  to `subagents/*.md`; `terminal-output/*.txt` fills in terminal results
-  only when no inline `output` exists. `checkpoints/` and `transcript.md`
-  are not transcript sources. `JUNIE_HOME` reroots `~/.junie`;
-  `JUNIE_DIR`/`agents.junie.dirs` override the sessions root.
+  children from the parent stream's nested `agent.id` blocks, linked to parent
+  `SubagentSpawnedEvent` calls via stepId prefix disambiguation;
+  `CancelAgentEvent` and `AgentTaskFailedEvent` mark sessions and failed
+  children with truncated termination. The parser falls back to
+  `subagents/*.md` when needed; `terminal-output/*.txt` fills in terminal
+  results only when no inline `output` exists. `checkpoints/` and
+  `transcript.md` are not transcript sources. `JUNIE_HOME` reroots
+  `~/.junie`; `JUNIE_DIR`/`agents.junie.dirs` override the sessions root.
 
 ## fx (`fx`)
 

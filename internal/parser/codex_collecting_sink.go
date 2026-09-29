@@ -250,6 +250,15 @@ func (s *CodexCollectingSink) Finalize() {
 	}
 }
 
+func (s *CodexCollectingSink) Reset() {
+	s.messages = nil
+	s.callRefs = make(map[string]codexToolCallRef)
+	s.callRefsByPosition = make(map[ParsedToolCallPosition]codexToolCallRef)
+	s.toolCallUpdates = nil
+	s.orphanNotificationIx = make(map[string]int)
+	s.nextOrdinal = 0
+}
+
 func (s *CodexCollectingSink) Messages() []ParsedMessage {
 	return s.messages
 }

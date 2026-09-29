@@ -226,8 +226,7 @@ func (p *codexProvider) RawCaptureSourcesForChangedPath(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if p.sources.ownsCodexSidecars() &&
-		filepath.Base(req.Path) == CodexSessionIndexFilename {
+	if p.sources.ownsCodexSidecars() && isCodexIndexPath(req.Path) {
 		return nil, nil
 	}
 	if isCompressedCodexRolloutPath(req.Path) {
@@ -1229,7 +1228,7 @@ func (s codexSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 			roots = append(roots, WatchRoot{
 				Path:         shallow,
 				Recursive:    false,
-				IncludeGlobs: []string{CodexSessionIndexFilename},
+				IncludeGlobs: []string{CodexSessionIndexFilename, "state_*.sqlite", "state_*.sqlite-*", "state_*.db", "state_*.db-*"},
 				DebounceKey:  string(s.agent) + ":index:" + shallow,
 			})
 		}
@@ -1244,8 +1243,7 @@ func (s codexSourceSet) SourcesForChangedPath(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if s.ownsCodexSidecars() &&
-		filepath.Base(req.Path) == CodexSessionIndexFilename {
+	if s.ownsCodexSidecars() && isCodexIndexPath(req.Path) {
 		return s.sourcesForIndexPath(ctx, req.Path)
 	}
 	compressed := isCompressedCodexRolloutPath(req.Path)
@@ -1389,6 +1387,19 @@ func (s codexSourceSet) pathFromSource(source SourceRef) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func isCodexIndexPath(path string) bool {
+	base := filepath.Base(path)
+	if base == CodexSessionIndexFilename {
+		return true
+	}
+	base = strings.TrimSuffix(base, "-wal")
+	base = strings.TrimSuffix(base, "-shm")
+	if strings.HasPrefix(base, "state_") && (strings.HasSuffix(base, ".sqlite") || strings.HasSuffix(base, ".db")) {
+		return true
+	}
+	return false
 }
 
 func (s codexSourceSet) sourcesForIndexPath(
