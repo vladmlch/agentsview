@@ -77,6 +77,13 @@ export interface RecentlyDeletedSessions {
   timer: ReturnType<typeof setTimeout>;
 }
 
+export interface GroupSessionsState {
+  sessions: Session[];
+  nextCursor: string | null;
+  total: number;
+  loading: boolean;
+}
+
 export interface Filters {
   project: string;
   machine: string;
@@ -337,7 +344,16 @@ class SessionsStore {
   private safetyNetTimer: ReturnType<typeof setInterval> | null = null;
 
   get activeSession(): Session | undefined {
-    const session = this.sessions.find((s) => s.id === this.activeSessionId);
+    let session = this.sessions.find((s) => s.id === this.activeSessionId);
+    if (!session && this.activeSessionId) {
+      for (const groupState of this.groupSessionsCache.values()) {
+        const found = groupState.sessions.find((s) => s.id === this.activeSessionId);
+        if (found) {
+          session = found;
+          break;
+        }
+      }
+    }
     return session?.is_index_only ? undefined : session;
   }
 
@@ -528,6 +544,7 @@ class SessionsStore {
       if (this.loadVersion !== version) return;
 
       this.sidebarIndexVersion = indexVersion;
+      this.clearGroupSessionsCache();
       this.hydratedSessionsByVersion.set(indexVersion, new Map());
       this.sidebarHydrationEpochByVersion.set(indexVersion, 0);
       this.pruneSidebarHydrationVersions(indexVersion);
@@ -660,15 +677,34 @@ class SessionsStore {
 
   private mergeHydratedSession(hydrated: Session) {
     const idx = this.sessions.findIndex((s) => s.id === hydrated.id);
-    if (idx < 0) return;
-    const current = this.sessions[idx]!;
-    this.sessions[idx] = {
-      ...current,
-      ...hydrated,
-      display_name: hydrated.display_name ?? current.display_name,
-      is_teammate: hydrated.is_teammate ?? current.is_teammate,
-      is_index_only: false,
-    };
+    if (idx >= 0) {
+      const current = this.sessions[idx]!;
+      this.sessions[idx] = {
+        ...current,
+        ...hydrated,
+        display_name: hydrated.display_name ?? current.display_name,
+        is_teammate: hydrated.is_teammate ?? current.is_teammate,
+        is_index_only: false,
+      };
+    }
+    for (const [key, groupState] of this.groupSessionsCache.entries()) {
+      const gIdx = groupState.sessions.findIndex((s) => s.id === hydrated.id);
+      if (gIdx >= 0) {
+        const current = groupState.sessions[gIdx]!;
+        const updated = [...groupState.sessions];
+        updated[gIdx] = {
+          ...current,
+          ...hydrated,
+          display_name: hydrated.display_name ?? current.display_name,
+          is_teammate: hydrated.is_teammate ?? current.is_teammate,
+          is_index_only: false,
+        };
+        this.groupSessionsCache.set(key, {
+          ...groupState,
+          sessions: updated,
+        });
+      }
+    }
   }
 
   private invalidateHydratedSessionDetails() {
@@ -756,6 +792,143 @@ class SessionsStore {
         break;
       }
     }
+  }
+
+  groupSessionsCache: Map<string, GroupSessionsState> = $state(new Map());
+  private groupSessionsInflight: Map<string, Promise<void>> = new Map();
+  private groupSessionsVersion = 0;
+
+  getGroupSessions(key: string): Session[] {
+    return this.groupSessionsCache.get(key)?.sessions ?? [];
+  }
+
+  getGroupState(key: string): GroupSessionsState | undefined {
+    return this.groupSessionsCache.get(key);
+  }
+
+  isGroupLoading(key: string): boolean {
+    return this.groupSessionsCache.get(key)?.loading ?? false;
+  }
+
+  clearGroupSessionsCache() {
+    this.groupSessionsVersion++;
+    this.groupSessionsInflight.clear();
+    this.groupSessionsCache = new Map();
+  }
+
+  async loadGroupSessions(mode: "agent" | "project", key: string, force = false): Promise<void> {
+    const existing = this.groupSessionsCache.get(key);
+    if (!force && existing && (existing.sessions.length > 0 || !existing.nextCursor)) {
+      return;
+    }
+    const inflight = this.groupSessionsInflight.get(key);
+    if (inflight) return inflight;
+
+    const version = this.groupSessionsVersion;
+    const promise = (async () => {
+      this.groupSessionsCache.set(key, {
+        sessions: existing?.sessions ?? [],
+        nextCursor: existing?.nextCursor ?? null,
+        total: existing?.total ?? 0,
+        loading: true,
+      });
+
+      try {
+        const signal = this.routeSignal();
+        const params: SidebarIndexParams = {
+          ...this.apiParams,
+          agent: mode === "agent" ? key : this.apiParams.agent,
+          project: mode === "project" ? key : this.apiParams.project,
+          limit: 100,
+        };
+        const index = await SessionsService.getApiV1SessionsSidebarIndex(params, { signal });
+        if (version !== this.groupSessionsVersion) return;
+
+        const existingById = new Map((existing?.sessions ?? []).map((s) => [s.id, s]));
+        const mapped = index.sessions.map((row) => sidebarIndexRowToSession(row, existingById.get(row.id)));
+
+        this.groupSessionsCache.set(key, {
+          sessions: mapped,
+          nextCursor: index.next_cursor ?? null,
+          total: index.total,
+          loading: false,
+        });
+      } catch (err) {
+        if (!isAbortError(err) && version === this.groupSessionsVersion) {
+          this.groupSessionsCache.set(key, {
+            sessions: existing?.sessions ?? [],
+            nextCursor: existing?.nextCursor ?? null,
+            total: existing?.total ?? 0,
+            loading: false,
+          });
+        }
+      } finally {
+        this.groupSessionsInflight.delete(key);
+      }
+    })();
+
+    this.groupSessionsInflight.set(key, promise);
+    return promise;
+  }
+
+  async loadMoreGroupSessions(mode: "agent" | "project", key: string): Promise<void> {
+    const existing = this.groupSessionsCache.get(key);
+    if (!existing || !existing.nextCursor || existing.loading) return;
+
+    const inflight = this.groupSessionsInflight.get(key);
+    if (inflight) return inflight;
+
+    const version = this.groupSessionsVersion;
+    const promise = (async () => {
+      this.groupSessionsCache.set(key, {
+        ...existing,
+        loading: true,
+      });
+
+      try {
+        const signal = this.routeSignal();
+        const params: SidebarIndexParams = {
+          ...this.apiParams,
+          agent: mode === "agent" ? key : this.apiParams.agent,
+          project: mode === "project" ? key : this.apiParams.project,
+          cursor: existing.nextCursor!,
+          limit: 100,
+        };
+        const index = await SessionsService.getApiV1SessionsSidebarIndex(params, { signal });
+        if (version !== this.groupSessionsVersion) return;
+
+        const existingById = new Map(existing.sessions.map((s) => [s.id, s]));
+        const nextMapped = index.sessions.map((row) => sidebarIndexRowToSession(row, existingById.get(row.id)));
+
+        const seen = new Set(existing.sessions.map((s) => s.id));
+        const merged = [...existing.sessions];
+        for (const s of nextMapped) {
+          if (!seen.has(s.id)) {
+            seen.add(s.id);
+            merged.push(s);
+          }
+        }
+
+        this.groupSessionsCache.set(key, {
+          sessions: merged,
+          nextCursor: index.next_cursor ?? null,
+          total: index.total,
+          loading: false,
+        });
+      } catch (err) {
+        if (!isAbortError(err) && version === this.groupSessionsVersion) {
+          this.groupSessionsCache.set(key, {
+            ...existing,
+            loading: false,
+          });
+        }
+      } finally {
+        this.groupSessionsInflight.delete(key);
+      }
+    })();
+
+    this.groupSessionsInflight.set(key, promise);
+    return promise;
   }
 
   async loadProjects() {
@@ -1367,6 +1540,7 @@ class SessionsStore {
   }
 
   invalidateFilterCaches() {
+    this.clearGroupSessionsCache();
     this.invalidateProjectCache();
     this.agentsVersion++;
     this.agentsLoaded = false;
@@ -1437,6 +1611,22 @@ class SessionsStore {
         merged.display_name = undefined;
       }
       this.sessions[idx] = merged;
+    }
+    for (const [key, groupState] of this.groupSessionsCache.entries()) {
+      const gIdx = groupState.sessions.findIndex((s) => s.id === id);
+      if (gIdx !== -1) {
+        const current = groupState.sessions[gIdx]!;
+        const merged = { ...current, ...updated };
+        if (displayName === null && updated.display_name === undefined) {
+          merged.display_name = undefined;
+        }
+        const updatedSessions = [...groupState.sessions];
+        updatedSessions[gIdx] = merged;
+        this.groupSessionsCache.set(key, {
+          ...groupState,
+          sessions: updatedSessions,
+        });
+      }
     }
   }
 

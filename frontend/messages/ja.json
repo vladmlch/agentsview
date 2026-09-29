@@ -402,6 +402,7 @@
     }
   ],
   "sidebar_loading": "読み込み中",
+  "sidebar_load_more": "さらに読み込む",
   "sidebar_multi_select": "複数選択",
   "sidebar_exit_multi_select": "複数選択を終了する",
   "sidebar_select_all_visible": "表示されているものをすべて選択します",
