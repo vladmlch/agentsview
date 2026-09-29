@@ -3580,6 +3580,8 @@ func soleToolResultEventTx(ctx context.Context,
 	imagePolicy config.ToolResultImages,
 ) ([]ToolResultEvent, error) {
 	var count int
+	var subagent, agentID string
+	var digest []byte
 	var content sql.NullString
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM (
@@ -3599,11 +3601,15 @@ func soleToolResultEventTx(ctx context.Context,
 		return nil, nil
 	}
 	if err := tx.QueryRowContext(ctx,
-		`SELECT content FROM tool_result_events
+		`SELECT COALESCE(subagent_session_id, ''),
+		        COALESCE(agent_id, ''),
+		        raw_content_digest,
+		        content
+		 FROM tool_result_events
 		 WHERE session_id = ? AND tool_call_message_ordinal = ?
 		   AND call_index = ?`,
 		sessionID, messageOrdinal, callIndex,
-	).Scan(&content); err != nil {
+	).Scan(&subagent, &agentID, &digest, &content); err != nil {
 		return nil, fmt.Errorf(
 			"reading sole tool result event for %s/%d/%d: %w",
 			sessionID, messageOrdinal, callIndex, err,
@@ -3614,7 +3620,12 @@ func soleToolResultEventTx(ctx context.Context,
 		stored, _ = StripToolResultImages(stored)
 	}
 	// Offload dedup must compare stored bytes because readers hydrate the original event.
-	return []ToolResultEvent{{Content: stored}}, nil
+	return []ToolResultEvent{{
+		Content:           stored,
+		SubagentSessionID: subagent,
+		AgentID:           agentID,
+		RawContentDigest:  digest,
+	}}, nil
 }
 
 func applyToolCallSubagentLinkTx(ctx context.Context,
@@ -3845,7 +3856,8 @@ func applyToolCallResultUpdateTx(ctx context.Context,
 				candidate.Content == currentResultContent &&
 				candidate.AgentID == "" && candidate.SubagentSessionID == "" {
 				storedDigest := sha256.Sum256([]byte(currentResultContent))
-				if bytes.Equal(candidate.RawContentDigest, storedDigest[:]) {
+				if bytes.Equal(candidate.RawContentDigest, storedDigest[:]) ||
+					strings.Contains(currentResultContent, "asset://") {
 					return false, nil, nil
 				}
 			}

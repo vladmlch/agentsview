@@ -2,12 +2,15 @@ package parser
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 )
 
 var _ Provider = (*antigravityProvider)(nil)
@@ -143,15 +146,130 @@ type antigravitySource struct {
 	SubagentRole     string
 }
 
+type antigravitySummary struct {
+	workspaceURIs string
+	title         string
+	cwd           string
+	project       string
+}
+
+type antigravitySummaryIndex struct {
+	mu      sync.RWMutex
+	entries map[string]antigravitySummary
+}
+
+func newAntigravitySummaryIndex() *antigravitySummaryIndex {
+	return &antigravitySummaryIndex{
+		entries: make(map[string]antigravitySummary),
+	}
+}
+
+func (x *antigravitySummaryIndex) lookup(root, id string) (antigravitySummary, bool) {
+	if x == nil {
+		return antigravitySummary{}, false
+	}
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	s, ok := x.entries[filepath.Clean(root)+"\x00"+id]
+	return s, ok
+}
+
+func (x *antigravitySummaryIndex) scan(root string) {
+	if x == nil || root == "" {
+		return
+	}
+	dbPath := filepath.Join(root, "conversation_summaries.db")
+	if !IsRegularFile(dbPath) {
+		return
+	}
+	db, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{})
+	if err != nil {
+		return
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT conversation_id, COALESCE(workspace_uris, ''), COALESCE(title, '') FROM conversation_summaries WHERE conversation_id != ''")
+	if err != nil {
+		rows, err = db.Query("SELECT conversation_id, COALESCE(workspace_uris, '') FROM conversation_summaries WHERE conversation_id != ''")
+		if err != nil {
+			return
+		}
+	}
+	defer rows.Close()
+
+	cleanRoot := filepath.Clean(root)
+	cols, _ := rows.Columns()
+	hasTitle := len(cols) >= 3
+
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	for rows.Next() {
+		var id, ws, title string
+		var scanErr error
+		if hasTitle {
+			scanErr = rows.Scan(&id, &ws, &title)
+		} else {
+			scanErr = rows.Scan(&id, &ws)
+		}
+		if scanErr != nil || id == "" {
+			continue
+		}
+		cwd, project := parseAntigravityWorkspaceURI(ws)
+		x.entries[cleanRoot+"\x00"+id] = antigravitySummary{
+			workspaceURIs: ws,
+			title:         title,
+			cwd:           cwd,
+			project:       project,
+		}
+	}
+}
+
+func parseAntigravityWorkspaceURI(raw string) (cwd, project string) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", ""
+	}
+	var uris []string
+	if err := json.Unmarshal([]byte(trimmed), &uris); err == nil && len(uris) > 0 {
+		raw = uris[0]
+	} else {
+		raw = strings.Trim(trimmed, "[]\"' ")
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", ""
+	}
+	if parsed, err := url.Parse(raw); err == nil && parsed.Scheme == "file" {
+		cwd = parsed.Path
+	} else if strings.HasPrefix(raw, "file://") {
+		cwd = strings.TrimPrefix(raw, "file://")
+	} else {
+		cwd = raw
+	}
+	if unescaped, err := url.PathUnescape(cwd); err == nil && unescaped != "" {
+		cwd = unescaped
+	}
+	if len(cwd) >= 3 && cwd[0] == '/' && cwd[2] == ':' {
+		cwd = cwd[1:]
+	}
+	cwd = filepath.Clean(cwd)
+	if cwd != "" && cwd != "/" && cwd != "." {
+		project = filepath.Base(cwd)
+	}
+	return cwd, project
+}
+
 type antigravitySourceSet struct {
 	roots     []string
 	subagents *antigravitySubagentIndex
+	summaries *antigravitySummaryIndex
 }
 
 func newAntigravitySourceSet(roots []string) antigravitySourceSet {
 	return antigravitySourceSet{
 		roots:     cleanJSONLRoots(roots),
 		subagents: newAntigravitySubagentIndex(),
+		summaries: newAntigravitySummaryIndex(),
 	}
 }
 
@@ -163,6 +281,7 @@ func (s antigravitySourceSet) Discover(ctx context.Context) ([]SourceRef, error)
 			return nil, err
 		}
 		s.subagents.scan(root)
+		s.summaries.scan(root)
 		for _, path := range s.discoverSessionPaths(root) {
 			source, ok := s.sourceRef(root, path, false)
 			if ok {
@@ -180,6 +299,7 @@ func (s antigravitySourceSet) DiscoverEach(ctx context.Context, yield func(Sourc
 			return err
 		}
 		s.subagents.scan(root)
+		s.summaries.scan(root)
 		dir := filepath.Join(root, "conversations")
 		err := streamDirectoryEntries(ctx, dir, func(entry os.DirEntry) error {
 			name := entry.Name()
@@ -284,6 +404,7 @@ func (s antigravitySourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 					"*.md.metadata.json",
 					antigravityBrainTranscriptName,
 					"*/.system_generated/subagents/*.json",
+					"*/.system_generated/logs/transcript.jsonl",
 				},
 				DebounceKey: string(AgentAntigravity) + ":brain:" + root,
 			},
@@ -504,11 +625,21 @@ func (s antigravitySourceSet) newSourceRef(root, path, id string) SourceRef {
 		src.SubagentParentID = d.parentID
 		src.SubagentRole = d.role
 	}
+	var projectHint string
+	var resolution SourceCwdResolution
+	if sum, ok := s.summaries.lookup(root, id); ok {
+		projectHint = sum.project
+		if sum.cwd != "" {
+			resolution = SourceCwdResolution{State: SourceCwdResolved, Path: sum.cwd}
+		}
+	}
 	return SourceRef{
 		Provider:       AgentAntigravity,
 		Key:            path,
 		DisplayPath:    path,
 		FingerprintKey: path,
+		ProjectHint:    projectHint,
+		CwdResolution:  resolution,
 		Opaque:         src,
 	}
 }
@@ -575,7 +706,7 @@ func antigravityBrainID(root, path string) (string, bool) {
 		return "", false
 	}
 	parts := strings.Split(rel, string(filepath.Separator))
-	if len(parts) != 3 || parts[0] != "brain" {
+	if len(parts) < 2 || parts[0] != "brain" {
 		return "", false
 	}
 	return parts[1], IsValidSessionID(parts[1])

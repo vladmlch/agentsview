@@ -1278,3 +1278,44 @@ func leaveAntigravityWALSidecars(t *testing.T, dbPath string) {
 	require.NoError(t, conn.Close())
 	require.NoError(t, db.Close())
 }
+
+func TestAntigravityProviderConversationSummaries(t *testing.T) {
+	root := t.TempDir()
+	id := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	writeAntigravityIDEProviderFixture(t, root, id)
+
+	dbPath := filepath.Join(root, "conversation_summaries.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = db.Exec("CREATE TABLE conversation_summaries (conversation_id text primary key, workspace_uris text, title text)")
+	require.NoError(t, err)
+	_, err = db.Exec("INSERT INTO conversation_summaries (conversation_id, workspace_uris, title) VALUES (?, ?, ?)",
+		id, `["file:///Users/dev/repos/my-service"]`, "Fix indexing bug")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	provider, ok := NewProvider(AgentAntigravity, ProviderConfig{
+		Roots:   []string{root},
+		Machine: "devbox",
+	})
+	require.True(t, ok)
+
+	discovered, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, discovered, 1)
+	assert.Equal(t, "my-service", discovered[0].ProjectHint)
+	assert.Equal(t, SourceCwdResolved, discovered[0].CwdResolution.State)
+	assert.Equal(t, "/Users/dev/repos/my-service", discovered[0].CwdResolution.Path)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
+		Source: discovered[0],
+	})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+
+	sess := outcome.Results[0].Result.Session
+	assert.Equal(t, "my-service", sess.Project)
+	assert.Equal(t, "/Users/dev/repos/my-service", sess.Cwd)
+	assert.Equal(t, "Fix indexing bug", sess.SessionName)
+	assert.True(t, sess.SessionNamePresent)
+}

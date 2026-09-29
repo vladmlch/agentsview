@@ -4008,3 +4008,51 @@ func TestCodexContinuationStitching_MissingParent_FailOpen(t *testing.T) {
 	require.Len(t, msgs, 1)
 	assert.Equal(t, "Only message available", msgs[0].Content)
 }
+
+func TestCodexGitBranch(t *testing.T) {
+	content := strings.Join([]string{
+		`{"timestamp":"2026-09-25T23:54:13Z","ordinal":0,"type":"session_meta","payload":{"id":"01a09999-5113-7a91-a159-a02da927e59f","git":{"branch":"feature/remediation-work"}}}`,
+		`{"timestamp":"2026-09-25T23:54:14Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Check git branch"}]}}`,
+	}, "\n") + "\n"
+	sess, msgs := runCodexParserTest(t, "", content, false)
+	require.NotEmpty(t, msgs)
+	assert.Equal(t, "feature/remediation-work", sess.GitBranch)
+}
+
+func TestCodexMultilineJSONRollout(t *testing.T) {
+	content := `[
+  {
+    "timestamp": "2026-09-25T23:54:13Z",
+    "ordinal": 0,
+    "type": "session_meta",
+    "payload": {
+      "id": "01a09999-5113-7a91-a159-a02da927e59f",
+      "cwd": "/work/project",
+      "git": {
+        "branch": "main"
+      }
+    }
+  },
+  {
+    "timestamp": "2026-09-25T23:54:14Z",
+    "ordinal": 1,
+    "type": "response_item",
+    "payload": {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Hello multiline JSON rollout"
+        }
+      ]
+    }
+  }
+]`
+	sess, msgs := runCodexParserTest(t, "", content, false)
+	require.NotEmpty(t, msgs)
+	assert.Equal(t, "codex:01a09999-5113-7a91-a159-a02da927e59f", sess.ID)
+	assert.Equal(t, "/work/project", sess.Cwd)
+	assert.Equal(t, "main", sess.GitBranch)
+	assert.Equal(t, "Hello multiline JSON rollout", msgs[0].Content)
+}

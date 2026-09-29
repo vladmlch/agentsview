@@ -18,8 +18,9 @@ import (
 // rates. Version 3 removed moonshot/kimi-k3 after LiteLLM added it.
 // Version 4 adds namespaced Codex mappings and a temporary Bedrock Astra
 // fallback until the pinned LiteLLM snapshot includes it. Version 5 adds
-// a StepFun step-5-preview row, which the pinned snapshot lacks.
-const supplementalVersion = "5"
+// a StepFun step-5-preview row, which the pinned snapshot lacks. Version 6
+// adds Devin internal models and Antigravity Gemini/Claude models.
+const supplementalVersion = "6"
 
 // Canonical pricing models runtime aliases resolve to.
 // KimiK26Canonical exists in the embedded LiteLLM snapshot;
@@ -89,6 +90,12 @@ var fixedPricingAliases = []FixedPricingAlias{
 	{Name: CodexGPT56LunaModelName, Canonical: BedrockGPT56LunaCanonical, Exact: true},
 	{Name: CodexGPT56TerraModelName, Canonical: BedrockGPT56TerraCanonical, Exact: true},
 	{Name: CodexAstraModelName, Canonical: GPT6AstraCanonical, Exact: true},
+	{Name: "claude-opus-4-6-thinking", Canonical: "claude-opus-4-6"},
+	{Name: "gpt-6-luna-xhigh-priority", Canonical: "gpt-6-luna"},
+	{Name: "gemini-3.8-flash-high", Canonical: "gemini-3.8-flash"},
+	{Name: "gemini-3.8-flash-exp-a", Canonical: "gemini-3.8-flash"},
+	{Name: "gemini-3.8-flash-medium", Canonical: "gemini-3.8-flash"},
+	{Name: "gemini-3.7-flash-high", Canonical: "gemini-3.7-flash"},
 }
 
 // DateAliasedModels returns the sorted unqualified date-ambiguous
@@ -239,6 +246,43 @@ var supplementalPricing = []ModelPricing{
 		OutputPerMTok:        money.MustParseDollars("2.70"),
 		CacheCreationPerMTok: money.MustParseDollars("1.00"),
 		CacheReadPerMTok:     money.MustParseDollars("0.05"),
+	},
+	{
+		ModelPattern:     "gemini-3.8-flash",
+		InputPerMTok:     money.MustParseDollars("0.75"),
+		OutputPerMTok:    money.MustParseDollars("3.75"),
+		CacheReadPerMTok: money.MustParseDollars("0.075"),
+	},
+	{
+		ModelPattern:         "swe-2-max",
+		InputPerMTok:         money.MustParseDollars("3.00"),
+		OutputPerMTok:        money.MustParseDollars("15.00"),
+		CacheCreationPerMTok: money.MustParseDollars("3.75"),
+		CacheReadPerMTok:     money.MustParseDollars("0.30"),
+	},
+	{
+		ModelPattern:     "swe-2-high",
+		InputPerMTok:     money.MustParseDollars("2.00"),
+		OutputPerMTok:    money.MustParseDollars("10.00"),
+		CacheReadPerMTok: money.MustParseDollars("0.20"),
+	},
+	{
+		ModelPattern:     "swe-2-medium",
+		InputPerMTok:     money.MustParseDollars("1.00"),
+		OutputPerMTok:    money.MustParseDollars("5.00"),
+		CacheReadPerMTok: money.MustParseDollars("0.10"),
+	},
+	{
+		ModelPattern:     "swe-1-6-slow",
+		InputPerMTok:     money.MustParseDollars("0.50"),
+		OutputPerMTok:    money.MustParseDollars("2.50"),
+		CacheReadPerMTok: money.MustParseDollars("0.05"),
+	},
+	{
+		ModelPattern:     "gpt-6-luna",
+		InputPerMTok:     money.MustParseDollars("0.10"),
+		OutputPerMTok:    money.MustParseDollars("0.50"),
+		CacheReadPerMTok: money.MustParseDollars("0.01"),
 	},
 }
 

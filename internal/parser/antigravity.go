@@ -80,6 +80,33 @@ func antigravityIDECompanionPaths(path string) []string {
 	)...)
 }
 
+func lookupAntigravitySummary(dbPath, id string) (antigravitySummary, bool) {
+	if !IsRegularFile(dbPath) || id == "" {
+		return antigravitySummary{}, false
+	}
+	db, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{})
+	if err != nil {
+		return antigravitySummary{}, false
+	}
+	defer db.Close()
+
+	var ws, title string
+	err = db.QueryRow("SELECT COALESCE(workspace_uris, ''), COALESCE(title, '') FROM conversation_summaries WHERE conversation_id = ?", id).Scan(&ws, &title)
+	if err != nil {
+		err = db.QueryRow("SELECT COALESCE(workspace_uris, '') FROM conversation_summaries WHERE conversation_id = ?", id).Scan(&ws)
+		if err != nil {
+			return antigravitySummary{}, false
+		}
+	}
+	cwd, proj := parseAntigravityWorkspaceURI(ws)
+	return antigravitySummary{
+		workspaceURIs: ws,
+		title:         title,
+		cwd:           cwd,
+		project:       proj,
+	}, true
+}
+
 // parseSession parses one IDE session DB. It is owned by the
 // antigravityProvider; the package-level ParseAntigravitySession
 // entrypoint was folded onto the provider.
@@ -153,6 +180,10 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 	// TranscriptFidelityFull explicitly below.
 	transcriptFidelity := ""
 
+	sidecarPath := strings.TrimSuffix(path, ".db") + ".trajectory.json"
+	tRes, tErr := parseAntigravityCLITrajectory(
+		sidecarPath, dbResult.executors,
+	)
 	// Prefer the agy-reader trajectory sidecar: it is the daemon's own
 	// decode, with structured tool calls/results and thinking, where the
 	// heuristic DB decode only recovers loose strings. Selection is
@@ -161,10 +192,6 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 	// behind a live session loses until agy-reader catches up. When the
 	// sidecar is absent, malformed, or fails the coverage gate the parser
 	// falls back to the heuristic decode exactly as before.
-	sidecarPath := strings.TrimSuffix(path, ".db") + ".trajectory.json"
-	tRes, tErr := parseAntigravityCLITrajectory(
-		sidecarPath, dbResult.executors,
-	)
 	sidecarOK := tErr == nil &&
 		hasDisplayableAntigravityCLITrajectoryMessage(tRes.messages)
 	sidecarCovers := dbResult.rawStepCount == 0 ||
@@ -178,7 +205,7 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 	// underreport totals on a row that looks current. sidecarCovers stays
 	// true when the DB offers no coverage signal (zero rows), so gap-fill
 	// still applies there.
-	if len(usageEvents) == 0 && tErr == nil && sidecarCovers {
+	if len(usageEvents) == 0 && tErr == nil && (dbResult.rawStepCount == 0 || tRes.rawSteps >= dbResult.rawStepCount) {
 		usageEvents = tRes.usageEvents
 	}
 
@@ -249,12 +276,31 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 		mtime = info.ModTime().UnixNano()
 	}
 
+	var cwd string
+	var sessionTitle string
+	if sum, ok := p.sources.summaries.lookup(root, id); ok {
+		if project == "" {
+			project = sum.project
+		}
+		cwd = sum.cwd
+		sessionTitle = sum.title
+	} else if sum, ok := lookupAntigravitySummary(filepath.Join(root, "conversation_summaries.db"), id); ok {
+		if project == "" {
+			project = sum.project
+		}
+		cwd = sum.cwd
+		sessionTitle = sum.title
+	}
+
 	sess := &ParsedSession{
 		ID:                 antigravityIDPrefix + id,
 		Project:            project,
+		Cwd:                cwd,
 		Machine:            machine,
 		Agent:              AgentAntigravity,
 		FirstMessage:       firstMessage,
+		SessionName:        sessionTitle,
+		SessionNamePresent: sessionTitle != "",
 		StartedAt:          startedAt,
 		EndedAt:            endedAt,
 		MessageCount:       len(messages),
@@ -277,6 +323,7 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 		sess.RelationshipType = RelSubagent
 		if name := d.sessionName(); name != "" {
 			sess.SessionName = name
+			sess.SessionNamePresent = true
 		}
 	} else if tErr == nil && tRes.parentCascadeID != "" &&
 		!strings.EqualFold(tRes.parentCascadeID, id) {

@@ -313,3 +313,46 @@ func TestSupplementalPricing_ReturnsCopy(t *testing.T) {
 		secondAstra.Bands[0].AboveInputTokens,
 		"SupplementalPricing bands must be independently copied")
 }
+
+func TestSupplementalPricing_DevinAndAntigravityModels(t *testing.T) {
+	fallback := requireEmbeddedFallbackPricing(t)
+	byPattern := make(map[string]ModelPricing, len(fallback))
+	for _, p := range fallback {
+		byPattern[p.ModelPattern] = p
+	}
+
+	for _, model := range []string{
+		"swe-2-max",
+		"swe-2-high",
+		"swe-2-medium",
+		"swe-1-6-slow",
+		"gpt-6-luna",
+		"gemini-3.8-flash",
+	} {
+		_, ok := Resolve(byPattern, model)
+		require.True(t, ok, "Resolve(%q) must succeed from FallbackPricing", model)
+	}
+
+	// Verify alias mappings for Devin and Antigravity models
+	for _, tc := range []struct {
+		reported  string
+		canonical string
+	}{
+		{"gpt-6-luna-xhigh-priority", "gpt-6-luna"},
+		{"claude-opus-4-6-thinking", "claude-opus-4-6"},
+		{"gemini-3.7-flash-high", "gemini-3.7-flash"},
+		{"gemini-3.8-flash-high", "gemini-3.8-flash"},
+		{"gemini-3.8-flash-medium", "gemini-3.8-flash"},
+		{"gemini-3.8-flash-exp-a", "gemini-3.8-flash"},
+	} {
+		canon := CanonicalModelForDate(tc.reported, time.Now())
+		assert.Equal(t, tc.canonical, canon, "CanonicalModelForDate(%q)", tc.reported)
+
+		got, ok := Resolve(byPattern, tc.reported)
+		require.True(t, ok, "Resolve(%q) must resolve via alias or base effort", tc.reported)
+		target, ok := Resolve(byPattern, tc.canonical)
+		require.True(t, ok, "Resolve(%q) canonical target must resolve", tc.canonical)
+		assert.Equal(t, target.InputPerMTok, got.InputPerMTok)
+		assert.Equal(t, target.OutputPerMTok, got.OutputPerMTok)
+	}
+}
