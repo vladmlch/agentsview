@@ -394,6 +394,31 @@ CREATE INDEX IF NOT EXISTS idx_tool_result_events_summary
                           (summary_participates IS NULL OR raw_content_digest IS NULL),
                           summary_participates, event_index);
 
+-- Stable projection backing tool_content_fts. A single row namespace bridges
+-- both source tables without changing their archive identities.
+CREATE TABLE IF NOT EXISTS tool_content (
+    id INTEGER PRIMARY KEY,
+    source_kind TEXT NOT NULL,
+    source_id INTEGER NOT NULL,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    message_id INTEGER,
+    ordinal INTEGER NOT NULL,
+    location TEXT NOT NULL,
+    tool_name TEXT NOT NULL DEFAULT '',
+    tool_use_id TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL DEFAULT '',
+    file_path TEXT NOT NULL DEFAULT '',
+    exit_code INTEGER,
+    is_error INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(source_kind, source_id, location)
+);
+CREATE INDEX IF NOT EXISTS idx_tool_content_session
+    ON tool_content(session_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_tool_content_source
+    ON tool_content(source_kind, source_id);
+CREATE INDEX IF NOT EXISTS idx_tool_content_filters
+    ON tool_content(location, exit_code, is_error, tool_name);
+
 -- Insights table for AI-generated activity insights
 CREATE TABLE IF NOT EXISTS insights (
     id          INTEGER PRIMARY KEY,
