@@ -1137,7 +1137,7 @@ func (b *directBackend) SearchContent(
 			return nil, &db.SearchInputError{Msg: "search: invalid exclude_active_since: use RFC3339"}
 		}
 	}
-	if req.Mode == "fts" || req.Mode == "terms" {
+	if req.Mode == "terms" {
 		for _, s := range req.Sources {
 			if s != "messages" {
 				return nil, &db.SearchInputError{Msg: fmt.Sprintf(
