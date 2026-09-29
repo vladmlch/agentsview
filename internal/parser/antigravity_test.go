@@ -4698,3 +4698,41 @@ func TestAntigravityIDEUnreadableStepsFailsClosed(t *testing.T) {
 		assert.Empty(t, usageEvents)
 	})
 }
+
+func TestLookupAntigravitySummary_LockContentionRetry(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "conversation_summaries.db")
+	id := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+	writer, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer writer.Close()
+	writer.SetMaxOpenConns(1)
+
+	_, err = writer.ExecContext(t.Context(), `
+		PRAGMA journal_mode=WAL;
+		CREATE TABLE conversation_summaries (conversation_id text primary key, workspace_uris text, title text);
+		INSERT INTO conversation_summaries VALUES ('`+id+`', '["file:///Users/dev/repos/my-service"]', 'Fix indexing bug');
+	`)
+	require.NoError(t, err)
+
+	// Acquire an exclusive lock on the database to simulate an active IDE writer holding a lock.
+	_, err = writer.ExecContext(t.Context(), "PRAGMA locking_mode=EXCLUSIVE")
+	require.NoError(t, err)
+
+	tx, err := writer.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(t.Context(), "INSERT INTO conversation_summaries VALUES ('other-id', '[]', 'other')")
+	require.NoError(t, err)
+
+	// lookupAntigravitySummary must succeed via WithSQLiteReadOnly scratch copy fallback despite lock contention.
+	sum, ok := lookupAntigravitySummary(dbPath, id)
+	require.True(t, ok, "lookupAntigravitySummary must succeed via scratch fallback when db is locked")
+	assert.Equal(t, "/Users/dev/repos/my-service", sum.cwd)
+	assert.Equal(t, "my-service", sum.project)
+	assert.Equal(t, "Fix indexing bug", sum.title)
+}

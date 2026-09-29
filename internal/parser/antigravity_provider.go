@@ -2,6 +2,7 @@ package parser
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -194,46 +195,43 @@ func (x *antigravitySummaryIndex) scan(root string) {
 	if !IsRegularFile(dbPath) {
 		return
 	}
-	db, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{})
-	if err != nil {
-		return
-	}
-	defer db.Close()
-
-	rows, err := db.Query("SELECT conversation_id, COALESCE(workspace_uris, ''), COALESCE(title, '') FROM conversation_summaries WHERE conversation_id != ''")
-	if err != nil {
-		rows, err = db.Query("SELECT conversation_id, COALESCE(workspace_uris, '') FROM conversation_summaries WHERE conversation_id != ''")
+	_ = WithSQLiteReadOnly(context.Background(), dbPath, sqliteReadOptions{busyTimeoutMS: 3000}, func(db *sql.DB) error {
+		rows, err := db.Query("SELECT conversation_id, COALESCE(workspace_uris, ''), COALESCE(title, '') FROM conversation_summaries WHERE conversation_id != ''")
 		if err != nil {
-			return
+			rows, err = db.Query("SELECT conversation_id, COALESCE(workspace_uris, '') FROM conversation_summaries WHERE conversation_id != ''")
+			if err != nil {
+				return err
+			}
 		}
-	}
-	defer rows.Close()
+		defer rows.Close()
 
-	cleanRoot := filepath.Clean(root)
-	cols, _ := rows.Columns()
-	hasTitle := len(cols) >= 3
+		cleanRoot := filepath.Clean(root)
+		cols, _ := rows.Columns()
+		hasTitle := len(cols) >= 3
 
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	for rows.Next() {
-		var id, ws, title string
-		var scanErr error
-		if hasTitle {
-			scanErr = rows.Scan(&id, &ws, &title)
-		} else {
-			scanErr = rows.Scan(&id, &ws)
+		x.mu.Lock()
+		defer x.mu.Unlock()
+		for rows.Next() {
+			var id, ws, title string
+			var scanErr error
+			if hasTitle {
+				scanErr = rows.Scan(&id, &ws, &title)
+			} else {
+				scanErr = rows.Scan(&id, &ws)
+			}
+			if scanErr != nil || id == "" {
+				continue
+			}
+			cwd, project := parseAntigravityWorkspaceURI(ws)
+			x.entries[cleanRoot+"\x00"+id] = antigravitySummary{
+				workspaceURIs: ws,
+				title:         title,
+				cwd:           cwd,
+				project:       project,
+			}
 		}
-		if scanErr != nil || id == "" {
-			continue
-		}
-		cwd, project := parseAntigravityWorkspaceURI(ws)
-		x.entries[cleanRoot+"\x00"+id] = antigravitySummary{
-			workspaceURIs: ws,
-			title:         title,
-			cwd:           cwd,
-			project:       project,
-		}
-	}
+		return rows.Err()
+	})
 }
 
 func parseAntigravityWorkspaceURI(raw string) (cwd, project string) {
