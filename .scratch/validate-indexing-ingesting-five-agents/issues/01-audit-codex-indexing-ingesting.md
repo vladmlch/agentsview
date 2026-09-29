@@ -1,7 +1,7 @@
 # Audit Codex indexing and ingesting across raw disk, parser code, and database
 
 Type: research
-Status: open
+Status: resolved
 Blocked by: 
 
 ## Question
@@ -22,3 +22,17 @@ Specifically investigate:
    - Are messages properly indexed into `messages_fts`?
 4. **Anomalies & Gaps**:
    - Identify any failed sessions, corrupted records, schema drift, or silent data loss.
+
+## Answer
+
+1. **Inventory Reconciliation (100% exact)**: 2,160 raw `.jsonl` files on disk (2,153 in `sessions/`, 7 in `archived_sessions/`) reconcile mathematically to 2,099 sessions in `sessions.db`:
+   - 35 files are continuation segment suffixes (`_<segment_uuid>`) mapping to 11 multi-segment sessions stitched by `resolveContinuationChain`.
+   - 26 files are un-suffixed paginated continuation rollouts stitched to ancestor root sessions.
+   - 3 files are indented multi-line JSON rollouts (`019d95fd...`, `019d9fe3...`, `019fc467...`) that fail the line reader.
+   - Formula: `2160 - 35 - 26 = 2099` sessions in DB.
+2. **Fidelity**: 111,240 messages, 76,066 tool calls across 58 tools, 100,903 assistant messages with exact `reasoning_effort` ratings. 40.6M output tokens and 10.82B context tokens captured. 100% indexed in `messages_fts`.
+3. **Discovered Bugs & Gaps**:
+   - **Bug: `git_branch` omitted**: `internal/parser/codex.go` extracts `payload.Get("git.branch")` for project extraction context but never assigns it to `sess.GitBranch`, leaving all 2,099 sessions with empty `git_branch`.
+   - **Bug: Pretty-printed JSON failure**: 3 indented files fail the single-line JSONL reader, resulting in empty sessions.
+   - **Gap: Missing titles from `state_5.sqlite`**: 1,420 sessions lack titles because `CodexMetadata` only reads legacy `session_index.jsonl` (826 lines), missing 2,043 titles in modern Codex's `.codex/state_5.sqlite`.
+   - **Gap: Misdeclared `Thinking`**: Codex encrypts reasoning (`encrypted_content`), so plaintext thought text is never available, though `ReasoningEffort` is supported. `SourceVersion` is also unpopulated.
