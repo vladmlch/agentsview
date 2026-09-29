@@ -166,6 +166,10 @@ func newAntigravitySummaryIndex() *antigravitySummaryIndex {
 }
 
 func (x *antigravitySummaryIndex) lookup(root, id string) (antigravitySummary, bool) {
+	return x.lookupContext(context.Background(), root, id)
+}
+
+func (x *antigravitySummaryIndex) lookupContext(ctx context.Context, root, id string) (antigravitySummary, bool) {
 	if x == nil || id == "" {
 		return antigravitySummary{}, false
 	}
@@ -177,7 +181,7 @@ func (x *antigravitySummaryIndex) lookup(root, id string) (antigravitySummary, b
 	if ok {
 		return s, true
 	}
-	sum, found := lookupAntigravitySummary(filepath.Join(cleanRoot, "conversation_summaries.db"), id)
+	sum, found := lookupAntigravitySummaryContext(ctx, filepath.Join(cleanRoot, "conversation_summaries.db"), id)
 	if !found {
 		return antigravitySummary{}, false
 	}
@@ -209,8 +213,7 @@ func (x *antigravitySummaryIndex) scan(root string) {
 		cols, _ := rows.Columns()
 		hasTitle := len(cols) >= 3
 
-		x.mu.Lock()
-		defer x.mu.Unlock()
+		batch := make(map[string]antigravitySummary)
 		for rows.Next() {
 			var id, ws, title string
 			var scanErr error
@@ -223,14 +226,22 @@ func (x *antigravitySummaryIndex) scan(root string) {
 				continue
 			}
 			cwd, project := parseAntigravityWorkspaceURI(ws)
-			x.entries[cleanRoot+"\x00"+id] = antigravitySummary{
+			batch[cleanRoot+"\x00"+id] = antigravitySummary{
 				workspaceURIs: ws,
 				title:         title,
 				cwd:           cwd,
 				project:       project,
 			}
 		}
-		return rows.Err()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		x.mu.Lock()
+		for k, v := range batch {
+			x.entries[k] = v
+		}
+		x.mu.Unlock()
+		return nil
 	})
 }
 
