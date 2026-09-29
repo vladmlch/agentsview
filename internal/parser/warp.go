@@ -44,12 +44,23 @@ func ListWarpSessionMeta(
 func ForEachWarpSessionMeta(
 	ctx context.Context, dbPath string, stableSnapshot bool, yield func(WarpSessionMeta) error,
 ) error {
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) || errors.Is(err, os.ErrPermission) {
 		return nil
 	}
+	f, err := os.Open(dbPath)
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return nil
+		}
+		return err
+	}
+	_ = f.Close()
 
 	db, err := openWarpDB(dbPath, stableSnapshot)
 	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return nil
+		}
 		return err
 	}
 	defer db.Close()
@@ -533,11 +544,13 @@ func parseWarpTimestamp(s string) time.Time {
 }
 
 // warpDBPath returns the path to warp.sqlite inside the
-// given directory, or "" if it doesn't exist.
+// given directory, or "" if it doesn't exist or is not readable.
 func warpDBPath(dir string) string {
 	candidate := filepath.Join(dir, WarpDBFilename)
-	if _, err := os.Stat(candidate); err == nil {
-		return candidate
+	f, err := os.Open(candidate)
+	if err != nil {
+		return ""
 	}
-	return ""
+	_ = f.Close()
+	return candidate
 }
