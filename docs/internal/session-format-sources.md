@@ -1815,13 +1815,18 @@ schemas keep their existing ordering behavior.
   days. It preceded the earliest bubble in 25 of the day-plus cases and
   followed it in 5; 6 composers had `createdAt` after their last bubble.
   Header order also differed from chronological order in 38 composers.
-  Agentsview therefore starts a session at its earliest timestamped message
-  and uses `createdAt` only when no bubble carries a timestamp. The session
-  ends at the later of `lastUpdatedAt` and the latest message timestamp.
-- **Usage and cost:** No per-message or per-session token, cache, reasoning,
-  credit, or monetary-cost fields were observed in `composerData` or bubble
-  documents. Agentsview emits no usage events for this agent; cost is
-  unpriced.
+  Agentsview therefore starts a session at its earliest timestamped message and
+  uses `createdAt` only when no bubble carries a timestamp. The session ends at
+  the later of `lastUpdatedAt` and the latest message timestamp.
+- **Usage and cost:** Some `composerData` documents expose a session-level
+  `contextTokensUsed` field. Agentsview distributes that total across the
+  parsed message sequence using the largest-remainder (Hamilton) method,
+  proportional to each message's content length, and records the result in
+  per-message `ContextTokens`. Because these per-message values are inferred
+  rather than supplied by the wire format, the Cursor IDE registry entry sets
+  `NoPerMessageTokenData: true`. The session's `PeakContextTokens` is set to
+  the composer-level total. No output-token, cache, reasoning, credit, or
+  monetary-cost fields have been observed; cost remains unpriced.
 - **Agentsview:** `internal/parser/cursor_ide.go` and
   `internal/parser/cursor_ide_provider.go`, built on the shared
   `multiSessionContainerSourceSet` framework (see Zed, below). Fingerprinting

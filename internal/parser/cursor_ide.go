@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -149,6 +150,7 @@ type cursorIDEComposerDoc struct {
 	LastUpdatedAt       int64                        `json:"lastUpdatedAt"`
 	WorkspaceIdentifier cursorIDEWorkspaceIdentifier `json:"workspaceIdentifier"`
 	TrackedGitRepos     []cursorIDEGitRepo           `json:"trackedGitRepos"`
+	ContextTokensUsed   int64                        `json:"contextTokensUsed"`
 }
 
 // cursorIDEComposerMeta is a per-composer descriptor for the engine's
@@ -525,6 +527,14 @@ func parseCursorIDEComposer(
 		return nil, nil
 	}
 
+	if doc.ContextTokensUsed > 0 {
+		allocated := distributeCursorIDETokens(doc.ContextTokensUsed, messages)
+		for i := range messages {
+			messages[i].ContextTokens = int(allocated[i])
+			messages[i].HasContextTokens = true
+		}
+	}
+
 	var firstMessage string
 	userCount := 0
 	for _, m := range messages {
@@ -572,19 +582,21 @@ func parseCursorIDEComposer(
 	}
 	cwd := cursorIDECwd(doc)
 	sess := ParsedSession{
-		ID:               cursorIDEIDPrefix + composerID,
-		Agent:            AgentCursorIDE,
-		Machine:          machine,
-		Project:          ExtractProjectFromCwd(cwd),
-		Cwd:              cwd,
-		GitBranch:        cursorIDELatestBranch(doc.TrackedGitRepos),
-		SessionName:      doc.Name,
-		FirstMessage:     firstMessage,
-		StartedAt:        startedAt,
-		EndedAt:          endedAt,
-		MessageCount:     len(messages),
-		UserMessageCount: userCount,
-		IsTruncated:      truncated,
+		ID:                   cursorIDEIDPrefix + composerID,
+		Agent:                AgentCursorIDE,
+		Machine:              machine,
+		Project:              ExtractProjectFromCwd(cwd),
+		Cwd:                  cwd,
+		GitBranch:            cursorIDELatestBranch(doc.TrackedGitRepos),
+		SessionName:          doc.Name,
+		FirstMessage:         firstMessage,
+		StartedAt:            startedAt,
+		EndedAt:              endedAt,
+		MessageCount:         len(messages),
+		UserMessageCount:     userCount,
+		IsTruncated:          truncated,
+		HasPeakContextTokens: doc.ContextTokensUsed > 0,
+		PeakContextTokens:    int(doc.ContextTokensUsed),
 		File: FileInfo{
 			Path:  VirtualSourcePath(dbPath, composerID),
 			Size:  dbInfo.Size(),
@@ -594,6 +606,58 @@ func parseCursorIDEComposer(
 	}
 
 	return &ParseResult{Session: sess, Messages: messages}, nil
+}
+
+// distributeCursorIDETokens apportions a session-level context-token total
+// across messages using the largest-remainder (Hamilton) method. Each
+// message first receives floor(total * contentLength / totalContentLength);
+// the remaining tokens are handed out one at a time to the messages with the
+// largest fractional remainders, ties broken by original message index.
+// The returned slice always sums exactly to total.
+func distributeCursorIDETokens(total int64, messages []ParsedMessage) []int64 {
+	n := len(messages)
+	out := make([]int64, n)
+	if total <= 0 || n == 0 {
+		return out
+	}
+
+	var totalLen int64
+	for _, m := range messages {
+		totalLen += int64(m.ContentLength)
+	}
+	if totalLen == 0 {
+		// Without any text length to apportion against, keep the whole total
+		// with the first message so the allocation still sums correctly.
+		out[0] = total
+		return out
+	}
+
+	type remainder struct {
+		rem int64
+		idx int
+	}
+	remainders := make([]remainder, n)
+	var allocated int64
+	for i, m := range messages {
+		prod := total * int64(m.ContentLength)
+		floor := prod / totalLen
+		out[i] = floor
+		allocated += floor
+		remainders[i] = remainder{rem: prod % totalLen, idx: i}
+	}
+
+	sort.Slice(remainders, func(a, b int) bool {
+		if remainders[a].rem == remainders[b].rem {
+			return remainders[a].idx < remainders[b].idx
+		}
+		return remainders[a].rem > remainders[b].rem
+	})
+
+	left := total - allocated
+	for i := int64(0); i < left; i++ {
+		out[remainders[i].idx]++
+	}
+	return out
 }
 
 // cursorIDETime converts an epoch-milliseconds stamp (composerData

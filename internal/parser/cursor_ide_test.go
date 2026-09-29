@@ -29,14 +29,15 @@ type cursorIDETestBubble struct {
 // cursorIDETestComposer is one synthetic composerData document plus its
 // bubbles, keyed under the same composer ID.
 type cursorIDETestComposer struct {
-	id        string
-	name      string
-	createdAt int64
-	updatedAt int64
-	cwd       string
-	repoPath  string
-	branch    string
-	bubbles   []cursorIDETestBubble
+	id                string
+	name              string
+	createdAt         int64
+	updatedAt         int64
+	cwd               string
+	repoPath          string
+	branch            string
+	contextTokensUsed int64
+	bubbles           []cursorIDETestBubble
 	// omitBubbleIDs skips writing these bubble IDs to cursorDiskKV even
 	// though they are still listed in fullConversationHeadersOnly, so the
 	// parser must tolerate a header pointing at a row Cursor never wrote or
@@ -65,10 +66,11 @@ func createCursorIDEDB(t *testing.T, composers []cursorIDETestComposer) string {
 			})
 		}
 		doc := cursorIDEComposerDoc{
-			Headers:       headers,
-			Name:          c.name,
-			CreatedAt:     c.createdAt,
-			LastUpdatedAt: c.updatedAt,
+			Headers:           headers,
+			Name:              c.name,
+			CreatedAt:         c.createdAt,
+			LastUpdatedAt:     c.updatedAt,
+			ContextTokensUsed: c.contextTokensUsed,
 		}
 		doc.WorkspaceIdentifier.URI.FSPath = c.cwd
 		if c.repoPath != "" {
@@ -1178,4 +1180,136 @@ func TestCursorIDE_FallbackOnBusy(t *testing.T) {
 	require.NoError(t, err, "provider.Parse must succeed via scratch fallback when locked")
 	require.Len(t, outcome.Results, 1)
 	assert.Equal(t, cursorIDEIDPrefix+composerID, outcome.Results[0].Result.Session.ID)
+}
+
+func TestDistributeCursorIDETokens(t *testing.T) {
+	tests := []struct {
+		name     string
+		total    int64
+		lengths  []int
+		expected []int64
+	}{
+		{
+			name:     "zero total leaves allocations zero",
+			total:    0,
+			lengths:  []int{10, 20},
+			expected: []int64{0, 0},
+		},
+		{
+			name:     "exact proportional split with no remainder",
+			total:    100,
+			lengths:  []int{25, 75},
+			expected: []int64{25, 75},
+		},
+		{
+			name:     "remainder awarded to larger fractional share",
+			total:    10,
+			lengths:  []int{1, 2},
+			expected: []int64{3, 7},
+		},
+		{
+			name:     "equal remainders tie-break by original index",
+			total:    10,
+			lengths:  []int{1, 1, 1},
+			expected: []int64{4, 3, 3},
+		},
+		{
+			name:     "single message receives the entire total",
+			total:    50,
+			lengths:  []int{42},
+			expected: []int64{50},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			messages := make([]ParsedMessage, len(tc.lengths))
+			for i, length := range tc.lengths {
+				messages[i].ContentLength = length
+			}
+			got := distributeCursorIDETokens(tc.total, messages)
+			assert.Equal(t, tc.expected, got)
+
+			var sum int64
+			for _, v := range got {
+				sum += v
+			}
+			assert.Equal(t, tc.total, sum, "allocated tokens must sum exactly to the requested total")
+		})
+	}
+}
+
+func TestParseCursorIDEComposer_ContextTokensUsedDistributed(t *testing.T) {
+	dbPath := createCursorIDEDB(t, []cursorIDETestComposer{{
+		id:                "tokens-0000-0000-0000-000000000000",
+		name:              "Token thread",
+		createdAt:         1782026756842,
+		updatedAt:         1782026791522,
+		contextTokensUsed: 100,
+		bubbles: []cursorIDETestBubble{
+			{
+				id: "u1", bubbleType: cursorIDEBubbleTypeUser,
+				text: "12345", createdAt: "2026-06-21T07:27:29.606Z",
+			},
+			{
+				id: "a1", bubbleType: cursorIDEBubbleTypeAssistant,
+				text: "123456789012345", createdAt: "2026-06-21T07:27:31.522Z",
+			},
+		},
+	}})
+	conn, err := openCursorIDEDB(dbPath)
+	require.NoError(t, err)
+	defer conn.Close()
+	info, err := os.Stat(dbPath)
+	require.NoError(t, err)
+
+	result, err := parseCursorIDEComposer(
+		t.Context(), conn, dbPath,
+		"tokens-0000-0000-0000-000000000000", "devbox", info,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Len(t, result.Messages, 2)
+
+	var sum int
+	for _, m := range result.Messages {
+		assert.True(t, m.HasContextTokens,
+			"every message must carry inferred context-token presence")
+		sum += m.ContextTokens
+	}
+	assert.Equal(t, 100, sum,
+		"per-message context tokens must sum to the composer-level total")
+	assert.True(t, result.Session.HasPeakContextTokens)
+	assert.Equal(t, 100, result.Session.PeakContextTokens)
+}
+
+func TestParseCursorIDEComposer_ZeroContextTokensUsedLeavesTokensUnset(t *testing.T) {
+	dbPath := createCursorIDEDB(t, []cursorIDETestComposer{{
+		id:                "no-tokens-0000-0000-0000-000000000000",
+		name:              "No token thread",
+		createdAt:         1782026756842,
+		updatedAt:         1782026791522,
+		contextTokensUsed: 0,
+		bubbles: []cursorIDETestBubble{
+			{
+				id: "u1", bubbleType: cursorIDEBubbleTypeUser,
+				text: "hello", createdAt: "2026-06-21T07:27:29.606Z",
+			},
+		},
+	}})
+	conn, err := openCursorIDEDB(dbPath)
+	require.NoError(t, err)
+	defer conn.Close()
+	info, err := os.Stat(dbPath)
+	require.NoError(t, err)
+
+	result, err := parseCursorIDEComposer(
+		t.Context(), conn, dbPath,
+		"no-tokens-0000-0000-0000-000000000000", "devbox", info,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Len(t, result.Messages, 1)
+	assert.False(t, result.Messages[0].HasContextTokens)
+	assert.Zero(t, result.Messages[0].ContextTokens)
+	assert.False(t, result.Session.HasPeakContextTokens)
 }

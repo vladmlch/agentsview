@@ -378,6 +378,12 @@ var Registry = []AgentDef{
 		DefaultDirs: cursorIDEDefaultDirs(),
 		IDPrefix:    "cursor-ide:",
 		FileBased:   true,
+		Usage: UsageCapabilities{
+			// composerData exposes contextTokensUsed at the session level;
+			// per-message counts are inferred by proportional distribution,
+			// not provided by the wire format.
+			NoPerMessageTokenData: true,
+		},
 		// state.vscdb is VS Code's shared global-state database: besides
 		// Cursor's own chat data, its ItemTable co-locates Cursor's live
 		// auth tokens (observed keys cursorAuth/accessToken and
