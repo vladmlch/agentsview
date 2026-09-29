@@ -404,6 +404,7 @@
     }
   ],
   "sidebar_loading": "cargando",
+  "sidebar_load_more": "Cargar más",
   "sidebar_multi_select": "Selección múltiple",
   "sidebar_exit_multi_select": "Salir de la selección múltiple",
   "sidebar_select_all_visible": "Seleccionar todas las visibles",

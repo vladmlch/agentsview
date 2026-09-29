@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
+  import { Button, Spinner } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
-  import { sessions } from "../../stores/sessions.svelte.js";
+  import { buildSessionGroups, sessions, type SessionGroup } from "../../stores/sessions.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { starred } from "../../stores/starred.svelte.js";
   import SessionItem from "./SessionItem.svelte";
@@ -73,6 +74,60 @@
     }
   });
 
+  $effect(() => {
+    if (groupMode === "agent") {
+      void sessions.loadAgents();
+    } else if (groupMode === "project") {
+      void sessions.loadProjects();
+    }
+  });
+
+  let groupMetadata = $derived.by(() => {
+    if (starred.filterOnly) return undefined;
+    if (groupMode === "agent") {
+      return sessions.agents.map((a) => ({
+        key: a.name,
+        totalCount: a.session_count,
+      }));
+    }
+    if (groupMode === "project") {
+      return sessions.projects.map((p) => ({
+        key: p.name,
+        totalCount: p.session_count,
+      }));
+    }
+    return undefined;
+  });
+
+  let perGroupSessions = $derived.by(() => {
+    if (groupMode === "none") return undefined;
+    const map = new Map<
+      string,
+      { groups: SessionGroup[]; totalCount?: number; hasMore?: boolean }
+    >();
+    for (const [key, state] of sessions.groupSessionsCache.entries()) {
+      let sess = state.sessions;
+      if (starred.filterOnly) {
+        sess = sess.filter((s) => starred.isStarred(s.id));
+      }
+      const grps = buildSessionGroups(sess);
+      map.set(key, {
+        groups: grps,
+        totalCount: state.total,
+        hasMore: Boolean(state.nextCursor),
+      });
+    }
+    return map;
+  });
+
+  let groupLoading = $derived.by(() => {
+    const loading = new Set<string>();
+    for (const [key, state] of sessions.groupSessionsCache.entries()) {
+      if (state.loading) loading.add(key);
+    }
+    return loading;
+  });
+
   let groups = $derived.by(() => {
     const all = sessions.groupedSessions;
     if (!starred.filterOnly) return all;
@@ -103,7 +158,7 @@
 
   // Build grouped structure when groupMode is not "none".
   let groupSections = $derived.by(() =>
-    buildGroupSections(groups, groupMode),
+    buildGroupSections(groups, groupMode, groupMetadata, perGroupSessions),
   );
 
   // Derive effective collapsed set synchronously so the first
@@ -119,9 +174,26 @@
     return all;
   });
 
+  // Ensure any expanded group has its sessions loaded.
+  $effect(() => {
+    if (groupMode === "none" || collapseAll) return;
+    for (const section of groupSections) {
+      if (!collapsed.has(section.label) && !sessions.groupSessionsCache.has(section.label)) {
+        void sessions.loadGroupSessions(groupMode, section.label);
+      }
+    }
+  });
+
   // Build flat display items for virtual scrolling.
   let displayItems = $derived.by(() =>
-    buildDisplayItems(groups, groupSections, groupMode, collapsed, expandedGroups),
+    buildDisplayItems(
+      groups,
+      groupSections,
+      groupMode,
+      collapsed,
+      expandedGroups,
+      groupLoading,
+    ),
   );
 
   // When include_children is enabled the API total includes
@@ -172,6 +244,7 @@
   }
 
   function toggleGroup(label: string) {
+    const isExpanding = collapseAll || !manualExpanded.has(label);
     if (collapseAll) {
       collapseAll = false;
       manualExpanded = new Set([label]);
@@ -183,6 +256,9 @@
         next.add(label);
       }
       manualExpanded = next;
+    }
+    if (isExpanding && groupMode !== "none") {
+      void sessions.loadGroupSessions(groupMode, label);
     }
   }
 
@@ -317,6 +393,25 @@
     }
   });
 
+  const lastAutoLoadedCursor = new Map<string, string>();
+  $effect(() => {
+    if (groupMode === "none") return;
+    for (const item of visibleItems) {
+      if (item.type === "group-load-more") {
+        const state = sessions.getGroupState(item.label);
+        if (
+          state &&
+          state.nextCursor &&
+          !state.loading &&
+          lastAutoLoadedCursor.get(item.label) !== state.nextCursor
+        ) {
+          lastAutoLoadedCursor.set(item.label, state.nextCursor);
+          void sessions.loadMoreGroupSessions(groupMode, item.label);
+        }
+      }
+    }
+  });
+
   // Clamp stale scrollTop when count shrinks.
   $effect(() => {
     if (!containerRef) return;
@@ -426,6 +521,14 @@
       // updates, and prevRevealedId is still unset so the
       // second pass will proceed to scroll.
       if (groupMode !== "none") {
+        const activeLabel =
+          groupMode === "agent"
+            ? sessions.activeSession?.agent
+            : sessions.activeSession?.project;
+        if (activeLabel && collapsed.has(activeLabel)) {
+          toggleGroup(activeLabel);
+          return;
+        }
         for (const section of groupSections) {
           const owns = section.groups.some((g) =>
             g.sessions.some((s) => s.id === activeId),
@@ -695,6 +798,33 @@
               selected={primary ? sessions.selectedIds.has(primary.id) : false}
             />
           {/if}
+        {:else if item.type === "group-loading"}
+          <div class="group-loading-row">
+            <Spinner size={12} label={m.sidebar_loading()} />
+            <span class="group-loading-text">{m.sidebar_loading()}</span>
+          </div>
+        {:else if item.type === "group-load-more"}
+          {@const isGroupLoading = sessions.isGroupLoading(item.label)}
+          <div class="group-load-more-row">
+            <Button
+              size="sm"
+              surface="soft"
+              tone="neutral"
+              disabled={isGroupLoading}
+              onclick={() => {
+                if (groupMode !== "none") {
+                  void sessions.loadMoreGroupSessions(groupMode, item.label);
+                }
+              }}
+            >
+              {#if isGroupLoading}
+                <Spinner size={11} label={m.sidebar_loading()} />
+                <span>{m.sidebar_loading()}</span>
+              {:else}
+                <span>{m.sidebar_load_more()}{item.count > 0 ? ` (${formatNumber(item.count)})` : ""}</span>
+              {/if}
+            </Button>
+          </div>
         {/if}
       </div>
     {/each}
@@ -1025,4 +1155,17 @@
     color: var(--text-primary);
   }
 
+  .group-loading-row,
+  .group-load-more-row {
+    display: flex;
+    align-items: center;
+    padding-left: 24px;
+    height: 100%;
+    gap: 8px;
+  }
+
+  .group-loading-text {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
 </style>

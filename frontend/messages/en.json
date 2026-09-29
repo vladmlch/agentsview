@@ -402,6 +402,7 @@
     }
   ],
   "sidebar_loading": "loading",
+  "sidebar_load_more": "Load more",
   "sidebar_multi_select": "Multi-select",
   "sidebar_exit_multi_select": "Exit multi-select",
   "sidebar_select_all_visible": "Select all visible",

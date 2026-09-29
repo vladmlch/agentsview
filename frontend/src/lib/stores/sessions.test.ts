@@ -3657,3 +3657,77 @@ describe("SessionsStore live refresh", () => {
     vi.useRealTimers();
   });
 });
+
+describe("SessionsStore on-demand group loading", () => {
+  it("loadGroupSessions fetches with agent param and limit 100", async () => {
+    const sessions = createSessionsStore();
+    vi.mocked(api.getSidebarSessionIndex).mockResolvedValueOnce({
+      sessions: [makeSkinnyRow({ id: "cursor-1", agent: "cursor-ide" })],
+      total: 1245,
+      next_cursor: "cursor-token-1",
+    });
+
+    await sessions.loadGroupSessions("agent", "cursor-ide");
+
+    expect(api.getSidebarSessionIndex).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agent: "cursor-ide",
+        limit: 100,
+      }),
+    );
+    const state = sessions.getGroupState("cursor-ide");
+    expect(state).toBeDefined();
+    expect(state!.sessions).toHaveLength(1);
+    expect(state!.sessions[0]!.id).toBe("cursor-1");
+    expect(state!.total).toBe(1245);
+    expect(state!.nextCursor).toBe("cursor-token-1");
+    expect(state!.loading).toBe(false);
+  });
+
+  it("loadMoreGroupSessions fetches next page using next_cursor", async () => {
+    const sessions = createSessionsStore();
+    vi.mocked(api.getSidebarSessionIndex)
+      .mockResolvedValueOnce({
+        sessions: [makeSkinnyRow({ id: "cursor-1", agent: "cursor-ide" })],
+        total: 1245,
+        next_cursor: "cursor-token-1",
+      })
+      .mockResolvedValueOnce({
+        sessions: [makeSkinnyRow({ id: "cursor-2", agent: "cursor-ide" })],
+        total: 1245,
+        next_cursor: null,
+      });
+
+    await sessions.loadGroupSessions("agent", "cursor-ide");
+    await sessions.loadMoreGroupSessions("agent", "cursor-ide");
+
+    expect(api.getSidebarSessionIndex).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        agent: "cursor-ide",
+        cursor: "cursor-token-1",
+        limit: 100,
+      }),
+    );
+    const state = sessions.getGroupState("cursor-ide");
+    expect(state!.sessions).toHaveLength(2);
+    expect(state!.sessions.map((s) => s.id)).toEqual(["cursor-1", "cursor-2"]);
+    expect(state!.nextCursor).toBeNull();
+  });
+
+  it("clearGroupSessionsCache resets the cache", async () => {
+    const sessions = createSessionsStore();
+    vi.mocked(api.getSidebarSessionIndex).mockResolvedValueOnce({
+      sessions: [makeSkinnyRow({ id: "cursor-1", agent: "cursor-ide" })],
+      total: 1245,
+      next_cursor: null,
+    });
+
+    await sessions.loadGroupSessions("agent", "cursor-ide");
+    expect(sessions.getGroupSessions("cursor-ide")).toHaveLength(1);
+
+    sessions.clearGroupSessionsCache();
+    expect(sessions.getGroupSessions("cursor-ide")).toHaveLength(0);
+    expect(sessions.getGroupState("cursor-ide")).toBeUndefined();
+  });
+});
+

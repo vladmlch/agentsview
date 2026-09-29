@@ -943,3 +943,114 @@ describe("selectPrimaryId", () => {
     expect(selectPrimaryId([a, b], "key")).toBe("b");
   });
 });
+
+// ---------------------------------------------------------------------------
+// buildGroupSections — with metadata & on-demand loading
+// ---------------------------------------------------------------------------
+
+describe("buildGroupSections (metadata and perGroupSessions)", () => {
+  it("uses metadata to establish groups and total counts even when groups array is empty", () => {
+    const metadata = [
+      { key: "cursor-ide", totalCount: 1245 },
+      { key: "claude", totalCount: 50 },
+    ];
+    const result = buildGroupSections([], "agent", metadata);
+
+    expect(result).toHaveLength(2);
+    expect(result[0]!.label).toBe("cursor-ide");
+    expect(result[0]!.totalCount).toBe(1245);
+    expect(result[0]!.hasMore).toBe(true);
+    expect(result[1]!.label).toBe("claude");
+    expect(result[1]!.totalCount).toBe(50);
+  });
+
+  it("sorts by totalCount descending from metadata", () => {
+    const metadata = [
+      { key: "small", totalCount: 5 },
+      { key: "large", totalCount: 1000 },
+      { key: "medium", totalCount: 50 },
+    ];
+    const result = buildGroupSections([], "agent", metadata);
+
+    expect(result.map((s) => s.label)).toEqual(["large", "medium", "small"]);
+  });
+
+  it("incorporates perGroupSessions when loaded on demand", () => {
+    const metadata = [
+      { key: "cursor-ide", totalCount: 1245 },
+      { key: "claude", totalCount: 50 },
+    ];
+    const loadedGroup = makeGroup("cursor-ide", 2);
+    const perGroupSessions = new Map([
+      [
+        "cursor-ide",
+        {
+          groups: [loadedGroup],
+          totalCount: 1245,
+          hasMore: true,
+        },
+      ],
+    ]);
+
+    const result = buildGroupSections([], "agent", metadata, perGroupSessions);
+
+    const cursorSection = result.find((s) => s.label === "cursor-ide")!;
+    expect(cursorSection.groups).toHaveLength(1);
+    expect(cursorSection.totalCount).toBe(1245);
+    expect(cursorSection.hasMore).toBe(true);
+
+    const claudeSection = result.find((s) => s.label === "claude")!;
+    expect(claudeSection.groups).toHaveLength(0);
+    expect(claudeSection.totalCount).toBe(50);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildDisplayItems — group-loading and group-load-more
+// ---------------------------------------------------------------------------
+
+describe("buildDisplayItems (group-loading and group-load-more)", () => {
+  it("emits group-loading item when expanded group has 0 sessions and is loading", () => {
+    const sections = [
+      {
+        label: "cursor-ide",
+        groups: [],
+        totalCount: 1245,
+        hasMore: true,
+      },
+    ];
+    const collapsed = new Set<string>();
+    const groupLoading = new Set(["cursor-ide"]);
+
+    const items = buildDisplayItems([], sections, "agent", collapsed, new Set(), groupLoading);
+
+    expect(items).toHaveLength(2);
+    expect(items[0]!.type).toBe("header");
+    expect(items[1]!.type).toBe("group-loading");
+    expect(items[1]!.label).toBe("cursor-ide");
+    expect(items[1]!.top).toBe(HEADER_HEIGHT);
+  });
+
+  it("emits group-load-more item when group has more sessions to load", () => {
+    const group = makeGroup("cursor-ide", 1);
+    const sections = [
+      {
+        label: "cursor-ide",
+        groups: [group],
+        totalCount: 1245,
+        hasMore: true,
+      },
+    ];
+    const collapsed = new Set<string>();
+
+    const items = buildDisplayItems([], sections, "agent", collapsed, new Set());
+
+    expect(items).toHaveLength(3);
+    expect(items[0]!.type).toBe("header");
+    expect(items[1]!.type).toBe("session");
+    expect(items[2]!.type).toBe("group-load-more");
+    expect(items[2]!.label).toBe("cursor-ide");
+    expect(items[2]!.count).toBe(1244);
+    expect(items[2]!.top).toBe(HEADER_HEIGHT + ITEM_HEIGHT);
+  });
+});

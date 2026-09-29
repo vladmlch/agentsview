@@ -404,6 +404,7 @@
     }
   ],
   "sidebar_loading": "Yüklənir",
+  "sidebar_load_more": "Daha çox yüklə",
   "sidebar_multi_select": "Çoxlu seçim",
   "sidebar_exit_multi_select": "Çoxlu seçimdən çıx",
   "sidebar_select_all_visible": "Bütün görünənləri seç",

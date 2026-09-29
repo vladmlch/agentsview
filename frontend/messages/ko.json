@@ -389,6 +389,7 @@
     }
   ],
   "sidebar_loading": "불러오는 중",
+  "sidebar_load_more": "더 보기",
   "sidebar_multi_select": "다중 선택",
   "sidebar_exit_multi_select": "다중 선택 종료",
   "sidebar_select_all_visible": "표시된 항목 모두 선택",

@@ -402,6 +402,7 @@
     }
   ],
   "sidebar_loading": "chargement",
+  "sidebar_load_more": "Charger plus",
   "sidebar_multi_select": "Sélection multiple",
   "sidebar_exit_multi_select": "Quitter la sélection multiple",
   "sidebar_select_all_visible": "Sélectionner les sessions visibles",

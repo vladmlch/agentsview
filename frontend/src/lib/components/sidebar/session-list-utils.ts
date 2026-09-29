@@ -14,6 +14,13 @@ export type GroupMode = "none" | "agent" | "project";
 export interface GroupSection {
   label: string;
   groups: SessionGroup[];
+  totalCount?: number;
+  hasMore?: boolean;
+}
+
+export interface GroupMetadataItem {
+  key: string;
+  totalCount: number;
 }
 
 /** @deprecated Use GroupSection */
@@ -21,7 +28,7 @@ export type AgentSection = GroupSection;
 
 export interface DisplayItem {
   id: string;
-  type: "header" | "session" | "team-group" | "subagent-group";
+  type: "header" | "session" | "team-group" | "subagent-group" | "group-loading" | "group-load-more";
   label: string;
   count: number;
   group?: SessionGroup;
@@ -88,7 +95,12 @@ export function selectPrimaryId(sessions: SessionGroupInput[], groupKey: string)
  * Groups by agent name or project depending on mode.
  * Returns empty array when mode is "none".
  */
-export function buildGroupSections(groups: SessionGroup[], mode: GroupMode): GroupSection[] {
+export function buildGroupSections(
+  groups: SessionGroup[],
+  mode: GroupMode,
+  metadata?: GroupMetadataItem[],
+  perGroupSessions?: Map<string, { groups: SessionGroup[]; totalCount?: number; hasMore?: boolean }>,
+): GroupSection[] {
   if (mode === "none") return [];
   const map = new Map<string, SessionGroup[]>();
   for (const g of groups) {
@@ -102,10 +114,49 @@ export function buildGroupSections(groups: SessionGroup[], mode: GroupMode): Gro
     }
     list.push(g);
   }
-  // Sort by count descending (most sessions first).
-  return Array.from(map.entries())
-    .sort((a, b) => b[1].length - a[1].length)
-    .map(([label, groups]) => ({ label, groups }));
+
+  if (!metadata || metadata.length === 0) {
+    // Sort by count descending (most sessions first).
+    return Array.from(map.entries())
+      .sort((a, b) => b[1].length - a[1].length)
+      .map(([label, groups]) => ({ label, groups, totalCount: groups.length }));
+  }
+
+  const seen = new Set<string>();
+  const sections: GroupSection[] = [];
+
+  for (const meta of metadata) {
+    const label = meta.key;
+    seen.add(label);
+    const perGroup = perGroupSessions?.get(label);
+    const sectionGroups = perGroup?.groups ?? map.get(label) ?? [];
+    const totalCount = perGroup?.totalCount ?? meta.totalCount;
+    const hasMore = perGroup?.hasMore ?? (totalCount > sectionGroups.length);
+
+    sections.push({
+      label,
+      groups: sectionGroups,
+      totalCount,
+      hasMore,
+    });
+  }
+
+  for (const [label, sectionGroups] of map.entries()) {
+    if (!seen.has(label)) {
+      sections.push({
+        label,
+        groups: sectionGroups,
+        totalCount: sectionGroups.length,
+        hasMore: false,
+      });
+    }
+  }
+
+  return sections.sort((a, b) => {
+    const diff = (b.totalCount ?? b.groups.length) - (a.totalCount ?? a.groups.length);
+    if (diff !== 0) return diff;
+    return a.label.localeCompare(b.label);
+  });
 }
 
 /** Check if a session is a teammate (received a <teammate-message>). */
@@ -334,6 +385,7 @@ export function buildDisplayItems(
   mode: GroupMode,
   collapsed: Set<string>,
   expandedGroups: Set<string>,
+  groupLoading?: Set<string>,
 ): DisplayItem[] {
   const y = { value: 0 };
 
@@ -347,11 +399,12 @@ export function buildDisplayItems(
 
   const items: DisplayItem[] = [];
   for (const section of sections) {
+    const count = section.totalCount ?? section.groups.length;
     items.push({
       id: `header:${section.label}`,
       type: "header",
       label: section.label,
-      count: section.groups.length,
+      count,
       sectionGroups: section.groups,
       height: HEADER_HEIGHT,
       top: y.value,
@@ -359,8 +412,32 @@ export function buildDisplayItems(
     y.value += HEADER_HEIGHT;
 
     if (!collapsed.has(section.label)) {
-      for (const g of section.groups) {
-        emitGroupItems(g, section.label, expandedGroups, items, y);
+      const isLoading = groupLoading?.has(section.label);
+      if (section.groups.length === 0 && isLoading) {
+        items.push({
+          id: `loading:${section.label}`,
+          type: "group-loading",
+          label: section.label,
+          count: 0,
+          height: ITEM_HEIGHT,
+          top: y.value,
+        });
+        y.value += ITEM_HEIGHT;
+      } else {
+        for (const g of section.groups) {
+          emitGroupItems(g, section.label, expandedGroups, items, y);
+        }
+        if (section.hasMore) {
+          items.push({
+            id: `more:${section.label}`,
+            type: "group-load-more",
+            label: section.label,
+            count: Math.max(0, (section.totalCount ?? 0) - section.groups.length),
+            height: ITEM_HEIGHT,
+            top: y.value,
+          });
+          y.value += ITEM_HEIGHT;
+        }
       }
     }
   }
