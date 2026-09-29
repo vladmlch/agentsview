@@ -33,6 +33,13 @@ func (m CodexMetadata) IndexFiles(root string) []string {
 	var paths []string
 	for _, dir := range m.dirs(root) {
 		paths = append(paths, filepath.Join(dir, CodexSessionIndexFilename))
+		for _, pattern := range []string{"state_*.sqlite", "state_*.db"} {
+			matches, err := filepath.Glob(filepath.Join(dir, pattern))
+			if err == nil && len(matches) > 0 {
+				sort.Strings(matches)
+				paths = append(paths, matches...)
+			}
+		}
 	}
 	return paths
 }
