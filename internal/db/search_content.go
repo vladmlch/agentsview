@@ -778,46 +778,130 @@ func literalPrefix(pattern string) string {
 // failed to load), so both modes report the same capability gate.
 var errFTSUnavailable = errors.New("search: full-text search is unavailable")
 
-// searchContentFTS uses messages_fts for fast tokenized matching over
-// message content only. The caller (service/CLI) guarantees Sources is
-// messages-only for fts mode.
-func (db *DB) searchContentFTS(
-	ctx context.Context, f ContentSearchFilter,
-) (ContentSearchPage, error) {
-	// Guard FTS availability up front: a missing messages_fts table would
-	// otherwise raise a generic SQLITE_ERROR that classifyFTSError would misread
-	// as invalid user input (400). With FTS present, the only SQLITE_ERROR the
-	// MATCH query can raise comes from a malformed pattern.
+type toolFTSFilters struct {
+	toolOnly, hasError bool
+	exitCode           *int
+	mcp, file, text    string
+}
+
+func parseToolFTSFilters(pattern string) (toolFTSFilters, error) {
+	var out toolFTSFilters
+	var text []string
+	for _, part := range strings.Fields(pattern) {
+		switch {
+		case part == "scope:tool":
+			out.toolOnly = true
+		case strings.HasPrefix(part, "exit:"):
+			value, err := strconv.Atoi(strings.TrimPrefix(part, "exit:"))
+			if err != nil || (value != 0 && value != 1) {
+				return out, searchInputErrorf("search: exit must be 0 or 1")
+			}
+			out.exitCode = &value
+		case part == "has_error:true":
+			out.hasError = true
+		case strings.HasPrefix(part, "mcp:"):
+			out.mcp = strings.TrimPrefix(part, "mcp:")
+		case strings.HasPrefix(part, "file:"):
+			out.file = strings.TrimPrefix(part, "file:")
+		default:
+			text = append(text, part)
+		}
+	}
+	out.text = strings.Join(text, " ")
+	return out, nil
+}
+
+// searchContentFTS unions the message and tool indexes. Tool qualifiers are
+// removed before MATCH parsing and applied to projection metadata.
+func (db *DB) searchContentFTS(ctx context.Context, f ContentSearchFilter) (ContentSearchPage, error) {
 	if !db.HasFTS(ctx) {
 		return ContentSearchPage{}, errFTSUnavailable
 	}
-	ftsQuery, err := db.prepareMessageFTSQuery(ctx, f.Pattern)
+	filters, err := parseToolFTSFilters(f.Pattern)
 	if err != nil {
 		return ContentSearchPage{}, err
 	}
-	scope, scopeArgs := sessionScopeSubquery(f)
-	sysPred := "1=1"
-	if f.ExcludeSystem {
-		sysPred = "m.is_system = 0 AND " + SystemPrefixSQL("m.content", "m.role")
+	var prepared messageFTSQuery
+	if filters.text != "" {
+		prepared, err = db.prepareMessageFTSQuery(ctx, filters.text)
+		if err != nil {
+			return ContentSearchPage{}, err
+		}
 	}
-	// Select the full content (not FTS snippet()) so the snippet is built in Go
-	// and secret redaction sees whole secrets rather than a pre-truncated window.
-	query := fmt.Sprintf(`
-		SELECT m.session_id, s.project, s.agent,
-			COALESCE(s.transcript_revision,''), 'message', m.role, '',
-			m.ordinal, COALESCE(m.timestamp,'') AS ts, m.content AS snippet
-		FROM messages_fts
-		JOIN messages m ON m.id = messages_fts.rowid
-		JOIN sessions s ON s.id = m.session_id
-		WHERE messages_fts MATCH ? AND %s AND m.%s
-		ORDER BY rank ASC, m.ordinal ASC, m.id ASC
-		LIMIT ? OFFSET ?`, sysPred, scope)
-	query = strings.ReplaceAll(query, "messages_fts", ftsQuery.table)
-	args := []any{ftsQuery.match}
-	args = append(args, scopeArgs...)
+	scope, scopeArgs := sessionScopeSubquery(f)
+	toolFiltered := filters.exitCode != nil || filters.hasError || filters.mcp != "" || filters.file != ""
+	var branches []string
+	var args []any
+	if !filters.toolOnly && !toolFiltered && hasSource(f, "messages") && filters.text != "" {
+		sysPred := "1=1"
+		if f.ExcludeSystem {
+			sysPred = "m.is_system = 0 AND " + SystemPrefixSQL("m.content", "m.role")
+		}
+		branch := fmt.Sprintf(`SELECT m.session_id,s.project,s.agent,
+			COALESCE(s.transcript_revision,''),'message',m.role,'',m.ordinal,
+			COALESCE(m.timestamp,''),m.content,0 AS src,m.id AS row_id
+			FROM %s JOIN messages m ON m.id=%s.rowid
+			JOIN sessions s ON s.id=m.session_id
+			WHERE %s MATCH ? AND %s AND m.%s`, prepared.table, prepared.table,
+			prepared.table, sysPred, scope)
+		branches = append(branches, branch)
+		args = append(args, prepared.match)
+		args = append(args, scopeArgs...)
+	}
+	wantTools := filters.toolOnly || toolFiltered || hasSource(f, "tool_input") || hasSource(f, "tool_result")
+	if wantTools {
+		predicates := []string{"tc." + scope}
+		toolArgs := append([]any(nil), scopeArgs...)
+		if filters.text != "" {
+			predicates = append([]string{"tool_content_fts MATCH ?"}, predicates...)
+			toolArgs = append([]any{prepared.match}, toolArgs...)
+		}
+		if !hasSource(f, "tool_input") || (filters.toolOnly && len(f.Sources) == 0) {
+			if hasSource(f, "tool_result") || filters.toolOnly || toolFiltered {
+				predicates = append(predicates, "tc.location='tool_result'")
+			}
+		} else if !hasSource(f, "tool_result") {
+			predicates = append(predicates, "tc.location='tool_input'")
+		}
+		if filters.exitCode != nil {
+			predicates = append(predicates, "tc.exit_code=?")
+			toolArgs = append(toolArgs, *filters.exitCode)
+		}
+		if filters.hasError {
+			predicates = append(predicates, "tc.is_error=1")
+		}
+		if filters.mcp != "" {
+			predicates = append(predicates, "(lower(tc.tool_name) LIKE lower(?) ESCAPE '\\' OR lower(tc.tool_name) LIKE lower(?) ESCAPE '\\')")
+			m := escapeLike(filters.mcp)
+			toolArgs = append(toolArgs, "%mcp%"+m+"%", "%"+strings.ReplaceAll(m, ".", "%")+"%")
+		}
+		if filters.file != "" {
+			predicates = append(predicates, "(tc.file_path LIKE ? ESCAPE '\\' OR tc.content LIKE ? ESCAPE '\\')")
+			like := "%" + escapeLike(filters.file) + "%"
+			toolArgs = append(toolArgs, like, like)
+		}
+		predicates = append(predicates, `(tc.source_kind<>'call' OR tc.location<>'tool_result' OR tc.tool_use_id='' OR NOT EXISTS
+			(SELECT 1 FROM tool_content ev WHERE ev.source_kind='event' AND ev.session_id=tc.session_id AND ev.tool_use_id=tc.tool_use_id))`)
+		branch := `SELECT tc.session_id,s.project,s.agent,COALESCE(s.transcript_revision,''),
+			tc.location,'assistant',tc.tool_name,tc.ordinal,COALESCE(m.timestamp,''),
+			tc.content,1 AS src,tc.id AS row_id FROM tool_content_fts
+			JOIN tool_content tc ON tc.id=tool_content_fts.rowid
+			LEFT JOIN messages m ON m.id=tc.message_id JOIN sessions s ON s.id=tc.session_id
+			WHERE ` + strings.Join(predicates, " AND ")
+		branches = append(branches, branch)
+		args = append(args, toolArgs...)
+	}
+	if len(branches) == 0 {
+		return ContentSearchPage{}, nil
+	}
+	query := `SELECT session_id,project,agent,transcript_revision,location,role,tool_name,ordinal,ts,snippet
+		FROM (` + strings.Join(branches, " UNION ALL ") + `)
+		ORDER BY session_id,ordinal,src,row_id LIMIT ? OFFSET ?`
 	args = append(args, f.Limit+1, f.Cursor)
 	page, err := db.scanContentMatches(ctx, query, args, f.Limit, f.Cursor, func(body string) string {
-		return f.ftsSnippet(body, ftsQuery.snippetTerm)
+		copy := f
+		copy.Pattern = filters.text
+		return copy.ftsSnippet(body, prepared.snippetTerm)
 	})
 	if err != nil {
 		return ContentSearchPage{}, classifyFTSError(err)

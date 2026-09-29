@@ -627,6 +627,111 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content_rowid='id',
     tokenize='porter unicode61'
 );
+CREATE VIRTUAL TABLE IF NOT EXISTS tool_content_fts USING fts5(
+    content,
+    content='tool_content',
+    content_rowid='id',
+    tokenize='porter unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS tool_content_fts_ai AFTER INSERT ON tool_content BEGIN
+    INSERT INTO tool_content_fts(rowid, content) VALUES(new.id, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS tool_content_fts_ad AFTER DELETE ON tool_content BEGIN
+    INSERT INTO tool_content_fts(tool_content_fts, rowid, content)
+        VALUES('delete', old.id, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS tool_content_fts_au AFTER UPDATE ON tool_content BEGIN
+    INSERT INTO tool_content_fts(tool_content_fts, rowid, content)
+        VALUES('delete', old.id, old.content);
+    INSERT INTO tool_content_fts(rowid, content) VALUES(new.id, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS tool_calls_fts_ai AFTER INSERT ON tool_calls BEGIN
+    INSERT INTO tool_content(source_kind, source_id, session_id, message_id,
+        ordinal, location, tool_name, tool_use_id, content, file_path,
+        exit_code, is_error)
+    SELECT 'call', new.id, new.session_id, new.message_id, m.ordinal,
+        'tool_input', new.tool_name, COALESCE(new.tool_use_id,''),
+        COALESCE(new.input_json,''), COALESCE(new.file_path,''), NULL, 0
+    FROM messages m WHERE m.id = new.message_id AND COALESCE(new.input_json,'') <> '';
+    INSERT INTO tool_content(source_kind, source_id, session_id, message_id,
+        ordinal, location, tool_name, tool_use_id, content, file_path,
+        exit_code, is_error)
+    SELECT 'call', new.id, new.session_id, new.message_id, m.ordinal,
+        'tool_result', new.tool_name, COALESCE(new.tool_use_id,''),
+        COALESCE(new.result_content,''), COALESCE(new.file_path,''),
+        CASE WHEN json_valid(new.result_content) THEN CAST(COALESCE(
+            json_extract(new.result_content,'$.exit_code'),
+            json_extract(new.result_content,'$.exitCode')) AS INTEGER) END,
+        CASE WHEN json_valid(new.result_content) AND
+                       COALESCE(json_extract(new.result_content,'$.is_error'),0)
+             THEN 1 ELSE 0 END
+    FROM messages m WHERE m.id = new.message_id AND COALESCE(new.result_content,'') <> '';
+END;
+CREATE TRIGGER IF NOT EXISTS tool_calls_fts_ad AFTER DELETE ON tool_calls BEGIN
+    DELETE FROM tool_content WHERE source_kind='call' AND source_id=old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS tool_calls_fts_au AFTER UPDATE ON tool_calls BEGIN
+    DELETE FROM tool_content WHERE source_kind='call' AND source_id=old.id;
+    INSERT INTO tool_content(source_kind, source_id, session_id, message_id,
+        ordinal, location, tool_name, tool_use_id, content, file_path,
+        exit_code, is_error)
+    SELECT 'call', new.id, new.session_id, new.message_id, m.ordinal,
+        'tool_input', new.tool_name, COALESCE(new.tool_use_id,''),
+        COALESCE(new.input_json,''), COALESCE(new.file_path,''), NULL, 0
+    FROM messages m WHERE m.id = new.message_id AND COALESCE(new.input_json,'') <> '';
+    INSERT INTO tool_content(source_kind, source_id, session_id, message_id,
+        ordinal, location, tool_name, tool_use_id, content, file_path,
+        exit_code, is_error)
+    SELECT 'call', new.id, new.session_id, new.message_id, m.ordinal,
+        'tool_result', new.tool_name, COALESCE(new.tool_use_id,''),
+        COALESCE(new.result_content,''), COALESCE(new.file_path,''),
+        CASE WHEN json_valid(new.result_content) THEN CAST(COALESCE(
+            json_extract(new.result_content,'$.exit_code'),
+            json_extract(new.result_content,'$.exitCode')) AS INTEGER) END,
+        CASE WHEN json_valid(new.result_content) AND
+                       COALESCE(json_extract(new.result_content,'$.is_error'),0)
+             THEN 1 ELSE 0 END
+    FROM messages m WHERE m.id = new.message_id AND COALESCE(new.result_content,'') <> '';
+END;
+CREATE TRIGGER IF NOT EXISTS tool_result_events_fts_ai AFTER INSERT ON tool_result_events BEGIN
+    INSERT INTO tool_content(source_kind, source_id, session_id, ordinal,
+        location, tool_name, tool_use_id, content, file_path, exit_code, is_error)
+    VALUES ('event', new.id, new.session_id, new.tool_call_message_ordinal,
+        'tool_result', COALESCE((SELECT tool_name FROM tool_calls
+          WHERE session_id=new.session_id AND
+            ((new.tool_use_id <> '' AND tool_use_id=new.tool_use_id) OR
+             (COALESCE(new.tool_use_id,'')='' AND call_index=new.call_index))
+          ORDER BY id LIMIT 1),''), COALESCE(new.tool_use_id,''), new.content,
+        '', CASE WHEN json_valid(new.content) THEN CAST(COALESCE(
+            json_extract(new.content,'$.exit_code'),
+            json_extract(new.content,'$.exitCode')) AS INTEGER) END,
+        CASE WHEN lower(new.status) IN ('error','failed','failure') OR
+                       (json_valid(new.content) AND COALESCE(
+                           json_extract(new.content,'$.is_error'),0))
+             THEN 1 ELSE 0 END);
+END;
+CREATE TRIGGER IF NOT EXISTS tool_result_events_fts_ad AFTER DELETE ON tool_result_events BEGIN
+    DELETE FROM tool_content WHERE source_kind='event' AND source_id=old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS tool_result_events_fts_au AFTER UPDATE ON tool_result_events BEGIN
+    DELETE FROM tool_content WHERE source_kind='event' AND source_id=old.id;
+    INSERT INTO tool_content(source_kind, source_id, session_id, ordinal,
+        location, tool_name, tool_use_id, content, file_path, exit_code, is_error)
+    VALUES ('event', new.id, new.session_id, new.tool_call_message_ordinal,
+        'tool_result', COALESCE((SELECT tool_name FROM tool_calls
+          WHERE session_id=new.session_id AND
+            ((new.tool_use_id <> '' AND tool_use_id=new.tool_use_id) OR
+             (COALESCE(new.tool_use_id,'')='' AND call_index=new.call_index))
+          ORDER BY id LIMIT 1),''), COALESCE(new.tool_use_id,''), new.content,
+        '', CASE WHEN json_valid(new.content) THEN CAST(COALESCE(
+            json_extract(new.content,'$.exit_code'),
+            json_extract(new.content,'$.exitCode')) AS INTEGER) END,
+        CASE WHEN lower(new.status) IN ('error','failed','failure') OR
+                       (json_valid(new.content) AND COALESCE(
+                           json_extract(new.content,'$.is_error'),0))
+             THEN 1 ELSE 0 END);
+END;
 `
 
 const schemaCJKFTS = `
@@ -4808,6 +4913,13 @@ func (db *DB) init(ctx context.Context, progress OpenProgressFunc) error {
 		return fmt.Errorf("checking fts table: %w", err)
 	}
 	hadFTS := ftsCount > 0
+	var toolFTSCount int
+	if err := w.QueryRowContext(ctx,
+		"SELECT count(*) FROM sqlite_master WHERE type='table' AND name='tool_content_fts'",
+	).Scan(&toolFTSCount); err != nil {
+		return fmt.Errorf("checking tool content fts table: %w", err)
+	}
+	hadToolFTS := toolFTSCount > 0
 
 	// Attempt to initialize FTS. Failure is non-fatal
 	// (might be missing module).
@@ -4831,6 +4943,37 @@ func (db *DB) init(ctx context.Context, progress OpenProgressFunc) error {
 				" VALUES('rebuild')",
 		); err != nil {
 			return fmt.Errorf("backfilling FTS: %w", err)
+		}
+	}
+	if !hadToolFTS && fts5Available {
+		// Existing archives are migrated inline and non-destructively. The
+		// projection has a uniqueness key, making an interrupted retry safe.
+		if _, err := w.ExecContext(ctx, `
+			INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
+				message_id, ordinal, location, tool_name, tool_use_id, content, file_path)
+			SELECT 'call', tc.id, tc.session_id, tc.message_id, m.ordinal,
+				'tool_input', tc.tool_name, COALESCE(tc.tool_use_id,''),
+				COALESCE(tc.input_json,''), COALESCE(tc.file_path,'')
+			FROM tool_calls tc JOIN messages m ON m.id=tc.message_id
+			WHERE COALESCE(tc.input_json,'') <> '';
+			INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
+				message_id, ordinal, location, tool_name, tool_use_id, content, file_path)
+			SELECT 'call', tc.id, tc.session_id, tc.message_id, m.ordinal,
+				'tool_result', tc.tool_name, COALESCE(tc.tool_use_id,''),
+				COALESCE(tc.result_content,''), COALESCE(tc.file_path,'')
+			FROM tool_calls tc JOIN messages m ON m.id=tc.message_id
+			WHERE COALESCE(tc.result_content,'') <> '';
+			INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
+				ordinal, location, tool_name, tool_use_id, content, is_error)
+			SELECT 'event', tre.id, tre.session_id, tre.tool_call_message_ordinal,
+				'tool_result', COALESCE((SELECT tc.tool_name FROM tool_calls tc
+				 WHERE tc.session_id=tre.session_id AND tc.tool_use_id=tre.tool_use_id
+				 AND COALESCE(tre.tool_use_id,'')<>'' ORDER BY tc.id LIMIT 1),''),
+				COALESCE(tre.tool_use_id,''), tre.content,
+				CASE WHEN lower(tre.status) IN ('error','failed','failure') THEN 1 ELSE 0 END
+			FROM tool_result_events tre;
+			INSERT INTO tool_content_fts(tool_content_fts) VALUES('rebuild')`); err != nil {
+			return fmt.Errorf("backfilling tool content FTS: %w", err)
 		}
 	}
 
