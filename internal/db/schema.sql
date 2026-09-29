@@ -232,8 +232,9 @@ CREATE INDEX IF NOT EXISTS idx_sessions_project
     ON sessions(project);
 CREATE INDEX IF NOT EXISTS idx_sessions_machine
     ON sessions(machine);
-CREATE INDEX IF NOT EXISTS idx_messages_session_ordinal
-    ON messages(session_id, ordinal);
+-- The UNIQUE(session_id, ordinal) constraint on messages already
+-- maintains an identical implicit index, so no explicit named index is
+-- needed here.
 CREATE INDEX IF NOT EXISTS idx_messages_velocity
     ON messages(session_id, ordinal, role, timestamp, content_length);
 CREATE INDEX IF NOT EXISTS idx_messages_session_role

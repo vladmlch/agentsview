@@ -1105,8 +1105,8 @@ func embeddableUnitsQuery(since string, includeAutomated bool) string {
 // predicate on the joined sessions row so SQLite can drive the scan from
 // sessions, which is orders of magnitude smaller than messages. With the
 // predicate on the join, the planner had no indexed way to apply it and
-// scanned every message row (content included) through
-// idx_messages_session_ordinal before discarding almost all of them; an
+// scanned every message row (content included) through the unique
+// (session_id, ordinal) index before discarding almost all of them; an
 // incremental refresh touching eight sessions still read the whole corpus.
 // The IN form makes the candidate session list the outer loop and looks its
 // messages up with SEARCH ... (session_id=?) on that same index, which also

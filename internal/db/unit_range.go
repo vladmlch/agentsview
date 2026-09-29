@@ -583,8 +583,9 @@ const unitExtentChunk = maxSQLVars / 6
 //
 // Orchestration is the shared ResolveRunExtents; one statement per
 // unitExtentChunk distinct probes resolves every probe with correlated point
-// lookups on idx_messages_session_ordinal (nearest stop row on each side,
-// then the farthest same-sidechain member inside the stop-narrowed interval)
+// lookups on the unique (session_id, ordinal) index (nearest stop row on each
+// side, then the farthest same-sidechain member inside the stop-narrowed
+// interval)
 // instead of transferring each interval's member rows to Go: an
 // interval-span scan moves O(interval) rows per page across the driver
 // boundary, the point lookups move exactly one result row per probe.
@@ -600,11 +601,12 @@ func (db *DB) RunExtents(
 // the inner subquery seeks the nearest STOP row between the anchor and the
 // interval bound — an embeddable user row (the reducer closes every run
 // there) or an opposite-sidechain embeddable assistant row (the flip rule);
-// ORDER BY ordinal DESC/ASC LIMIT 1 walks idx_messages_session_ordinal from
-// the anchor outward and stops at the first hit. The outer subquery then
-// seeks the farthest same-sidechain member inside the stop-narrowed
-// interval. Folding the user boundary into the stop set is what lets
-// DeriveUnitRanges probe with sentinel (Lo, Hi) bounds instead of paying a
+// ORDER BY ordinal DESC/ASC LIMIT 1 walks the unique (session_id, ordinal)
+// index from the anchor outward and stops at the first hit. The outer
+// subquery then seeks the farthest same-sidechain member inside the
+// stop-narrowed interval. Folding the user boundary into the stop set is
+// what lets DeriveUnitRanges probe with sentinel (Lo, Hi) bounds instead of
+// paying a
 // NearestUserBoundaries round trip first. The member predicate is role +
 // is_system only: SystemPrefixSQL constrains user rows exclusively, so it is
 // identically TRUE for assistant rows and deliberately omitted there.

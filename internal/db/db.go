@@ -3622,6 +3622,14 @@ func (db *DB) createPartialIndexesLocked(ctx context.Context, w *writerHandle) e
 		WHERE file_path IS NOT NULL AND deleted_at IS NULL`); err != nil {
 		return fmt.Errorf("creating active session source index: %w", err)
 	}
+	// The UNIQUE(session_id, ordinal) constraint on messages already
+	// maintains an identical implicit index, so the explicit named index
+	// is redundant and wastes space and write cost.
+	if _, err := w.Exec(ctx,
+		`DROP INDEX IF EXISTS idx_messages_session_ordinal`,
+	); err != nil {
+		return fmt.Errorf("dropping redundant messages session ordinal index: %w", err)
+	}
 	if _, err := w.Exec(ctx,
 		`DROP INDEX IF EXISTS idx_artifact_checkpoint_stage_pending`,
 	); err != nil {

@@ -182,10 +182,10 @@ func explainQueryPlan(t *testing.T, d *DB, query string, args ...any) []string {
 // TestEmbeddableUnitsQueryPlanDrivesFromSessionsWhenSinceIsSet is the
 // regression guard for the after-sync refresh reading the entire message
 // corpus (including content) on every run. With a watermark the planner must
-// look messages up per candidate session through
-// idx_messages_session_ordinal; a plan that scans messages means the
-// watermark stopped narrowing the scan. Without a watermark the full scan is
-// the intended shape and must stay.
+// look messages up per candidate session through the unique (session_id,
+// ordinal) index; a plan that scans messages means the watermark stopped
+// narrowing the scan. Without a watermark the full scan is the intended shape
+// and must stay.
 func TestEmbeddableUnitsQueryPlanDrivesFromSessionsWhenSinceIsSet(t *testing.T) {
 	d := testDB(t)
 	seedEmbeddableScopeCorpus(t, d)
@@ -219,8 +219,11 @@ func TestEmbeddableUnitsQueryPlanDrivesFromSessionsWhenSinceIsSet(t *testing.T) 
 				if strings.HasPrefix(line, "SCAN m") {
 					scansMessages = true
 				}
-				if strings.HasPrefix(line,
-					"SEARCH m USING INDEX idx_messages_session_ordinal (session_id=") {
+				// The planner may use either the explicit index name on older
+				// archives or the implicit autoindex created by the
+				// UNIQUE(session_id, ordinal) constraint on current ones.
+				if strings.HasPrefix(line, "SEARCH m USING INDEX") &&
+					strings.Contains(line, "(session_id=") {
 					searchesMessages = true
 				}
 			}
