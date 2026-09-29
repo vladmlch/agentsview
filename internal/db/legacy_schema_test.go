@@ -389,6 +389,68 @@ func requireLegacyRepairIndexes(t *testing.T, d *DB) {
 	}
 }
 
+// TestMessagesSessionOrdinalRedundantIndexDropped verifies that the
+// explicit idx_messages_session_ordinal index is removed from both fresh
+// and upgraded archives while the UNIQUE(session_id, ordinal) constraint
+// and its implicit index remain.
+func TestMessagesSessionOrdinalRedundantIndexDropped(t *testing.T) {
+	assertNoRedundantIndex := func(t *testing.T, d *DB) {
+		t.Helper()
+		var explicitCount int
+		err := d.getReader().QueryRow(t.Context(), `
+			SELECT count(*) FROM sqlite_master
+			WHERE type = 'index' AND name = 'idx_messages_session_ordinal'
+		`).Scan(&explicitCount)
+		require.NoError(t, err)
+		assert.Equal(t, 0, explicitCount,
+			"explicit idx_messages_session_ordinal must be absent")
+
+		requireIndexColumns(t, d, "sqlite_autoindex_messages_1", []string{
+			"session_id", "ordinal",
+		})
+	}
+
+	t.Run("fresh database", func(t *testing.T) {
+		d := testDB(t)
+		assertNoRedundantIndex(t, d)
+	})
+
+	t.Run("legacy database with explicit index", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "legacy.db")
+		conn, err := sql.Open("sqlite3", makeDSN(path, false))
+		require.NoError(t, err)
+		conn.SetMaxOpenConns(1)
+
+		_, err = conn.ExecContext(t.Context(), preParentLegacySchema+`
+			CREATE INDEX idx_messages_session_ordinal
+			    ON messages(session_id, ordinal);
+			INSERT INTO sessions (
+			    id, project, machine, agent
+			) VALUES ('legacy-session', 'project-a', 'local', 'claude');
+			INSERT INTO messages (
+			    id, session_id, ordinal, role, content
+			) VALUES (1, 'legacy-session', 0, 'user', 'archived');
+		`)
+		require.NoError(t, err)
+		require.NoError(t, conn.Close())
+
+		d, err := Open(t.Context(), path)
+		require.NoError(t, err)
+		defer d.Close()
+
+		assertNoRedundantIndex(t, d)
+
+		// The UNIQUE(session_id, ordinal) constraint must still enforce
+		// uniqueness after the redundant explicit index is dropped.
+		_, err = d.getWriter().ExecContext(t.Context(), `
+			INSERT INTO messages (session_id, ordinal, role, content)
+			VALUES ('legacy-session', 0, 'assistant', 'duplicate')
+		`)
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "UNIQUE constraint failed")
+	})
+}
+
 func TestToolResultMetadataMigrationPreservesArchivedEvents(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.db")
 	conn, err := sql.Open("sqlite3", makeDSN(path, false))
