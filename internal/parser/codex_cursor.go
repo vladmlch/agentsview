@@ -536,6 +536,7 @@ func cloneCodexCursorState(state codexCursorState) codexCursorState {
 	state.model = strings.Clone(state.model)
 	state.reasoningEffort = strings.Clone(state.reasoningEffort)
 	state.cwd = strings.Clone(state.cwd)
+	state.gitBranch = strings.Clone(state.gitBranch)
 	state.agentPath = strings.Clone(state.agentPath)
 	state.lastTaskEvent = strings.Clone(state.lastTaskEvent)
 	for i := range state.pendingCallCount {
@@ -557,6 +558,7 @@ func estimateCodexCursorEntryBytes(
 			len(state.model)+
 			len(state.reasoningEffort)+
 			len(state.cwd)+
+			len(state.gitBranch)+
 			len(state.agentPath)+
 			len(state.lastTaskEvent)+
 			codexPendingCallStringBytes(state)+

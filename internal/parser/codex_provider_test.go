@@ -42,7 +42,7 @@ func TestCodexProviderSourceMethods(t *testing.T) {
 	assert.Equal(t, []string{"*.jsonl"}, plan.Roots[0].IncludeGlobs)
 	assert.Equal(t, base, plan.Roots[1].Path)
 	assert.False(t, plan.Roots[1].Recursive)
-	assert.Equal(t, []string{CodexSessionIndexFilename}, plan.Roots[1].IncludeGlobs)
+	assert.Equal(t, []string{CodexSessionIndexFilename, "state_*.sqlite", "state_*.sqlite-*", "state_*.db", "state_*.db-*"}, plan.Roots[1].IncludeGlobs)
 
 	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
@@ -59,7 +59,7 @@ func TestCodexProviderSourceMethods(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, sourcePath, found.DisplayPath)
 
-	for _, path := range []string{sourcePath, indexPath} {
+	for _, path := range []string{sourcePath, indexPath, filepath.Join(base, "state_5.sqlite")} {
 		changed, err := provider.SourcesForChangedPath(
 			t.Context(),
 			ChangedPathRequest{Path: path, EventKind: "write"},

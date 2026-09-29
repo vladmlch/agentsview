@@ -474,7 +474,7 @@ func TestAntigravityWatchPlanIncludesSubagentGlob(t *testing.T) {
 	provider := newAntigravityTestProvider(t, root)
 	plan, err := provider.WatchPlan(t.Context())
 	require.NoError(t, err)
-	require.Len(t, plan.Roots, 3)
+	require.Len(t, plan.Roots, 4)
 	assert.Equal(t, filepath.Join(root, "brain"), plan.Roots[1].Path)
 	assert.True(t, plan.Roots[1].Recursive)
 	assert.Contains(t, plan.Roots[1].IncludeGlobs,

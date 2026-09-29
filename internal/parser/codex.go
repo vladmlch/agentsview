@@ -1815,14 +1815,19 @@ func readCodexSessionMetaHeader(path string) (gjson.Result, error) {
 	}
 	if _, seekErr := f.Seek(0, io.SeekStart); seekErr == nil {
 		dec := json.NewDecoder(f)
-		var raw json.RawMessage
-		if decErr := dec.Decode(&raw); decErr == nil {
+		for {
+			var raw json.RawMessage
+			if decErr := dec.Decode(&raw); decErr != nil {
+				break
+			}
 			trimmed := bytes.TrimSpace(raw)
 			if bytes.HasPrefix(trimmed, []byte("[")) {
 				var items []json.RawMessage
-				if err := json.Unmarshal(trimmed, &items); err == nil && len(items) > 0 {
-					if gjson.Get(string(items[0]), "type").Str == codexTypeSessionMeta {
-						return gjson.Get(string(items[0]), "payload"), nil
+				if err := json.Unmarshal(trimmed, &items); err == nil {
+					for _, item := range items {
+						if gjson.Get(string(item), "type").Str == codexTypeSessionMeta {
+							return gjson.Get(string(item), "payload"), nil
+						}
 					}
 				}
 			} else if gjson.Get(string(raw), "type").Str == codexTypeSessionMeta {
@@ -2015,6 +2020,7 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 
 	if b.sessionID == "" && malformedLines > 0 {
 		if _, seekErr := f.Seek(0, io.SeekStart); seekErr == nil {
+			sink.Reset()
 			tee = newCodexHashAnchorTee(io.LimitReader(f, info.Size()))
 			b = newCodexSessionBuilder(
 				ctx, includeExec, p.parentTurnResolver(ctx, path), sink,
