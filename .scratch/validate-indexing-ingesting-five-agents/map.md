@@ -23,13 +23,18 @@ Produce an evidence-based audit report and discrepancy matrix comparing raw on-d
 
 ## Decisions so far
 
-<!-- the index: one line per closed ticket, enough to judge relevance, then zoom the link for the detail the ticket holds -->
+- [Audit Codex indexing and ingesting across raw disk, parser code, and database](issues/01-audit-codex-indexing-ingesting.md): 2,160 files reconcile 100% to 2,099 sessions (multi-segment rollouts stitched); uncovered omitted `git_branch` bug and 1,420 untitled sessions due to unread `state_5.sqlite`.
+- [Audit Claude indexing and ingesting across raw disk, parser code, and database](issues/02-audit-claude-indexing-ingesting.md): 330 regular disk files are 100% indexed with exact token parity; 251 subagents have 0 orphan parents; identified attachment nodes in v2.1+ triggering DAG-to-linear fallback.
+- [Audit Junie indexing and ingesting across raw disk, parser code, and database](issues/03-audit-junie-indexing-ingesting.md): 209 transcript dirs reconcile 100% to 251 sessions (198 root + 53 subagents) billing $322.54; uncovered dropped top-level `CancelAgentEvent` and duplicate subagent name collisions.
+- [Audit Devin indexing and ingesting across raw disk, parser code, and database](issues/04-audit-devin-indexing-ingesting.md): 86 visible sessions in `~/.local/share/devin/cli/sessions.db` partition cleanly into 1,377 sessions (1,291 subagents, 0 orphans); proprietary models unpriced ($0.00) in catalog.
+- [Audit Antigravity indexing and ingesting across raw disk, parser code, and database](issues/05-audit-antigravity-indexing-ingesting.md): 74 CLI and 533 IDE sessions reconcile 100%; discovered that 100% of IDE sessions lack `project`/`cwd` (unread `conversation_summaries.db`) and native `brain/.../transcript.jsonl` is ignored in favor of protobuf scraping.
+- [Synthesize cross-provider indexing and ingesting discrepancies](issues/06-synthesize-cross-provider-indexing-discrepancies.md): Cross-provider audit confirmed 100% inventory reconciliation (4,765 sessions total), 100% FTS5 indexing (351,406 messages), and 0 orphan subagents (2,848 subagents), while graduating four focused remediation tickets.
 
 ## Not yet specified
 
-- Remediation tickets for any discovered parser bugs or dropped session data (will graduate once audits complete).
 - Long-term automated regression testing harness for live session formats.
 - Vector search semantic indexing validation across these providers.
+- Keychain-based auto-discovery of `ANTIGRAVITY_KEY` for legacy encrypted CLI transcripts.
 
 ## Out of scope
 

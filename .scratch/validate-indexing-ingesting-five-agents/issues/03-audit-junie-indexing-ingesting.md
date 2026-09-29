@@ -1,7 +1,7 @@
 # Audit Junie indexing and ingesting across raw disk, parser code, and database
 
 Type: research
-Status: open
+Status: resolved
 Blocked by: 
 
 ## Question
@@ -21,3 +21,13 @@ Specifically investigate:
    - Verify FTS5 searchability.
 4. **Anomalies & Gaps**:
    - Check for dropped blocks, missing outputs, or mismatched timestamps.
+
+## Answer
+
+1. **Inventory Reconciliation (100% exact)**: 834 directories in `~/.junie/sessions/`. 624 are 21-byte `transcript.md` stubs created before task initialization; 1 directory is empty; 209 contain `events.jsonl`. 11 directories contain only `SystemMessageEvent` (IDE update notices) and are correctly discarded by `junieFinishSession`. The remaining 198 root sessions + 53 synthesized subagents (`junie:<rawId>--<agentId>`) yield exactly 251 sessions in `sessions.db`.
+2. **Fidelity**: 1,271 messages, 428 thinking blocks (86.8% of assistant messages), 32,813 tool calls (13,303 ViewFiles, 10,356 Terminal, 5,355 Search, 2,315 FileChanges, 247 MCP, 60 Task). Total output tokens (17,762,838) match `SUM(usage_events.output_tokens)` to the single token, billing $322.5362 USD. 100% indexed in `messages_fts`.
+3. **Discovered Bugs & Gaps**:
+   - **Bug: Dropped `CancelAgentEvent` & `AgentTaskFailedEvent`**: 96 `CancelAgentEvent` lines on disk are top-level events, but the parser's top-level switch drops them into `default:`, causing cancelled tasks to be classified as `awaiting_user` or `clean`.
+   - **Bug: Subagent spawn link collision**: When multiple subagents share the same name (e.g. `junie-cli-docs`), the name-matching loop links all parent calls to `agent-1`, leaving `agent-2` unlinked.
+   - **Bug: Self-referential task tool call**: `CustomAgentBlockUpdatedEvent` on the child stream creates an unlinked task tool call inside the child session.
+   - **Gap: `UserAsyncResponseEvent` drops prompt**: Question text is discarded, keeping only the answer. Unhandled `TestRunBlockUpdatedEvent` ignores IDE test runs.
