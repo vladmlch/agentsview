@@ -218,6 +218,114 @@ func TestCodexProviderChildOnlySubagentWithoutParentStaysCurrent(t *testing.T) {
 	assert.Equal(t, DataVersionCurrent, outcome.Results[0].DataVersion)
 }
 
+func TestCodexProviderForkWithoutReplayedPrefixStaysCurrent(t *testing.T) {
+	root := t.TempDir()
+	const childID = "22222222-2222-4222-8222-222222222222"
+	const parentID = "11111111-1111-4111-8111-111111111111"
+	writeCodexProviderSessionContent(t, root, parentID, testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(parentID, "/workspace/project", "codex_cli_rs", tsEarly),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", "parent-turn", tsEarly),
+	))
+	writeCodexProviderSessionContent(t, root, childID, testjsonl.JoinJSONL(
+		testjsonl.CodexForkedSessionMetaJSON(
+			childID, parentID, "/workspace/project", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.5", "child-turn", tsEarlyS1),
+		testjsonl.CodexMsgJSON("user", "child task", tsEarlyS1),
+		testjsonl.CodexMsgJSON("assistant", "child answer", tsEarlyS5),
+	))
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	source := requireCodexProviderSource(t, provider, childID)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	result := outcome.Results[0]
+	assert.Equal(t, DataVersionCurrent, result.DataVersion)
+	assert.Empty(t, result.RetryReason)
+	assert.Equal(t, RelFork, result.Result.Session.RelationshipType)
+	assert.Equal(t, "codex:"+parentID, result.Result.Session.ParentSessionID)
+	require.Len(t, result.Result.Messages, 2)
+	assert.Equal(t, "child task", result.Result.Messages[0].Content)
+	assert.Equal(t, "child answer", result.Result.Messages[1].Content)
+}
+
+func TestCodexProviderSubagentWithoutReplayedPrefixStaysCurrent(t *testing.T) {
+	root := t.TempDir()
+	const childID = "22222222-2222-4222-8222-222222222222"
+	const parentID = "11111111-1111-4111-8111-111111111111"
+	writeCodexProviderSessionContent(t, root, parentID, testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(parentID, "/workspace/project", "codex_cli_rs", tsEarly),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", "parent-turn", tsEarly),
+	))
+	writeCodexProviderSessionContent(t, root, childID, testjsonl.JoinJSONL(
+		testjsonl.CodexSubagentSessionMetaJSON(
+			childID, parentID, "/workspace/project", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.5", "child-turn", tsEarlyS1),
+		testjsonl.CodexMsgJSON("user", "child task", tsEarlyS1),
+	))
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	source := requireCodexProviderSource(t, provider, childID)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	result := outcome.Results[0]
+	assert.Equal(t, DataVersionCurrent, result.DataVersion)
+	assert.Empty(t, result.RetryReason)
+	assert.Equal(t, RelSubagent, result.Result.Session.RelationshipType)
+	assert.Equal(t, "codex:"+parentID, result.Result.Session.ParentSessionID)
+	require.Len(t, result.Result.Messages, 1)
+	assert.Equal(t, "child task", result.Result.Messages[0].Content)
+}
+
+func TestCodexProviderSubagentReplayedPrefixMissingParentFailOpen(t *testing.T) {
+	root := t.TempDir()
+	const childID = "22222222-2222-4222-8222-222222222222"
+	const parentID = "11111111-1111-4111-8111-111111111111"
+	// Parent file is absent. The subagent still carries a replayed copy of
+	// the parent's transcript, so the gate cannot safely suppress it.
+	writeCodexProviderSessionContent(t, root, childID, testjsonl.JoinJSONL(
+		testjsonl.CodexSubagentSessionMetaJSON(
+			childID, parentID, "/workspace/project", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexSessionMetaJSON(parentID, "/workspace/project", "codex_cli_rs", tsEarly),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", "parent-turn", tsEarly),
+		testjsonl.CodexMsgJSON("user", "replayed parent question", tsEarly),
+		testjsonl.CodexMsgJSON("assistant", "replayed parent answer", tsEarly),
+		testjsonl.CodexTokenCountJSON(tsEarly, 50_000, 9_000, 0),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.5", "child-turn", tsEarlyS1),
+		testjsonl.CodexMsgJSON("user", "genuine child task", tsEarlyS1),
+	))
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	source := requireCodexProviderSource(t, provider, childID)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	result := outcome.Results[0]
+	// The explicit replay parent could not be resolved, so the child remains
+	// visible but is marked for a later retry when the parent is available.
+	assert.Equal(t, DataVersionNeedsRetry, result.DataVersion)
+	assert.Contains(t, result.RetryReason, "parent turns")
+	assert.Equal(t, RelSubagent, result.Result.Session.RelationshipType)
+	assert.Equal(t, "codex:"+parentID, result.Result.Session.ParentSessionID)
+	// All content is preserved; the only suppressed line is the copied
+	// parent session_meta, which must not overwrite the child's identity.
+	assert.Equal(t, "codex:"+childID, result.Result.Session.ID)
+	require.Len(t, result.Result.Messages, 3)
+	assert.Equal(t, "replayed parent question", result.Result.Messages[0].Content)
+	assert.Equal(t, "replayed parent answer", result.Result.Messages[1].Content)
+	assert.Equal(t, "genuine child task", result.Result.Messages[2].Content)
+}
+
 func TestCodexActivityHintsUseConfiguredRootParent(t *testing.T) {
 	base := t.TempDir()
 	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{
