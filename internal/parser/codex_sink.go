@@ -45,6 +45,7 @@ type CodexSessionSink interface {
 	ApplyTokenUsageToLastAssistant(raw string) bool
 	InsertOrphanMessage(key string, m ParsedMessage) bool
 	Finalize()
+	Reset()
 	Messages() []ParsedMessage
 	ToolCallUpdates() []ParsedToolCallUpdate
 }

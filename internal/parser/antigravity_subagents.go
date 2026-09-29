@@ -258,6 +258,12 @@ var antigravityConversationIDRE = regexp.MustCompile(
 		`[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"`,
 )
 
+var antigravitySnakeConversationIDRE = regexp.MustCompile(
+	`"conversation_id"\s*:\s*"` +
+		`([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-` +
+		`[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"`,
+)
+
 // linkAntigravitySubagentSpawnEdges attaches spawned session ids to
 // invoke_subagent tool calls. Only steps carrying the
 // "Created the following subagents" marker are spawn results; all

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -27,13 +28,16 @@ func TestAntigravityProviderSourceMethods(t *testing.T) {
 
 	plan, err := provider.WatchPlan(t.Context())
 	require.NoError(t, err)
-	require.Len(t, plan.Roots, 3)
+	require.Len(t, plan.Roots, 4)
 	assert.Equal(t, filepath.Join(root, "annotations"), plan.Roots[0].Path)
 	assert.False(t, plan.Roots[0].Recursive)
 	assert.Equal(t, filepath.Join(root, "brain"), plan.Roots[1].Path)
 	assert.True(t, plan.Roots[1].Recursive)
 	assert.Equal(t, filepath.Join(root, "conversations"), plan.Roots[2].Path)
 	assert.False(t, plan.Roots[2].Recursive)
+	assert.Equal(t, root, plan.Roots[3].Path)
+	assert.False(t, plan.Roots[3].Recursive)
+	assert.Equal(t, []string{"conversation_summaries.db*"}, plan.Roots[3].IncludeGlobs)
 
 	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
@@ -979,7 +983,7 @@ func TestAntigravityProviderRoutesTrajectorySidecar(t *testing.T) {
 
 	plan, err := provider.WatchPlan(t.Context())
 	require.NoError(t, err)
-	require.Len(t, plan.Roots, 3)
+	require.Len(t, plan.Roots, 4)
 	assert.Equal(t, filepath.Join(root, "conversations"), plan.Roots[2].Path)
 	assert.Contains(t, plan.Roots[2].IncludeGlobs, "*.trajectory.json",
 		"conversations watch must include the trajectory sidecar")
@@ -1053,6 +1057,7 @@ func TestAntigravityProviderCapabilitiesAdvertiseSidecarContent(t *testing.T) {
 	assert.Equal(t, CapabilitySupported, caps.Content.ToolResults)
 	assert.Equal(t, CapabilitySupported, caps.Content.Model)
 	assert.Equal(t, CapabilitySupported, caps.Content.ToolCalls)
+	assert.Equal(t, CapabilitySupported, caps.Content.Cwd)
 }
 
 // antigravitySQLiteProviderCase describes one Antigravity provider whose
@@ -1318,4 +1323,74 @@ func TestAntigravityProviderConversationSummaries(t *testing.T) {
 	assert.Equal(t, "/Users/dev/repos/my-service", sess.Cwd)
 	assert.Equal(t, "Fix indexing bug", sess.SessionName)
 	assert.True(t, sess.SessionNamePresent)
+}
+
+func TestAntigravityFindSourceDirectSummaryLookup(t *testing.T) {
+	root := t.TempDir()
+	id := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	writeAntigravityIDEProviderFixture(t, root, id)
+
+	dbPath := filepath.Join(root, "conversation_summaries.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = db.Exec("CREATE TABLE conversation_summaries (conversation_id text primary key, workspace_uris text, title text)")
+	require.NoError(t, err)
+	_, err = db.Exec("INSERT INTO conversation_summaries (conversation_id, workspace_uris, title) VALUES (?, ?, ?)",
+		id, `["file:///Users/dev/repos/my-service"]`, "Fix indexing bug")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	provider, ok := NewProvider(AgentAntigravity, ProviderConfig{
+		Roots:   []string{root},
+		Machine: "devbox",
+	})
+	require.True(t, ok)
+
+	// Call FindSource directly without Discover to verify cache miss fallback
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: id})
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, "my-service", source.ProjectHint)
+	assert.Equal(t, SourceCwdResolved, source.CwdResolution.State)
+	assert.Equal(t, "/Users/dev/repos/my-service", source.CwdResolution.Path)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	sess := outcome.Results[0].Result.Session
+	assert.Equal(t, "my-service", sess.Project)
+	assert.Equal(t, "/Users/dev/repos/my-service", sess.Cwd)
+	assert.Equal(t, "Fix indexing bug", sess.SessionName)
+}
+
+func TestAntigravityWatchPlanAndSummaryChange(t *testing.T) {
+	root := t.TempDir()
+	id := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	writeAntigravityIDEProviderFixture(t, root, id)
+
+	provider, ok := NewProvider(AgentAntigravity, ProviderConfig{
+		Roots:   []string{root},
+		Machine: "devbox",
+	})
+	require.True(t, ok)
+
+	plan, err := provider.WatchPlan(t.Context())
+	require.NoError(t, err)
+	var foundSummariesWatch bool
+	for _, wr := range plan.Roots {
+		if wr.Path == root && slices.Contains(wr.IncludeGlobs, "conversation_summaries.db*") {
+			foundSummariesWatch = true
+			break
+		}
+	}
+	assert.True(t, foundSummariesWatch, "expected WatchPlan to watch conversation_summaries.db* under root")
+
+	// Trigger changed path for conversation_summaries.db
+	sources, err := provider.SourcesForChangedPath(t.Context(), ChangedPathRequest{
+		Path:      filepath.Join(root, "conversation_summaries.db"),
+		EventKind: "write",
+	})
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	assert.Equal(t, filepath.Join(root, "conversations", id+".db"), sources[0].DisplayPath)
 }

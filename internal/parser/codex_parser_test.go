@@ -4056,3 +4056,50 @@ func TestCodexMultilineJSONRollout(t *testing.T) {
 	assert.Equal(t, "main", sess.GitBranch)
 	assert.Equal(t, "Hello multiline JSON rollout", msgs[0].Content)
 }
+
+func TestCodexMultilineJSONMetaNotFirst(t *testing.T) {
+	content := `[
+  {
+    "timestamp": "2026-09-25T23:54:12Z",
+    "ordinal": 0,
+    "type": "turn_context",
+    "payload": {
+      "context": "starting"
+    }
+  },
+  {
+    "timestamp": "2026-09-25T23:54:13Z",
+    "ordinal": 1,
+    "type": "session_meta",
+    "payload": {
+      "id": "01a09999-5113-7a91-a159-a02da927e59f",
+      "cwd": "/work/project",
+      "git": {
+        "branch": "feature/branch"
+      }
+    }
+  },
+  {
+    "timestamp": "2026-09-25T23:54:14Z",
+    "ordinal": 2,
+    "type": "response_item",
+    "payload": {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Hello non-first meta"
+        }
+      ]
+    }
+  }
+]`
+	sess, msgs := runCodexParserTest(t, "", content, false)
+	require.NotEmpty(t, msgs)
+	assert.Equal(t, "codex:01a09999-5113-7a91-a159-a02da927e59f", sess.ID)
+	assert.Equal(t, "/work/project", sess.Cwd)
+	assert.Equal(t, "feature/branch", sess.GitBranch)
+	assert.Equal(t, "Hello non-first meta", msgs[0].Content)
+	assert.Len(t, msgs, 1)
+}

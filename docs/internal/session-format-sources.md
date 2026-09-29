@@ -464,11 +464,11 @@ fixtures retain this field; missing identities remain source-local.
   Its integration test checks parsed messages and aggregate output tokens.
 
 - **Format:** Rollout JSONL files, with a separate JSONL session index used by
-  older releases for discovery and metadata. Current releases no longer write
-  `session_index.jsonl`; thread titles live in `thread_history_*.sqlite`
-  databases that agentsview does not read, so an absent index is the normal
-  state, not a rename signal (reverified 2026-08-13 against a live `~/.codex`
-  with no `session_index.jsonl` and a populated `thread_history_1.sqlite`).
+  older releases for discovery and metadata. Current releases write thread titles
+  into `state_*.sqlite` (or `state_*.db`) databases (`threads` table) alongside
+  older `session_index.jsonl`; Agentsview reads and watches both sources.
+  Streaming rollouts are parsed line-by-line with a multiline JSON decoder
+  fallback for pretty-printed array rollouts.
   The TUI also maintains an append-oriented `history.jsonl` whose records
   contain `session_id`, Unix-seconds `ts`, and submitted prompt `text`;
   configured size enforcement can rewrite a retained tail in place. Agentsview
@@ -2951,10 +2951,11 @@ schemas keep their existing ordering behavior.
 
 ## Antigravity IDE (`antigravity`)
 
-- **Format:** Per-session SQLite databases, optionally supplemented by
-  trajectory JSON sidecars, plus the agent brain's plaintext
-  `brain/<uuid>/.system_generated/logs/transcript.jsonl`, which is the session
-  itself for a conversation with no database.
+- **Format:** Per-session SQLite databases (`conversations/<id>.db`),
+  supplemented by global workspace directory `conversation_summaries.db`
+  (extracting workspace URIs, thread titles, and cwd), native execution logs
+  (`brain/<id>/.system_generated/logs/transcript.jsonl` for full-fidelity thinking
+  traces and tool result interleaving), and trajectory JSON sidecars.
 - **Evidence:** `no-public-source`.
 - **Upstream:** Google's first-party Antigravity product and documentation
   surfaces and public repositories were searched 2026-07-19; no application
@@ -3635,13 +3636,15 @@ schemas keep their existing ordering behavior.
   `timestampMs` (epoch milliseconds), and a nested `agentEvent` or `agent`
   object; a few kinds such as `TaskState` and `SystemMessageEvent` appear at
   the envelope's top level. Observed kinds include `UserPromptEvent`,
-  `UserResponseEvent`, `AgentThoughtBlockUpdatedEvent`,
-  `ResultBlockUpdatedEvent`, `ToolBlockUpdatedEvent`,
-  `TerminalBlockUpdatedEvent`, `ViewFilesBlockUpdatedEvent`,
-  `McpBlockUpdatedEvent`, `CustomAgentBlockUpdatedEvent`,
-  `SubagentSpawnedEvent`, `AgentPatchCreatedEvent`,
-  `LlmResponseMetadataEvent`, `SessionCostTrajectorySnapshotEvent`,
-  `TaskState`, and `AgentTaskNameUpdatedEvent`. `*UpdatedEvent` records are
+  `UserResponseEvent`, `UserAsyncResponseEvent`,
+  `AgentThoughtBlockUpdatedEvent`, `ResultBlockUpdatedEvent`,
+  `ToolBlockUpdatedEvent`, `TerminalBlockUpdatedEvent`,
+  `ViewFilesBlockUpdatedEvent`, `McpBlockUpdatedEvent`,
+  `CustomAgentBlockUpdatedEvent`, `SubagentSpawnedEvent`,
+  `AgentPatchCreatedEvent`, `LlmResponseMetadataEvent`,
+  `CancelAgentEvent`, `AgentTaskFailedEvent`,
+  `SessionCostTrajectorySnapshotEvent`, `TaskState`, and
+  `AgentTaskNameUpdatedEvent`. `*UpdatedEvent` records are
   incremental snapshots keyed by `stepId` whose `status` progresses from
   `IN_PROGRESS` to `COMPLETED`, `CANCELLED`, or `FAILED`; the last update
   wins. Nested agents appear inline with `agent.id` (`agent-1`, ...) and
@@ -3676,11 +3679,14 @@ schemas keep their existing ordering behavior.
   `AgentTaskNameUpdatedEvent` and `state.json` as fallbacks. Repeated
   `stepId` updates deduplicate last-wins; assistant blocks group into one
   message per `taskId`. Subagent sessions synthesize as `<parent>--agent-N`
-  children from the parent stream's nested `agent.id` blocks, falling back
-  to `subagents/*.md`; `terminal-output/*.txt` fills in terminal results
-  only when no inline `output` exists. `checkpoints/` and `transcript.md`
-  are not transcript sources. `JUNIE_HOME` reroots `~/.junie`;
-  `JUNIE_DIR`/`agents.junie.dirs` override the sessions root.
+  children from the parent stream's nested `agent.id` blocks, linked to parent
+  `SubagentSpawnedEvent` calls via stepId prefix disambiguation;
+  `CancelAgentEvent` and `AgentTaskFailedEvent` mark sessions and failed
+  children with truncated termination. The parser falls back to
+  `subagents/*.md` when needed; `terminal-output/*.txt` fills in terminal
+  results only when no inline `output` exists. `checkpoints/` and
+  `transcript.md` are not transcript sources. `JUNIE_HOME` reroots
+  `~/.junie`; `JUNIE_DIR`/`agents.junie.dirs` override the sessions root.
 
 [evener-source-1]: https://github.com/prime-radiant-inc/evener/blob/da7c06396c9848abfae362dcffce3861a6a0c95a/agent/transcript/transcript.go
 [evener-source-2]: https://github.com/prime-radiant-inc/evener/blob/da7c06396c9848abfae362dcffce3861a6a0c95a/agent/schema/turn.go

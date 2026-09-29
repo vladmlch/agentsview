@@ -165,13 +165,25 @@ func newAntigravitySummaryIndex() *antigravitySummaryIndex {
 }
 
 func (x *antigravitySummaryIndex) lookup(root, id string) (antigravitySummary, bool) {
-	if x == nil {
+	if x == nil || id == "" {
 		return antigravitySummary{}, false
 	}
+	cleanRoot := filepath.Clean(root)
+	key := cleanRoot + "\x00" + id
 	x.mu.RLock()
-	defer x.mu.RUnlock()
-	s, ok := x.entries[filepath.Clean(root)+"\x00"+id]
-	return s, ok
+	s, ok := x.entries[key]
+	x.mu.RUnlock()
+	if ok {
+		return s, true
+	}
+	sum, found := lookupAntigravitySummary(filepath.Join(cleanRoot, "conversation_summaries.db"), id)
+	if !found {
+		return antigravitySummary{}, false
+	}
+	x.mu.Lock()
+	x.entries[key] = sum
+	x.mu.Unlock()
+	return sum, true
 }
 
 func (x *antigravitySummaryIndex) scan(root string) {
@@ -387,7 +399,7 @@ func (s antigravitySourceSet) findSourceFile(root, id string) string {
 }
 
 func (s antigravitySourceSet) WatchPlan(context.Context) (WatchPlan, error) {
-	roots := make([]WatchRoot, 0, len(s.roots)*3)
+	roots := make([]WatchRoot, 0, len(s.roots)*4)
 	for _, root := range s.roots {
 		roots = append(roots,
 			WatchRoot{
@@ -414,6 +426,12 @@ func (s antigravitySourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 				IncludeGlobs: []string{"*.db", "*.db-wal", "*.trajectory.json"},
 				DebounceKey:  string(AgentAntigravity) + ":conversations:" + root,
 			},
+			WatchRoot{
+				Path:         root,
+				Recursive:    false,
+				IncludeGlobs: []string{"conversation_summaries.db*"},
+				DebounceKey:  string(AgentAntigravity) + ":summaries:" + root,
+			},
 		)
 	}
 	return WatchPlan{Roots: roots}, nil
@@ -430,12 +448,34 @@ func (s antigravitySourceSet) SourcesForChangedPath(
 		if req.WatchRoot != "" && !antigravityWatchRootMatches(root, req.WatchRoot) {
 			continue
 		}
+		if isAntigravitySummaryDB(root, req.Path) {
+			s.summaries.scan(root)
+			var sources []SourceRef
+			for _, p := range s.discoverSessionPaths(root) {
+				if src, ok := s.sourceRef(root, p, false); ok {
+					sources = append(sources, src)
+				}
+			}
+			return sources, nil
+		}
 		source, ok := s.sourceForChangedPath(root, req.Path)
 		if ok {
 			return []SourceRef{source}, nil
 		}
 	}
 	return nil, nil
+}
+
+func isAntigravitySummaryDB(root, path string) bool {
+	cleanPath := filepath.Clean(path)
+	cleanRoot := filepath.Clean(root)
+	if filepath.Dir(cleanPath) != cleanRoot {
+		return false
+	}
+	base := filepath.Base(cleanPath)
+	return base == "conversation_summaries.db" ||
+		base == "conversation_summaries.db-wal" ||
+		base == "conversation_summaries.db-shm"
 }
 
 func (s antigravitySourceSet) FindSource(
@@ -730,6 +770,7 @@ func antigravityProviderCapabilities() Capabilities {
 		Source: source,
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
+			Cwd:                  CapabilitySupported,
 			Thinking:             CapabilitySupported,
 			ToolCalls:            CapabilitySupported,
 			ToolResults:          CapabilitySupported,

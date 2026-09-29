@@ -289,3 +289,17 @@ func TestCodexCursorFullParseSeedBoundaries(t *testing.T) {
 		assert.False(t, ok)
 	})
 }
+
+func TestCodexCursorStateGitBranch(t *testing.T) {
+	orig := codexCursorState{
+		model:     "gpt-5",
+		cwd:       "/workspace",
+		gitBranch: "feature/remediation",
+	}
+	cloned := cloneCodexCursorState(orig)
+	assert.Equal(t, orig.gitBranch, cloned.gitBranch)
+
+	key := codexCursorKey{path: "/tmp/test.jsonl"}
+	bytes := estimateCodexCursorEntryBytes(key, orig)
+	assert.Greater(t, bytes, int64(codexCursorEntryOverheadBytes+len(orig.gitBranch)))
+}
