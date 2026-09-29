@@ -365,3 +365,27 @@ func devinMessageNodesWithout(
 	}
 	return filtered
 }
+
+func devinSubagentExists(
+	ctx context.Context,
+	dbPath, rawSessionID string,
+	rootNodeID int64,
+) (bool, error) {
+	rows, err := listDevinMessageNodes(ctx, dbPath, rawSessionID)
+	if err != nil {
+		return false, err
+	}
+	if len(rows) == 0 {
+		return false, nil
+	}
+	partition, err := partitionDevinSubagentMessageNodes(ctx, rows)
+	if err != nil {
+		return false, err
+	}
+	for _, tree := range partition.Trees {
+		if tree.RootNodeID == rootNodeID {
+			return true, nil
+		}
+	}
+	return false, nil
+}

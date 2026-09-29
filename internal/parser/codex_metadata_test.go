@@ -2,6 +2,7 @@ package parser
 
 import (
 	"database/sql"
+	"errors"
 	"maps"
 	"os"
 	"path/filepath"
@@ -224,4 +225,34 @@ func TestCodexMetadata_StateSQLiteIndex(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, ok)
 	assert.Equal(t, "SQLite Title From Threads", name)
+}
+
+func TestCodexMetadata_ToleratesCorruptIndexFile(t *testing.T) {
+	primary, _ := aliasedCodexHomes(t)
+	const id = "019f0000-0000-7000-8000-000000000043"
+	session := filepath.Join(primary, "sessions", "2026", "09", "03",
+		"rollout-2026-09-03T10-00-00-"+id+".jsonl")
+
+	// Create a corrupt state_corrupt.sqlite file with junk bytes.
+	corruptDBPath := filepath.Join(primary, "state_corrupt.sqlite")
+	require.NoError(t, os.WriteFile(corruptDBPath, []byte("NOT_A_VALID_SQLITE_DATABASE_HEADER"), 0o644))
+
+	// Also write a valid session_index.jsonl containing the session title.
+	writeIndex(t, primary, `{"id":"`+id+`","thread_name":"Title from valid jsonl"}`+"\n", time.Now())
+
+	sessionRoot := filepath.Join(primary, "sessions")
+	metadata := CodexMetadata{roots: map[string][]string{sessionRoot: {primary}}}
+	files := metadata.IndexFiles(sessionRoot)
+	assert.Contains(t, files, corruptDBPath)
+
+	// ReadThreadName must tolerate the corrupt sqlite file and read the title from session_index.jsonl.
+	name, ok, err := metadata.ReadThreadName(session, id)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "Title from valid jsonl", name)
+
+	// If only corrupt index files exist, loadCodexSessionIndexes should return an error.
+	_, errOnlyCorrupt := loadCodexSessionIndexes([]string{corruptDBPath})
+	require.Error(t, errOnlyCorrupt)
+	assert.False(t, errors.Is(errOnlyCorrupt, os.ErrNotExist))
 }

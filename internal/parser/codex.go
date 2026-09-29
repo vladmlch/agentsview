@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -73,6 +74,7 @@ type codexSessionBuilder struct {
 	sink                        CodexSessionSink
 	projectContext              context.Context
 	resolveParentTurns          codexParentTurnResolver
+	resolveCanonicalParent      codexParentSessionResolver
 	parentTurnIDs               map[string]struct{}
 	firstMessage                string
 	startedAt                   time.Time
@@ -145,6 +147,7 @@ func (g *codexForkGate) retryReason() string {
 }
 
 type codexParentTurnResolver func(string) (map[string]struct{}, bool)
+type codexParentSessionResolver func(string) string
 
 // armFromMeta records explicit lineage and activates replay filtering only
 // when the referenced parent transcript was resolved. Missing parents fail
@@ -260,8 +263,14 @@ func (b *codexSessionBuilder) armForkGate(payload gjson.Result) {
 		parentID = codexSubagentParentThreadID(payload)
 	}
 	resolved := false
-	if parentID != "" && b.resolveParentTurns != nil {
-		b.parentTurnIDs, resolved = b.resolveParentTurns(parentID)
+	if parentID != "" {
+		canonicalParent := parentID
+		if b.resolveCanonicalParent != nil {
+			canonicalParent = b.resolveCanonicalParent(parentID)
+		}
+		if b.resolveParentTurns != nil {
+			b.parentTurnIDs, resolved = b.resolveParentTurns(canonicalParent)
+		}
 	}
 	b.forkGate.armFromMeta(payload, resolved)
 }
@@ -272,7 +281,11 @@ func (b *codexSessionBuilder) suppresses(
 ) bool {
 	if b.forkGate.active && b.parentTurnIDs == nil &&
 		b.resolveParentTurns != nil {
-		b.parentTurnIDs, _ = b.resolveParentTurns(b.forkGate.parentSessionID)
+		parentID := b.forkGate.parentSessionID
+		if b.resolveCanonicalParent != nil {
+			parentID = b.resolveCanonicalParent(parentID)
+		}
+		b.parentTurnIDs, _ = b.resolveParentTurns(parentID)
 	}
 	return b.forkGate.suppresses(lineType, payload, b.parentTurnIDs)
 }
@@ -456,9 +469,20 @@ func (b *codexSessionBuilder) handleSessionMeta(
 			payload.Get("source.subagent.thread_spawn.agent_path").Str,
 		)
 	}
-	b.parentSessionID = codexSubagentParentThreadID(payload)
-	if b.parentSessionID != "" {
-		b.parentSessionID = codexSubagentSessionID(b.parentSessionID)
+	forkedFromID := strings.TrimSpace(payload.Get("forked_from_id").Str)
+	if forkedFromID != "" {
+		canonicalParent := forkedFromID
+		if b.resolveCanonicalParent != nil {
+			canonicalParent = b.resolveCanonicalParent(forkedFromID)
+		}
+		b.parentSessionID = codexSubagentSessionID(canonicalParent)
+		b.relationshipType = RelFork
+	} else if parentThreadID := codexSubagentParentThreadID(payload); parentThreadID != "" {
+		canonicalParent := parentThreadID
+		if b.resolveCanonicalParent != nil {
+			canonicalParent = b.resolveCanonicalParent(parentThreadID)
+		}
+		b.parentSessionID = codexSubagentSessionID(canonicalParent)
 		b.relationshipType = RelSubagent
 	}
 	if payload.Get("originator").Str == codexOriginatorExec && b.sessionKind != SessionKindRoborev {
@@ -1760,6 +1784,68 @@ func (p *codexProvider) parseSessionWithCursor(
 	)
 }
 
+func (p *codexProvider) resolveCanonicalParentID(
+	ctx context.Context, childPath, parentID string,
+) string {
+	curr := strings.TrimPrefix(strings.TrimSpace(parentID), "codex:")
+	if curr == "" || !IsValidSessionID(curr) {
+		return parentID
+	}
+	visited := make(map[string]struct{})
+	for i := 0; i < 20; i++ {
+		if ctx.Err() != nil {
+			return curr
+		}
+		if _, seen := visited[curr]; seen {
+			break
+		}
+		visited[curr] = struct{}{}
+
+		pf := p.sources.findContinuationParentFile(childPath, curr)
+		if pf == "" {
+			for _, root := range p.sources.roots {
+				if cand := p.sources.findSourceFile(root, curr); cand != "" {
+					pf = cand
+					break
+				}
+			}
+		}
+		if pf == "" {
+			break
+		}
+		bname := filepath.Base(pf)
+		rootUUID := extractUUIDFromRollout(bname)
+		if rootUUID != "" && rootUUID != curr {
+			curr = rootUUID
+			continue
+		}
+		header, err := readCodexSessionMetaHeader(pf)
+		if err != nil {
+			break
+		}
+		if header.Get("history_mode").Str == "paginated" {
+			hb := header.Get("history_base")
+			if hb.Exists() && hb.Type != gjson.Null {
+				nextID := strings.TrimSpace(hb.Get("thread_id").Str)
+				if nextID != "" && nextID != curr {
+					curr = nextID
+					continue
+				}
+			}
+		}
+		break
+	}
+	return curr
+}
+
+func (p *codexProvider) canonicalParentResolver(
+	ctx context.Context, childPath string,
+) codexParentSessionResolver {
+	return func(parentID string) string {
+		return p.resolveCanonicalParentID(ctx, childPath, parentID)
+	}
+}
+
 // parentTurnResolver returns the turn ids of a replay parent thread. A fork
 // copies the thread's live history, which spans its own rollout and every
 // revert page (<thread>_<rollout>), so the ids come from all of those files.
@@ -1773,23 +1859,36 @@ func (p *codexProvider) parentTurnResolver(
 	ctx context.Context, childPath string,
 ) codexParentTurnResolver {
 	return func(parentID string) (map[string]struct{}, bool) {
+		if ctx.Err() != nil {
+			return nil, false
+		}
+		canonicalParent := p.resolveCanonicalParentID(ctx, childPath, parentID)
 		var paths []string
 		hasOriginal := false
 		for _, root := range p.sources.roots {
 			if ctx.Err() != nil {
 				return nil, false
 			}
-			parentPaths, err := p.sources.findThreadSourceFiles(ctx, root, parentID)
+			parentPaths, err := p.sources.findThreadSourceFiles(ctx, root, canonicalParent)
 			if err != nil {
 				return nil, false
 			}
-			p.sources.threadFiles.recordParent(ctx, root, parentID, parentPaths, CodexParentInventorySource{Agent: p.spec.agent, Path: childPath})
+			p.sources.threadFiles.recordParent(ctx, root, canonicalParent, parentPaths, CodexParentInventorySource{Agent: p.spec.agent, Path: childPath})
 			for _, path := range parentPaths {
 				if filepath.Clean(path) != filepath.Clean(childPath) {
 					paths = append(paths, path)
-					if CodexSessionUUIDFromFilename(filepath.Base(path)) == parentID {
+					if CodexSessionUUIDFromFilename(filepath.Base(path)) == canonicalParent {
 						hasOriginal = true
 					}
+				}
+			}
+		}
+		if len(paths) == 0 {
+			candidate := p.sources.findContinuationParentFile(childPath, canonicalParent)
+			if candidate != "" && filepath.Clean(candidate) != filepath.Clean(childPath) {
+				paths = append(paths, candidate)
+				if CodexSessionUUIDFromFilename(filepath.Base(candidate)) == canonicalParent {
+					hasOriginal = true
 				}
 			}
 		}
@@ -1816,14 +1915,39 @@ func (p *codexProvider) parentTurnResolver(
 			return turnIDs, true
 		}
 		turnIDs := make(map[string]struct{})
-		for _, path := range paths {
-			_, err := readCodexJSONLFromContext(ctx, path, 0, func(line string) {
-				if gjson.Get(line, "type").Str == codexTypeTurnContext {
-					turnIDs[gjson.Get(line, "payload.turn_id").Str] = struct{}{}
+		collectTurns := func(filePath string) error {
+			_, err := readCodexJSONLFromContext(ctx, filePath, 0, func(line string) {
+				if gjson.Get(line, "type").Str != codexTypeTurnContext {
+					return
 				}
+				turnIDs[gjson.Get(line, "payload.turn_id").Str] = struct{}{}
 			})
+			return err
+		}
+		for _, path := range paths {
+			err := collectTurns(path)
 			if err != nil && !errors.Is(err, errCodexIncrementalNeedsFullParse) {
 				return nil, false
+			}
+			// A paginated parent copies turns from every earlier segment of
+			// its continuation chain, so those segments' turns belong to the
+			// parent's replay lineage too.
+			if parentHeader, headErr := readCodexSessionMetaHeader(path); headErr == nil && parentHeader.Get("history_mode").Str == "paginated" {
+				pBase := parentHeader.Get("history_base")
+				if pBase.Exists() && pBase.Type != gjson.Null {
+					nextID := strings.TrimSpace(pBase.Get("thread_id").Str)
+					if nextID != "" {
+						chain, chainErr := p.resolveContinuationChain(ctx, path, nextID, pBase.Get("end_ordinal_exclusive").Int())
+						if chainErr == nil {
+							for _, seg := range chain {
+								if err := collectTurns(seg.path); err != nil &&
+									!errors.Is(err, errCodexIncrementalNeedsFullParse) {
+									return nil, false
+								}
+							}
+						}
+					}
+				}
 			}
 		}
 		p.parentTurnCache.Put(files, turnIDs)
@@ -2155,6 +2279,7 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 	b := newCodexSessionBuilder(
 		ctx, p.spec.agent, includeExec, p.parentTurnResolver(ctx, path), sink,
 	)
+	b.resolveCanonicalParent = p.canonicalParentResolver(ctx, path)
 	malformedLines := 0
 	continuationLoaded := false
 
@@ -2220,6 +2345,7 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 			b = newCodexSessionBuilder(
 				ctx, p.spec.agent, includeExec, p.parentTurnResolver(ctx, path), sink,
 			)
+			b.resolveCanonicalParent = p.canonicalParentResolver(ctx, path)
 			malformedLines = 0
 			continuationLoaded = false
 
@@ -2382,6 +2508,12 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 	if !sessionNamePresent && sessionName == "" && b.firstMessage == "" &&
 		b.relationshipType == RelSubagent {
 		sessionName = codexAgentPathLeaf(b.agentPath)
+	}
+
+	if b.resolveCanonicalParent != nil && parentSessionID != "" {
+		rawParent := strings.TrimPrefix(parentSessionID, "codex:")
+		canonical := b.resolveCanonicalParent(rawParent)
+		parentSessionID = codexSubagentSessionID(canonical)
 	}
 
 	sess := &ParsedSession{
@@ -2558,27 +2690,32 @@ func codexSessionIndexPath(sessionPath string) string {
 }
 
 func loadCodexSessionIndexSQLite(dbPath string) (map[string]string, error) {
-	db, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{})
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-
-	rows, err := db.Query("SELECT id, title FROM threads WHERE id != '' AND title != ''")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	titles := make(map[string]string)
-	for rows.Next() {
-		var id, title string
-		if err := rows.Scan(&id, &title); err != nil {
-			return nil, err
+	var titles map[string]string
+	err := WithSQLiteReadOnly(context.Background(), dbPath, sqliteReadOptions{busyTimeoutMS: 3000}, func(db *sql.DB) error {
+		rows, err := db.Query("SELECT id, title FROM threads WHERE id != '' AND title != ''")
+		if err != nil {
+			return err
 		}
-		titles[id] = title
+		defer rows.Close()
+
+		t := make(map[string]string)
+		for rows.Next() {
+			var id, title string
+			if err := rows.Scan(&id, &title); err != nil {
+				return err
+			}
+			t[id] = title
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		titles = t
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return titles, rows.Err()
+	return titles, nil
 }
 
 func loadCodexSessionIndex(indexPath string) (map[string]string, error) {
@@ -3097,6 +3234,7 @@ func (p *codexProvider) parseSessionFromWithSources(ctx context.Context,
 		NewCodexCollectingSink(startOrdinal),
 	)
 	b.incremental = true
+	b.resolveCanonicalParent = p.canonicalParentResolver(ctx, path)
 	b.codexCursorState = seed.codexCursorState
 	b.overflowPendingCalls = seed.overflowPendingCalls
 	if committedUsageTarget != nil {

@@ -2,6 +2,7 @@ package parser
 
 import (
 	"errors"
+	"log"
 	"maps"
 	"os"
 	"path/filepath"
@@ -65,26 +66,34 @@ func loadCodexSessionIndexes(paths []string) (map[string]string, error) {
 		titles map[string]string
 	}
 	var found []loaded
+	var lastErr error
 	for _, path := range paths {
 		info, err := os.Stat(path)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
 		if err != nil {
-			return nil, err
+			log.Printf("codex: loading session index %s: %v", path, err)
+			lastErr = err
+			continue
 		}
 		titles, err := loadCodexSessionIndex(path)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
 		if err != nil {
-			return nil, err
+			log.Printf("codex: loading session index %s: %v", path, err)
+			lastErr = err
+			continue
 		}
 		found = append(found, loaded{
 			mtime: info.ModTime().UnixNano(), titles: titles,
 		})
 	}
 	if len(found) == 0 {
+		if lastErr != nil {
+			return nil, lastErr
+		}
 		return nil, os.ErrNotExist
 	}
 	if len(found) == 1 {
