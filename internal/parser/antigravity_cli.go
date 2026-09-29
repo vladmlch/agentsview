@@ -443,7 +443,7 @@ func loadAntigravityCLIDBSteps(ctx context.Context,
 	path string, sessionIDPrefix string,
 ) (antigravityStepLoadResult, error) {
 	result, err := loadAntigravityCLIDBStepsWithOptions(
-		ctx, path, sqliteReadOptions{}, sessionIDPrefix,
+		ctx, path, sqliteReadOptions{busyTimeoutMS: 3000}, sessionIDPrefix,
 	)
 	if err != nil && !sqliteWALHasFrames(path+"-wal") {
 		// When a WAL database has been cleanly checkpointed and closed by

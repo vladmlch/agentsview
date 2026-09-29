@@ -81,30 +81,41 @@ func antigravityIDECompanionPaths(path string) []string {
 }
 
 func lookupAntigravitySummary(dbPath, id string) (antigravitySummary, bool) {
+	return lookupAntigravitySummaryContext(context.Background(), dbPath, id)
+}
+
+func lookupAntigravitySummaryContext(ctx context.Context, dbPath, id string) (antigravitySummary, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if !IsRegularFile(dbPath) || id == "" {
 		return antigravitySummary{}, false
 	}
-	db, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{})
-	if err != nil {
+	var sum antigravitySummary
+	var found bool
+	err := WithSQLiteReadOnly(ctx, dbPath, sqliteReadOptions{busyTimeoutMS: 3000}, func(db *sql.DB) error {
+		var ws, title string
+		err := db.QueryRowContext(ctx, "SELECT COALESCE(workspace_uris, ''), COALESCE(title, '') FROM conversation_summaries WHERE conversation_id = ?", id).Scan(&ws, &title)
+		if err != nil {
+			err = db.QueryRowContext(ctx, "SELECT COALESCE(workspace_uris, '') FROM conversation_summaries WHERE conversation_id = ?", id).Scan(&ws)
+			if err != nil {
+				return err
+			}
+		}
+		cwd, proj := parseAntigravityWorkspaceURI(ws)
+		sum = antigravitySummary{
+			workspaceURIs: ws,
+			title:         title,
+			cwd:           cwd,
+			project:       proj,
+		}
+		found = true
+		return nil
+	})
+	if err != nil || !found {
 		return antigravitySummary{}, false
 	}
-	defer db.Close()
-
-	var ws, title string
-	err = db.QueryRow("SELECT COALESCE(workspace_uris, ''), COALESCE(title, '') FROM conversation_summaries WHERE conversation_id = ?", id).Scan(&ws, &title)
-	if err != nil {
-		err = db.QueryRow("SELECT COALESCE(workspace_uris, '') FROM conversation_summaries WHERE conversation_id = ?", id).Scan(&ws)
-		if err != nil {
-			return antigravitySummary{}, false
-		}
-	}
-	cwd, proj := parseAntigravityWorkspaceURI(ws)
-	return antigravitySummary{
-		workspaceURIs: ws,
-		title:         title,
-		cwd:           cwd,
-		project:       proj,
-	}, true
+	return sum, true
 }
 
 // parseSession parses one IDE session DB. It is owned by the
@@ -133,9 +144,10 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 	}
 	root := filepath.Dir(filepath.Dir(path))
 
-	// Open read-only (falling back to immutable=1 when a checkpointed WAL DB
-	// lives on a read-only mount without a .db-shm file). The IDE prefix
-	// stamps subagent spawn edges with the same ids this provider writes.
+	// Open read-only with a busy timeout for lock retry (falling back to
+	// immutable=1 when a checkpointed WAL DB lives on a read-only mount
+	// without a .db-shm file). The IDE prefix stamps subagent spawn edges
+	// with the same ids this provider writes.
 	dbResult, err := loadAntigravityCLIDBSteps(ctx, path, antigravityIDPrefix)
 	sourceVersion := dbResult.sourceVersion
 	if err != nil {
@@ -271,7 +283,7 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 		}
 		cwd = sum.cwd
 		sessionTitle = sum.title
-	} else if sum, ok := lookupAntigravitySummary(filepath.Join(root, "conversation_summaries.db"), id); ok {
+	} else if sum, ok := lookupAntigravitySummaryContext(ctx, filepath.Join(root, "conversation_summaries.db"), id); ok {
 		if project == "" {
 			project = sum.project
 		}
