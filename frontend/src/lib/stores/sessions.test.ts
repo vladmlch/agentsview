@@ -3305,6 +3305,89 @@ describe("buildSessionGroups", () => {
     expect(groups[0]!.primarySessionId).toBe("s2");
   });
 
+  it("prefers session with user messages over newer zero-user-message continuation", () => {
+    const sessions = [
+      makeSession({
+        id: "s1",
+        project: "proj",
+        message_count: 52,
+        user_message_count: 11,
+        started_at: "2024-01-01T00:00:00Z",
+        ended_at: "2024-01-01T01:00:00Z",
+      }),
+      makeSession({
+        id: "s2",
+        project: "proj",
+        parent_session_id: "s1",
+        relationship_type: "continuation",
+        message_count: 3,
+        user_message_count: 0,
+        started_at: "2024-01-01T00:00:00Z",
+        ended_at: "2024-01-01T02:00:00Z",
+      }),
+    ];
+
+    const groups = buildSessionGroups(sessions);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.primarySessionId).toBe("s1");
+  });
+
+  it("selects newer continuation when both have user messages", () => {
+    const sessions = [
+      makeSession({
+        id: "s1",
+        project: "proj",
+        message_count: 10,
+        user_message_count: 5,
+        started_at: "2024-01-01T00:00:00Z",
+        ended_at: "2024-01-01T01:00:00Z",
+      }),
+      makeSession({
+        id: "s2",
+        project: "proj",
+        parent_session_id: "s1",
+        relationship_type: "continuation",
+        message_count: 6,
+        user_message_count: 2,
+        started_at: "2024-01-01T01:30:00Z",
+        ended_at: "2024-01-01T02:00:00Z",
+      }),
+    ];
+
+    const groups = buildSessionGroups(sessions);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.primarySessionId).toBe("s2");
+  });
+
+  it("prefers non-automated session over automated continuation when both have zero user messages", () => {
+    const sessions = [
+      makeSession({
+        id: "s1",
+        project: "proj",
+        message_count: 2,
+        user_message_count: 0,
+        is_automated: false,
+        started_at: "2024-01-01T00:00:00Z",
+        ended_at: "2024-01-01T01:00:00Z",
+      }),
+      makeSession({
+        id: "s2",
+        project: "proj",
+        parent_session_id: "s1",
+        relationship_type: "continuation",
+        message_count: 2,
+        user_message_count: 0,
+        is_automated: true,
+        started_at: "2024-01-01T01:30:00Z",
+        ended_at: "2024-01-01T02:00:00Z",
+      }),
+    ];
+
+    const groups = buildSessionGroups(sessions);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.primarySessionId).toBe("s1");
+  });
+
   it("sorts sessions within group by startedAt asc", () => {
     const sessions = [
       makeSession({
