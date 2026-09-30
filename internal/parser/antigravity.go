@@ -1414,7 +1414,10 @@ func cleanAntigravityStepStrings(step antigravityStep) (cleaned, urlOnly []strin
 		// candidates; prose, when present, still outscores a bare link.
 		candidates := append(append([]string{}, cleaned...), bareURLs...)
 		if prompt := bestAntigravityUserPrompt(candidates); prompt != "" {
-			return []string{prompt}, nil
+			return []string{cleanAntigravityPrompt(prompt)}, nil
+		}
+		for i := range cleaned {
+			cleaned[i] = cleanAntigravityPrompt(cleaned[i])
 		}
 		return cleaned, nil
 	}
@@ -1555,6 +1558,44 @@ func antigravityPromptScore(s string) int {
 		score -= 100
 	}
 	return score
+}
+
+var antigravityMetadataEnvelopes = regexp.MustCompile(
+	`(?s)<ADDITIONAL_METADATA>.*?(?:</ADDITIONAL_METADATA>|$)|<USER_SETTINGS_CHANGE>.*?(?:</USER_SETTINGS_CHANGE>|$)|<SYSTEM_INFORMATION>.*?(?:</SYSTEM_INFORMATION>|$)`,
+)
+
+// cleanAntigravityPrompt extracts the human-authored prompt from Antigravity's
+// prompt-envelope format. Antigravity IDE and CLI wrap user turns in
+// <USER_REQUEST>...</USER_REQUEST> and append runtime-injected metadata blocks
+// (<ADDITIONAL_METADATA>, <USER_SETTINGS_CHANGE>). If an outer <USER_REQUEST>
+// envelope is present, its inner text is returned; any metadata blocks are
+// stripped. Prompts without the envelope are preserved unchanged.
+func cleanAntigravityPrompt(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return content
+	}
+
+	if strings.HasPrefix(trimmed, "<USER_REQUEST>") {
+		inner := trimmed[len("<USER_REQUEST>"):]
+		if lastIdx := strings.LastIndex(inner, "</USER_REQUEST>"); lastIdx >= 0 {
+			inner = inner[:lastIdx]
+		} else {
+			if idx := strings.Index(inner, "<ADDITIONAL_METADATA>"); idx >= 0 {
+				inner = inner[:idx]
+			}
+			if idx := strings.Index(inner, "<USER_SETTINGS_CHANGE>"); idx >= 0 {
+				inner = inner[:idx]
+			}
+		}
+		return strings.TrimSpace(inner)
+	}
+
+	stripped := antigravityMetadataEnvelopes.ReplaceAllString(trimmed, "")
+	if s := strings.TrimSpace(stripped); s != "" {
+		return s
+	}
+	return trimmed
 }
 
 // earliestAntigravityTimestamp walks the field tree and returns

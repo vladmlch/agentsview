@@ -591,7 +591,18 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // (134: inverted tool result storage: single-event results are stored directly
 // in tool_calls.result_content with 0 rows in tool_result_events, eliminating
 // duplicate output/history drawers across all providers.)
-const dataVersion = 134
+// (135: JetBrains Junie CLI session indexing. Re-parse Junie sessions to store
+// events.jsonl block-update streams and synthesize subagent child sessions.)
+// (136: the Antigravity IDE and CLI providers now catalog-price reasoning
+// tokens from gemini-2.5-pro / gemini-2.5-flash / gemini-3-flash thinking
+// blocks when cost is not recorded by the provider.)
+// (137: the Cursor IDE parser now distributes composerData.contextTokensUsed
+// across the session's parsed messages proportional to content length,
+// setting per-message ContextTokens and session PeakContextTokens.)
+// (138: the Antigravity parser unwraps <USER_REQUEST> envelopes and strips
+// runtime prompt-injection metadata (<ADDITIONAL_METADATA>,
+// <USER_SETTINGS_CHANGE>) from user messages.)
+const dataVersion = 138
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 

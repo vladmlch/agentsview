@@ -248,6 +248,9 @@ func collectAntigravityBrainTranscriptMessages(path string) ([]ParsedMessage, er
 	for _, entry := range entries {
 		role, isSystem := roleForAntigravityBrainSource(entry.source)
 		content := entry.content
+		if role == RoleUser {
+			content = cleanAntigravityPrompt(content)
+		}
 		toolCalls := entry.toolCalls
 		if content == "" && len(toolCalls) > 0 {
 			// A step that only called tools has no prose of its own, so the
