@@ -115,15 +115,15 @@ func parseJunieSessionWithSummary(
 	ctx context.Context, path, machine string,
 	summary junieSessionSummary, summaryPresent bool,
 	openRoot junieRootOpener,
-) (*ParsedSession, []ParsedMessage, error) {
+) (*ParsedSession, []ParsedMessage, bool, error) {
 	f, err := openJunieEventStream(path, openRoot)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open %s: %w", path, err)
+		return nil, nil, false, fmt.Errorf("open %s: %w", path, err)
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return nil, nil, fmt.Errorf("stat %s: %w", path, err)
+		return nil, nil, false, fmt.Errorf("stat %s: %w", path, err)
 	}
 
 	state := junieParserState{
@@ -139,21 +139,21 @@ func parseJunieSessionWithSummary(
 			break
 		}
 		if err := contextErrEvery(ctx, lineNumber); err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		if !gjson.Valid(line) {
 			state.malformedLines++
 			continue
 		}
 		if err := state.consumeEvent(gjson.Parse(line), lineNumber); err != nil {
-			return nil, nil, fmt.Errorf("parsing Junie session %s line %d: %w", path, lineNumber, err)
+			return nil, nil, false, fmt.Errorf("parsing Junie session %s line %d: %w", path, lineNumber, err)
 		}
 	}
 	if err := lr.Err(); err != nil {
-		return nil, nil, fmt.Errorf("reading Junie session %s: %w", path, err)
+		return nil, nil, false, fmt.Errorf("reading Junie session %s: %w", path, err)
 	}
 	if lr.skippedOversized {
-		return nil, nil, fmt.Errorf("reading Junie session %s: record exceeds %d bytes", path, maxLineSize)
+		return nil, nil, false, fmt.Errorf("reading Junie session %s: record exceeds %d bytes", path, maxLineSize)
 	}
 	return state.session(
 		ctx, path, machine, filepath.Base(filepath.Dir(path)),
@@ -252,6 +252,16 @@ func (s *junieParserState) consumeA2UXEvent(
 		content = strings.TrimSpace(strings.TrimPrefix(
 			agentEvent.Get("result").Str, "<!-- ANSWER -->",
 		))
+	case "AgentTaskNameUpdatedEvent":
+		taskName := strings.TrimSpace(firstNonEmptyJSONLString(
+			agentEvent.Get("name").Str,
+			agentEvent.Get("taskName").Str,
+		))
+		if taskName != "" {
+			s.sessionName = taskName
+			s.sessionNameFound = true
+		}
+		return nil
 	default:
 		return nil
 	}
@@ -335,7 +345,7 @@ func (s *junieParserState) session(
 	ctx context.Context, path, machine, sourceSessionID string,
 	fileSize, mtime int64,
 	summary junieSessionSummary, summaryPresent bool,
-) (*ParsedSession, []ParsedMessage, error) {
+) (*ParsedSession, []ParsedMessage, bool, error) {
 	messages := make([]ParsedMessage, 0, len(s.entries))
 	firstMessage := ""
 	userCount := 0
@@ -355,7 +365,10 @@ func (s *junieParserState) session(
 	// Preserve recognized empty projections so force replacement can clear stale messages.
 	// A wholly empty or unrecognized stream may be a partial rewrite and stays skipped.
 	if len(messages) == 0 && len(s.entries) == 0 && len(s.usageEvents) == 0 && !s.sessionNameFound {
-		return nil, nil, nil
+		return nil, nil, false, nil
+	}
+	if userCount == 0 && len(s.assistantMessages) == 0 && len(s.usageEvents) == 0 && !s.sessionNameFound && !summaryPresent {
+		return nil, nil, true, nil
 	}
 
 	if !summary.createdAt.IsZero() &&
@@ -409,7 +422,7 @@ func (s *junieParserState) session(
 	}
 	applyUsageEventTokenTotals(session, s.usageEvents)
 	session.UsageEvents = s.usageEvents
-	return session, messages, nil
+	return session, messages, false, nil
 }
 
 func parseJunieSessionSummary(line string) junieSessionSummary {
