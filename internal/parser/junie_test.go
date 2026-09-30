@@ -129,7 +129,7 @@ func TestParseJunieSessionRejectsInvalidReportedCost(t *testing.T) {
 		`{"kind":"SessionA2uxEvent","event":{"agentEvent":{"kind":"LlmResponseMetadataEvent","modelUsage":[{"model":"test","cost":-1}]}}}`+"\n",
 	), 0o600))
 
-	_, _, err := parseJunieSessionWithSummary(
+	_, _, _, err := parseJunieSessionWithSummary(
 		t.Context(), path, "session-one", junieSessionSummary{}, false, openJunieRoot,
 	)
 	require.ErrorContains(t, err, "invalid model usage cost")
@@ -803,4 +803,50 @@ func TestJunieRejectsOversizedRecords(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestJunieStartupStubDirectoryIsExcluded(t *testing.T) {
+	root := t.TempDir()
+	sessionID := "session-startup-stub"
+	sessionDir := filepath.Join(root, sessionID)
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(
+		`{"kind":"SystemMessageEvent","text":"A new version of Junie is available.","timestampMs":1704067201000}`+"\n"+
+			`{"kind":"SystemMessageEvent","text":"Model switched to Grok","timestampMs":1704067202000}`+"\n",
+	), 0o600))
+
+	provider, ok := NewProvider(AgentJunie, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	sources, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+
+	fingerprint, err := provider.Fingerprint(t.Context(), sources[0])
+	require.NoError(t, err)
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
+		Source: sources[0], Fingerprint: fingerprint, Machine: "local",
+	})
+	require.NoError(t, err)
+	assert.Empty(t, outcome.Results)
+	assert.Equal(t, []string{"junie:" + sessionID}, outcome.ExcludedSessionIDs)
+	assert.True(t, outcome.ForceReplace)
+	assert.True(t, outcome.ResultSetComplete)
+}
+
+func TestJunieAgentTaskNameUpdatedEventSetsSessionName(t *testing.T) {
+	root := t.TempDir()
+	sessionID := "session-task-name"
+	sessionDir := filepath.Join(root, sessionID)
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(
+		`{"kind":"UserPromptEvent","requestId":"req-1","prompt":"Do work","timestampMs":1704067201000}`+"\n"+
+			`{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"AgentTaskNameUpdatedEvent","name":"Title from agent event"}},"taskId":"task-1","timestampMs":1704067202000}`+"\n",
+	), 0o600))
+
+	sess, messages := parseJunieProviderSession(t, path, "local")
+	assert.Equal(t, "Title from agent event", sess.SessionName)
+	assert.True(t, sess.SessionNamePresent)
+	require.Len(t, messages, 1)
 }
