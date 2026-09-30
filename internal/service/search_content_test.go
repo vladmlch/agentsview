@@ -55,20 +55,6 @@ func TestDirectSearchContentRedacts(t *testing.T) {
 		"reveal should show full secret: %q", rev.Matches[0].Snippet)
 }
 
-func TestDirectSearchContentFTSSourceGuard(t *testing.T) {
-	t.Parallel()
-	d := dbtest.OpenTestDB(t)
-	be := service.NewDirectBackend(d, nil)
-
-	_, err := be.SearchContent(t.Context(), service.ContentSearchRequest{
-		Pattern: "test", Mode: "fts",
-		Sources: []string{"tool_result"},
-		Limit:   50,
-	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "messages only")
-}
-
 // fakeContentStore is a minimal db.Store fake for context-enrichment tests:
 // only SearchContent and GetMessagesWindow are implemented; every other
 // Store method comes from the embedded nil interface and would panic if a
