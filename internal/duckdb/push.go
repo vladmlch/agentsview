@@ -1192,14 +1192,14 @@ func (s *Sync) upsertSession(
 			duplicate_prompt_count, no_code_context_count,
 			runaway_tool_loop_count, data_version,
 			cwd, git_branch, source_session_id, source_version, transcript_fidelity,
-			parser_malformed_lines, is_truncated, deleted_at, deletion_cause, created_at,
+			parser_malformed_lines, is_truncated, deleted_at, deletion_cause, source_missing_at, created_at,
 			termination_status, secret_leak_count, secrets_rules_version,
 			agentsview_push_fingerprint, source_archive_id
 		) VALUES (
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		)`
 	query += `
 		ON CONFLICT(id) DO UPDATE SET
@@ -1266,6 +1266,7 @@ func (s *Sync) upsertSession(
 			is_truncated = excluded.is_truncated,
 			deleted_at = excluded.deleted_at,
 			deletion_cause = excluded.deletion_cause,
+			source_missing_at = excluded.source_missing_at,
 			created_at = excluded.created_at,
 			termination_status = excluded.termination_status,
 			secret_leak_count = excluded.secret_leak_count,
@@ -1320,6 +1321,7 @@ func sessionInsertArgs(
 		sess.Cwd, sess.GitBranch, sess.SourceSessionID,
 		sess.SourceVersion, sess.TranscriptFidelity, sess.ParserMalformedLines,
 		sess.IsTruncated, nilTime(sess.DeletedAt), nilString(sess.DeletionCause),
+		nilTime(sess.SourceMissingAt),
 		timeValue(sess.CreatedAt), nilString(sess.TerminationStatus),
 		sess.SecretLeakCount, sess.SecretsRulesVersion,
 		nilEmpty(fingerprint), archiveID,

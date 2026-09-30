@@ -288,12 +288,12 @@ func TestDBMigrateReachesTrashedAndOrphanRows(t *testing.T) {
 	assert.Contains(t, orphanStored, "asset://")
 	assert.NotContains(t, orphanStored, "input_image")
 
-	// Count trashed-session event rows that were migrated.
+	// Count trashed-session tool call rows that were migrated.
 	var trashedMigrated int
 	require.NoError(t, database2.Reader().QueryRow(cmd.Context(), `
-		SELECT COUNT(*) FROM tool_result_events e
-		JOIN sessions s ON s.id = e.session_id
-		WHERE s.deleted_at IS NOT NULL AND e.content LIKE '%image_ref%'`).Scan(&trashedMigrated))
+		SELECT COUNT(*) FROM tool_calls tc
+		JOIN sessions s ON s.id = tc.session_id
+		WHERE s.deleted_at IS NOT NULL AND tc.result_content LIKE '%image_ref%'`).Scan(&trashedMigrated))
 	assert.Equal(t, 1, trashedMigrated)
 }
 
