@@ -636,7 +636,10 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // (155: inverted tool result storage: single-event results are stored directly
 // in tool_calls.result_content with 0 rows in tool_result_events, eliminating
 // duplicate output/history drawers across all providers.)
-const dataVersion = 155
+// (156: the Antigravity parser unwraps <USER_REQUEST> envelopes and strips
+// runtime prompt-injection metadata (<ADDITIONAL_METADATA>,
+// <USER_SETTINGS_CHANGE>) from user messages.)
+const dataVersion = 156
 
 const archiveOnlyVersionBase = 1 << 20
 

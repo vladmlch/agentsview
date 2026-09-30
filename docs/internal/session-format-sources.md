@@ -4053,7 +4053,9 @@ schemas keep their existing ordering behavior.
   Because `tool_calls` stores one subagent id per call, Agentsview keeps only
   the first `conversationId` echoed per `invoke_subagent` call for the inline
   subagent link; the descriptor edge still links every spawned child to its
-  parent session.
+  parent session. User prompt envelopes (`<USER_REQUEST>`) are unwrapped and
+  runtime prompt metadata (`<ADDITIONAL_METADATA>`, `<USER_SETTINGS_CHANGE>`)
+  is stripped from stored user messages and previews.
 
 - **Title evidence:**
   [antigravity-cli#1042](https://github.com/google-antigravity/antigravity-cli/issues/1042)
