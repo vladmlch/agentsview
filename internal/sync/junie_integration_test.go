@@ -474,3 +474,75 @@ func TestJunieBadIndexDoesNotBlockHealthyRoot(t *testing.T) {
 		}
 	}
 }
+
+func TestSyncJunieStartupStubDirectoryIsExcludedAndPurged(t *testing.T) {
+	root := t.TempDir()
+	sessionID := "session-stub"
+	sessionDir := filepath.Join(root, sessionID)
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	eventsPath := filepath.Join(sessionDir, "events.jsonl")
+
+	// 1. Initial valid session sync
+	require.NoError(t, os.WriteFile(eventsPath, []byte(
+		`{"kind":"UserPromptEvent","requestId":"req-1","prompt":"Hello"}`+"\n",
+	), 0o600))
+
+	database := openTestDB(t)
+	engine := NewEngine(t.Context(), database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentJunie: {root}},
+		Machine:   "test",
+	})
+	t.Cleanup(engine.Close)
+
+	first := engine.SyncAll(t.Context(), nil)
+	require.Equal(t, 1, first.Synced)
+	require.Zero(t, first.Failed)
+
+	sess, err := database.GetSessionFull(t.Context(), "junie:"+sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+
+	// 2. Rewrite to startup stub (only SystemMessageEvents, no user prompts, no index)
+	require.NoError(t, os.WriteFile(eventsPath, []byte(
+		`{"kind":"SystemMessageEvent","text":"A new version is available"}`+"\n"+
+			`{"kind":"SystemMessageEvent","text":"Model switched to Grok"}`+"\n",
+	), 0o600))
+
+	second := engine.SyncAll(t.Context(), nil)
+	require.Zero(t, second.Failed)
+
+	// Verify session has been deleted from SQLite database
+	sess, err = database.GetSessionFull(t.Context(), "junie:"+sessionID)
+	require.NoError(t, err)
+	require.Nil(t, sess)
+
+	// 3. Fresh startup stub directory never creates a session in SQLite
+	freshStubID := "session-fresh-stub"
+	freshStubDir := filepath.Join(root, freshStubID)
+	require.NoError(t, os.MkdirAll(freshStubDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(freshStubDir, "events.jsonl"), []byte(
+		`{"kind":"SystemMessageEvent","text":"Update check"}`+"\n",
+	), 0o600))
+
+	third := engine.SyncAll(t.Context(), nil)
+	require.Zero(t, third.Failed)
+
+	sess, err = database.GetSessionFull(t.Context(), "junie:"+freshStubID)
+	require.NoError(t, err)
+	require.Nil(t, sess)
+
+	// 4. Stub directory that later receives a real conversation is ingested normally
+	require.NoError(t, os.WriteFile(filepath.Join(freshStubDir, "events.jsonl"), []byte(
+		`{"kind":"SystemMessageEvent","text":"Update check"}`+"\n"+
+			`{"kind":"UserPromptEvent","requestId":"req-2","prompt":"Real question"}`+"\n",
+	), 0o600))
+
+	fourth := engine.SyncAll(t.Context(), nil)
+	require.Equal(t, 1, fourth.Synced)
+	require.Zero(t, fourth.Failed)
+
+	sess, err = database.GetSessionFull(t.Context(), "junie:"+freshStubID)
+	require.NoError(t, err)
+	require.NotNil(t, sess.FirstMessage)
+	assert.Equal(t, "Real question", *sess.FirstMessage)
+}

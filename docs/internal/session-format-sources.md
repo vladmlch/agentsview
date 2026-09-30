@@ -3681,9 +3681,12 @@ schemas keep their existing ordering behavior.
   a usage record.
 - **Agentsview:** `internal/parser/junie.go` and
   `internal/parser/junie_provider.go`. Discovery scans `*/events.jsonl`
-  without requiring an index row and skips startup-stub directories;
-  `index.jsonl` supplies title, project, and timestamps when present, with
-  `AgentTaskNameUpdatedEvent` and `state.json` as fallbacks. Repeated
+  without requiring an index row and excludes startup-stub directories
+  (streams containing only system notices or non-conversational events without
+  user prompts, assistant turns, usage, a task title, or an index row),
+  purging any previously ingested stubs; `index.jsonl` supplies title, project,
+  and timestamps when present, with `AgentTaskNameUpdatedEvent` and
+  `state.json` as fallbacks. Repeated `stepId` updates deduplicate last-wins;
   `stepId` updates deduplicate last-wins; assistant blocks group into one
   message per `taskId`. Subagent sessions synthesize as `<parent>--agent-N`
   children from the parent stream's nested `agent.id` blocks, linked to parent

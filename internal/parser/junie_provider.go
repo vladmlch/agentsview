@@ -495,13 +495,17 @@ func (c *junieIndexCache) parseFile(
 	if present {
 		summary = indexSummary.sessionSummary()
 	}
-	sess, msgs, err := parseJunieSessionWithSummary(
+	sess, msgs, isStartupStub, err := parseJunieSessionWithSummary(
 		ctx, path, req.Machine, summary, present, openJunieRoot,
 	)
 	if err != nil {
 		return nil, nil, err
 	}
 	if sess == nil {
+		if isStartupStub {
+			sessionID := filepath.Base(filepath.Dir(path))
+			return nil, []string{"junie:" + sessionID}, nil
+		}
 		return nil, nil, nil
 	}
 	if req.Fingerprint.Hash != "" {
