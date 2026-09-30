@@ -3580,7 +3580,7 @@ func soleToolResultEventTx(ctx context.Context,
 	imagePolicy config.ToolResultImages,
 ) ([]ToolResultEvent, error) {
 	var count int
-	var subagent, agentID string
+	var subagent, agentID, status, timestamp string
 	var digest []byte
 	var content sql.NullString
 	if err := tx.QueryRowContext(ctx,
@@ -3603,13 +3603,15 @@ func soleToolResultEventTx(ctx context.Context,
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COALESCE(subagent_session_id, ''),
 		        COALESCE(agent_id, ''),
+		        COALESCE(status, ''),
+		        COALESCE(timestamp, ''),
 		        raw_content_digest,
 		        content
 		 FROM tool_result_events
 		 WHERE session_id = ? AND tool_call_message_ordinal = ?
 		   AND call_index = ?`,
 		sessionID, messageOrdinal, callIndex,
-	).Scan(&subagent, &agentID, &digest, &content); err != nil {
+	).Scan(&subagent, &agentID, &status, &timestamp, &digest, &content); err != nil {
 		return nil, fmt.Errorf(
 			"reading sole tool result event for %s/%d/%d: %w",
 			sessionID, messageOrdinal, callIndex, err,
@@ -3624,6 +3626,8 @@ func soleToolResultEventTx(ctx context.Context,
 		Content:           stored,
 		SubagentSessionID: subagent,
 		AgentID:           agentID,
+		Status:            status,
+		Timestamp:         timestamp,
 		RawContentDigest:  digest,
 	}}, nil
 }

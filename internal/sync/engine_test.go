@@ -96,7 +96,7 @@ func TestIncrementalClaudeLateResultLinkScansDefiniteSecret(t *testing.T) {
 	require.NoError(t, err)
 	found := false
 	for _, finding := range findings {
-		if finding.LocationKind == "tool_result_event" &&
+		if (finding.LocationKind == "tool_result" || finding.LocationKind == "tool_result_event") &&
 			strings.Contains(finding.RedactedMatch, "AKIA") {
 			found = true
 			break

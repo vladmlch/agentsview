@@ -310,7 +310,7 @@ const duckSessionCols = `id, project, project_assigned, machine, agent,
 	cwd, git_branch, source_session_id, source_version, transcript_fidelity,
 	parser_malformed_lines, is_truncated,
 	secret_leak_count, secrets_rules_version,
-	deleted_at, deletion_cause, termination_status, transcript_revision`
+	deleted_at, deletion_cause, source_missing_at, termination_status, transcript_revision`
 
 func scanSession(rs interface{ Scan(...any) error }) (db.Session, error) {
 	return scanSessionWithSource(rs, false)
@@ -321,7 +321,7 @@ func scanSessionWithSource(
 ) (db.Session, error) {
 	var s db.Session
 	var createdAt any
-	var startedAt, endedAt, deletedAt any
+	var startedAt, endedAt, deletedAt, sourceMissingAt any
 	targets := []any{
 		&s.ID, &s.Project, &s.ProjectAssigned, &s.Machine, &s.Agent,
 		&s.AgentLabel, &s.Entrypoint, &s.SessionKind,
@@ -350,7 +350,7 @@ func scanSessionWithSource(
 		&s.SourceSessionID, &s.SourceVersion, &s.TranscriptFidelity,
 		&s.ParserMalformedLines, &s.IsTruncated,
 		&s.SecretLeakCount, &s.SecretsRulesVersion,
-		&deletedAt, &s.DeletionCause, &s.TerminationStatus, &s.TranscriptRevision,
+		&deletedAt, &s.DeletionCause, &sourceMissingAt, &s.TerminationStatus, &s.TranscriptRevision,
 	}
 	if includeSource {
 		targets = append(targets, &s.FilePath)
@@ -368,6 +368,9 @@ func scanSessionWithSource(
 	}
 	if v := formatDBTime(deletedAt); v != "" {
 		s.DeletedAt = &v
+	}
+	if v := formatDBTime(sourceMissingAt); v != "" {
+		s.SourceMissingAt = &v
 	}
 	return s, nil
 }

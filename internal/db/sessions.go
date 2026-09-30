@@ -3050,6 +3050,7 @@ func updateSessionIncrementalTx(ctx context.Context,
 			has_total_output_tokens = ?,
 			has_peak_context_tokens = ?,
 			termination_status = ?,
+			data_version = ?,
 			-- Mark the row as last written by the incremental-append path.
 			-- The full-replace writer (upsertSessionArgs) resets this to
 			-- false; parse-diff reads it to classify benign
@@ -3062,7 +3063,7 @@ func updateSessionIncrementalTx(ctx context.Context,
 		update.NextOrdinal, lastEntryUUID,
 		update.TotalOutputTokens, update.PeakContextTokens,
 		update.HasTotalOutputTokens, update.HasPeakContextTokens,
-		update.TerminationStatus, id,
+		update.TerminationStatus, CurrentDataVersion(), id,
 	)
 	if err != nil {
 		return fmt.Errorf(
@@ -3170,6 +3171,7 @@ func replaceSessionIncrementalTx(ctx context.Context,
 			next_ordinal = ?,
 			last_entry_uuid = ?,
 			termination_status = ?,
+			data_version = ?,
 			last_write_incremental = 1
 		WHERE id = ?`,
 		update.EndedAt,
@@ -3180,7 +3182,8 @@ func replaceSessionIncrementalTx(ctx context.Context,
 		recomputePeak, id, added.peakContext,
 		recomputePeak, id, added.hasContext,
 		update.FileSize, update.FileMtime, update.FileHash,
-		update.NextOrdinal, lastEntryUUID, update.TerminationStatus, id,
+		update.NextOrdinal, lastEntryUUID, update.TerminationStatus,
+		CurrentDataVersion(), id,
 	)
 	if err != nil {
 		return fmt.Errorf(

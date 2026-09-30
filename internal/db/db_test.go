@@ -816,6 +816,12 @@ func TestMigration_ResultContentColumn(t *testing.T) {
 	conn, err := sql.Open("sqlite3", path)
 	requireNoError(t, err, "raw open")
 	_, err = conn.ExecContext(t.Context(), `
+		DROP TRIGGER IF EXISTS tool_result_events_fts_ai;
+		DROP TRIGGER IF EXISTS tool_result_events_fts_ad;
+		DROP TRIGGER IF EXISTS tool_result_events_fts_au;
+		DROP TRIGGER IF EXISTS tool_calls_fts_ai;
+		DROP TRIGGER IF EXISTS tool_calls_fts_ad;
+		DROP TRIGGER IF EXISTS tool_calls_fts_au;
 		CREATE TABLE tool_calls_old AS
 			SELECT id, message_id, session_id, tool_name,
 			       category, tool_use_id, input_json,
@@ -1054,6 +1060,21 @@ func TestCurrentDataVersionDevinMultiGenerationCompaction(t *testing.T) {
 func TestCurrentDataVersionCodexContinuationHistory(t *testing.T) {
 	assert.GreaterOrEqual(t, CurrentDataVersion(), 125,
 		"Codex continuation history stitching requires re-parsing paginated rollouts to recover full history")
+}
+
+func TestCurrentDataVersionJunieSessionIndexing(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 127,
+		"Junie session indexing requires re-parsing to ingest events.jsonl block-update streams")
+}
+
+func TestCurrentDataVersionAntigravityThinkingPricing(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 128,
+		"Antigravity thinking pricing requires re-pricing sessions with reasoning tokens")
+}
+
+func TestCurrentDataVersionCursorContextTokens(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 129,
+		"Cursor context tokens distribution requires re-parsing sessions to populate per-message context tokens")
 }
 
 func TestCurrentDataVersionPositAssistantProviderIdentity(t *testing.T) {
@@ -6377,6 +6398,9 @@ func TestCopyOrphanedDataFrom_LegacyNoIsSystem(t *testing.T) {
 	// SQLite doesn't support DROP COLUMN before 3.35;
 	// recreate the table without is_system.
 	_, err = raw.ExecContext(t.Context(), `
+		DROP TRIGGER IF EXISTS tool_calls_fts_ai;
+		DROP TRIGGER IF EXISTS tool_calls_fts_ad;
+		DROP TRIGGER IF EXISTS tool_calls_fts_au;
 		CREATE TABLE messages_new (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			session_id TEXT NOT NULL,

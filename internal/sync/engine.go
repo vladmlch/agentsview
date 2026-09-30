@@ -10658,6 +10658,9 @@ func (e *Engine) collectAndBatchWithOptions(
 				r.releaseAll()
 				continue
 			}
+			if r.cacheSkip && r.incremental.fileMtime != 0 && !r.noCacheSkip {
+				e.cacheSkip(r.skipCacheKey(), r.incremental.fileMtime, r.sourceFingerprint)
+			}
 			stats.RecordSynced(1)
 			if !sourceProofWithheld {
 				baselineJob := r
@@ -19107,7 +19110,8 @@ func (e *Engine) writeIncremental(ctx context.Context,
 
 	var replaceFromOrdinal *int
 	if inc.suffixReplace {
-		replaceFromOrdinal = new(inc.replaceFromOrdinal)
+		ord := inc.replaceFromOrdinal
+		replaceFromOrdinal = &ord
 	}
 	var signalsMaintained bool
 	var maintainer db.SignalMaintainer

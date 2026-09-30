@@ -558,7 +558,15 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // (126: inverted tool result storage: single-event results are stored directly
 // in tool_calls.result_content with 0 rows in tool_result_events, eliminating
 // duplicate output/history drawers across all providers.)
-const dataVersion = 126
+// (127: JetBrains Junie CLI session indexing. Re-parse Junie sessions to store
+// events.jsonl block-update streams and synthesize subagent child sessions.)
+// (128: the Antigravity IDE and CLI providers now catalog-price reasoning
+// tokens from gemini-2.5-pro / gemini-2.5-flash / gemini-3-flash thinking
+// blocks when cost is not recorded by the provider.)
+// (129: the Cursor IDE parser now distributes composerData.contextTokensUsed
+// across the session's parsed messages proportional to content length,
+// setting per-message ContextTokens and session PeakContextTokens.)
+const dataVersion = 129
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
@@ -645,7 +653,18 @@ CREATE TRIGGER IF NOT EXISTS tool_content_fts_au AFTER UPDATE ON tool_content BE
         VALUES('delete', old.id, old.content);
     INSERT INTO tool_content_fts(rowid, content) VALUES(new.id, new.content);
 END;
+`
 
+const toolContentTriggersDropsSQL = `
+DROP TRIGGER IF EXISTS tool_calls_fts_ai;
+DROP TRIGGER IF EXISTS tool_calls_fts_ad;
+DROP TRIGGER IF EXISTS tool_calls_fts_au;
+DROP TRIGGER IF EXISTS tool_result_events_fts_ai;
+DROP TRIGGER IF EXISTS tool_result_events_fts_ad;
+DROP TRIGGER IF EXISTS tool_result_events_fts_au;
+`
+
+const toolContentTriggersCreatesSQL = `
 CREATE TRIGGER IF NOT EXISTS tool_calls_fts_ai AFTER INSERT ON tool_calls BEGIN
     INSERT INTO tool_content(source_kind, source_id, session_id, message_id,
         ordinal, location, tool_name, tool_use_id, content, file_path,
@@ -2993,6 +3012,9 @@ func (db *DB) migrateColumns(ctx context.Context, progress OpenProgressFunc) err
 	if _, err := w.ExecContext(ctx, artifactSessionQueueTriggerDropsSQL); err != nil {
 		return fmt.Errorf("dropping artifact session queue triggers: %w", err)
 	}
+	if _, err := w.ExecContext(ctx, toolContentTriggersDropsSQL); err != nil {
+		return fmt.Errorf("dropping tool content triggers: %w", err)
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -3001,6 +3023,9 @@ func (db *DB) migrateColumns(ctx context.Context, progress OpenProgressFunc) err
 	}
 	if _, err := w.ExecContext(ctx, artifactSessionQueueTriggerCreatesSQL); err != nil {
 		return fmt.Errorf("installing artifact session queue triggers: %w", err)
+	}
+	if _, err := w.ExecContext(ctx, toolContentTriggersCreatesSQL); err != nil {
+		return fmt.Errorf("installing tool content triggers: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -3026,6 +3051,12 @@ func (db *DB) migrateColumns(ctx context.Context, progress OpenProgressFunc) err
 		return err
 	}
 	if err := db.backfillToolCallFieldsLocked(ctx, w); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := db.backfillToolContentFTSLocked(ctx, w); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
@@ -4002,6 +4033,56 @@ func (db *DB) markToolCallFieldBackfillDoneLocked(ctx context.Context,
 	return nil
 }
 
+func (db *DB) backfillToolContentFTSLocked(ctx context.Context, w *writerHandle) error {
+	var fts5Available bool
+	if err := w.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pragma_module_list WHERE name = 'fts5')`,
+	).Scan(&fts5Available); err != nil || !fts5Available {
+		return nil
+	}
+	var count int
+	if err := w.QueryRowContext(ctx,
+		"SELECT count(*) FROM sqlite_master WHERE type='table' AND name='tool_content'",
+	).Scan(&count); err != nil || count == 0 {
+		return nil
+	}
+	var tcCount int
+	if err := w.QueryRowContext(ctx, "SELECT count(*) FROM tool_content").Scan(&tcCount); err != nil {
+		return nil
+	}
+	if tcCount > 0 {
+		return nil
+	}
+	if _, err := w.ExecContext(ctx, `
+		INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
+			message_id, ordinal, location, tool_name, tool_use_id, content, file_path)
+		SELECT 'call', tc.id, tc.session_id, tc.message_id, m.ordinal,
+			'tool_input', tc.tool_name, COALESCE(tc.tool_use_id,''),
+			COALESCE(tc.input_json,''), COALESCE(tc.file_path,'')
+		FROM tool_calls tc JOIN messages m ON m.id=tc.message_id
+		WHERE COALESCE(tc.input_json,'') <> '';
+		INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
+			message_id, ordinal, location, tool_name, tool_use_id, content, file_path)
+		SELECT 'call', tc.id, tc.session_id, tc.message_id, m.ordinal,
+			'tool_result', tc.tool_name, COALESCE(tc.tool_use_id,''),
+			COALESCE(tc.result_content,''), COALESCE(tc.file_path,'')
+		FROM tool_calls tc JOIN messages m ON m.id=tc.message_id
+		WHERE COALESCE(tc.result_content,'') <> '';
+		INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
+			ordinal, location, tool_name, tool_use_id, content, is_error)
+		SELECT 'event', tre.id, tre.session_id, tre.tool_call_message_ordinal,
+			'tool_result', COALESCE((SELECT tc.tool_name FROM tool_calls tc
+			 WHERE tc.session_id=tre.session_id AND tc.tool_use_id=tre.tool_use_id
+			 AND COALESCE(tre.tool_use_id,'')<>'' ORDER BY tc.id LIMIT 1),''),
+			COALESCE(tre.tool_use_id,''), tre.content,
+			CASE WHEN lower(tre.status) IN ('error','failed','failure') THEN 1 ELSE 0 END
+		FROM tool_result_events tre;
+		INSERT INTO tool_content_fts(tool_content_fts) VALUES('rebuild')`); err != nil {
+		return fmt.Errorf("backfilling tool content FTS: %w", err)
+	}
+	return nil
+}
+
 // ForceBackfillIsAutomated reclassifies is_automated across
 // every session, ignoring any cached classifier hash. ResyncAll
 // calls this after CopyOrphanedDataFrom because orphan-copied
@@ -4913,13 +4994,6 @@ func (db *DB) init(ctx context.Context, progress OpenProgressFunc) error {
 		return fmt.Errorf("checking fts table: %w", err)
 	}
 	hadFTS := ftsCount > 0
-	var toolFTSCount int
-	if err := w.QueryRowContext(ctx,
-		"SELECT count(*) FROM sqlite_master WHERE type='table' AND name='tool_content_fts'",
-	).Scan(&toolFTSCount); err != nil {
-		return fmt.Errorf("checking tool content fts table: %w", err)
-	}
-	hadToolFTS := toolFTSCount > 0
 
 	// Attempt to initialize FTS. Failure is non-fatal
 	// (might be missing module).
@@ -4943,37 +5017,6 @@ func (db *DB) init(ctx context.Context, progress OpenProgressFunc) error {
 				" VALUES('rebuild')",
 		); err != nil {
 			return fmt.Errorf("backfilling FTS: %w", err)
-		}
-	}
-	if !hadToolFTS && fts5Available {
-		// Existing archives are migrated inline and non-destructively. The
-		// projection has a uniqueness key, making an interrupted retry safe.
-		if _, err := w.ExecContext(ctx, `
-			INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
-				message_id, ordinal, location, tool_name, tool_use_id, content, file_path)
-			SELECT 'call', tc.id, tc.session_id, tc.message_id, m.ordinal,
-				'tool_input', tc.tool_name, COALESCE(tc.tool_use_id,''),
-				COALESCE(tc.input_json,''), COALESCE(tc.file_path,'')
-			FROM tool_calls tc JOIN messages m ON m.id=tc.message_id
-			WHERE COALESCE(tc.input_json,'') <> '';
-			INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
-				message_id, ordinal, location, tool_name, tool_use_id, content, file_path)
-			SELECT 'call', tc.id, tc.session_id, tc.message_id, m.ordinal,
-				'tool_result', tc.tool_name, COALESCE(tc.tool_use_id,''),
-				COALESCE(tc.result_content,''), COALESCE(tc.file_path,'')
-			FROM tool_calls tc JOIN messages m ON m.id=tc.message_id
-			WHERE COALESCE(tc.result_content,'') <> '';
-			INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
-				ordinal, location, tool_name, tool_use_id, content, is_error)
-			SELECT 'event', tre.id, tre.session_id, tre.tool_call_message_ordinal,
-				'tool_result', COALESCE((SELECT tc.tool_name FROM tool_calls tc
-				 WHERE tc.session_id=tre.session_id AND tc.tool_use_id=tre.tool_use_id
-				 AND COALESCE(tre.tool_use_id,'')<>'' ORDER BY tc.id LIMIT 1),''),
-				COALESCE(tre.tool_use_id,''), tre.content,
-				CASE WHEN lower(tre.status) IN ('error','failed','failure') THEN 1 ELSE 0 END
-			FROM tool_result_events tre;
-			INSERT INTO tool_content_fts(tool_content_fts) VALUES('rebuild')`); err != nil {
-			return fmt.Errorf("backfilling tool content FTS: %w", err)
 		}
 	}
 
