@@ -2001,6 +2001,51 @@ function findPublicRoots(id: string, byId: Map<string, SessionGroupInput>): stri
   return [...roots].sort();
 }
 
+/**
+ * Select the best primary session from a list.
+ *
+ * For groups with subagents, prefer the root session (matching the group key).
+ * Otherwise (e.g. continuation chains), prefer sessions with user messages so that
+ * automated or background continuation stubs (such as task notifications) never
+ * displace the interactive conversation. Among equal candidate tiers, pick the
+ * most recently active session.
+ */
+export function selectPrimaryId(sessions: SessionGroupInput[], groupKey: string): string {
+  if (sessions.length === 0) return groupKey;
+  const hasSubagents = sessions.some((s) => s.relationship_type === "subagent");
+  if (hasSubagents) {
+    const root = sessions.find((s) => s.id === groupKey);
+    return root ? root.id : sessions[0]!.id;
+  }
+  const userCandidates = sessions.filter(
+    (s) => !s.is_automated && (s.user_message_count ?? 0) > 0,
+  );
+  const nonZeroCandidates = sessions.filter(
+    (s) => (s.user_message_count ?? 0) > 0,
+  );
+  const nonAutomatedCandidates = sessions.filter((s) => !s.is_automated);
+  const pool =
+    userCandidates.length > 0
+      ? userCandidates
+      : nonZeroCandidates.length > 0
+        ? nonZeroCandidates
+        : nonAutomatedCandidates.length > 0
+          ? nonAutomatedCandidates
+          : sessions;
+
+  let best = pool[0]!;
+  let bestKey = recencyKey(best);
+  for (let i = 1; i < pool.length; i++) {
+    const s = pool[i]!;
+    const k = recencyKey(s);
+    if (k > bestKey) {
+      bestKey = k;
+      best = s;
+    }
+  }
+  return best.id;
+}
+
 export function buildSessionGroups(sessions: SessionGroupInput[]): SessionGroup[] {
   const byId = new Map<string, SessionGroupInput>();
   for (const s of sessions) {
@@ -2156,25 +2201,7 @@ export function buildSessionGroups(sessions: SessionGroupInput[]): SessionGroup[
     }
     group.firstMessage = group.sessions[0]?.first_message ?? null;
 
-    // For groups containing subagent children, the root session
-    // should always be the main entry (not the most recent child).
-    const hasSubagents = group.sessions.some((s) => s.relationship_type === "subagent");
-    if (hasSubagents) {
-      const rootIdx = group.sessions.findIndex((s) => s.id === group.key);
-      group.primarySessionId = rootIdx >= 0 ? group.sessions[rootIdx]!.id : group.sessions[0]!.id;
-    } else {
-      // For continuation chains, use the most recently active session.
-      let bestIdx = 0;
-      let bestKey = recencyKey(group.sessions[0]!);
-      for (let i = 1; i < group.sessions.length; i++) {
-        const k = recencyKey(group.sessions[i]!);
-        if (k > bestKey) {
-          bestKey = k;
-          bestIdx = i;
-        }
-      }
-      group.primarySessionId = group.sessions[bestIdx]!.id;
-    }
+    group.primarySessionId = selectPrimaryId(group.sessions, group.key);
   }
 
   const ordered = insertionOrder.filter((k) => !keysToRemove.has(k)).map((k) => groupMap.get(k)!);

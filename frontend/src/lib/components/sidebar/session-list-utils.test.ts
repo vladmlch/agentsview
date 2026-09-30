@@ -942,6 +942,21 @@ describe("selectPrimaryId", () => {
     });
     expect(selectPrimaryId([a, b], "key")).toBe("b");
   });
+
+  it("prefers session with user messages over newer zero-user-message continuation", () => {
+    const parent = makeSession({
+      id: "parent",
+      user_message_count: 11,
+      ended_at: "2025-01-01T00:00:00Z",
+    });
+    const continuation = makeSession({
+      id: "continuation",
+      user_message_count: 0,
+      relationship_type: "continuation",
+      ended_at: "2025-01-02T00:00:00Z",
+    });
+    expect(selectPrimaryId([parent, continuation], "parent")).toBe("parent");
+  });
 });
 
 // ---------------------------------------------------------------------------
