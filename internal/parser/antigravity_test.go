@@ -4736,3 +4736,74 @@ func TestLookupAntigravitySummary_LockContentionRetry(t *testing.T) {
 	assert.Equal(t, "my-service", sum.project)
 	assert.Equal(t, "Fix indexing bug", sum.title)
 }
+
+func TestCleanAntigravityPrompt(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "plain prompt unchanged",
+			input: "list the files in the project",
+			want:  "list the files in the project",
+		},
+		{
+			name:  "empty prompt unchanged",
+			input: "",
+			want:  "",
+		},
+		{
+			name:  "whitespace only unchanged",
+			input: "   \n\t  ",
+			want:  "   \n\t  ",
+		},
+		{
+			name:  "basic user request envelope unwrapped",
+			input: "<USER_REQUEST>\nhello world\n</USER_REQUEST>",
+			want:  "hello world",
+		},
+		{
+			name:  "user request with additional metadata",
+			input: "<USER_REQUEST>\nlist files\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-30T21:02:41+02:00.\n</ADDITIONAL_METADATA>",
+			want:  "list files",
+		},
+		{
+			name: "full prompt with slash command and settings change",
+			input: "<USER_REQUEST>\n/systematic-debugging\nпока ничего не меняй\nhttp://127.0.0.1:8000/?provider=junie&cid=session-123\n</USER_REQUEST>\n" +
+				"<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-18T23:55:05+02:00.\n\n" +
+				"/systematic-debugging is a [Slash Command]:\n<SKILL>The user requested you read the skill</SKILL>\n</ADDITIONAL_METADATA>\n" +
+				"<USER_SETTINGS_CHANGE>\nThe user changed setting Model Selection from None to Gemini 3.8 Flash (High).\n</USER_SETTINGS_CHANGE>",
+			want: "/systematic-debugging\nпока ничего не меняй\nhttp://127.0.0.1:8000/?provider=junie&cid=session-123",
+		},
+		{
+			name: "user request mentioning tags inside prompt",
+			input: "<USER_REQUEST>\nпосмотри почему появились \n<USER_REQUEST>, <ADDITIONAL_METADATA> и  тп\n</USER_REQUEST>\n" +
+				"<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-30T21:02:41+02:00.\n</ADDITIONAL_METADATA>",
+			want: "посмотри почему появились \n<USER_REQUEST>, <ADDITIONAL_METADATA> и  тп",
+		},
+		{
+			name: "user request mentioning closing tag inside prompt",
+			input: "<USER_REQUEST>\nwhy is </USER_REQUEST> shown here?\n</USER_REQUEST>\n" +
+				"<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-30T21:02:41+02:00.\n</ADDITIONAL_METADATA>",
+			want: "why is </USER_REQUEST> shown here?",
+		},
+		{
+			name:  "unwrapped prompt with trailing metadata stripped",
+			input: "plain prompt text\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-30T21:02:41+02:00.\n</ADDITIONAL_METADATA>",
+			want:  "plain prompt text",
+		},
+		{
+			name:  "unclosed user request envelope with trailing metadata",
+			input: "<USER_REQUEST>\nincomplete tag prompt\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-30T21:02:41+02:00.\n</ADDITIONAL_METADATA>",
+			want:  "incomplete tag prompt",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := cleanAntigravityPrompt(tt.input)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}

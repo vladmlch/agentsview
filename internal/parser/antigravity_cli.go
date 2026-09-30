@@ -1529,10 +1529,11 @@ func parseAntigravityCLITrajectory(
 			if step.UserInput == nil {
 				continue
 			}
+			prompt := cleanAntigravityPrompt(step.UserInput.UserResponse)
 			msgs = append(msgs, ParsedMessage{
 				Role:          RoleUser,
-				Content:       step.UserInput.UserResponse,
-				ContentLength: len(step.UserInput.UserResponse),
+				Content:       prompt,
+				ContentLength: len(prompt),
 				Timestamp:     stepTime,
 			})
 

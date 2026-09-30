@@ -566,7 +566,10 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // (129: the Cursor IDE parser now distributes composerData.contextTokensUsed
 // across the session's parsed messages proportional to content length,
 // setting per-message ContextTokens and session PeakContextTokens.)
-const dataVersion = 129
+// (130: the Antigravity parser unwraps <USER_REQUEST> envelopes and strips
+// runtime prompt-injection metadata (<ADDITIONAL_METADATA>,
+// <USER_SETTINGS_CHANGE>) from user messages.)
+const dataVersion = 130
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 

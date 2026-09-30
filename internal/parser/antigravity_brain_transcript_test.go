@@ -418,3 +418,28 @@ func TestAntigravityDefaultRootsCoverTheIDETree(t *testing.T) {
 			"the CLI reader must not be pointed at %s", dir)
 	}
 }
+
+func TestAntigravityBrainTranscriptCleansUserPromptEnvelopes(t *testing.T) {
+	root := t.TempDir()
+	id := "05385df3-99c4-4772-81a9-24fb6508046b"
+	body := `{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-09-18T21:55:05Z","content":"<USER_REQUEST>\n/systematic-debugging\nпока ничего не меняй\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-18T23:55:05+02:00.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting Model Selection from None to Gemini 3.8 Flash (High).\n</USER_SETTINGS_CHANGE>"}
+{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-09-18T21:55:10Z","content":"understood"}
+`
+	path := writeAntigravityBrainTranscript(t, root, id, body)
+	assert.NotEmpty(t, path)
+	provider := newAntigravityProviderForRoots(t, root)
+
+	sources, err := provider.Discover(t.Context())
+	require.NoError(t, err, "Discover")
+	require.Len(t, sources, 1)
+
+	results := parseAntigravitySources(t, provider, sources)
+	require.Len(t, results, 1)
+	sess := results[0].Session
+	msgs := results[0].Messages
+
+	require.Len(t, msgs, 2)
+	assert.Equal(t, RoleUser, msgs[0].Role)
+	assert.Equal(t, "/systematic-debugging\nпока ничего не меняй", msgs[0].Content)
+	assert.Equal(t, "/systematic-debugging пока ничего не меняй", sess.FirstMessage)
+}
