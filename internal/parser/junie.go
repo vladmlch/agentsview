@@ -2,6 +2,7 @@ package parser
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -601,7 +602,9 @@ func junieAssistantMessage(
 				content = append(content, b.text)
 			}
 		default:
-			// Tool calls in Task 2
+			if call, ok := junieToolCall(b); ok {
+				calls = append(calls, call)
+			}
 		}
 	}
 
@@ -619,6 +622,149 @@ func junieAssistantMessage(
 	}
 	msg.ContentLength = len(msg.Content)
 	return msg, true
+}
+
+func junieToolCall(b *junieBlock) (ParsedToolCall, bool) {
+	status := junieResultStatus(b.status)
+	if b.cancelled && (status == "" || status == "running") {
+		status = "cancelled"
+	}
+	event := func(content string) []ParsedToolResultEvent {
+		if status == "" && content == "" {
+			return nil
+		}
+		return []ParsedToolResultEvent{{
+			Status:    status,
+			Content:   content,
+			Timestamp: b.ts,
+		}}
+	}
+	completed := func(content string) []ParsedToolResultEvent {
+		return []ParsedToolResultEvent{{
+			Status:    "completed",
+			Content:   content,
+			Timestamp: b.ts,
+		}}
+	}
+	input := func(fields map[string]any) string {
+		if len(fields) == 0 {
+			return ""
+		}
+		raw, err := json.Marshal(fields)
+		if err != nil {
+			return ""
+		}
+		return string(raw)
+	}
+
+	switch b.kind {
+	case "TerminalBlockUpdatedEvent":
+		return ParsedToolCall{
+			ToolUseID:    b.taskID + ":" + b.stepID,
+			ToolName:     "Terminal",
+			Category:     "Bash",
+			InputJSON:    input(map[string]any{"command": b.command}),
+			ResultEvents: event(b.output),
+		}, true
+	case "ViewFilesBlockUpdatedEvent":
+		return ParsedToolCall{
+			ToolUseID:    b.taskID + ":" + b.stepID,
+			ToolName:     "ViewFiles",
+			Category:     "Read",
+			InputJSON:    input(map[string]any{"files": b.files}),
+			FilePath:     firstString(b.files),
+			ResultEvents: event(b.details),
+		}, true
+	case "FileChangesBlockUpdatedEvent":
+		return ParsedToolCall{
+			ToolUseID:    b.taskID + ":" + b.stepID,
+			ToolName:     "FileChanges",
+			Category:     "Edit",
+			InputJSON:    input(map[string]any{"files": b.changes}),
+			FilePath:     firstString(b.changes),
+			ResultEvents: event(b.details),
+		}, true
+	case "McpBlockUpdatedEvent":
+		return ParsedToolCall{
+			ToolUseID:    b.taskID + ":" + b.stepID,
+			ToolName:     b.toolName,
+			Category:     "Tool",
+			InputJSON:    b.input,
+			ResultEvents: event(b.details),
+		}, true
+	case "ToolBlockUpdatedEvent":
+		category := "Other"
+		switch b.toolType {
+		case "Search":
+			category = "Grep"
+		case "Skill":
+			category = "Tool"
+		}
+		return ParsedToolCall{
+			ToolUseID:    b.taskID + ":" + b.stepID,
+			ToolName:     firstNonEmptyJSONLString(b.toolType, "Tool"),
+			Category:     category,
+			InputJSON:    input(map[string]any{"text": b.text}),
+			SkillName:    b.skillName,
+			ResultEvents: event(b.details),
+		}, true
+	case "CustomAgentBlockUpdatedEvent", "SubagentSpawnedEvent":
+		var events []ParsedToolResultEvent
+		if b.cancelled {
+			events = []ParsedToolResultEvent{{
+				Status:    "cancelled",
+				Timestamp: b.ts,
+			}}
+		} else if b.status != "" && b.status != "IN_PROGRESS" && b.status != "STARTED" {
+			events = event("")
+		}
+		if events == nil {
+			events = completed("")
+		}
+		return ParsedToolCall{
+			ToolUseID: b.taskID + ":" + b.stepID,
+			ToolName:  b.name,
+			Category:  "Task",
+			InputJSON: input(map[string]any{
+				"task": b.task, "model": b.model,
+			}),
+			ResultEvents: events,
+		}, true
+	case "AgentPatchCreatedEvent":
+		return ParsedToolCall{
+			ToolUseID:    b.taskID + ":" + b.stepID,
+			ToolName:     "Patch",
+			Category:     "Edit",
+			InputJSON:    input(map[string]any{"patch": b.patch}),
+			ResultEvents: completed(b.patch),
+		}, true
+	case "AskAsyncRequestUpdatedEvent", "ChoiceRequestUpdatedEvent":
+		return ParsedToolCall{
+			ToolUseID: b.taskID + ":" + b.stepID,
+			ToolName:  "AskUserQuestion",
+			Category:  "Tool",
+			InputJSON: input(map[string]any{
+				"title": b.title, "options": b.options,
+			}),
+			ResultEvents: completed(""),
+		}, true
+	}
+	return ParsedToolCall{}, false
+}
+
+func junieResultStatus(status string) string {
+	switch status {
+	case "COMPLETED", "FINISHED":
+		return "completed"
+	case "FAILED", "ERROR":
+		return "error"
+	case "CANCELLED", "CANCELED":
+		return "cancelled"
+	case "IN_PROGRESS", "STARTED":
+		return "running"
+	default:
+		return strings.ToLower(status)
+	}
 }
 
 func (s *junieParserState) appendMessage(
