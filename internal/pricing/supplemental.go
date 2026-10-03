@@ -20,7 +20,8 @@ import (
 // fallback until the pinned LiteLLM snapshot includes it. Version 5 adds
 // a StepFun step-5-preview row, which the pinned snapshot lacks. Version 6
 // removes the temporary Bedrock Astra row now supplied by the snapshot.
-// Version 7 adds Devin internal models and Antigravity Gemini/Claude models.
+// Version 7 adds Devin internal models and Antigravity/Devin tier aliases;
+// the pinned snapshot prices their canonical models.
 const supplementalVersion = "7"
 
 // Canonical pricing models runtime aliases resolve to.
@@ -240,12 +241,6 @@ var supplementalPricing = []ModelPricing{
 		CacheReadPerMTok:     money.MustParseDollars("0.05"),
 	},
 	{
-		ModelPattern:     "gemini-3.8-flash",
-		InputPerMTok:     money.MustParseDollars("0.75"),
-		OutputPerMTok:    money.MustParseDollars("3.75"),
-		CacheReadPerMTok: money.MustParseDollars("0.075"),
-	},
-	{
 		ModelPattern:         "swe-2-max",
 		InputPerMTok:         money.MustParseDollars("3.00"),
 		OutputPerMTok:        money.MustParseDollars("15.00"),
@@ -269,12 +264,6 @@ var supplementalPricing = []ModelPricing{
 		InputPerMTok:     money.MustParseDollars("0.50"),
 		OutputPerMTok:    money.MustParseDollars("2.50"),
 		CacheReadPerMTok: money.MustParseDollars("0.05"),
-	},
-	{
-		ModelPattern:     "gpt-6-luna",
-		InputPerMTok:     money.MustParseDollars("0.10"),
-		OutputPerMTok:    money.MustParseDollars("0.50"),
-		CacheReadPerMTok: money.MustParseDollars("0.01"),
 	},
 }
 
