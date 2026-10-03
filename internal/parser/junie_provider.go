@@ -85,11 +85,36 @@ func newJunieSourceSetWithCache(
 			WithSessionIDFromPath(func(_, path string) string {
 				return filepath.Base(filepath.Dir(path))
 			}),
+			WithRawSessionIDForLookup(junieBaseRawSessionID),
+			WithRawSessionIDSourceFiles(junieSessionIDSourceFiles),
+			WithDescendPath(func(root, path string) bool { return filepath.Dir(path) == root }),
 			WithParseFile(indexCache.parseFile),
 			WithForceReplace(),
 		).JSONLSourceSet,
 		indexCache: indexCache,
 	}
+}
+
+func (s junieSourceSet) StoredSourceHintScopes(
+	req ChangedPathRequest,
+) []StoredSourceHintScope {
+	path := req.Path
+	if container, _, ok := ParseVirtualSourcePathForBase(path, "events.jsonl"); ok {
+		path = container
+	}
+	if filepath.Base(path) != "events.jsonl" {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	for _, root := range s.roots {
+		if filepath.Dir(dir) == filepath.Clean(root) {
+			return []StoredSourceHintScope{{
+				Path:                  path,
+				IncludeVirtualMembers: true,
+			}}
+		}
+	}
+	return nil
 }
 
 func (s junieSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
@@ -497,35 +522,32 @@ func (c *junieIndexCache) parseFile(
 	if present {
 		summary = indexSummary.sessionSummary()
 	}
-	sess, msgs, isStartupStub, err := parseJunieSessionWithSummary(
+	results, excluded, err := parseJunieSessionWithSummary(
 		ctx, path, req.Machine, summary, present, openJunieRoot,
 	)
 	if err != nil {
 		return nil, nil, err
 	}
-	if sess == nil {
-		if isStartupStub {
-			sessionID := filepath.Base(filepath.Dir(path))
-			return nil, []string{"junie:" + sessionID}, nil
+	for i := range results {
+		if req.Fingerprint.Hash != "" {
+			results[i].Session.File.Hash = req.Fingerprint.Hash
 		}
-		return nil, nil, nil
+		if req.Fingerprint.Size > 0 {
+			results[i].Session.File.Size = req.Fingerprint.Size
+		}
+		if req.Fingerprint.MTimeNS > 0 {
+			results[i].Session.File.Mtime = req.Fingerprint.MTimeNS
+		}
 	}
-	if req.Fingerprint.Hash != "" {
-		sess.File.Hash = req.Fingerprint.Hash
-	}
-	if req.Fingerprint.Size > 0 {
-		sess.File.Size = req.Fingerprint.Size
-	}
-	if req.Fingerprint.MTimeNS > 0 {
-		sess.File.Mtime = req.Fingerprint.MTimeNS
-	}
-	return []ParseResult{{Session: *sess, Messages: msgs, UsageEvents: sess.UsageEvents}}, nil, nil
+	return results, excluded, nil
 }
 
 func junieProviderCapabilities() Capabilities {
 	source := jsonlFileProviderSourceCapabilities()
 	source.ForceReplaceOnParse = CapabilitySupported
 	source.ChangedPathRelevance = CapabilitySupported
+	source.MultiSessionSource = CapabilitySupported
+	source.ExcludedSessions = CapabilitySupported
 	return Capabilities{
 		Source: source,
 		Sync: ProviderSyncSemantics{
@@ -544,6 +566,8 @@ func junieProviderCapabilities() Capabilities {
 			ToolResultEvents:     CapabilitySupported,
 			TerminationStatus:    CapabilitySupported,
 			TruncationStatus:     CapabilitySupported,
+			Subagents:            CapabilitySupported,
+			Relationships:        CapabilitySupported,
 		},
 	}
 }

@@ -31,7 +31,7 @@ func parseJunieProviderSession(
 		Source: source, Fingerprint: fingerprint, Machine: machine,
 	})
 	require.NoError(t, err)
-	require.Len(t, outcome.Results, 1)
+	require.NotEmpty(t, outcome.Results)
 	result := outcome.Results[0].Result
 	return &result.Session, result.Messages
 }
@@ -129,7 +129,7 @@ func TestParseJunieSessionRejectsInvalidReportedCost(t *testing.T) {
 		`{"kind":"SessionA2uxEvent","event":{"agentEvent":{"kind":"LlmResponseMetadataEvent","modelUsage":[{"model":"test","cost":-1}]}}}`+"\n",
 	), 0o600))
 
-	_, _, _, err := parseJunieSessionWithSummary(
+	_, _, err := parseJunieSessionWithSummary(
 		t.Context(), path, "session-one", junieSessionSummary{}, false, openJunieRoot,
 	)
 	require.ErrorContains(t, err, "invalid model usage cost")
@@ -1058,5 +1058,86 @@ func TestJunieCancelledResultBlockExcluded(t *testing.T) {
 	_, messages := parseJunieProviderSession(t, path, "local")
 	for _, m := range messages {
 		assert.NotContains(t, m.Content, "partial draft")
+	}
+}
+
+func parseJunieProviderOutcome(
+	t *testing.T, path, machine string,
+) ParseOutcome {
+	t.Helper()
+	root := filepath.Dir(filepath.Dir(path))
+	provider, ok := NewProvider(AgentJunie, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	sources, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	fingerprint, err := provider.Fingerprint(t.Context(), sources[0])
+	require.NoError(t, err)
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
+		Source: sources[0], Fingerprint: fingerprint, Machine: machine,
+	})
+	require.NoError(t, err)
+	return outcome
+}
+
+func junieSubagentFixture() string {
+	return `{"kind":"UserPromptEvent","requestId":"r1","prompt":"Audit auth","timestampMs":1704067200000}` + "\n" +
+		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"SubagentSpawnedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"sub-step-1-spawned","name":"auth-auditor","task":"Audit the auth module for leaks"}},"timestampMs":1704067200100}` + "\n" +
+		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"MarkdownBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-1","name":"auth-auditor"},"stepId":"sub-step-1-request","text":"Audit the auth module for leaks"}},"timestampMs":1704067200110}` + "\n" +
+		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"AgentThoughtBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-1","name":"auth-auditor"},"stepId":"sub-think-1","text":"Scanning token handling"}},"timestampMs":1704067200120}` + "\n" +
+		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-1","name":"auth-auditor"},"stepId":"sub-res-1","result":"No leaks found."}},"timestampMs":1704067200130}` + "\n" +
+		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"LlmResponseMetadataEvent","agent":{"kind":"BuiltInAgent","id":"agent-1"},"modelUsage":[{"model":"gpt-4.1-mini","cost":0.0003,"inputTokens":710,"outputTokens":13,"time":0}]}},"timestampMs":1704067200140}` + "\n" +
+		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"res-1","result":"Audited: clean."}},"timestampMs":1704067200200}` + "\n"
+}
+
+func TestJunieSubagentSession(t *testing.T) {
+	root := t.TempDir()
+	sessionID := "session-260101-120000-abcd"
+	sessionDir := filepath.Join(root, sessionID)
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(junieSubagentFixture()), 0o600))
+
+	outcome := parseJunieProviderOutcome(t, path, "local")
+	require.Len(t, outcome.Results, 2)
+
+	parent := outcome.Results[0].Result
+	sub := outcome.Results[1].Result.Session
+	subMsgs := outcome.Results[1].Result.Messages
+
+	assert.Equal(t, "junie:"+sessionID, parent.Session.ID)
+	assert.Equal(t, "junie:"+sessionID+"--agent-1", sub.ID)
+	assert.Equal(t, "junie:"+sessionID, sub.ParentSessionID)
+	assert.Equal(t, RelSubagent, sub.RelationshipType)
+	assert.Equal(t, "auth-auditor", sub.SessionName)
+	assert.Equal(t, VirtualSourcePath(path, "agent-1"), sub.File.Path)
+
+	require.Len(t, subMsgs, 2)
+	assert.Equal(t, RoleUser, subMsgs[0].Role)
+	assert.Equal(t, "Audit the auth module for leaks", subMsgs[0].Content)
+	assert.Equal(t, RoleAssistant, subMsgs[1].Role)
+	assert.Equal(t, "Scanning token handling", subMsgs[1].ThinkingText)
+	assert.Equal(t, "No leaks found.", subMsgs[1].Content)
+
+	require.Len(t, sub.UsageEvents, 1)
+	assert.Equal(t, "junie:"+sessionID+"--agent-1", sub.UsageEvents[0].SessionID)
+
+	// Parent Task call links to the child session.
+	var taskCall *ParsedToolCall
+	for i := range parent.Messages {
+		for j := range parent.Messages[i].ToolCalls {
+			if parent.Messages[i].ToolCalls[j].Category == "Task" {
+				taskCall = &parent.Messages[i].ToolCalls[j]
+			}
+		}
+	}
+	require.NotNil(t, taskCall)
+	assert.Equal(t, "auth-auditor", taskCall.ToolName)
+	assert.Equal(t, sub.ID, taskCall.SubagentSessionID)
+
+	// Child content stays out of the parent transcript.
+	for _, m := range parent.Messages {
+		assert.NotContains(t, m.Content, "No leaks found")
+		assert.NotContains(t, m.ThinkingText, "Scanning token handling")
 	}
 }

@@ -546,3 +546,61 @@ func TestSyncJunieStartupStubDirectoryIsExcludedAndPurged(t *testing.T) {
 	require.NotNil(t, sess.FirstMessage)
 	assert.Equal(t, "Real question", *sess.FirstMessage)
 }
+
+func TestSyncJunieVanishedSubagentTombstones(t *testing.T) {
+	root := t.TempDir()
+	sessionID := "session-subagent-tombstone"
+	sessionDir := filepath.Join(root, sessionID)
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	eventsPath := filepath.Join(sessionDir, "events.jsonl")
+
+	subagentEvents := `{"kind":"UserPromptEvent","requestId":"r1","prompt":"Audit auth","timestampMs":1704067200000}` + "\n" +
+		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"SubagentSpawnedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"sub-step-1-spawned","name":"auth-auditor","task":"Audit the auth module for leaks"}},"timestampMs":1704067200100}` + "\n" +
+		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"MarkdownBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-1","name":"auth-auditor"},"stepId":"sub-step-1-request","text":"Audit the auth module for leaks"}},"timestampMs":1704067200110}` + "\n" +
+		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"AgentThoughtBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-1","name":"auth-auditor"},"stepId":"sub-think-1","text":"Scanning token handling"}},"timestampMs":1704067200120}` + "\n" +
+		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-1","name":"auth-auditor"},"stepId":"sub-res-1","result":"No leaks found."}},"timestampMs":1704067200130}` + "\n" +
+		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"res-1","result":"Audited: clean."}},"timestampMs":1704067200200}` + "\n"
+
+	require.NoError(t, os.WriteFile(eventsPath, []byte(subagentEvents), 0o600))
+
+	database := openTestDB(t)
+	engine := NewEngine(t.Context(), database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentJunie: {root}},
+		Machine:   "test",
+	})
+	t.Cleanup(engine.Close)
+
+	first := engine.SyncAll(t.Context(), nil)
+	require.Equal(t, 2, first.Synced)
+	require.Zero(t, first.Failed)
+
+	parentSess, err := database.GetSessionFull(t.Context(), "junie:"+sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, parentSess)
+	assert.Nil(t, parentSess.SourceMissingAt)
+
+	childSess, err := database.GetSessionFull(t.Context(), "junie:"+sessionID+"--agent-1")
+	require.NoError(t, err)
+	require.NotNil(t, childSess)
+	assert.Nil(t, childSess.SourceMissingAt)
+
+	// Rewrite events without the child blocks
+	rewrittenEvents := `{"kind":"UserPromptEvent","requestId":"r1","prompt":"Audit auth","timestampMs":1704067200000}` + "\n" +
+		`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"res-1","result":"Audited: clean."}},"timestampMs":1704067200200}` + "\n"
+
+	require.NoError(t, os.WriteFile(eventsPath, []byte(rewrittenEvents), 0o600))
+
+	second := engine.SyncAll(t.Context(), nil)
+	require.Equal(t, 1, second.Synced)
+	require.Zero(t, second.Failed)
+
+	parentSess, err = database.GetSessionFull(t.Context(), "junie:"+sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, parentSess)
+	assert.Nil(t, parentSess.SourceMissingAt)
+
+	childSess, err = database.GetSessionFull(t.Context(), "junie:"+sessionID+"--agent-1")
+	require.NoError(t, err)
+	require.NotNil(t, childSess)
+	assertSourceMissingState(t, childSess)
+}
