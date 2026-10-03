@@ -84,7 +84,7 @@ func TestParseJunieSession(t *testing.T) {
 	assert.True(t, sess.SessionNamePresent)
 	assert.Equal(t, time.UnixMilli(1704067200000), sess.StartedAt)
 	assert.Equal(t, time.UnixMilli(1704067207000), sess.EndedAt)
-	assert.Equal(t, 7, sess.MessageCount)
+	assert.Equal(t, 6, sess.MessageCount)
 	assert.Equal(t, 3, sess.UserMessageCount)
 	assert.Equal(t, 1, sess.MalformedLines)
 	assert.True(t, sess.HasTotalOutputTokens)
@@ -107,16 +107,15 @@ func TestParseJunieSession(t *testing.T) {
 	assert.Equal(t, "2024-01-01T00:00:05.1Z", usage.OccurredAt)
 	assert.Equal(t, "junie:"+sessionID+":llm-response:12:0", usage.DedupKey)
 
-	require.Len(t, messages, 7)
+	require.Len(t, messages, 6)
 	assertMessage(t, messages[0], RoleUser, "Implement it")
 	assertMessage(t, messages[1], RoleUser, "Restore me")
-	assertMessage(t, messages[2], RoleAssistant, "Done")
+	assertMessage(t, messages[2], RoleAssistant, "Done\n\nFinished")
 	assertMessage(t, messages[3], RoleSystem, "Notice\n\nDetails")
 	assertMessage(t, messages[4], RoleSystem, "Agent task failed")
 	assert.True(t, messages[3].IsSystem)
 	assert.True(t, messages[4].IsSystem)
 	assertMessage(t, messages[5], RoleUser, "Continue?\nYes")
-	assertMessage(t, messages[6], RoleAssistant, "Finished")
 	for i, message := range messages {
 		assert.Equal(t, i, message.Ordinal)
 	}
@@ -849,4 +848,40 @@ func TestJunieAgentTaskNameUpdatedEventSetsSessionName(t *testing.T) {
 	assert.Equal(t, "Title from agent event", sess.SessionName)
 	assert.True(t, sess.SessionNamePresent)
 	require.Len(t, messages, 1)
+}
+
+func TestJunieThinkingAndTaskGrouping(t *testing.T) {
+	root := t.TempDir()
+	sessionID := "session-260101-120000-abcd"
+	sessionDir := filepath.Join(root, sessionID)
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Explain auth","timestampMs":1704067200000}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"AgentThoughtBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"step-think","text":"Reading auth"}},"timestampMs":1704067200100}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"state":"COMPLETED","agentEvent":{"kind":"AgentThoughtBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"step-think","text":"Read auth and traced login"}},"timestampMs":1704067200200}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"state":"COMPLETED","agentEvent":{"kind":"MarkdownBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"step-md","text":"Working on it"}},"timestampMs":1704067200300}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"state":"COMPLETED","agentEvent":{"kind":"ResultBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"step-res","result":"<!-- ANSWER -->Auth uses middleware."}},"timestampMs":1704067200400}` + "\n" +
+			// A BuiltInAgent's block must NOT pollute the parent transcript.
+			`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"MarkdownBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-1","name":"auditor"},"stepId":"sub-1","text":"child working"}},"timestampMs":1704067200500}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	sess, messages := parseJunieProviderSession(t, path, "local")
+
+	// One assistant message per taskId: thinking + markdown + result merged.
+	var assistant []ParsedMessage
+	for _, m := range messages {
+		if m.Role == RoleAssistant {
+			assistant = append(assistant, m)
+		}
+	}
+	require.Len(t, assistant, 1)
+	assert.True(t, assistant[0].HasThinking)
+	assert.Equal(t, "Read auth and traced login", assistant[0].ThinkingText)
+	assert.Equal(t, "Working on it\n\nAuth uses middleware.", assistant[0].Content)
+	for _, m := range messages {
+		assert.NotContains(t, m.Content, "child working")
+	}
+	assert.False(t, sess.IsTruncated)
 }
