@@ -176,21 +176,22 @@ func parseJunieSessionWithSummary(
 	ctx context.Context, path, machine string,
 	summary junieSessionSummary, summaryPresent bool,
 	openRoot junieRootOpener,
-) (*ParsedSession, []ParsedMessage, bool, error) {
+) ([]ParseResult, []string, error) {
 	f, err := openJunieEventStream(path, openRoot)
 	if err != nil {
-		return nil, nil, false, fmt.Errorf("open %s: %w", path, err)
+		return nil, nil, fmt.Errorf("open %s: %w", path, err)
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return nil, nil, false, fmt.Errorf("stat %s: %w", path, err)
+		return nil, nil, fmt.Errorf("stat %s: %w", path, err)
 	}
 
+	rawID := filepath.Base(filepath.Dir(path))
 	state := junieParserState{
 		userMessages:    make(map[string]int),
 		streams:         map[string]*junieAgentStream{"main": newJunieAgentStream("main")},
-		sourceSessionID: filepath.Base(filepath.Dir(path)),
+		sourceSessionID: rawID,
 	}
 	lr := newLineReaderContext(ctx, f, maxLineSize)
 	defer releaseLineReader(lr)
@@ -200,7 +201,7 @@ func parseJunieSessionWithSummary(
 			break
 		}
 		if err := contextErrEvery(ctx, lineNumber); err != nil {
-			return nil, nil, false, err
+			return nil, nil, err
 		}
 		if !gjson.Valid(line) {
 			state.malformedLines++
@@ -209,18 +210,17 @@ func parseJunieSessionWithSummary(
 		}
 		state.lastLineBad = false
 		if err := state.consumeEvent(gjson.Parse(line), lineNumber); err != nil {
-			return nil, nil, false, fmt.Errorf("parsing Junie session %s line %d: %w", path, lineNumber, err)
+			return nil, nil, fmt.Errorf("parsing Junie session %s line %d: %w", path, lineNumber, err)
 		}
 	}
 	if err := lr.Err(); err != nil {
-		return nil, nil, false, fmt.Errorf("reading Junie session %s: %w", path, err)
+		return nil, nil, fmt.Errorf("reading Junie session %s: %w", path, err)
 	}
 	if lr.skippedOversized {
-		return nil, nil, false, fmt.Errorf("reading Junie session %s: record exceeds %d bytes", path, maxLineSize)
+		return nil, nil, fmt.Errorf("reading Junie session %s: record exceeds %d bytes", path, maxLineSize)
 	}
-	return state.session(
-		ctx, path, machine, filepath.Base(filepath.Dir(path)),
-		info.Size(), info.ModTime().UnixNano(), summary, summaryPresent,
+	return state.results(
+		ctx, path, machine, rawID, info, summary, summaryPresent,
 	)
 }
 
@@ -688,6 +688,9 @@ func junieAssembleMessages(
 	merged = append(merged, stream.notes...)
 
 	sort.SliceStable(merged, func(i, j int) bool {
+		if merged[i].Timestamp.IsZero() || merged[j].Timestamp.IsZero() {
+			return false
+		}
 		return merged[i].Timestamp.Before(merged[j].Timestamp)
 	})
 	for i := range merged {
@@ -904,11 +907,11 @@ func (s *junieParserState) setUserMessagesActive(ids gjson.Result, active bool) 
 	}
 }
 
-func (s *junieParserState) session(
+func (s *junieParserState) parentResult(
 	ctx context.Context, path, machine, sourceSessionID string,
 	fileSize, mtime int64,
 	summary junieSessionSummary, summaryPresent bool,
-) (*ParsedSession, []ParsedMessage, bool, error) {
+) (*ParsedSession, []ParsedMessage, bool) {
 	main := s.streams["main"]
 	if main == nil {
 		main = newJunieAgentStream("main")
@@ -932,10 +935,10 @@ func (s *junieParserState) session(
 
 	hasActivity := len(main.blocks) > 0 || len(main.usage) > 0
 	if len(messages) == 0 && len(s.entries) == 0 && !hasActivity && !s.sessionNameFound {
-		return nil, nil, false, nil
+		return nil, nil, false
 	}
 	if userCount == 0 && !hasActivity && !s.sessionNameFound && !summaryPresent {
-		return nil, nil, true, nil
+		return nil, nil, true
 	}
 
 	if !summary.createdAt.IsZero() &&
@@ -967,6 +970,12 @@ func (s *junieParserState) session(
 		cwd = filepath.Clean(cwd)
 	} else if !strings.HasPrefix(cwd, "/") && !looksLikeWindowsPath(cwd) {
 		cwd = ""
+	}
+
+	for i := range messages {
+		if messages[i].Timestamp.IsZero() {
+			messages[i].Timestamp = s.startedAt
+		}
 	}
 
 	usageEvents := junieRewriteUsageSession(main, "junie:"+sourceSessionID)
@@ -1010,7 +1019,62 @@ func (s *junieParserState) session(
 	}
 	applyUsageEventTokenTotals(session, usageEvents)
 	session.UsageEvents = usageEvents
-	return session, messages, false, nil
+	return session, messages, false
+}
+
+func (s *junieParserState) results(
+	ctx context.Context, path, machine, rawID string, info os.FileInfo,
+	summary junieSessionSummary, summaryPresent bool,
+) ([]ParseResult, []string, error) {
+	fullID := "junie:" + rawID
+	var fileSize, mtime int64
+	if info != nil {
+		fileSize = info.Size()
+		mtime = info.ModTime().UnixNano()
+	}
+	sess, msgs, isStub := s.parentResult(ctx, path, machine, rawID, fileSize, mtime, summary, summaryPresent)
+	var results []ParseResult
+	var excluded []string
+	if sess == nil {
+		if isStub {
+			excluded = append(excluded, fullID)
+		}
+	} else {
+		results = append(results, ParseResult{
+			Session: *sess, Messages: msgs, UsageEvents: sess.UsageEvents,
+		})
+	}
+	emitted := map[string]bool{}
+	for _, agentID := range s.streamOrder {
+		stream := s.streams[agentID]
+		sub, subMsgs, ok := junieFinishSubagent(
+			fullID+"--"+agentID, fullID, path, info,
+			stream, summary, summaryPresent, machine, "",
+		)
+		if !ok {
+			continue
+		}
+		emitted[agentID] = true
+		results = append(results, ParseResult{
+			Session: *sub, Messages: subMsgs, UsageEvents: sub.UsageEvents,
+		})
+	}
+	if len(results) > 0 && results[0].Session.ID == fullID {
+		junieLinkSubagentCalls(results, s.streams, emitted, rawID)
+		if results[0].Session.TerminationStatus == TerminationToolCallPending {
+			stopReason := ""
+			switch {
+			case s.lastTaskState == "COMPLETED":
+				stopReason = "task_complete"
+			case summary.lifecycle == "FINISHED" || summary.lifecycle == "COMPLETED":
+				stopReason = "task_complete"
+			}
+			results[0].Session.TerminationStatus = Classify(
+				results[0].Messages, stopReason, s.lastLineBad,
+			)
+		}
+	}
+	return results, excluded, nil
 }
 
 func minInt(a, b int) int {
@@ -1048,4 +1112,29 @@ func junieMillisTimestamp(ms int64) time.Time {
 		return time.Time{}
 	}
 	return time.UnixMilli(ms)
+}
+
+func junieTimestampFromID(id string) time.Time {
+	for i := 0; i+13 <= len(id); i++ {
+		sub := id[i : i+13]
+		if isDigit2(sub[0:2]) && isDigit2(sub[2:4]) && isDigit2(sub[4:6]) &&
+			sub[6] == '-' &&
+			isDigit2(sub[7:9]) && isDigit2(sub[9:11]) && isDigit2(sub[11:13]) {
+			yy := (int(sub[0]-'0') * 10) + int(sub[1]-'0')
+			mm := (int(sub[2]-'0') * 10) + int(sub[3]-'0')
+			dd := (int(sub[4]-'0') * 10) + int(sub[5]-'0')
+			hour := (int(sub[7]-'0') * 10) + int(sub[8]-'0')
+			min := (int(sub[9]-'0') * 10) + int(sub[10]-'0')
+			sec := (int(sub[11]-'0') * 10) + int(sub[12]-'0')
+			if mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31 &&
+				hour >= 0 && hour <= 23 && min >= 0 && min <= 59 && sec >= 0 && sec <= 59 {
+				return time.Date(2000+yy, time.Month(mm), dd, hour, min, sec, 0, time.UTC)
+			}
+		}
+	}
+	return time.Time{}
+}
+
+func isDigit2(s string) bool {
+	return s[0] >= '0' && s[0] <= '9' && s[1] >= '0' && s[1] <= '9'
 }

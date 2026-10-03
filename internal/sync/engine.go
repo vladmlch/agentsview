@@ -13188,6 +13188,7 @@ func (e *Engine) processProviderFile(
 		(file.Agent == parser.AgentDevin && outcome.ForceReplace) ||
 		(file.Agent == parser.AgentOmnigent && outcome.ForceReplace) ||
 		(file.Agent == parser.AgentCursorIDE && outcome.ForceReplace) ||
+		(file.Agent == parser.AgentJunie && outcome.ForceReplace) ||
 		(file.Agent == parser.AgentTrae && !e.forceParse)) &&
 		outcome.ResultSetComplete && len(outcome.SourceErrors) == 0 {
 		missingMembers, err = e.providerSourceMissingSessionOwnershipsForCompleteResultWithPreserved(
