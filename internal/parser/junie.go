@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -34,17 +35,74 @@ type junieTranscriptMessage struct {
 	active bool
 }
 
+type junieBlock struct {
+	kind      string
+	stepID    string
+	seq       int
+	ts        time.Time
+	taskID    string
+	status    string
+	text      string
+	details   string
+	toolType  string
+	toolName  string
+	command   string
+	output    string
+	input     string
+	skillName string
+	name      string
+	model     string
+	task      string
+	patch     string
+	title     string
+	files     []string
+	changes   []string
+	options   []string
+	cancelled bool
+}
+
+type junieAgentStream struct {
+	id        string
+	name      string
+	kind      string
+	stepID    string
+	blocks    map[string]*junieBlock
+	blockOrd  []string
+	request   string
+	requestTS time.Time
+	usage     []ParsedUsageEvent
+	usageSeen map[string]struct{}
+	cwd       string
+	taskName  string
+	firstTS   time.Time
+	lastTS    time.Time
+	notes     []ParsedMessage
+	cancelled bool
+	failed    bool
+	state     string
+}
+
+func newJunieAgentStream(id string) *junieAgentStream {
+	return &junieAgentStream{
+		id:        id,
+		blocks:    make(map[string]*junieBlock),
+		usageSeen: make(map[string]struct{}),
+	}
+}
+
 type junieParserState struct {
-	entries           []junieTranscriptMessage
-	usageEvents       []ParsedUsageEvent
-	userMessages      map[string]int
-	assistantMessages map[string]int
-	sourceSessionID   string
-	startedAt         time.Time
-	endedAt           time.Time
-	sessionName       string
-	sessionNameFound  bool
-	malformedLines    int
+	entries          []junieTranscriptMessage
+	userMessages     map[string]int
+	streams          map[string]*junieAgentStream
+	streamOrder      []string
+	lastTaskState    string
+	sourceSessionID  string
+	startedAt        time.Time
+	endedAt          time.Time
+	sessionName      string
+	sessionNameFound bool
+	malformedLines   int
+	lastLineBad      bool
 }
 
 type junieRootOpener func(string) (*os.Root, error)
@@ -127,9 +185,9 @@ func parseJunieSessionWithSummary(
 	}
 
 	state := junieParserState{
-		userMessages:      make(map[string]int),
-		assistantMessages: make(map[string]int),
-		sourceSessionID:   filepath.Base(filepath.Dir(path)),
+		userMessages:    make(map[string]int),
+		streams:         map[string]*junieAgentStream{"main": newJunieAgentStream("main")},
+		sourceSessionID: filepath.Base(filepath.Dir(path)),
 	}
 	lr := newLineReaderContext(ctx, f, maxLineSize)
 	defer releaseLineReader(lr)
@@ -143,8 +201,10 @@ func parseJunieSessionWithSummary(
 		}
 		if !gjson.Valid(line) {
 			state.malformedLines++
+			state.lastLineBad = true
 			continue
 		}
+		state.lastLineBad = false
 		if err := state.consumeEvent(gjson.Parse(line), lineNumber); err != nil {
 			return nil, nil, false, fmt.Errorf("parsing Junie session %s line %d: %w", path, lineNumber, err)
 		}
@@ -164,10 +224,12 @@ func parseJunieSessionWithSummary(
 func (s *junieParserState) consumeEvent(event gjson.Result, lineNumber int) error {
 	timestamp := junieTimestamp(event.Get("timestampMs"))
 	if !timestamp.IsZero() {
-		if s.startedAt.IsZero() {
+		if s.startedAt.IsZero() || timestamp.Before(s.startedAt) {
 			s.startedAt = timestamp
 		}
-		s.endedAt = timestamp
+		if timestamp.After(s.endedAt) {
+			s.endedAt = timestamp
+		}
 	}
 
 	switch event.Get("kind").Str {
@@ -241,51 +303,202 @@ func (s *junieParserState) consumeSystemMessage(event gjson.Result, timestamp ti
 func (s *junieParserState) consumeA2UXEvent(
 	event gjson.Result, timestamp time.Time, lineNumber int,
 ) error {
-	agentEvent := event.Get("event.agentEvent")
-	var content string
-	switch agentEvent.Get("kind").Str {
-	case "LlmResponseMetadataEvent":
-		return s.consumeModelUsage(agentEvent, timestamp, lineNumber)
-	case "MarkdownBlockUpdatedEvent":
-		content = strings.TrimSpace(agentEvent.Get("text").Str)
-	case "ResultBlockUpdatedEvent":
-		content = strings.TrimSpace(strings.TrimPrefix(
-			agentEvent.Get("result").Str, "<!-- ANSWER -->",
-		))
-	case "AgentTaskNameUpdatedEvent":
-		taskName := strings.TrimSpace(firstNonEmptyJSONLString(
-			agentEvent.Get("name").Str,
-			agentEvent.Get("taskName").Str,
-		))
-		if taskName != "" {
-			s.sessionName = taskName
-			s.sessionNameFound = true
+	ae := event.Get("event.agentEvent")
+	kind := ae.Get("kind").Str
+	agentID := ae.Get("agent.id").Str
+	if agentID == "" {
+		agentID = ae.Get("agentId").Str
+	}
+	if agentID == "" {
+		if ae.Get("agent.kind").Str == "BuiltInAgent" {
+			agentID = firstNonEmptyJSONLString(
+				ae.Get("agent.name").Str,
+				strings.TrimSuffix(strings.TrimSuffix(
+					ae.Get("stepId").Str, "-request"), "-spawned"),
+				"subagent",
+			)
+		} else {
+			agentID = "main"
 		}
-		return nil
+	}
+	stream := s.streams[agentID]
+	if stream == nil {
+		stream = newJunieAgentStream(agentID)
+		s.streams[agentID] = stream
+		if agentID != "main" {
+			s.streamOrder = append(s.streamOrder, agentID)
+		}
+	}
+	if stream.name == "" {
+		stream.name = firstNonEmptyJSONLString(
+			ae.Get("agent.name").Str, ae.Get("name").Str)
+	}
+	if stream.kind == "" {
+		stream.kind = ae.Get("agent.kind").Str
+	}
+	if !timestamp.IsZero() {
+		if stream.firstTS.IsZero() || timestamp.Before(stream.firstTS) {
+			stream.firstTS = timestamp
+		}
+		if timestamp.After(stream.lastTS) {
+			stream.lastTS = timestamp
+		}
+	}
+	if agentID != "main" {
+		if rawStepID := ae.Get("stepId").Str; rawStepID != "" {
+			if strings.HasSuffix(rawStepID, "-request") ||
+				strings.HasSuffix(rawStepID, "-spawned") {
+				stream.stepID = strings.TrimSuffix(strings.TrimSuffix(
+					rawStepID, "-request"), "-spawned")
+			} else if stream.stepID == "" {
+				stream.stepID = rawStepID
+			}
+		}
+	}
+	taskID := event.Get("taskId").Str
+	eventState := event.Get("event.state").Str
+	if eventState == "CANCELLED" || eventState == "CANCELED" {
+		if agentID == "main" {
+			s.lastTaskState = "CANCELLED"
+		} else {
+			stream.cancelled = true
+			stream.state = "CANCELLED"
+		}
+	} else if eventState == "FAILED" || eventState == "ERROR" {
+		if agentID == "main" {
+			if s.lastTaskState == "" || s.lastTaskState == "COMPLETED" {
+				s.lastTaskState = "FAILED"
+			}
+		} else {
+			stream.failed = true
+			stream.state = "FAILED"
+		}
+	}
+
+	switch kind {
+	case "AgentThoughtBlockUpdatedEvent",
+		"ResultBlockUpdatedEvent",
+		"MarkdownBlockUpdatedEvent",
+		"ToolBlockUpdatedEvent",
+		"TerminalBlockUpdatedEvent",
+		"ViewFilesBlockUpdatedEvent",
+		"FileChangesBlockUpdatedEvent",
+		"McpBlockUpdatedEvent",
+		"AgentPatchCreatedEvent",
+		"AskAsyncRequestUpdatedEvent",
+		"ChoiceRequestUpdatedEvent":
+		junieUpsertBlock(stream, ae, kind, taskID, eventState, lineNumber, timestamp)
+	case "CustomAgentBlockUpdatedEvent",
+		"SubagentSpawnedEvent":
+		if agentID == "main" {
+			junieUpsertBlock(stream, ae, kind, taskID, eventState, lineNumber, timestamp)
+		}
+	case "AgentTaskNameUpdatedEvent":
+		name := strings.TrimSpace(firstNonEmptyJSONLString(
+			ae.Get("name").Str, ae.Get("taskName").Str))
+		if agentID == "main" {
+			if name != "" {
+				s.sessionName = name
+				s.sessionNameFound = true
+			}
+		} else if stream.taskName == "" && name != "" {
+			stream.taskName = name
+		}
+	case "LlmResponseMetadataEvent":
+		return s.consumeModelUsage(stream, ae, taskID, timestamp, lineNumber)
+	case "CurrentDirectoryUpdatedEvent":
+		if dir := ae.Get("currentDirectory").Str; dir != "" && stream.cwd == "" {
+			stream.cwd = dir
+		}
+	case "AgentFailureEvent", "AgentTaskFailedEvent", "CancelAgentEvent":
 	default:
-		return nil
-	}
-	stepID := agentEvent.Get("stepId").Str
-	if index, ok := s.assistantMessages[stepID]; stepID != "" && ok {
-		s.entries[index].Content = content
-		s.entries[index].ContentLength = len(content)
-		s.entries[index].Timestamp = timestamp
-		s.entries[index].active = content != ""
-		return nil
-	}
-	index := s.appendMessage(RoleAssistant, content, timestamp)
-	if stepID != "" {
-		s.assistantMessages[stepID] = index
 	}
 	return nil
 }
 
+func junieUpsertBlock(
+	stream *junieAgentStream, ae gjson.Result, kind, taskID, eventState string,
+	seq int, ts time.Time,
+) {
+	stepID := ae.Get("stepId").Str
+	if stepID == "" {
+		stepID = kind + "#" + ae.Raw[:minInt(len(ae.Raw), 64)]
+	}
+	status := firstNonEmptyJSONLString(ae.Get("status").Str, eventState)
+	cancelled := ae.Get("cancelled").Bool() ||
+		status == "CANCELLED" ||
+		status == "CANCELED" ||
+		eventState == "CANCELLED" ||
+		eventState == "CANCELED" ||
+		(stream != nil && stream.cancelled)
+
+	text := firstNonEmptyJSONLString(ae.Get("text").Str, ae.Get("result").Str)
+	if kind == "ResultBlockUpdatedEvent" {
+		text = strings.TrimPrefix(text, "<!-- ANSWER -->")
+	}
+
+	b := &junieBlock{
+		kind:      kind,
+		stepID:    stepID,
+		seq:       seq,
+		ts:        ts,
+		taskID:    taskID,
+		status:    status,
+		text:      text,
+		details:   ae.Get("details").Str,
+		toolType:  ae.Get("toolType").Str,
+		toolName:  ae.Get("toolName").Str,
+		command:   ae.Get("command").Str,
+		output:    ae.Get("output").Str,
+		input:     ae.Get("input").Str,
+		skillName: ae.Get("skillName").Str,
+		name:      firstNonEmptyJSONLString(ae.Get("name").Str, ae.Get("agent.name").Str),
+		model:     ae.Get("model").Str,
+		task:      firstNonEmptyJSONLString(ae.Get("task").Str, ae.Get("description").Str, ae.Get("prompt").Str),
+		patch:     ae.Get("patch").Str,
+		title:     ae.Get("title").Str,
+		cancelled: cancelled,
+	}
+	for _, f := range ae.Get("files").Array() {
+		if p := f.Get("relativePath").Str; p != "" {
+			b.files = append(b.files, p)
+		}
+	}
+	for _, c := range ae.Get("changes").Array() {
+		if p := c.Get("afterRelativePath").Str; p != "" {
+			b.changes = append(b.changes, p)
+		} else if p := c.Get("relativePath").Str; p != "" {
+			b.changes = append(b.changes, p)
+		}
+	}
+	for _, o := range ae.Get("request.options").Array() {
+		if t := o.Get("title").Str; t != "" {
+			b.options = append(b.options, t)
+		}
+	}
+	if kind == "MarkdownBlockUpdatedEvent" &&
+		strings.HasSuffix(stepID, "-request") && stream.id != "main" {
+		if stream.request == "" {
+			stream.request = b.text
+			stream.requestTS = ts
+		}
+		stream.stepID = strings.TrimSuffix(stepID, "-request")
+		return
+	}
+	if existing, ok := stream.blocks[stepID]; ok {
+		b.seq = existing.seq
+		stream.blocks[stepID] = b
+		return
+	}
+	stream.blocks[stepID] = b
+	stream.blockOrd = append(stream.blockOrd, stepID)
+}
+
 func (s *junieParserState) consumeModelUsage(
-	event gjson.Result, timestamp time.Time, lineNumber int,
+	stream *junieAgentStream, event gjson.Result, taskID string, timestamp time.Time, lineNumber int,
 ) error {
 	for index, usage := range event.Get("modelUsage").Array() {
 		parsed := ParsedUsageEvent{
-			SessionID:                "junie:" + s.sourceSessionID,
 			Source:                   "llm-response",
 			Model:                    strings.TrimSpace(usage.Get("model").Str),
 			InputTokens:              max(int(usage.Get("inputTokens").Int()), 0),
@@ -294,7 +507,7 @@ func (s *junieParserState) consumeModelUsage(
 			CacheReadInputTokens:     max(int(usage.Get("cacheInputTokens").Int()), 0),
 			OccurredAt:               timeString(timestamp.UTC(), s.startedAt.UTC()),
 			DedupKey: fmt.Sprintf(
-				"junie:%s:llm-response:%d:%d", s.sourceSessionID, lineNumber, index,
+				"llm-response:%d:%d", lineNumber, index,
 			),
 		}
 		costValue := usage.Get("cost")
@@ -313,10 +526,99 @@ func (s *junieParserState) consumeModelUsage(
 		if parsed.InputTokens > 0 || parsed.OutputTokens > 0 ||
 			parsed.CacheCreationInputTokens > 0 || parsed.CacheReadInputTokens > 0 ||
 			parsed.Cost != nil {
-			s.usageEvents = append(s.usageEvents, parsed)
+			stream.usage = append(stream.usage, parsed)
 		}
 	}
 	return nil
+}
+
+func junieRewriteUsageSession(
+	stream *junieAgentStream, fullID string,
+) []ParsedUsageEvent {
+	out := make([]ParsedUsageEvent, len(stream.usage))
+	copy(out, stream.usage)
+	for i := range out {
+		out[i].SessionID = fullID
+		out[i].DedupKey = fullID + ":" + out[i].DedupKey
+	}
+	return out
+}
+
+func junieAssembleMessages(
+	stream *junieAgentStream, extra []ParsedMessage,
+) []ParsedMessage {
+	var taskIDs []string
+	byTask := make(map[string][]*junieBlock)
+	for _, stepID := range stream.blockOrd {
+		b := stream.blocks[stepID]
+		if b == nil {
+			continue
+		}
+		if _, seen := byTask[b.taskID]; !seen {
+			taskIDs = append(taskIDs, b.taskID)
+			byTask[b.taskID] = []*junieBlock{b}
+			continue
+		}
+		byTask[b.taskID] = append(byTask[b.taskID], b)
+	}
+
+	var merged []ParsedMessage
+	merged = append(merged, extra...)
+	for _, taskID := range taskIDs {
+		if msg, ok := junieAssistantMessage(byTask[taskID], stream); ok {
+			merged = append(merged, msg)
+		}
+	}
+	merged = append(merged, stream.notes...)
+
+	sort.SliceStable(merged, func(i, j int) bool {
+		return merged[i].Timestamp.Before(merged[j].Timestamp)
+	})
+	for i := range merged {
+		merged[i].Ordinal = i
+	}
+	return merged
+}
+
+func junieAssistantMessage(
+	blocks []*junieBlock, stream *junieAgentStream,
+) (ParsedMessage, bool) {
+	var thinking, content []string
+	var calls []ParsedToolCall
+	var ts time.Time
+
+	for _, b := range blocks {
+		if ts.IsZero() || (!b.ts.IsZero() && b.ts.Before(ts)) {
+			ts = b.ts
+		}
+		switch b.kind {
+		case "AgentThoughtBlockUpdatedEvent":
+			if b.text != "" {
+				thinking = append(thinking, b.text)
+			}
+		case "ResultBlockUpdatedEvent", "MarkdownBlockUpdatedEvent":
+			if b.text != "" && !b.cancelled {
+				content = append(content, b.text)
+			}
+		default:
+			// Tool calls in Task 2
+		}
+	}
+
+	if len(thinking) == 0 && len(content) == 0 && len(calls) == 0 {
+		return ParsedMessage{}, false
+	}
+	msg := ParsedMessage{
+		Role:         RoleAssistant,
+		Content:      strings.Join(content, "\n\n"),
+		ThinkingText: strings.Join(thinking, "\n\n"),
+		Timestamp:    ts,
+		HasThinking:  len(thinking) > 0,
+		HasToolUse:   len(calls) > 0,
+		ToolCalls:    calls,
+	}
+	msg.ContentLength = len(msg.Content)
+	return msg, true
 }
 
 func (s *junieParserState) appendMessage(
@@ -346,28 +648,32 @@ func (s *junieParserState) session(
 	fileSize, mtime int64,
 	summary junieSessionSummary, summaryPresent bool,
 ) (*ParsedSession, []ParsedMessage, bool, error) {
-	messages := make([]ParsedMessage, 0, len(s.entries))
-	firstMessage := ""
+	main := s.streams["main"]
+	if main == nil {
+		main = newJunieAgentStream("main")
+	}
+	var extra []ParsedMessage
 	userCount := 0
+	firstMessage := ""
 	for _, entry := range s.entries {
 		if !entry.active || strings.TrimSpace(entry.Content) == "" {
 			continue
 		}
-		entry.Ordinal = len(messages)
-		messages = append(messages, entry.ParsedMessage)
-		if entry.Role == RoleUser {
+		extra = append(extra, entry.ParsedMessage)
+		if entry.Role == RoleUser && !entry.IsSystem {
 			userCount++
 			if firstMessage == "" {
 				firstMessage = truncate(strings.ReplaceAll(entry.Content, "\n", " "), 300)
 			}
 		}
 	}
-	// Preserve recognized empty projections so force replacement can clear stale messages.
-	// A wholly empty or unrecognized stream may be a partial rewrite and stays skipped.
-	if len(messages) == 0 && len(s.entries) == 0 && len(s.usageEvents) == 0 && !s.sessionNameFound {
+	messages := junieAssembleMessages(main, extra)
+
+	hasActivity := len(main.blocks) > 0 || len(main.usage) > 0
+	if len(messages) == 0 && len(s.entries) == 0 && !hasActivity && !s.sessionNameFound {
 		return nil, nil, false, nil
 	}
-	if userCount == 0 && len(s.assistantMessages) == 0 && len(s.usageEvents) == 0 && !s.sessionNameFound && !summaryPresent {
+	if userCount == 0 && !hasActivity && !s.sessionNameFound && !summaryPresent {
 		return nil, nil, true, nil
 	}
 
@@ -393,11 +699,16 @@ func (s *junieParserState) session(
 	}
 	projectDir := strings.TrimSpace(summary.projectDir)
 	cwd := projectDir
-	if filepath.IsAbs(projectDir) {
-		cwd = filepath.Clean(projectDir)
-	} else if !strings.HasPrefix(projectDir, "/") && !looksLikeWindowsPath(projectDir) {
+	if cwd == "" {
+		cwd = main.cwd
+	}
+	if filepath.IsAbs(cwd) {
+		cwd = filepath.Clean(cwd)
+	} else if !strings.HasPrefix(cwd, "/") && !looksLikeWindowsPath(cwd) {
 		cwd = ""
 	}
+
+	usageEvents := junieRewriteUsageSession(main, "junie:"+sourceSessionID)
 
 	session := &ParsedSession{
 		ID:                 "junie:" + sourceSessionID,
@@ -420,9 +731,23 @@ func (s *junieParserState) session(
 			Mtime: mtime,
 		},
 	}
-	applyUsageEventTokenTotals(session, s.usageEvents)
-	session.UsageEvents = s.usageEvents
+	applyUsageEventTokenTotals(session, usageEvents)
+	session.UsageEvents = usageEvents
 	return session, messages, false, nil
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func firstString(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
 }
 
 func parseJunieSessionSummary(line string) junieSessionSummary {
