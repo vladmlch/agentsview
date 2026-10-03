@@ -18,6 +18,7 @@ import (
 type junieSessionSummary struct {
 	projectDir string
 	taskName   string
+	lifecycle  string
 	createdAt  time.Time
 	updatedAt  time.Time
 }
@@ -26,6 +27,7 @@ func (s junieIndexSummary) sessionSummary() junieSessionSummary {
 	return junieSessionSummary{
 		projectDir: s.ProjectDir,
 		taskName:   s.TaskName,
+		lifecycle:  strings.ToUpper(s.Status),
 		createdAt:  junieMillisTimestamp(s.CreatedAt),
 		updatedAt:  junieMillisTimestamp(s.UpdatedAt),
 	}
@@ -249,8 +251,17 @@ func (s *junieParserState) consumeEvent(event gjson.Result, lineNumber int) erro
 		s.sessionNameFound = true
 	case "SystemMessageEvent":
 		s.consumeSystemMessage(event, timestamp)
-	case "AgentTaskFailedEvent":
-		s.appendMessage(RoleSystem, "Agent task failed", timestamp)
+	case "CancelAgentEvent":
+		s.consumeAgentLifecycleEvent(event, timestamp, "CancelAgentEvent")
+	case "AgentTaskFailedEvent", "AgentFailureEvent":
+		s.consumeAgentLifecycleEvent(event, timestamp, event.Get("kind").Str)
+	case "TaskState":
+		st := event.Get("state").Str
+		if s.lastTaskState != "CANCELLED" && s.lastTaskState != "CANCELED" && s.lastTaskState != "FAILED" {
+			s.lastTaskState = st
+		} else if st == "CANCELLED" || st == "CANCELED" || st == "FAILED" {
+			s.lastTaskState = st
+		}
 	case "SessionA2uxEvent":
 		return s.consumeA2UXEvent(event, timestamp, lineNumber)
 	}
@@ -298,7 +309,78 @@ func (s *junieParserState) consumeSystemMessage(event gjson.Result, timestamp ti
 	if details != "" && details != text {
 		text = strings.TrimSpace(text + "\n\n" + details)
 	}
-	s.appendMessage(RoleSystem, text, timestamp)
+	s.entries = append(s.entries, junieTranscriptMessage{
+		ParsedMessage: ParsedMessage{
+			Role:          RoleSystem,
+			IsSystem:      true,
+			Content:       text,
+			ContentLength: len(text),
+			Timestamp:     timestamp,
+			SourceSubtype: event.Get("level").Str,
+		},
+		active: strings.TrimSpace(text) != "",
+	})
+}
+
+func (s *junieParserState) consumeAgentLifecycleEvent(
+	event gjson.Result, timestamp time.Time, kind string,
+) {
+	targetAgent := firstNonEmptyJSONLString(
+		event.Get("agent.id").Str, event.Get("agentId").Str,
+		event.Get("targetAgentId").Str, event.Get("agent.name").Str,
+		event.Get("agentName").Str,
+	)
+	stepID := event.Get("stepId").Str
+	fallback := "Task failed"
+	if kind == "CancelAgentEvent" {
+		fallback = "Task cancelled"
+	}
+	text := firstNonEmptyJSONLString(
+		event.Get("message").Str, event.Get("reason").Str,
+		event.Get("errorCode").Str, fallback,
+	)
+	msg := junieTranscriptMessage{
+		ParsedMessage: ParsedMessage{
+			Role:          RoleSystem,
+			IsSystem:      true,
+			Content:       text,
+			ContentLength: len(text),
+			Timestamp:     timestamp,
+			SourceSubtype: kind,
+		},
+		active: strings.TrimSpace(text) != "",
+	}
+	st := findJunieStream(s.streams, targetAgent, stepID)
+	switch {
+	case st != nil && st.id != "main":
+		if kind == "CancelAgentEvent" {
+			st.cancelled = true
+			st.state = "CANCELLED"
+		} else {
+			st.failed = true
+			st.state = "FAILED"
+		}
+		st.notes = append(st.notes, msg.ParsedMessage)
+	case targetAgent != "" && targetAgent != "main":
+		st = newJunieAgentStream(targetAgent)
+		if kind == "CancelAgentEvent" {
+			st.cancelled = true
+			st.state = "CANCELLED"
+		} else {
+			st.failed = true
+			st.state = "FAILED"
+		}
+		s.streams[targetAgent] = st
+		s.streamOrder = append(s.streamOrder, targetAgent)
+		st.notes = append(st.notes, msg.ParsedMessage)
+	default:
+		if kind == "CancelAgentEvent" {
+			s.lastTaskState = "CANCELLED"
+		} else {
+			s.lastTaskState = "FAILED"
+		}
+		s.entries = append(s.entries, msg)
+	}
 }
 
 func (s *junieParserState) consumeA2UXEvent(
@@ -412,6 +494,39 @@ func (s *junieParserState) consumeA2UXEvent(
 			stream.cwd = dir
 		}
 	case "AgentFailureEvent", "AgentTaskFailedEvent", "CancelAgentEvent":
+		fallback := "Task failed"
+		if kind == "CancelAgentEvent" {
+			fallback = "Task cancelled"
+		}
+		text := firstNonEmptyJSONLString(
+			ae.Get("message").Str, ae.Get("reason").Str,
+			ae.Get("errorCode").Str, fallback,
+		)
+		stream.notes = append(stream.notes, ParsedMessage{
+			Role:          RoleSystem,
+			IsSystem:      true,
+			Content:       text,
+			ContentLength: len(text),
+			Timestamp:     timestamp,
+			SourceSubtype: kind,
+		})
+		if kind == "CancelAgentEvent" {
+			if agentID == "main" {
+				s.lastTaskState = "CANCELLED"
+			} else {
+				stream.cancelled = true
+				stream.state = "CANCELLED"
+			}
+		} else {
+			if agentID == "main" {
+				if s.lastTaskState == "" || s.lastTaskState == "COMPLETED" {
+					s.lastTaskState = "FAILED"
+				}
+			} else {
+				stream.failed = true
+				stream.state = "FAILED"
+			}
+		}
 	default:
 	}
 	return nil
@@ -876,6 +991,22 @@ func (s *junieParserState) session(
 			Size:  fileSize,
 			Mtime: mtime,
 		},
+	}
+	session.IsTruncated = s.lastLineBad
+	stopReason := ""
+	switch {
+	case s.lastTaskState == "COMPLETED":
+		stopReason = "task_complete"
+	case summary.lifecycle == "FINISHED" || summary.lifecycle == "COMPLETED":
+		stopReason = "task_complete"
+	}
+	isCancelledOrFailed := s.lastTaskState == "CANCELLED" || s.lastTaskState == "CANCELED" || s.lastTaskState == "FAILED" ||
+		summary.lifecycle == "CANCELLED" || summary.lifecycle == "CANCELED" || summary.lifecycle == "FAILED" ||
+		main.cancelled || main.failed || main.state == "CANCELLED" || main.state == "CANCELED" || main.state == "FAILED"
+	if isCancelledOrFailed {
+		session.TerminationStatus = TerminationTruncated
+	} else {
+		session.TerminationStatus = Classify(messages, stopReason, s.lastLineBad)
 	}
 	applyUsageEventTokenTotals(session, usageEvents)
 	session.UsageEvents = usageEvents
