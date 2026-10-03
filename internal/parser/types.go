@@ -421,6 +421,7 @@ var Registry = []AgentDef{
 		DefaultDirs:       []string{".junie/sessions"},
 		IDPrefix:          "junie:",
 		FileBased:         true,
+		Usage:             UsageCapabilities{NoPerMessageTokenData: true},
 	},
 	{
 		Type:        AgentZencoder,

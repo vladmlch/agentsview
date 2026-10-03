@@ -90,9 +90,29 @@ func newJunieSourceSetWithCache(
 			WithDescendPath(func(root, path string) bool { return filepath.Dir(path) == root }),
 			WithParseFile(indexCache.parseFile),
 			WithForceReplace(),
+			WithContentHashing(),
+			WithCompanionFiles(junieCompanionFiles),
+			WithCompanionTranscript(junieCompanionTranscript),
+			WithRejectSymlinkCompanions(),
 		).JSONLSourceSet,
 		indexCache: indexCache,
 	}
+}
+
+func junieCompanionFiles(transcriptPath string) []string {
+	dir := filepath.Dir(transcriptPath)
+	return []string{
+		filepath.Join(dir, junieStateFile),
+		filepath.Join(dir, junieSummaryFile),
+	}
+}
+
+func junieCompanionTranscript(companionPath string) (string, bool) {
+	switch filepath.Base(companionPath) {
+	case junieStateFile, junieSummaryFile:
+		return filepath.Join(filepath.Dir(companionPath), junieEventsFile), true
+	}
+	return "", false
 }
 
 func (s junieSourceSet) StoredSourceHintScopes(
@@ -293,6 +313,10 @@ func (s junieSourceSet) Fingerprint(
 		Hash: hex.EncodeToString(h.Sum(nil)),
 		Size: info.Size(), MTimeNS: info.ModTime().UnixNano(),
 		Inode: inode, Device: device,
+	}
+
+	if err := s.JSONLSourceSet.foldCompanionFingerprint(src.Path, &fingerprint); err != nil {
+		return SourceFingerprint{}, err
 	}
 
 	indexPath := filepath.Join(filepath.Dir(filepath.Dir(src.Path)), "index.jsonl")

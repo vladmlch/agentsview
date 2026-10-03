@@ -35,7 +35,8 @@ The latest published release is
   override so new OMO sessions are not indexed twice.
 - Index JetBrains Junie sessions from `~/.junie/sessions/` with full
   transcripts: prompts, thinking, replies, tool, terminal, file, and MCP
-  activity, subagent runs, and per-call token usage with Junie's recorded
+  activity, sidecar metadata from `summary.json` and `state.json`, subagent
+  runs as linked sessions, and per-call token usage with Junie's recorded
   USD costs. `JUNIE_HOME` re-roots the Junie home directory and `JUNIE_DIR`
   or `agents.junie.dirs` point at custom sessions directories.
 - Verify conversation memory through an opt-in live release gate that records a

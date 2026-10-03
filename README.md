@@ -447,7 +447,7 @@ append-only event stream JetBrains Junie writes per task: user prompts, agent
 thinking, replies, tool, terminal, file-view, and MCP blocks, subagent
 activity, and per-call token usage with recorded costs. Session titles,
 projects, and timestamps come from the `index.jsonl` catalog when present and
-fall back to in-stream metadata. Set `JUNIE_DIR` or `agents.junie.dirs` to one
+fall back to in-stream and sidecar metadata. Set `JUNIE_DIR` or `agents.junie.dirs` to one
 or more sessions directories, or `JUNIE_HOME` to a Junie home directory whose
 `sessions/` subdirectory is indexed.
 

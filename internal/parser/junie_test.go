@@ -1141,3 +1141,89 @@ func TestJunieSubagentSession(t *testing.T) {
 		assert.NotContains(t, m.ThinkingText, "Scanning token handling")
 	}
 }
+
+func TestJunieSummaryJSONLifecycleCancelled(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-260101-120000-abcd")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Hi","timestampMs":1704067200000}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"s1","result":"ok"}},"timestampMs":1704067200100}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(sessionDir, "summary.json"),
+		[]byte(`{"taskName":"Sidecar title","lifecycle":"CANCELLED"}`), 0o600))
+
+	sess, _ := parseJunieProviderSession(t, path, "local")
+	assert.Equal(t, "Sidecar title", sess.SessionName)
+	assert.Equal(t, TerminationTruncated, sess.TerminationStatus)
+}
+
+func TestJunieStateJSONCwdFallback(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-260101-120000-abcd")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Hi","timestampMs":1704067200000}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"s1","result":"ok"}},"timestampMs":1704067200100}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(sessionDir, "state.json"),
+		[]byte(`{"event":{"agentEvent":{"blob":"{\"currentDirectory\":\"/work/stateproj\",\"lastAgentState\":{\"issue\":{\"name\":\"State title\"}}}"}}}`), 0o600))
+
+	sess, _ := parseJunieProviderSession(t, path, "local")
+	assert.Equal(t, "/work/stateproj", sess.Cwd)
+	assert.Equal(t, "stateproj", sess.Project)
+	assert.Equal(t, "State title", sess.SessionName)
+}
+
+func TestJunieFallsBackToIDTimestampWhenTimestampMsMissing(t *testing.T) {
+	root := t.TempDir()
+	sessionID := "session-260423-110831-1hhe"
+	sessionDir := filepath.Join(root, sessionID)
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Hi"}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"s1","result":"ok"}}}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	sess, messages := parseJunieProviderSession(t, path, "local")
+	want := time.Date(2026, 4, 23, 11, 8, 31, 0, time.UTC)
+	assert.Equal(t, want, sess.StartedAt.UTC())
+	for _, m := range messages {
+		assert.Equal(t, want, m.Timestamp.UTC(), "zero-ts messages backfill to session start")
+	}
+}
+
+func TestJunieFallsBackToFileMtime(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-notimestamp")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Hi"}`+"\n"), 0o600))
+	mtime := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	require.NoError(t, os.Chtimes(path, mtime, mtime))
+
+	sess, _ := parseJunieProviderSession(t, path, "local")
+	assert.Equal(t, mtime, sess.StartedAt.UTC())
+}
+
+func TestJunieUserPromptSourceUUID(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-260101-120000-abcd")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"req-abc-123","prompt":"Hi","timestampMs":1704067200000}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	_, messages := parseJunieProviderSession(t, path, "local")
+	require.Len(t, messages, 1)
+	assert.Equal(t, "req-abc-123", messages[0].SourceUUID)
+}
