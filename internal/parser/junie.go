@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,6 +14,12 @@ import (
 
 	"github.com/tidwall/gjson"
 	"go.kenn.io/agentsview/internal/money"
+)
+
+const (
+	junieEventsFile  = "events.jsonl"
+	junieStateFile   = "state.json"
+	junieSummaryFile = "summary.json"
 )
 
 type junieSessionSummary struct {
@@ -188,6 +195,12 @@ func parseJunieSessionWithSummary(
 	}
 
 	rawID := filepath.Base(filepath.Dir(path))
+	sessionDir := filepath.Dir(path)
+	if err := junieLoadSidecarMeta(sessionDir, openRoot, &summary); err != nil {
+		return nil, nil, fmt.Errorf("reading Junie sidecar metadata %s: %w", sessionDir, err)
+	}
+	stateCwd, stateTaskName := junieStateMeta(sessionDir, openRoot)
+
 	state := junieParserState{
 		userMessages:    make(map[string]int),
 		streams:         map[string]*junieAgentStream{"main": newJunieAgentStream("main")},
@@ -220,7 +233,7 @@ func parseJunieSessionWithSummary(
 		return nil, nil, fmt.Errorf("reading Junie session %s: record exceeds %d bytes", path, maxLineSize)
 	}
 	return state.results(
-		ctx, path, machine, rawID, info, summary, summaryPresent,
+		ctx, path, machine, rawID, info, summary, summaryPresent, stateCwd, stateTaskName,
 	)
 }
 
@@ -280,10 +293,12 @@ func (s *junieParserState) consumeUserPrompt(event gjson.Result, timestamp time.
 		s.entries[index].ContentLength = len(content)
 		s.entries[index].Timestamp = timestamp
 		s.entries[index].active = active
+		s.entries[index].SourceUUID = requestID
 		return
 	}
 	index := s.appendMessage(RoleUser, content, timestamp)
 	s.entries[index].active = active
+	s.entries[index].SourceUUID = requestID
 	if requestID != "" {
 		s.userMessages[requestID] = index
 	}
@@ -911,6 +926,7 @@ func (s *junieParserState) parentResult(
 	ctx context.Context, path, machine, sourceSessionID string,
 	fileSize, mtime int64,
 	summary junieSessionSummary, summaryPresent bool,
+	stateCwd, stateTaskName string,
 ) (*ParsedSession, []ParsedMessage, bool) {
 	main := s.streams["main"]
 	if main == nil {
@@ -934,37 +950,54 @@ func (s *junieParserState) parentResult(
 	messages := junieAssembleMessages(main, extra)
 
 	hasActivity := len(main.blocks) > 0 || len(main.usage) > 0
-	if len(messages) == 0 && len(s.entries) == 0 && !hasActivity && !s.sessionNameFound {
+	if len(messages) == 0 && len(s.entries) == 0 && !hasActivity && !s.sessionNameFound && summary.taskName == "" && stateTaskName == "" {
 		return nil, nil, false
 	}
-	if userCount == 0 && !hasActivity && !s.sessionNameFound && !summaryPresent {
+	if userCount == 0 && !hasActivity && !s.sessionNameFound && !summaryPresent && summary.taskName == "" && stateTaskName == "" {
 		return nil, nil, true
 	}
 
-	if !summary.createdAt.IsZero() &&
-		(s.startedAt.IsZero() || summary.createdAt.Before(s.startedAt)) {
-		s.startedAt = summary.createdAt
+	startedAt := s.startedAt
+	if !summary.createdAt.IsZero() && (startedAt.IsZero() || summary.createdAt.Before(startedAt)) {
+		startedAt = summary.createdAt
 	}
-	if summary.updatedAt.After(s.endedAt) {
-		s.endedAt = summary.updatedAt
+	if startedAt.IsZero() {
+		startedAt = junieTimestampFromID(sourceSessionID)
 	}
-	if !s.sessionNameFound && summaryPresent {
-		s.sessionName = summary.taskName
+	if startedAt.IsZero() && mtime > 0 {
+		startedAt = time.Unix(0, mtime).UTC()
+	}
+
+	endedAt := s.endedAt
+	if !summary.updatedAt.IsZero() && summary.updatedAt.After(endedAt) {
+		endedAt = summary.updatedAt
+	}
+	if endedAt.IsZero() || endedAt.Before(startedAt) {
+		if mtime > 0 && time.Unix(0, mtime).UTC().After(startedAt) {
+			endedAt = time.Unix(0, mtime).UTC()
+		} else {
+			endedAt = startedAt
+		}
+	}
+
+	if !s.sessionNameFound {
+		if summary.taskName != "" {
+			s.sessionName = summary.taskName
+		} else if stateTaskName != "" {
+			s.sessionName = stateTaskName
+		}
 	}
 	if firstMessage == "" && strings.TrimSpace(s.sessionName) != "" {
 		firstMessage = s.sessionName
 	}
 
-	project := ExtractProjectFromCwdWithBranchContext(
-		WithoutFilesystemProjectDiscovery(ctx), summary.projectDir, "",
-	)
-	if project == "" {
-		project = "junie"
-	}
 	projectDir := strings.TrimSpace(summary.projectDir)
 	cwd := projectDir
 	if cwd == "" {
 		cwd = main.cwd
+	}
+	if cwd == "" {
+		cwd = stateCwd
 	}
 	if filepath.IsAbs(cwd) {
 		cwd = filepath.Clean(cwd)
@@ -972,9 +1005,16 @@ func (s *junieParserState) parentResult(
 		cwd = ""
 	}
 
+	project := ExtractProjectFromCwdWithBranchContext(
+		WithoutFilesystemProjectDiscovery(ctx), cwd, "",
+	)
+	if project == "" {
+		project = "junie"
+	}
+
 	for i := range messages {
 		if messages[i].Timestamp.IsZero() {
-			messages[i].Timestamp = s.startedAt
+			messages[i].Timestamp = startedAt
 		}
 	}
 
@@ -989,9 +1029,9 @@ func (s *junieParserState) parentResult(
 		Cwd:                cwd,
 		FirstMessage:       firstMessage,
 		SessionName:        s.sessionName,
-		SessionNamePresent: s.sessionNameFound || summaryPresent,
-		StartedAt:          s.startedAt,
-		EndedAt:            s.endedAt,
+		SessionNamePresent: s.sessionNameFound || summaryPresent || summary.taskName != "" || stateTaskName != "",
+		StartedAt:          startedAt,
+		EndedAt:            endedAt,
 		MessageCount:       len(messages),
 		UserMessageCount:   userCount,
 		MalformedLines:     s.malformedLines,
@@ -1025,6 +1065,7 @@ func (s *junieParserState) parentResult(
 func (s *junieParserState) results(
 	ctx context.Context, path, machine, rawID string, info os.FileInfo,
 	summary junieSessionSummary, summaryPresent bool,
+	stateCwd, stateTaskName string,
 ) ([]ParseResult, []string, error) {
 	fullID := "junie:" + rawID
 	var fileSize, mtime int64
@@ -1032,7 +1073,9 @@ func (s *junieParserState) results(
 		fileSize = info.Size()
 		mtime = info.ModTime().UnixNano()
 	}
-	sess, msgs, isStub := s.parentResult(ctx, path, machine, rawID, fileSize, mtime, summary, summaryPresent)
+	sess, msgs, isStub := s.parentResult(
+		ctx, path, machine, rawID, fileSize, mtime, summary, summaryPresent, stateCwd, stateTaskName,
+	)
 	var results []ParseResult
 	var excluded []string
 	if sess == nil {
@@ -1075,6 +1118,76 @@ func (s *junieParserState) results(
 		}
 	}
 	return results, excluded, nil
+}
+
+func readJunieSidecarFile(
+	sessionDir, name string, openRoot junieRootOpener,
+) ([]byte, error) {
+	root, err := openRoot(filepath.Dir(sessionDir))
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	rel := filepath.Join(filepath.Base(sessionDir), name)
+	info, err := root.Lstat(rel)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("junie sidecar is not a regular file")
+	}
+	f, err := openJuniePinnedFile(root, rel, info)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
+func junieLoadSidecarMeta(
+	sessionDir string, openRoot junieRootOpener, summary *junieSessionSummary,
+) error {
+	raw, err := readJunieSidecarFile(sessionDir, junieSummaryFile, openRoot)
+	if err != nil {
+		if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !gjson.ValidBytes(raw) {
+		return nil
+	}
+	s := gjson.ParseBytes(raw)
+	if v := s.Get("taskName").Str; v != "" {
+		summary.taskName = v
+	}
+	if v := s.Get("projectDir").Str; v != "" {
+		summary.projectDir = v
+	}
+	if v := firstNonEmptyJSONLString(s.Get("lifecycle").Str, s.Get("status").Str, s.Get("state").Str); v != "" {
+		summary.lifecycle = v
+	}
+	if t := junieTimestamp(s.Get("createdAt")); !t.IsZero() {
+		summary.createdAt = t
+	}
+	if t := junieTimestamp(s.Get("updatedAt")); !t.IsZero() {
+		summary.updatedAt = t
+	}
+	return nil
+}
+
+func junieStateMeta(sessionDir string, openRoot junieRootOpener) (string, string) {
+	raw, err := readJunieSidecarFile(sessionDir, junieStateFile, openRoot)
+	if err != nil || !gjson.ValidBytes(raw) {
+		return "", ""
+	}
+	blob := gjson.GetBytes(raw, "event.agentEvent.blob").Str
+	if blob == "" || !gjson.Valid(blob) {
+		return "", ""
+	}
+	cwd := gjson.Get(blob, "currentDirectory").Str
+	taskName := gjson.Get(blob, "lastAgentState.issue.name").Str
+	return cwd, taskName
 }
 
 func minInt(a, b int) int {

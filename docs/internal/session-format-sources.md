@@ -4915,7 +4915,7 @@ schemas keep their existing ordering behavior.
   Per-session sidecars include `state.json`, `summary.json` (lifecycle plus
   aggregate `modelUsage`), `transcript.md`, `checkpoints/`, and
   `task-*/terminal-output/*.txt`. An optional `<root>/index.jsonl` catalog
-  carries `sessionId`, `taskName`, `projectDir`, `createdAt`, and
+  carries `sessionId`, `taskName`, `projectDir`, `status`, `createdAt`, and
   `updatedAt` (epoch ms); the catalog is incomplete — observed session
   directories exist without index rows.
 - **Evidence:** `no-public-source`.
@@ -4931,7 +4931,9 @@ schemas keep their existing ordering behavior.
   `cacheInputTokens`, `cacheCreateTokens`, and a provider-reported `cost` in
   USD. Agentsview maps `cacheInputTokens` to cache-read input and
   `cacheCreateTokens` to cache-creation input and preserves the recorded USD
-  cost rather than catalog-pricing. `SessionCostTrajectorySnapshotEvent`
+  cost rather than catalog-pricing. Usage dedup is position-scoped per stream
+  (`junie:<id>:llm-response:<line>:<index>`).
+  `SessionCostTrajectorySnapshotEvent`
   holds cumulative session totals (including `reasoningTokens`, which is not
   persisted per call) and is used only as a test cross-check, not emitted as
   a usage record.
@@ -4941,18 +4943,20 @@ schemas keep their existing ordering behavior.
   (streams containing only system notices or non-conversational events without
   user prompts, assistant turns, usage, a task title, or an index row),
   purging any previously ingested stubs; `index.jsonl` supplies title, project,
-  and timestamps when present, with `AgentTaskNameUpdatedEvent` and
-  `state.json` as fallbacks. Repeated `stepId` updates deduplicate last-wins;
+  status (mapped to lifecycle), and timestamps when present, with
+  `AgentTaskNameUpdatedEvent`, `summary.json`, and `state.json` as fallbacks.
+  `summary.json` and `state.json` are read as sidecars and folded into source
+  freshness. When timestamps are missing, start times fall back to directory ID
+  timestamp parsing (`session-YYMMDD-HHMMSS-...`) and file mtime. Repeated
   `stepId` updates deduplicate last-wins; assistant blocks group into one
   message per `taskId`. Subagent sessions synthesize as `<parent>--agent-N`
   children from the parent stream's nested `agent.id` blocks, linked to parent
   `SubagentSpawnedEvent` calls via stepId prefix disambiguation;
   `CancelAgentEvent` and `AgentTaskFailedEvent` mark sessions and failed
-  children with truncated termination. The parser falls back to
-  `subagents/*.md` when needed; `terminal-output/*.txt` fills in terminal
-  results only when no inline `output` exists. `checkpoints/` and
-  `transcript.md` are not transcript sources. `JUNIE_HOME` reroots
-  `~/.junie`; `JUNIE_DIR`/`agents.junie.dirs` override the sessions root.
+  children with truncated termination. On-disk artifacts like `subagents/*.md`,
+  `task-*/terminal-output/*.txt`, `checkpoints/`, and `transcript.md` are not
+  parsed as transcripts. `JUNIE_HOME` reroots `~/.junie`;
+  `JUNIE_DIR`/`agents.junie.dirs` override the sessions root.
 
 ## fx (`fx`)
 
