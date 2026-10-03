@@ -29,6 +29,7 @@ var errInvalidJunieIndex = errors.New("invalid Junie index")
 type junieIndexSummary struct {
 	ProjectDir string `json:"projectDir,omitempty"`
 	TaskName   string `json:"taskName,omitempty"`
+	Status     string `json:"status,omitempty"`
 	CreatedAt  int64  `json:"createdAt,omitempty"`
 	UpdatedAt  int64  `json:"updatedAt,omitempty"`
 }
@@ -480,6 +481,7 @@ func parseJunieIndexSummary(line string) junieIndexSummary {
 	return junieIndexSummary{
 		ProjectDir: summary.projectDir,
 		TaskName:   summary.taskName,
+		Status:     summary.lifecycle,
 		CreatedAt:  createdAt,
 		UpdatedAt:  updatedAt,
 	}
@@ -541,6 +543,8 @@ func junieProviderCapabilities() Capabilities {
 			ToolCalls:            CapabilitySupported,
 			ToolResults:          CapabilitySupported,
 			ToolResultEvents:     CapabilitySupported,
+			TerminationStatus:    CapabilitySupported,
+			TruncationStatus:     CapabilitySupported,
 		},
 	}
 }

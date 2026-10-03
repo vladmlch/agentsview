@@ -112,9 +112,10 @@ func TestParseJunieSession(t *testing.T) {
 	assertMessage(t, messages[1], RoleUser, "Restore me")
 	assertMessage(t, messages[2], RoleAssistant, "Done\n\nFinished")
 	assertMessage(t, messages[3], RoleSystem, "Notice\n\nDetails")
-	assertMessage(t, messages[4], RoleSystem, "Agent task failed")
+	assertMessage(t, messages[4], RoleSystem, "Task failed")
 	assert.True(t, messages[3].IsSystem)
 	assert.True(t, messages[4].IsSystem)
+	assert.Equal(t, "AgentTaskFailedEvent", messages[4].SourceSubtype)
 	assertMessage(t, messages[5], RoleUser, "Continue?\nYes")
 	for i, message := range messages {
 		assert.Equal(t, i, message.Ordinal)
@@ -957,4 +958,105 @@ func TestJunieToolCalls(t *testing.T) {
 	// An IN_PROGRESS call stays "running" — feeds tool_call_pending later.
 	assert.Equal(t, "Terminal", tc[8].ToolName)
 	assert.Equal(t, "running", tc[8].ResultEvents[0].Status)
+}
+
+func TestJunieCancelAndFailedEvents(t *testing.T) {
+	for _, tt := range []struct {
+		kind, body, want string
+	}{
+		{"CancelAgentEvent", `"message":"Interrupted by user"`, "Interrupted by user"},
+		{"AgentTaskFailedEvent", `"reason":"LLM rate limit"`, "LLM rate limit"},
+		{"AgentFailureEvent", `"errorCode":"AUTH"`, "AUTH"},
+	} {
+		t.Run(tt.kind, func(t *testing.T) {
+			root := t.TempDir()
+			sessionDir := filepath.Join(root, "session-260101-120000-abcd")
+			require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+			events := []byte(
+				`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Hi","timestampMs":1704067200000}` + "\n" +
+					`{"kind":"` + tt.kind + `",` + tt.body + `,"timestampMs":1704067200100}` + "\n",
+			)
+			path := filepath.Join(sessionDir, "events.jsonl")
+			require.NoError(t, os.WriteFile(path, events, 0o600))
+
+			sess, messages := parseJunieProviderSession(t, path, "local")
+
+			var note *ParsedMessage
+			for i := range messages {
+				if messages[i].IsSystem && messages[i].SourceSubtype == tt.kind {
+					note = &messages[i]
+				}
+			}
+			require.NotNil(t, note)
+			assert.Equal(t, tt.want, note.Content)
+			assert.Equal(t, TerminationTruncated, sess.TerminationStatus)
+		})
+	}
+}
+
+func TestJunieTaskStateCompletedClassifiesAwaitingUser(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-260101-120000-abcd")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Hi","timestampMs":1704067200000}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"s1","result":"ok"}},"timestampMs":1704067200100}` + "\n" +
+			`{"kind":"TaskState","state":"COMPLETED","timestampMs":1704067200200}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	sess, _ := parseJunieProviderSession(t, path, "local")
+	assert.Equal(t, TerminationAwaitingUser, sess.TerminationStatus)
+}
+
+func TestJunieCancelThenCompletedStaysTruncated(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-260101-120000-abcd")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Hi","timestampMs":1704067200000}` + "\n" +
+			`{"kind":"CancelAgentEvent","message":"stop","timestampMs":1704067200100}` + "\n" +
+			`{"kind":"TaskState","state":"COMPLETED","timestampMs":1704067200200}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	sess, _ := parseJunieProviderSession(t, path, "local")
+	assert.Equal(t, TerminationTruncated, sess.TerminationStatus)
+}
+
+func TestJunieTruncatedFileMarksSession(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-260101-120000-abcd")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Hi","timestampMs":1704067200000}` + "\n" +
+			"{\"kind\":\"UserPromptEvent\",\"prompt\":\"cut" + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	sess, _ := parseJunieProviderSession(t, path, "local")
+	assert.True(t, sess.IsTruncated)
+	assert.Equal(t, 1, sess.MalformedLines)
+	assert.Equal(t, TerminationTruncated, sess.TerminationStatus)
+}
+
+func TestJunieCancelledResultBlockExcluded(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-260101-120000-abcd")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Hi","timestampMs":1704067200000}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"s1","status":"CANCELLED","result":"partial draft"}},"timestampMs":1704067200100}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"MarkdownBlockUpdatedEvent","stepId":"s2","text":"real answer"}},"timestampMs":1704067200200}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	_, messages := parseJunieProviderSession(t, path, "local")
+	for _, m := range messages {
+		assert.NotContains(t, m.Content, "partial draft")
+	}
 }
