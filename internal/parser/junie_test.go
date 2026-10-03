@@ -885,3 +885,76 @@ func TestJunieThinkingAndTaskGrouping(t *testing.T) {
 	}
 	assert.False(t, sess.IsTruncated)
 }
+
+func TestJunieToolCalls(t *testing.T) {
+	root := t.TempDir()
+	sessionID := "session-260101-120000-abcd"
+	sessionDir := filepath.Join(root, sessionID)
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Do the work","timestampMs":1704067200000}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"state":"COMPLETED","agentEvent":{"kind":"ViewFilesBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"sv","status":"COMPLETED","files":[{"relativePath":"src/auth.go"}],"details":"opened"}},"timestampMs":1704067200100}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"state":"COMPLETED","agentEvent":{"kind":"TerminalBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"st","status":"COMPLETED","command":"go test ./auth","output":"ok auth"}},"timestampMs":1704067200200}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"McpBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"sm","toolName":"ijproxy/search_text","input":"{\"q\":\"login\"}","status":"COMPLETED","details":"4 hits"}},"timestampMs":1704067200300}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"ToolBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"sg","text":"Search login","status":"COMPLETED","toolType":"Search"}},"timestampMs":1704067200400}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"ToolBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"ss","text":"Run lint","status":"COMPLETED","toolType":"Skill","skillName":"golangci-lint"}},"timestampMs":1704067200500}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"FileChangesBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"sf","status":"COMPLETED","changes":[{"afterRelativePath":"src/auth.go"}]}},"timestampMs":1704067200600}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"AgentPatchCreatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"sp","patch":"diff --git a/x b/x"}},"timestampMs":1704067200700}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"ChoiceRequestUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"sq","title":"Pick one","request":{"options":[{"title":"a"},{"title":"b"}]}}},"timestampMs":1704067200800}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"TerminalBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"srun","status":"IN_PROGRESS","command":"sleep 60"}},"timestampMs":1704067200900}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"task-1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"sr","result":"Done."}},"timestampMs":1704067201000}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	_, messages := parseJunieProviderSession(t, path, "local")
+
+	var assistant ParsedMessage
+	for _, m := range messages {
+		if m.Role == RoleAssistant {
+			assistant = m
+		}
+	}
+	assert.True(t, assistant.HasToolUse)
+	require.Len(t, assistant.ToolCalls, 9)
+
+	tc := assistant.ToolCalls
+	assert.Equal(t, "ViewFiles", tc[0].ToolName)
+	assert.Equal(t, "Read", tc[0].Category)
+	assert.Equal(t, "src/auth.go", tc[0].FilePath)
+	assert.Equal(t, "task-1:sv", tc[0].ToolUseID)
+
+	assert.Equal(t, "Terminal", tc[1].ToolName)
+	assert.Equal(t, "Bash", tc[1].Category)
+	assert.Contains(t, tc[1].InputJSON, "go test ./auth")
+	require.Len(t, tc[1].ResultEvents, 1)
+	assert.Equal(t, "completed", tc[1].ResultEvents[0].Status)
+	assert.Equal(t, "ok auth", tc[1].ResultEvents[0].Content)
+
+	assert.Equal(t, "ijproxy/search_text", tc[2].ToolName)
+	assert.Equal(t, "Tool", tc[2].Category)
+	assert.Equal(t, "4 hits", tc[2].ResultEvents[0].Content)
+
+	assert.Equal(t, "Search", tc[3].ToolName)
+	assert.Equal(t, "Grep", tc[3].Category)
+
+	assert.Equal(t, "Skill", tc[4].ToolName)
+	assert.Equal(t, "Tool", tc[4].Category)
+	assert.Equal(t, "golangci-lint", tc[4].SkillName)
+
+	assert.Equal(t, "FileChanges", tc[5].ToolName)
+	assert.Equal(t, "Edit", tc[5].Category)
+	assert.Equal(t, "src/auth.go", tc[5].FilePath)
+
+	assert.Equal(t, "Patch", tc[6].ToolName)
+	assert.Equal(t, "Edit", tc[6].Category)
+	assert.Equal(t, "completed", tc[6].ResultEvents[0].Status)
+
+	assert.Equal(t, "AskUserQuestion", tc[7].ToolName)
+	assert.Equal(t, "Tool", tc[7].Category)
+	assert.Contains(t, tc[7].InputJSON, "Pick one")
+
+	// An IN_PROGRESS call stays "running" — feeds tool_call_pending later.
+	assert.Equal(t, "Terminal", tc[8].ToolName)
+	assert.Equal(t, "running", tc[8].ResultEvents[0].Status)
+}

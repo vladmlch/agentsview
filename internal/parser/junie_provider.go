@@ -537,6 +537,10 @@ func junieProviderCapabilities() Capabilities {
 			Cwd:                  CapabilitySupported,
 			AggregateUsageEvents: CapabilitySupported,
 			MalformedLineCount:   CapabilitySupported,
+			Thinking:             CapabilitySupported,
+			ToolCalls:            CapabilitySupported,
+			ToolResults:          CapabilitySupported,
+			ToolResultEvents:     CapabilitySupported,
 		},
 	}
 }
