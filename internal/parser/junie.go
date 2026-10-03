@@ -81,7 +81,6 @@ type junieAgentStream struct {
 	request   string
 	requestTS time.Time
 	usage     []ParsedUsageEvent
-	usageSeen map[string]struct{}
 	cwd       string
 	taskName  string
 	firstTS   time.Time
@@ -94,9 +93,8 @@ type junieAgentStream struct {
 
 func newJunieAgentStream(id string) *junieAgentStream {
 	return &junieAgentStream{
-		id:        id,
-		blocks:    make(map[string]*junieBlock),
-		usageSeen: make(map[string]struct{}),
+		id:     id,
+		blocks: make(map[string]*junieBlock),
 	}
 }
 
@@ -553,7 +551,7 @@ func junieUpsertBlock(
 ) {
 	stepID := ae.Get("stepId").Str
 	if stepID == "" {
-		stepID = kind + "#" + ae.Raw[:minInt(len(ae.Raw), 64)]
+		stepID = kind + "#" + ae.Raw[:min(len(ae.Raw), 64)]
 	}
 	status := firstNonEmptyJSONLString(ae.Get("status").Str, eventState)
 	cancelled := ae.Get("cancelled").Bool() ||
@@ -565,7 +563,7 @@ func junieUpsertBlock(
 
 	text := firstNonEmptyJSONLString(ae.Get("text").Str, ae.Get("result").Str)
 	if kind == "ResultBlockUpdatedEvent" {
-		text = strings.TrimPrefix(text, "<!-- ANSWER -->")
+		text = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(text), "<!-- ANSWER -->"))
 	}
 
 	b := &junieBlock{
@@ -587,7 +585,7 @@ func junieUpsertBlock(
 		model:     ae.Get("model").Str,
 		task:      firstNonEmptyJSONLString(ae.Get("task").Str, ae.Get("description").Str, ae.Get("prompt").Str),
 		patch:     ae.Get("patch").Str,
-		title:     ae.Get("title").Str,
+		title:     firstNonEmptyJSONLString(ae.Get("title").Str, ae.Get("request.question").Str, ae.Get("request.name").Str),
 		cancelled: cancelled,
 	}
 	for _, f := range ae.Get("files").Array() {
@@ -1091,8 +1089,9 @@ func (s *junieParserState) results(
 	for _, agentID := range s.streamOrder {
 		stream := s.streams[agentID]
 		sub, subMsgs, ok := junieFinishSubagent(
-			fullID+"--"+agentID, fullID, path, info,
+			ctx, fullID+"--"+agentID, fullID, path, info,
 			stream, summary, summaryPresent, machine, "",
+			stateCwd, rawID+"--"+agentID,
 		)
 		if !ok {
 			continue
@@ -1188,13 +1187,6 @@ func junieStateMeta(sessionDir string, openRoot junieRootOpener) (string, string
 	cwd := gjson.Get(blob, "currentDirectory").Str
 	taskName := gjson.Get(blob, "lastAgentState.issue.name").Str
 	return cwd, taskName
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func firstString(values []string) string {

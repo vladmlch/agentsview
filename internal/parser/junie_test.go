@@ -1107,6 +1107,9 @@ func TestJunieSubagentSession(t *testing.T) {
 
 	assert.Equal(t, "junie:"+sessionID, parent.Session.ID)
 	assert.Equal(t, "junie:"+sessionID+"--agent-1", sub.ID)
+	assert.Equal(t, sessionID+"--agent-1", sub.SourceSessionID)
+	assert.Equal(t, "junie", sub.Project)
+	assert.Equal(t, "Audit the auth module for leaks", sub.FirstMessage)
 	assert.Equal(t, "junie:"+sessionID, sub.ParentSessionID)
 	assert.Equal(t, RelSubagent, sub.RelationshipType)
 	assert.Equal(t, "auth-auditor", sub.SessionName)
@@ -1226,4 +1229,95 @@ func TestJunieUserPromptSourceUUID(t *testing.T) {
 	_, messages := parseJunieProviderSession(t, path, "local")
 	require.Len(t, messages, 1)
 	assert.Equal(t, "req-abc-123", messages[0].SourceUUID)
+}
+
+func TestJunieSubagentMultilinePromptTruncationAndFallback(t *testing.T) {
+	root := t.TempDir()
+	sessionID := "session-260101-120000-abcd"
+	sessionDir := filepath.Join(root, sessionID)
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+
+	longRequest := strings.Repeat("Long line with words. ", 20) + "\\nSecond line\\nThird line"
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Parent prompt","timestampMs":1704067200000}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"MarkdownBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-long","name":"long-worker"},"stepId":"long-req-request","text":"` + longRequest + `"}},"timestampMs":1704067200100}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-long","name":"long-worker"},"stepId":"long-res","result":"Done."}},"timestampMs":1704067200200}` + "\n" +
+			// Second subagent with no request prompt — tests fallback to SessionName
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-noreq","name":"namer-worker"},"stepId":"noreq-res","result":"Done."}},"timestampMs":1704067200300}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	outcome := parseJunieProviderOutcome(t, path, "local")
+	require.Len(t, outcome.Results, 3)
+
+	longSub := outcome.Results[1].Result.Session
+	assert.Equal(t, sessionID+"--agent-long", longSub.SourceSessionID)
+	assert.NotContains(t, longSub.FirstMessage, "\n", "FirstMessage must be newline-flattened")
+	assert.LessOrEqual(t, len(longSub.FirstMessage), 303, "FirstMessage must be truncated to 300 runes plus ellipsis")
+	assert.True(t, strings.HasSuffix(longSub.FirstMessage, "..."))
+	assert.True(t, strings.HasPrefix(longSub.FirstMessage, "Long line with words."))
+
+	noreqSub := outcome.Results[2].Result.Session
+	assert.Equal(t, sessionID+"--agent-noreq", noreqSub.SourceSessionID)
+	assert.Equal(t, "namer-worker", noreqSub.FirstMessage, "FirstMessage must fall back to SessionName when no user prompt")
+}
+
+func TestJunieAskUserQuestionTitleFallback(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-260101-120000-abcd")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+
+	// AskAsyncRequestUpdatedEvent with empty title, but question provided in request
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Do work","timestampMs":1704067200000}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"AskAsyncRequestUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"ask-1","request":{"question":"Which DB engine?","options":[{"title":"sqlite"}]}}},"timestampMs":1704067200100}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	_, messages := parseJunieProviderSession(t, path, "local")
+	require.Len(t, messages, 2)
+	assert.True(t, messages[1].HasToolUse)
+	require.Len(t, messages[1].ToolCalls, 1)
+	assert.Equal(t, "AskUserQuestion", messages[1].ToolCalls[0].ToolName)
+	assert.Contains(t, messages[1].ToolCalls[0].InputJSON, "Which DB engine?")
+}
+
+func TestJunieResultBlockUpdatedEventAnswerWhitespaceTrim(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-260101-120000-abcd")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Explain","timestampMs":1704067200000}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"res-1","result":"<!-- ANSWER -->\nClean answer."}},"timestampMs":1704067200100}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	_, messages := parseJunieProviderSession(t, path, "local")
+	require.Len(t, messages, 2)
+	assert.Equal(t, "Clean answer.", messages[1].Content)
+}
+
+func TestJunieSubagentEndedAtFallbackToFileMtime(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-notimestamp")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Parent"}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"MarkdownBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-1","name":"worker"},"stepId":"w-request","text":"Work"}}}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	mtime := time.Date(2026, 6, 15, 14, 30, 0, 0, time.UTC)
+	require.NoError(t, os.Chtimes(path, mtime, mtime))
+
+	outcome := parseJunieProviderOutcome(t, path, "local")
+	require.Len(t, outcome.Results, 2)
+	sub := outcome.Results[1].Result.Session
+	assert.Equal(t, mtime, sub.EndedAt.UTC())
 }
