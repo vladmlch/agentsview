@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sort"
@@ -62,10 +63,11 @@ func findJunieStream(
 }
 
 func junieFinishSubagent(
+	ctx context.Context,
 	fullID, parentFullID, path string, info os.FileInfo,
 	stream *junieAgentStream,
 	summary junieSessionSummary, summaryPresent bool,
-	machine, hash string,
+	machine, hash, stateCwd, rawSubID string,
 ) (*ParsedSession, []ParsedMessage, bool) {
 	// A subagent session must have actual activity: either assignment prompt or blocks.
 	if stream.request == "" && len(stream.blocks) == 0 {
@@ -85,11 +87,26 @@ func junieFinishSubagent(
 	if len(msgs) == 0 {
 		return nil, nil, false
 	}
-	cwd := firstNonEmptyJSONLString(stream.cwd, summary.projectDir)
-	project := ""
-	if cwd != "" {
-		project = filepath.Base(filepath.Clean(cwd))
+	cwd := strings.TrimSpace(stream.cwd)
+	if cwd == "" {
+		cwd = strings.TrimSpace(summary.projectDir)
 	}
+	if cwd == "" {
+		cwd = stateCwd
+	}
+	if filepath.IsAbs(cwd) {
+		cwd = filepath.Clean(cwd)
+	} else if !strings.HasPrefix(cwd, "/") && !looksLikeWindowsPath(cwd) {
+		cwd = ""
+	}
+
+	project := ExtractProjectFromCwdWithBranchContext(
+		WithoutFilesystemProjectDiscovery(ctx), cwd, "",
+	)
+	if project == "" {
+		project = "junie"
+	}
+
 	startedAt := stream.firstTS
 	if startedAt.IsZero() {
 		startedAt = stream.requestTS
@@ -105,9 +122,12 @@ func junieFinishSubagent(
 	}
 
 	endedAt := stream.lastTS
+	if !summary.updatedAt.IsZero() && summary.updatedAt.After(endedAt) {
+		endedAt = summary.updatedAt
+	}
 	if endedAt.IsZero() || endedAt.Before(startedAt) {
-		if !summary.updatedAt.IsZero() && summary.updatedAt.After(startedAt) {
-			endedAt = summary.updatedAt
+		if info != nil && info.ModTime().UTC().After(startedAt) {
+			endedAt = info.ModTime().UTC()
 		} else {
 			endedAt = startedAt
 		}
@@ -120,6 +140,21 @@ func junieFinishSubagent(
 	}
 
 	subName := firstNonEmptyJSONLString(stream.name, stream.taskName)
+	var firstMessage string
+	if stream.request != "" {
+		firstMessage = truncate(strings.ReplaceAll(stream.request, "\n", " "), 300)
+	} else {
+		for _, m := range msgs {
+			if m.Role == RoleUser && !m.IsSystem {
+				firstMessage = truncate(strings.ReplaceAll(m.Content, "\n", " "), 300)
+				break
+			}
+		}
+	}
+	if firstMessage == "" && strings.TrimSpace(subName) != "" {
+		firstMessage = subName
+	}
+
 	fileInfo := FileInfo{
 		Path: VirtualSourcePath(path, stream.id),
 		Hash: hash,
@@ -130,6 +165,7 @@ func junieFinishSubagent(
 	}
 	sess := &ParsedSession{
 		ID:                 fullID,
+		SourceSessionID:    rawSubID,
 		Project:            project,
 		Agent:              AgentJunie,
 		Machine:            machine,
@@ -137,21 +173,12 @@ func junieFinishSubagent(
 		RelationshipType:   RelSubagent,
 		SessionName:        subName,
 		SessionNamePresent: subName != "",
+		FirstMessage:       firstMessage,
 		Cwd:                cwd,
 		StartedAt:          startedAt,
 		EndedAt:            endedAt,
 		MessageCount:       len(msgs),
 		File:               fileInfo,
-	}
-	if stream.request != "" {
-		sess.FirstMessage = stream.request
-	} else {
-		for _, m := range msgs {
-			if m.Role == RoleUser && !m.IsSystem {
-				sess.FirstMessage = m.Content
-				break
-			}
-		}
 	}
 	for i := range msgs {
 		if msgs[i].Role == RoleUser && !msgs[i].IsSystem {
