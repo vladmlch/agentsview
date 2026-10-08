@@ -111,6 +111,7 @@ var fixedPricingAliases = []FixedPricingAlias{
 	{Name: "gemini-3.8-flash-exp-a", Canonical: "gemini-3.8-flash"},
 	{Name: "gemini-3.8-flash-medium", Canonical: "gemini-3.8-flash"},
 	{Name: "gemini-3.7-flash-high", Canonical: "gemini-3.7-flash"},
+	{Name: "gemini-3.7-flash-exp-b", Canonical: "gemini-3.7-flash"},
 }
 
 // DateAliasedModels returns the sorted unqualified date-ambiguous

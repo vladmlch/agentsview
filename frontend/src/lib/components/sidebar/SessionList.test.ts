@@ -1019,3 +1019,210 @@ function makeSession(overrides: Partial<Session> & { id: string }): Session {
     ...overrides,
   };
 }
+
+describe("SessionList grouped lazy loading", () => {
+  let component: ReturnType<typeof mount> | undefined;
+  let originalResizeObserver: typeof ResizeObserver | undefined;
+  let clientHeightSpy: ReturnType<typeof vi.spyOn> | undefined;
+  let rafSpy: ReturnType<typeof vi.spyOn> | undefined;
+  let savedFilters: typeof sessions.filters;
+
+  beforeEach(() => {
+    originalResizeObserver = globalThis.ResizeObserver;
+    Object.defineProperty(globalThis, "ResizeObserver", {
+      configurable: true,
+      writable: true,
+      value: ResizeObserverMock,
+    });
+    clientHeightSpy = vi
+      .spyOn(HTMLElement.prototype, "clientHeight", "get")
+      .mockReturnValue(ITEM_HEIGHT * 3);
+    rafSpy = vi
+      .spyOn(globalThis, "requestAnimationFrame")
+      .mockImplementation((cb: FrameRequestCallback) => {
+        queueMicrotask(() => cb(0));
+        return 1;
+      });
+    savedFilters = sessions.filters;
+    sessions.sessions = [];
+    sessions.projects = [];
+    sessions.agents = [];
+    sessions.machines = [];
+    sessions.activeSessionId = null;
+    sessions.nextCursor = null;
+    sessions.loading = false;
+    sessions.selectedIds = new Set();
+    sessions.selectMode = false;
+    sessions.sidebarIndexVersion++;
+    sessions.hydratedSessionsByVersion = new Map([[sessions.sidebarIndexVersion, new Map()]]);
+    sessions.clearGroupSessionsCache();
+    readProgress.reset();
+    starred.filterOnly = false;
+    starred.ids = new Set();
+    setLocale("en");
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    if (component) {
+      unmount(component);
+      component = undefined;
+    }
+    document.body.innerHTML = "";
+    Object.defineProperty(globalThis, "ResizeObserver", {
+      configurable: true,
+      writable: true,
+      value: originalResizeObserver,
+    });
+    clientHeightSpy?.mockRestore();
+    rafSpy?.mockRestore();
+    sessions.filters = savedFilters;
+    sessions.clearGroupSessionsCache();
+    readProgress.reset();
+    vi.restoreAllMocks();
+  });
+
+  it("builds sections from the filtered list when filters bypass metadata", async () => {
+    localStorage.setItem(STORAGE_KEY_GROUP, "agent");
+    sessions.filters = { ...sessions.filters, machine: "workstation" };
+    sessions.agents = [
+      { name: "phantom-agent", session_count: 900 },
+      { name: "claude", session_count: 500 },
+    ];
+    sessions.sessions = [
+      makeSession({ id: "s1", agent: "claude", display_name: "Visible one" }),
+      makeSession({ id: "s2", agent: "claude", display_name: "Visible two" }),
+    ];
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+    vi.spyOn(sessions, "loadGroupSessions").mockResolvedValue(undefined);
+
+    component = mount(SessionList, { target: document.body });
+    await tick();
+
+    const headers = [...document.querySelectorAll<HTMLElement>(".group-header")];
+    expect(headers.map((h) => h.querySelector(".group-name")?.textContent)).toEqual([
+      "claude",
+    ]);
+    expect(headers[0]!.querySelector(".group-count")?.textContent).toBe("2");
+  });
+
+  it("keeps a deep-linked session visible inside a cached group section", async () => {
+    localStorage.setItem(STORAGE_KEY_GROUP, "agent");
+    sessions.agents = [{ name: "claude", session_count: 2 }];
+    sessions.sessions = [
+      makeSession({ id: "deep-linked", agent: "claude", display_name: "Deep linked" }),
+    ];
+    // A previously loaded group page that does not contain the
+    // deep-linked session must not mask the flat list.
+    sessions.groupSessionsCache.set(
+      "agent",
+      new Map([
+        [
+          "claude",
+          {
+            sessions: [
+              makeSession({ id: "cached", agent: "claude", display_name: "Cached" }),
+            ],
+            nextCursor: null,
+            total: 1,
+            loading: false,
+          },
+        ],
+      ]),
+    );
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+    vi.spyOn(sessions, "loadGroupSessions").mockResolvedValue(undefined);
+
+    component = mount(SessionList, { target: document.body });
+    await tick();
+    document.querySelector<HTMLButtonElement>(".group-header")!.click();
+    await tick();
+
+    expect(document.querySelector('[data-session-id="deep-linked"]')).not.toBeNull();
+    expect(document.querySelector('[data-session-id="cached"]')).not.toBeNull();
+  });
+
+  it("re-loads the same group cursor after the cache is cleared", async () => {
+    localStorage.setItem(STORAGE_KEY_GROUP, "agent");
+    sessions.agents = [{ name: "claude", session_count: 5 }];
+    sessions.sessions = [];
+    const seed = () =>
+      sessions.groupSessionsCache.set(
+        "agent",
+        new Map([
+          [
+            "claude",
+            {
+              sessions: [
+                makeSession({ id: "cached-1", agent: "claude", display_name: "Cached" }),
+              ],
+              nextCursor: "cursor-1",
+              total: 5,
+              loading: false,
+            },
+          ],
+        ]),
+      );
+    seed();
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+    vi.spyOn(sessions, "loadGroupSessions").mockResolvedValue(undefined);
+    const loadMore = vi
+      .spyOn(sessions, "loadMoreGroupSessions")
+      .mockResolvedValue(undefined);
+
+    component = mount(SessionList, { target: document.body });
+    await tick();
+    document.querySelector<HTMLButtonElement>(".group-header")!.click();
+    await tick();
+    await tick();
+
+    expect(loadMore).toHaveBeenCalledTimes(1);
+
+    // Same cursor value arrives again after the cache reset — without
+    // the epoch reset the dedup map would suppress this load.
+    sessions.clearGroupSessionsCache();
+    seed();
+    await tick();
+    await tick();
+
+    expect(loadMore).toHaveBeenCalledTimes(2);
+  });
+
+  it("renders a retry row for a failed group section", async () => {
+    localStorage.setItem(STORAGE_KEY_GROUP, "agent");
+    sessions.agents = [{ name: "claude", session_count: 5 }];
+    sessions.sessions = [];
+    sessions.groupSessionsCache.set(
+      "agent",
+      new Map([
+        [
+          "claude",
+          {
+            sessions: [],
+            nextCursor: null,
+            total: 0,
+            loading: false,
+            error: true,
+          },
+        ],
+      ]),
+    );
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+    const loadGroups = vi
+      .spyOn(sessions, "loadGroupSessions")
+      .mockResolvedValue(undefined);
+
+    component = mount(SessionList, { target: document.body });
+    await tick();
+    document.querySelector<HTMLButtonElement>(".group-header")!.click();
+    await tick();
+
+    const retryButton =
+      document.querySelector<HTMLButtonElement>(".group-error-row button");
+    expect(retryButton).not.toBeNull();
+    retryButton!.click();
+    await tick();
+
+    expect(loadGroups).toHaveBeenLastCalledWith("agent", "claude", true);
+  });
+});

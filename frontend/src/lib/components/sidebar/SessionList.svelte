@@ -2,7 +2,7 @@
   import { onDestroy, onMount } from "svelte";
   import { Button, Spinner } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
-  import { buildSessionGroups, sessions, type SessionGroup } from "../../stores/sessions.svelte.js";
+  import { sessions, type SessionGroupInput } from "../../stores/sessions.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { starred } from "../../stores/starred.svelte.js";
   import SessionItem from "./SessionItem.svelte";
@@ -29,6 +29,7 @@
     adjacentVisibleSessionId,
     buildGroupSections,
     buildDisplayItems,
+    type PerGroupSectionState,
     computeTotalSize,
     findStart,
     isSubagentDescendant,
@@ -82,8 +83,13 @@
     }
   });
 
+  // Metadata (agents/projects endpoints) only understands the
+  // include_one_shot/include_automated flags. While any other filter is
+  // active its counts are unfiltered, so sections are built from the
+  // filtered loaded list instead — otherwise headers show wrong counters
+  // and phantom sections for labels the filter excludes entirely.
   let groupMetadata = $derived.by(() => {
-    if (starred.filterOnly) return undefined;
+    if (sessions.hasNonMetadataFilters) return undefined;
     if (groupMode === "agent") {
       return sessions.agents.map((a) => ({
         key: a.name,
@@ -101,20 +107,19 @@
 
   let perGroupSessions = $derived.by(() => {
     if (groupMode === "none") return undefined;
-    const map = new Map<
-      string,
-      { groups: SessionGroup[]; totalCount?: number; hasMore?: boolean }
-    >();
-    for (const [key, state] of sessions.groupSessionsCache.entries()) {
-      let sess = state.sessions;
+    const map = new Map<string, PerGroupSectionState>();
+    const modeCache = sessions.groupSessionsCache.get(groupMode);
+    if (!modeCache) return map;
+    for (const [key, state] of modeCache.entries()) {
+      let sess: SessionGroupInput[] = state.sessions;
       if (starred.filterOnly) {
         sess = sess.filter((s) => starred.isStarred(s.id));
       }
-      const grps = buildSessionGroups(sess);
       map.set(key, {
-        groups: grps,
+        sessions: sess,
         totalCount: state.total,
         hasMore: Boolean(state.nextCursor),
+        error: state.error,
       });
     }
     return map;
@@ -122,7 +127,10 @@
 
   let groupLoading = $derived.by(() => {
     const loading = new Set<string>();
-    for (const [key, state] of sessions.groupSessionsCache.entries()) {
+    if (groupMode === "none") return loading;
+    const modeCache = sessions.groupSessionsCache.get(groupMode);
+    if (!modeCache) return loading;
+    for (const [key, state] of modeCache.entries()) {
       if (state.loading) loading.add(key);
     }
     return loading;
@@ -174,11 +182,14 @@
     return all;
   });
 
-  // Ensure any expanded group has its sessions loaded.
+  // Ensure any expanded group has its sessions loaded. Starred-only mode
+  // already renders the filtered flat list, so per-group fetches would be
+  // redundant requests.
   $effect(() => {
-    if (groupMode === "none" || collapseAll) return;
+    if (groupMode === "none" || collapseAll || starred.filterOnly) return;
+    const modeCache = sessions.groupSessionsCache.get(groupMode);
     for (const section of groupSections) {
-      if (!collapsed.has(section.label) && !sessions.groupSessionsCache.has(section.label)) {
+      if (!collapsed.has(section.label) && !modeCache?.has(section.label)) {
         void sessions.loadGroupSessions(groupMode, section.label);
       }
     }
@@ -233,6 +244,7 @@
     groupMode = mode;
     collapseAll = mode !== "none";
     manualExpanded = new Set();
+    lastAutoLoadedCursor.clear();
   }
 
   function toggleGroupByAgent() {
@@ -257,7 +269,7 @@
       }
       manualExpanded = next;
     }
-    if (isExpanding && groupMode !== "none") {
+    if (isExpanding && groupMode !== "none" && !starred.filterOnly) {
       void sessions.loadGroupSessions(groupMode, label);
     }
   }
@@ -394,11 +406,24 @@
   });
 
   const lastAutoLoadedCursor = new Map<string, string>();
+  // Cursor values repeat after the group cache is cleared (filter change,
+  // first-page reload): a stale dedup entry would suppress exactly the
+  // first auto-load the refresh makes necessary. Keep the map in sync
+  // with the cache epoch; declared before the auto-load effect so it
+  // runs first when both are invalidated together.
+  let lastSeenGroupCacheEpoch = -1;
   $effect(() => {
-    if (groupMode === "none") return;
+    const epoch = sessions.groupSessionsEpoch;
+    if (epoch !== lastSeenGroupCacheEpoch) {
+      lastSeenGroupCacheEpoch = epoch;
+      lastAutoLoadedCursor.clear();
+    }
+  });
+  $effect(() => {
+    if (groupMode === "none" || starred.filterOnly) return;
     for (const item of visibleItems) {
       if (item.type === "group-load-more") {
-        const state = sessions.getGroupState(item.label);
+        const state = sessions.getGroupState(groupMode, item.label);
         if (
           state &&
           state.nextCursor &&
@@ -521,14 +546,10 @@
       // updates, and prevRevealedId is still unset so the
       // second pass will proceed to scroll.
       if (groupMode !== "none") {
-        const activeLabel =
-          groupMode === "agent"
-            ? sessions.activeSession?.agent
-            : sessions.activeSession?.project;
-        if (activeLabel && collapsed.has(activeLabel)) {
-          toggleGroup(activeLabel);
-          return;
-        }
+        // Prefer the section that actually owns the session: a child
+        // inside a continuation chain can carry an agent/project that
+        // differs from the chain primary's, so reading the row's own
+        // label first could expand the wrong section.
         for (const section of groupSections) {
           const owns = section.groups.some((g) =>
             g.sessions.some((s) => s.id === activeId),
@@ -537,6 +558,21 @@
             toggleGroup(section.label);
             return;
           }
+        }
+        // Not in any rendered section (still loading, or a skinny
+        // deep link activeSession hides for index-only rows): fall back
+        // to the row's own label to name its future section.
+        const activeRow =
+          sessions.sessions.find((s) => s.id === activeId) ??
+          sessions.sessionFromGroupCache(activeId, groupMode);
+        const activeLabel = activeRow
+          ? groupMode === "agent"
+            ? activeRow.agent
+            : activeRow.project
+          : undefined;
+        if (activeLabel && collapsed.has(activeLabel)) {
+          toggleGroup(activeLabel);
+          return;
         }
       }
       // Session may be inside a collapsed continuation chain.
@@ -809,8 +845,25 @@
             <Spinner size={12} label={m.sidebar_loading()} />
             <span class="group-loading-text">{m.sidebar_loading()}</span>
           </div>
+        {:else if item.type === "group-error"}
+          <div class="group-error-row">
+            <span class="group-loading-text">{m.shared_failed_to_load()}</span>
+            <Button
+              size="sm"
+              surface="soft"
+              tone="neutral"
+              disabled={groupMode !== "none" && sessions.isGroupLoading(groupMode, item.label)}
+              onclick={() => {
+                if (groupMode !== "none") {
+                  void sessions.loadGroupSessions(groupMode, item.label, true);
+                }
+              }}
+            >
+              <span>{m.shared_retry()}</span>
+            </Button>
+          </div>
         {:else if item.type === "group-load-more"}
-          {@const isGroupLoading = sessions.isGroupLoading(item.label)}
+          {@const isGroupLoading = groupMode !== "none" && sessions.isGroupLoading(groupMode, item.label)}
           <div class="group-load-more-row">
             <Button
               size="sm"
@@ -1168,7 +1221,8 @@
   }
 
   .group-loading-row,
-  .group-load-more-row {
+  .group-load-more-row,
+  .group-error-row {
     display: flex;
     align-items: center;
     padding-left: 24px;

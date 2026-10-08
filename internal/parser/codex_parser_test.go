@@ -193,6 +193,54 @@ func TestParseCodexSession_TracksMalformedMiddleRecord(t *testing.T) {
 	assert.Len(t, msgs, 2)
 }
 
+// A damaged or absent session_meta must not cost the transcript its valid
+// records: the multi-line JSON fallback decoder stops at the first
+// undecodable record, so rerunning it over an ordinary broken-line JSONL
+// would republish an empty session instead of the salvaged one. The
+// fallback therefore runs only when the first pass decoded nothing at
+// all, and the session id falls back to the file name.
+func TestParseCodexSession_MalformedSessionMetaPreservesTail(t *testing.T) {
+	content := `{"type":"session_meta","payload":{"id":"019eb791` + "\n" +
+		testjsonl.JoinJSONL(
+			testjsonl.CodexTurnContextJSON("gpt-5.4", tsEarlyS1),
+			testjsonl.CodexMsgJSON("user", "hello", tsEarlyS5),
+			testjsonl.CodexMsgJSON("assistant", "hi there", tsLate),
+		)
+
+	sess, msgs := runCodexParserTest(t, "broken-meta.jsonl", content, false)
+
+	require.NotNil(t, sess)
+	assert.Equal(t, "codex:broken-meta", sess.ID,
+		"the session id must fall back to the file name")
+	assert.Equal(t, 1, sess.MalformedLines)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "hello", msgs[0].Content)
+	assert.Equal(t, "hi there", msgs[1].Content)
+}
+
+// An unterminated tail line is a live write in progress, not malformed
+// input: it must not count against the snapshot or trip the multi-line
+// fallback.
+func TestParseCodexSession_UnterminatedTailNotMalformed(t *testing.T) {
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			"019eb791-cf7d-75c1-8439-9ed74c122b30",
+			"/tmp", "user", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+	) + `{"type":"response_item","payload":{"role":"assistant","conte`
+
+	sess, msgs := runCodexParserTest(t, "live-tail.jsonl", content, false)
+
+	require.NotNil(t, sess)
+	assert.Equal(t,
+		"codex:019eb791-cf7d-75c1-8439-9ed74c122b30", sess.ID)
+	assert.Zero(t, sess.MalformedLines,
+		"an unterminated tail is a live write, not a malformed record")
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "hello", msgs[0].Content)
+}
+
 func TestParseCodexSession_SubagentLineage(t *testing.T) {
 	const (
 		childID  = "01900000-0000-7000-8000-000000000002"
@@ -3860,6 +3908,7 @@ func TestSeedCodexIncrementalStatePropagatesReaderError(t *testing.T) {
 
 	_, err := seedCodexIncrementalStateFromReader(t.Context(), AgentCodex,
 		iotest.ErrReader(wantErr),
+		nil,
 		nil,
 	)
 

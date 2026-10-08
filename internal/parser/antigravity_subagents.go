@@ -17,6 +17,10 @@ import (
 // of children sharing the same spawnStepIndex (the result step that
 // echoes each spawned conversation id back to the planner).
 
+// antigravitySubagentsDir is the descriptor directory name inside a
+// brain conversation's .system_generated tree.
+const antigravitySubagentsDir = "subagents"
+
 type antigravitySubagentDescriptor struct {
 	childID        string
 	parentID       string
@@ -85,7 +89,8 @@ func (x *antigravitySubagentIndex) scan(root string) {
 		return
 	}
 	paths, err := filepath.Glob(filepath.Join(
-		root, "brain", "*", ".system_generated", "subagents", "*.json",
+		root, "brain", "*", antigravityBrainGeneratedDir,
+		antigravitySubagentsDir, "*.json",
 	))
 	if err != nil {
 		return
@@ -110,8 +115,8 @@ func (x *antigravitySubagentIndex) refresh(root, childID string) {
 		return
 	}
 	paths, err := filepath.Glob(filepath.Join(
-		root, "brain", "*", ".system_generated", "subagents",
-		childID+".json",
+		root, "brain", "*", antigravityBrainGeneratedDir,
+		antigravitySubagentsDir, childID+".json",
 	))
 	if err != nil {
 		return
@@ -195,8 +200,8 @@ func findAntigravitySubagentDescriptor(
 		return antigravitySubagentDescriptor{}, false
 	}
 	paths, err := filepath.Glob(filepath.Join(
-		root, "brain", "*", ".system_generated", "subagents",
-		childID+".json",
+		root, "brain", "*", antigravityBrainGeneratedDir,
+		antigravitySubagentsDir, childID+".json",
 	))
 	if err != nil {
 		return antigravitySubagentDescriptor{}, false
@@ -219,7 +224,8 @@ func antigravitySubagentDescriptorID(root, path string) (string, bool) {
 	}
 	parts := strings.Split(rel, string(filepath.Separator))
 	if len(parts) != 5 || parts[0] != "brain" ||
-		parts[2] != ".system_generated" || parts[3] != "subagents" ||
+		parts[2] != antigravityBrainGeneratedDir ||
+		parts[3] != antigravitySubagentsDir ||
 		!strings.HasSuffix(parts[4], ".json") {
 		return "", false
 	}
@@ -239,6 +245,39 @@ func (s antigravitySourceSet) subagentDescriptor(
 	return findAntigravitySubagentDescriptor(root, id)
 }
 
+// antigravitySubagentChainLimit bounds the descriptor parent-chain walk
+// in subagentChainCycles, matching the codex continuation-chain cap.
+const antigravitySubagentChainLimit = 20
+
+// subagentChainCycles reports whether the descriptor parent chain
+// starting at parentID leads back to id. Descriptor validation rejects
+// only a direct self link, so a cyclic pair (A claimed by B while B is
+// claimed by A) or a longer loop would otherwise be emitted as edges
+// and make every member somebody's child -- dropping all of them from
+// the sidebar roots. The walk stops at the first ancestor with no
+// descriptor claim and is bounded at antigravitySubagentChainLimit.
+func (s antigravitySourceSet) subagentChainCycles(
+	root, id, parentID string,
+) bool {
+	if id == "" || parentID == "" {
+		return false
+	}
+	visited := map[string]struct{}{id: {}}
+	cur := parentID
+	for i := 0; i < antigravitySubagentChainLimit; i++ {
+		if _, seen := visited[cur]; seen {
+			return true
+		}
+		visited[cur] = struct{}{}
+		d, ok := s.subagentDescriptor(root, cur)
+		if !ok {
+			return false
+		}
+		cur = d.parentID
+	}
+	return false
+}
+
 // antigravitySubagentResultWindow bounds how far past an invoke_subagent
 // planner step the spawned-conversation scan reaches. The result step
 // follows the call within a few rows; a wide window risks attributing a
@@ -252,26 +291,34 @@ const antigravitySubagentResultWindow = 3
 // edge.
 const antigravitySubagentSpawnMarker = "Created the following subagents"
 
+// antigravityConversationIDRE extracts a spawned conversation id from a
+// marked result step. The tool emits "conversationId" (camelCase);
+// older builds wrote "conversation_id" (snake_case) and both spellings
+// appear in real payloads, so both are matched.
 var antigravityConversationIDRE = regexp.MustCompile(
-	`"conversationId"\s*:\s*"` +
+	`"conversation(?:Id|_id)"\s*:\s*"` +
 		`([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-` +
 		`[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"`,
 )
 
-var antigravitySnakeConversationIDRE = regexp.MustCompile(
-	`"conversation_id"\s*:\s*"` +
-		`([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-` +
-		`[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"`,
-)
-
-// linkAntigravitySubagentSpawnEdges attaches spawned session ids to
-// invoke_subagent tool calls. Only steps carrying the
-// "Created the following subagents" marker are spawn results; all
-// "conversationId" matches in marked steps are collected and the Nth
-// invoke_subagent call takes the Nth id, so a batch of three children
-// still links exactly one child per call (tool_calls stores one id
-// each). Unmarked results -- including manage_subagents list output that
-// legitimately names running children -- are never scanned.
+// linkAntigravitySubagentSpawnEdges attaches a spawned session id to an
+// invoke_subagent tool call. Only steps carrying the
+// "Created the following subagents" marker are spawn results; unmarked
+// results -- including manage_subagents list output that legitimately
+// names running children -- are never scanned.
+//
+// An edge is emitted only when the call<->result pairing is
+// unambiguous: exactly one invoke_subagent call in the planner step and
+// exactly one marked result step inside the window. Every conversation
+// id that step lists is then a child of that call, so storing the first
+// id is a true edge whichever sibling the batch carried. Anything else
+// is refused: several invoke calls in one step or several marked steps
+// in the window cannot be paired positionally with confidence -- result
+// order is not guaranteed to match call order, and a marked step can be
+// a result belonging to a different call. A wrong edge is worse than
+// none because the archive linker (subagentSpawnerExpr) repoints the
+// child's parent_session_id from it, overriding the authoritative
+// descriptor link.
 func linkAntigravitySubagentSpawnEdges(
 	steps []antigravityLoadedStep, sessionIDPrefix string,
 ) {
@@ -287,7 +334,7 @@ func linkAntigravitySubagentSpawnEdges(
 		if len(spawnCalls) == 0 {
 			continue
 		}
-		var spawnIDs []string
+		var markedIDs [][]string
 		for j := i + 1; j < len(steps) &&
 			j-i <= antigravitySubagentResultWindow; j++ {
 			next := steps[j]
@@ -309,21 +356,23 @@ func linkAntigravitySubagentSpawnEdges(
 			if !marked {
 				continue
 			}
+			var ids []string
 			for _, s := range strs {
 				for _, m := range antigravityConversationIDRE.
 					FindAllStringSubmatch(s, -1) {
 					if id := canonicalAgyCascadeID(m[1]); id != "" {
-						spawnIDs = append(spawnIDs, id)
+						ids = append(ids, id)
 					}
 				}
 			}
+			markedIDs = append(markedIDs, ids)
 		}
-		for n, k := range spawnCalls {
-			if n >= len(spawnIDs) {
-				break
-			}
-			steps[i].msg.ToolCalls[k].SubagentSessionID =
-				sessionIDPrefix + spawnIDs[n]
+		if len(spawnCalls) != 1 || len(markedIDs) != 1 ||
+			len(markedIDs[0]) == 0 {
+			// Ambiguous pairing -- emit nothing rather than a guess.
+			continue
 		}
+		steps[i].msg.ToolCalls[spawnCalls[0]].SubagentSessionID =
+			sessionIDPrefix + markedIDs[0][0]
 	}
 }

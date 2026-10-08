@@ -13,4 +13,4 @@ How should AgentsView update `model_pricing` / pricing seed catalogs to:
 ## Answer
 
 1. **Devin Model Pricing**: In `internal/pricing/supplemental.go` and `internal/pricing/normalize.go`, Devin CLI internal model names (`swe-2-max`, `swe-2-high`, `swe-2-medium`, `swe-1-6-slow`) are mapped to fixed alias rates and canonical representations, while `gpt-6-luna-xhigh-priority` is normalized to the GPT-6 Luna pricing rules.
-2. **Antigravity Model Pricing**: Seeded pricing rules in `supplemental.go` (bumping supplemental catalog to version 6) for `gemini-3.8-flash-*`, `gemini-3.7-flash-*`, and `claude-opus-4-6-thinking`. Microdollar rates per million tokens now allow dynamic calculation to produce accurate non-zero cost totals across the 600M+ tokens recorded.
+2. **Antigravity Model Pricing**: Seeded pricing rules in `supplemental.go` (bumping supplemental catalog to version 7) for `gemini-3.8-flash-*`, `gemini-3.7-flash-*`, and `claude-opus-4-6-thinking`. Microdollar rates per million tokens now allow dynamic calculation to produce accurate non-zero cost totals across the 600M+ tokens recorded.

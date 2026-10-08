@@ -657,10 +657,9 @@ agentsview session search "flaky test" --hybrid --project myapp
 - `--hybrid` fuses the semantic ranking with an FTS5 ranking of the same corpus
   using reciprocal rank fusion, so exact-term matches and meaning-based
   matches both surface.
-- Both modes are restricted to the `messages` source — the same restriction
-  `--fts` already has — since only user/assistant message content is embedded
-  (never raw tool_input/tool_result rows or system messages). Passing `--in`
-  with any other source is rejected.
+- Both modes are restricted to the `messages` source since only
+  user/assistant message content is embedded (never raw tool_input/tool_result
+  rows or system messages). Passing `--in` with any other source is rejected.
 - All the usual filters apply: `--project`, `--agent`, `--machine`, `--date*`,
   etc. Metadata filters are applied *after* the vector leg over-fetches
   candidates (4x the requested limit) — see [Limitations](#limitations). In
@@ -1024,9 +1023,9 @@ keyword leg is the mirror's recency-ordered term match, as on PostgreSQL.
   DuckDB-backed server return the "not available" error (HTTP 501) described
   above. PostgreSQL is supported through pgvector — see
   [PostgreSQL](#postgresql).
-- **The index embeds message `content` verbatim.** Like `--fts`, it only draws
-  from the `messages` source, so raw tool_input/tool_result rows are never
-  candidates. System messages are handled more strictly, though: `--fts` still
+- **The index embeds message `content` verbatim.** Unlike `--fts`, it only
+  draws from the `messages` source, so raw tool_input/tool_result rows are
+  never candidates. System messages are handled more strictly, though: `--fts` still
   includes them unless the caller passes `--exclude-system`, while
   `--semantic`/`--hybrid` always exclude system messages from the index with
   no flag to opt back in. But anything a parser rendered *into* a

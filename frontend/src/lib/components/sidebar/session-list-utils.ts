@@ -1,4 +1,5 @@
 import type { SessionGroup, SessionGroupInput } from "../../stores/sessions.svelte.js";
+import { buildSessionGroups } from "../../stores/sessions.svelte.js";
 import { sessionAncestryMatches } from "../../utils/session-ancestry.js";
 
 export const ITEM_HEIGHT = 42;
@@ -14,8 +15,16 @@ export type GroupMode = "none" | "agent" | "project";
 export interface GroupSection {
   label: string;
   groups: SessionGroup[];
+  /** Number of unique sessions currently loaded for the section — the
+   *  union of the flat list slice and the per-group cache. `totalCount`
+   *  is a server-side session count, so remaining-row math must compare
+   *  against this, not against `groups.length` (continuation chains
+   *  collapse several sessions into one group). */
+  sessionCount?: number;
   totalCount?: number;
   hasMore?: boolean;
+  /** The section's first-page load failed; display can offer a retry. */
+  error?: boolean;
 }
 
 export interface GroupMetadataItem {
@@ -23,12 +32,32 @@ export interface GroupMetadataItem {
   totalCount: number;
 }
 
+/**
+ * Per-label loading state for lazily fetched group sections.
+ * `sessions` are the raw cached rows for the label; they are merged with
+ * the flat list inside `buildGroupSections` so deep-linked or freshly
+ * appended sessions are never dropped when a cache entry exists.
+ */
+export interface PerGroupSectionState {
+  sessions: SessionGroupInput[];
+  totalCount?: number;
+  hasMore?: boolean;
+  error?: boolean;
+}
+
 /** @deprecated Use GroupSection */
 export type AgentSection = GroupSection;
 
 export interface DisplayItem {
   id: string;
-  type: "header" | "session" | "team-group" | "subagent-group" | "group-loading" | "group-load-more";
+  type:
+    | "header"
+    | "session"
+    | "team-group"
+    | "subagent-group"
+    | "group-loading"
+    | "group-load-more"
+    | "group-error";
   label: string;
   count: number;
   group?: SessionGroup;
@@ -67,15 +96,46 @@ export function getInitialGroupMode(): GroupMode {
 export { selectPrimaryId } from "../../stores/sessions.svelte.js";
 
 /**
+ * Union of the sessions a label has in the per-group cache and in the
+ * flat loaded list, deduped by id. The flat copy wins ties (it is kept
+ * fresh by rename/assignment merges), except that a skinny index row
+ * never displaces a hydrated one. Merging matters because a cache entry
+ * used to mask the flat list entirely, hiding deep-linked sessions that
+ * only ever landed in `sessions.sessions`.
+ */
+function mergeSectionSessions(
+  cached: SessionGroupInput[] | undefined,
+  flat: SessionGroup[] | undefined,
+): SessionGroupInput[] {
+  const byId = new Map<string, SessionGroupInput>();
+  for (const s of cached ?? []) {
+    byId.set(s.id, s);
+  }
+  for (const g of flat ?? []) {
+    for (const s of g.sessions) {
+      const prev = byId.get(s.id);
+      if (prev && !prev.is_index_only && s.is_index_only) continue;
+      byId.set(s.id, s);
+    }
+  }
+  return [...byId.values()];
+}
+
+/**
  * Build grouped sections from flat session groups.
  * Groups by agent name or project depending on mode.
  * Returns empty array when mode is "none".
+ *
+ * `metadata` (agents/projects endpoints) only knows the
+ * include_one_shot/include_automated flags — callers must omit it while
+ * any other filter is active so sections and counters reflect the
+ * filtered list instead of unfiltered totals.
  */
 export function buildGroupSections(
   groups: SessionGroup[],
   mode: GroupMode,
   metadata?: GroupMetadataItem[],
-  perGroupSessions?: Map<string, { groups: SessionGroup[]; totalCount?: number; hasMore?: boolean }>,
+  perGroupSessions?: Map<string, PerGroupSectionState>,
 ): GroupSection[] {
   if (mode === "none") return [];
   const map = new Map<string, SessionGroup[]>();
@@ -91,11 +151,49 @@ export function buildGroupSections(
     list.push(g);
   }
 
+  // Resolve the merged content of one label. When the per-group cache
+  // has an entry, its sessions are unioned with the flat slice and
+  // re-grouped so chains spanning the two sources stay intact.
+  const sectionFor = (label: string): GroupSection => {
+    const flat = map.get(label);
+    const perGroup = perGroupSessions?.get(label);
+    const merged = mergeSectionSessions(perGroup?.sessions, flat);
+    const sectionGroups = perGroup ? buildSessionGroups(merged) : (flat ?? []);
+    return {
+      label,
+      groups: sectionGroups,
+      sessionCount: merged.length,
+      error: perGroup?.error,
+    };
+  };
+
+  const byTotalDesc = (a: GroupSection, b: GroupSection) => {
+    const diff =
+      (b.totalCount ?? b.sessionCount ?? b.groups.length) -
+      (a.totalCount ?? a.sessionCount ?? a.groups.length);
+    if (diff !== 0) return diff;
+    return a.label.localeCompare(b.label);
+  };
+
   if (!metadata || metadata.length === 0) {
-    // Sort by count descending (most sessions first).
-    return Array.from(map.entries())
-      .sort((a, b) => b[1].length - a[1].length)
-      .map(([label, groups]) => ({ label, groups, totalCount: groups.length }));
+    // Sections come from the loaded (filtered) list plus any cached
+    // per-group pages — the BASE behavior for filtered views.
+    const labels = new Set<string>([
+      ...map.keys(),
+      ...(perGroupSessions?.keys() ?? []),
+    ]);
+    const sections: GroupSection[] = [];
+    for (const label of labels) {
+      const section = sectionFor(label);
+      const perGroup = perGroupSessions?.get(label);
+      if (section.groups.length === 0 && !section.error) continue;
+      sections.push({
+        ...section,
+        totalCount: perGroup?.totalCount ?? section.sessionCount,
+        hasMore: perGroup?.hasMore ?? false,
+      });
+    }
+    return sections.sort(byTotalDesc);
   }
 
   const seen = new Set<string>();
@@ -104,35 +202,44 @@ export function buildGroupSections(
   for (const meta of metadata) {
     const label = meta.key;
     seen.add(label);
+    const section = sectionFor(label);
     const perGroup = perGroupSessions?.get(label);
-    const sectionGroups = perGroup?.groups ?? map.get(label) ?? [];
     const totalCount = perGroup?.totalCount ?? meta.totalCount;
-    const hasMore = perGroup?.hasMore ?? (totalCount > sectionGroups.length);
-
     sections.push({
-      label,
-      groups: sectionGroups,
+      ...section,
       totalCount,
-      hasMore,
+      hasMore: perGroup?.hasMore ?? totalCount > (section.sessionCount ?? 0),
     });
   }
 
-  for (const [label, sectionGroups] of map.entries()) {
+  for (const label of map.keys()) {
     if (!seen.has(label)) {
+      const section = sectionFor(label);
+      const perGroup = perGroupSessions?.get(label);
       sections.push({
-        label,
-        groups: sectionGroups,
-        totalCount: sectionGroups.length,
-        hasMore: false,
+        ...section,
+        totalCount: perGroup?.totalCount ?? section.sessionCount,
+        hasMore: perGroup?.hasMore ?? false,
       });
+      seen.add(label);
     }
   }
 
-  return sections.sort((a, b) => {
-    const diff = (b.totalCount ?? b.groups.length) - (a.totalCount ?? a.groups.length);
-    if (diff !== 0) return diff;
-    return a.label.localeCompare(b.label);
-  });
+  // A cache entry whose label is absent from both the metadata and the
+  // flat list still holds real loaded rows — keep it visible.
+  for (const label of perGroupSessions?.keys() ?? []) {
+    if (seen.has(label)) continue;
+    const section = sectionFor(label);
+    if (section.groups.length === 0 && !section.error) continue;
+    const perGroup = perGroupSessions?.get(label);
+    sections.push({
+      ...section,
+      totalCount: perGroup?.totalCount ?? section.sessionCount,
+      hasMore: perGroup?.hasMore ?? false,
+    });
+  }
+
+  return sections.sort(byTotalDesc);
 }
 
 /** Check if a session is a teammate (received a <teammate-message>). */
@@ -403,12 +510,28 @@ export function buildDisplayItems(
         for (const g of section.groups) {
           emitGroupItems(g, section.label, expandedGroups, items, y);
         }
-        if (section.hasMore) {
+        if (section.groups.length === 0 && section.error) {
+          items.push({
+            id: `error:${section.label}`,
+            type: "group-error",
+            label: section.label,
+            count: 0,
+            height: ITEM_HEIGHT,
+            top: y.value,
+          });
+          y.value += ITEM_HEIGHT;
+        } else if (section.hasMore) {
           items.push({
             id: `more:${section.label}`,
             type: "group-load-more",
             label: section.label,
-            count: Math.max(0, (section.totalCount ?? 0) - section.groups.length),
+            // totalCount counts sessions while groups.length counts
+            // continuation chains — the remainder must be computed in
+            // sessions or multi-session chains inflate it.
+            count: Math.max(
+              0,
+              (section.totalCount ?? 0) - (section.sessionCount ?? section.groups.length),
+            ),
             height: ITEM_HEIGHT,
             top: y.value,
           });

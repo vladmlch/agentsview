@@ -999,7 +999,11 @@ func TestCopyOrphanedDataProjectsArchiveContent(t *testing.T) {
 		assert.Empty(t, call.InputJSON)
 		assert.Empty(t, call.ResultContent)
 		assert.Equal(t, 9, call.ResultContentLength)
-		require.Empty(t, call.ResultEvents)
+		require.Len(t, call.ResultEvents, 1,
+			"a status-bearing result event keeps its row on a transcripts archive")
+		assert.Equal(t, "ok", call.ResultEvents[0].Status)
+		assert.Empty(t, call.ResultEvents[0].Content)
+		assert.Equal(t, 9, call.ResultEvents[0].ContentLength)
 		require.Len(t, messages[2].ToolCalls, 1)
 		assert.Equal(t, "child", messages[2].ToolCalls[0].SubagentSessionID)
 		assert.Empty(t, messages[2].ToolCalls[0].InputJSON)
@@ -1454,7 +1458,10 @@ func TestArchiveProjectionOfLateToolResults(t *testing.T) {
 			} else {
 				assert.Equal(t, "tool output", call.ResultContent)
 				assert.Equal(t, 11, call.ResultContentLength)
-				require.Empty(t, call.ResultEvents)
+				require.Len(t, call.ResultEvents, 1,
+					"a status-bearing late result keeps its event row")
+				assert.Equal(t, "ok", call.ResultEvents[0].Status)
+				assert.Equal(t, "tool output", call.ResultEvents[0].Content)
 			}
 		})
 	}

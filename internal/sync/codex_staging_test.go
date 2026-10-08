@@ -520,7 +520,9 @@ func TestCodexStagedToolResultSummaryStorage(t *testing.T) {
 		{"single event", []string{"command finished"}, "command finished", "command finished", 0},
 		{"duplicate event", []string{"command finished", "command finished"}, "command finished", "command finished", 0},
 		{"multiple events", []string{"working", "command finished"}, "command finished", "command finished", 2},
-		{"sanitized single event", []string{"before\x00after"}, "beforeafter", "beforeafter", 0},
+		// The raw-content digest no longer matches the sanitized summary,
+		// so the single event keeps its row on both write paths.
+		{"sanitized single event", []string{"before\x00after"}, "beforeafter", "beforeafter", 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			const uuid = "019eb791-cf7d-75c1-8439-9ed74c122d01"
@@ -873,7 +875,7 @@ func assertCodexStagedParity(t *testing.T, uuid, content string) {
 			)
 			combined := append(
 				append([]db.SecretFinding(nil), findings...),
-				stagedSink.Findings(rowS.ID, positions)...,
+				stagedSink.Findings(t.Context(), rowS.ID, positions)...,
 			)
 			update.SecretLeakCount = definiteFindingCount(combined)
 			return update, combined, nil
@@ -1227,4 +1229,126 @@ func TestCodexStagedParseCancellation(t *testing.T) {
 	entries, err := os.ReadDir(stage)
 	require.NoError(t, err)
 	assert.Empty(t, entries, "cancellation releases scratch storage")
+}
+
+// A second parse pass into the same sink must start from an empty staging
+// state: the embedded collecting reset does not clear the occurrence
+// counters, call-key indexes, findings, summary caches, or the staged
+// stage_events rows, so without the staged Reset every one of them would
+// leak the first pass into the second.
+func TestCodexStagingSinkResetClearsSecondPassState(t *testing.T) {
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122c21"
+	root := writeCodexParityRoot(t, uuid)
+	cfg := parser.ProviderConfig{Roots: []string{root}, Machine: "local"}
+	provider, ok := parser.NewProvider(parser.AgentCodex, cfg)
+	require.True(t, ok)
+	source, found, err := provider.FindSource(
+		t.Context(), parser.FindSourceRequest{
+			FullSessionID: "codex:" + uuid,
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, found)
+
+	sink, err := newCodexStagingSink(t.Context(), "", map[string]bool{})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, sink.Close()) }()
+
+	sess1, msgs1, _, _, _, _, err := parser.ParseCodexSessionStreaming(
+		t.Context(), cfg, source, sink,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, sess1)
+	require.NotEmpty(t, msgs1)
+	firstFindings := len(sink.findings)
+	require.Positive(t, firstFindings,
+		"the parity transcript carries a definite finding")
+	firstRows := 0
+	require.NoError(t, sink.scratch.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM stage_events`).Scan(&firstRows))
+	require.Positive(t, firstRows)
+
+	sink.Reset()
+
+	assert.Empty(t, sink.Messages())
+	assert.Empty(t, sink.findings)
+	assert.Empty(t, sink.findingPos)
+	assert.Empty(t, sink.singleSummaries)
+	assert.Empty(t, sink.contentFailures)
+	assert.Empty(t, sink.callOccurrences)
+	assert.Empty(t, sink.callKeyByPosition)
+	assert.Zero(t, sink.eventSeq)
+	assert.NoError(t, sink.Err())
+	resetRows := -1
+	require.NoError(t, sink.scratch.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM stage_events`).Scan(&resetRows))
+	assert.Zero(t, resetRows,
+		"the staged rows of the discarded pass must be deleted")
+
+	sess2, msgs2, _, _, _, _, err := parser.ParseCodexSessionStreaming(
+		t.Context(), cfg, source, sink,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, sess2)
+	require.Len(t, msgs2, len(msgs1))
+	require.Len(t, sink.findings, firstFindings,
+		"re-parsing must not pile a second copy on the first pass's findings")
+	secondRows := 0
+	require.NoError(t, sink.scratch.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM stage_events`).Scan(&secondRows))
+	assert.Equal(t, firstRows, secondRows,
+		"re-parsing must stage exactly the second pass's rows")
+	ordinals := make(map[int]bool, len(msgs2))
+	for _, m := range msgs2 {
+		assert.False(t, ordinals[m.Ordinal],
+			"ordinal %d emitted twice", m.Ordinal)
+		ordinals[m.Ordinal] = true
+	}
+	assert.True(t, ordinals[0],
+		"the second pass must restart ordinals at zero")
+}
+
+// The staged collapse must apply the direct write path's raw-digest rule:
+// when sanitization changed the stored bytes, the event's raw_content_digest
+// no longer matches the summary's digest and the sole event keeps its row.
+func TestCodexStagedCollapseRequiresRawDigestMatch(t *testing.T) {
+	sink, err := newCodexStagingSink(t.Context(), "", map[string]bool{})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, sink.Close()) }()
+
+	sink.AppendMessage(parser.ParsedMessage{ToolCalls: []parser.ParsedToolCall{
+		{ToolUseID: "call_clean", ToolName: "exec_command"},
+		{ToolUseID: "call_sanitized", ToolName: "exec_command"},
+	}})
+	sink.AppendToolResultEvent(t.Context(), "call_clean", nil,
+		parser.ParsedToolResultEvent{
+			ToolUseID: "call_clean",
+			Source:    "function_call_output",
+			Content:   "plain output",
+		})
+	// The NUL is stripped before storage, so the staged digest (of the raw
+	// content) differs from sha256 of the stored summary.
+	sink.AppendToolResultEvent(t.Context(), "call_sanitized", nil,
+		parser.ParsedToolResultEvent{
+			ToolUseID: "call_sanitized",
+			Source:    "function_call_output",
+			Content:   "before\x00after",
+		})
+	require.NoError(t, sink.Err())
+
+	cleanKey := db.StagedToolCallKey("call_clean", 0)
+	sanitizedKey := db.StagedToolCallKey("call_sanitized", 0)
+	aggs, err := sink.loadStagedCallAggregates(
+		t.Context(), []string{cleanKey, sanitizedKey},
+	)
+	require.NoError(t, err)
+	require.Len(t, aggs, 2)
+
+	collapsed, err := sink.collapsedSingleEventKeys(t.Context(), aggs)
+	require.NoError(t, err)
+	assert.True(t, collapsed[cleanKey],
+		"an untouched sole event collapses into its summary")
+	assert.False(t, collapsed[sanitizedKey],
+		"a sanitized sole event keeps its row: "+
+			"digest(raw) != sha256(summary) without an image marker")
 }

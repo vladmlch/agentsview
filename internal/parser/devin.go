@@ -8,6 +8,7 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -331,7 +332,10 @@ func parseDevinSessionWithSubagents(
 
 	// message_nodes is Devin's live session history. Explicit exports can lag
 	// behind it, so use the node chain whenever the database has a usable node
-	// representation; the export remains the compatibility fallback.
+	// representation; the export remains the compatibility fallback for every
+	// node-layer failure mode (unreadable or locked database, missing columns,
+	// invalid node JSON), so a transient live-database error cannot kill a
+	// session that still has a good export.
 	nodeSess, nodeMsgs, nodeSubagents, nodeOK, nodesErr :=
 		parseDevinSessionFromMessageNodesWithSubagents(
 			ctx, dbPath, rawSessionID, machine, meta,
@@ -339,34 +343,52 @@ func parseDevinSessionWithSubagents(
 	if nodesErr == nil && nodeOK {
 		return nodeSess, nodeMsgs, nodeSubagents, nil
 	}
-	if _, ok := errors.AsType[*devinSubagentParseError](nodesErr); ok {
-		return nil, nil, nil, nodesErr
+
+	sess, messages, transcriptErr := parseDevinSessionFromTranscript(
+		ctx, dbPath, rawSessionID, machine, meta,
+	)
+	if transcriptErr == nil {
+		return sess, messages, nodeSubagents, nil
 	}
+	// Both representations failed. A genuine node-layer failure (a locked or
+	// unreadable database, a scan error) is the actionable cause when no
+	// usable export exists; when the nodes merely carried no valid history,
+	// the export error describes the real fallback failure.
 	if nodesErr != nil && !errors.Is(nodesErr, errInvalidDevinMessageNode) {
 		return nil, nil, nil, nodesErr
 	}
+	return nil, nil, nil, transcriptErr
+}
 
+// parseDevinSessionFromTranscript parses the explicit session export at
+// cli/transcripts/<id>.json, the compatibility fallback for sessions whose
+// message_nodes history is missing or unusable.
+func parseDevinSessionFromTranscript(
+	ctx context.Context,
+	dbPath, rawSessionID, machine string,
+	meta *DevinSessionMeta,
+) (*ParsedSession, []ParsedMessage, error) {
 	transcriptPath := filepath.Join(filepath.Dir(dbPath), "transcripts", rawSessionID+".json")
 	info, err := os.Stat(transcriptPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			return nil, nil, nil, newDevinTranscriptError("stat", err)
+			return nil, nil, newDevinTranscriptError("stat", err)
 		}
-		return nil, nil, nil, newDevinTranscriptError("missing", nil)
+		return nil, nil, newDevinTranscriptError("missing", nil)
 	}
 
 	data, err := os.ReadFile(transcriptPath)
 	if err != nil {
-		return nil, nil, nil, newDevinTranscriptError("read", err)
+		return nil, nil, newDevinTranscriptError("read", err)
 	}
 	if !gjson.ValidBytes(data) {
-		return nil, nil, nil, newDevinTranscriptError("invalid", nil)
+		return nil, nil, newDevinTranscriptError("invalid", nil)
 	}
 
 	root := gjson.ParseBytes(data)
 	steps := root.Get("steps")
 	if !steps.IsArray() {
-		return nil, nil, nil, newDevinTranscriptError("missing steps array in", nil)
+		return nil, nil, newDevinTranscriptError("missing steps array in", nil)
 	}
 
 	model := firstNonEmpty(root.Get("agent.model_name").Str, metaValue(meta, func(m *DevinSessionMeta) string { return m.Model }))
@@ -414,7 +436,12 @@ func parseDevinSessionWithSubagents(
 	if devinTranscriptLostPreContinuation(messages) {
 		recovered, rerr := devinRecoveredEraMessages(ctx, dbPath, rawSessionID, meta, model)
 		if rerr != nil {
-			return nil, nil, nil, rerr
+			if ctx.Err() != nil {
+				return nil, nil, rerr
+			}
+			// Era recovery enriches an already-valid export; a node-layer
+			// failure must not discard the parsed transcript.
+			log.Printf("devin: skipping pre-continuation era recovery: %v", rerr)
 		}
 		if len(recovered) > 0 {
 			messages = append(recovered, messages...)
@@ -461,7 +488,7 @@ func parseDevinSessionWithSubagents(
 	sess := buildDevinParsedSession(meta, rawSessionID, machine, cwd, firstMessage, startedAt, endedAt, userMsgCount, messages, fileInfo)
 	accumulateMessageTokenUsage(sess, messages)
 	applyDevinFinalMetrics(sess, root.Get("final_metrics"))
-	return sess, messages, nodeSubagents, nil
+	return sess, messages, nil
 }
 
 func parseDevinSessionFromMessageNodes(ctx context.Context,
@@ -491,7 +518,13 @@ func parseDevinSessionFromMessageNodesWithSubagents(
 	model := metaValue(meta, func(m *DevinSessionMeta) string { return m.Model })
 	cwd := metaValue(meta, func(m *DevinSessionMeta) string { return m.CWD })
 	fileInfo := devinBaseFileInfo(dbPath, rawSessionID)
-	partition, err := partitionDevinSubagentMessageNodes(ctx, rows)
+
+	// The main chain is resolved before partitioning so the session's own
+	// root node is never mistaken for a subagent or summarizer tree.
+	chain := devinMainChainRows(rows, meta)
+	partition, err := partitionDevinSubagentMessageNodes(
+		ctx, rows, devinMainChainRootNodeID(chain, meta),
+	)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
@@ -502,7 +535,6 @@ func parseDevinSessionFromMessageNodesWithSubagents(
 		return nil, nil, nil, false, err
 	}
 
-	chain := devinMainChainRows(rows, meta)
 	recovered := devinRecoveredEraRows(rows, chain, meta)
 	if len(recovered) > 0 {
 		chain = devinTrimLeadingContinuationBoilerplate(chain)
@@ -605,6 +637,22 @@ func devinMainChainRows(
 		reversed[i], reversed[j] = reversed[j], reversed[i]
 	}
 	return reversed
+}
+
+// devinMainChainRootNodeID returns the node_id of the resolved main chain's
+// root, or -1 when the chain walk fell back to the flat node list (in which
+// case no single node is known to head the conversation).
+func devinMainChainRootNodeID(
+	chain []devinMessageNodeRow, meta *DevinSessionMeta,
+) int64 {
+	if meta == nil || !meta.MainChainID.Valid || len(chain) == 0 {
+		return -1
+	}
+	if chain[len(chain)-1].NodeID != meta.MainChainID.Int64 ||
+		chain[0].ParentNodeID.Valid {
+		return -1
+	}
+	return chain[0].NodeID
 }
 
 func devinDedupeNodeIDs(nodes []devinMessageNodeRow) []devinMessageNodeRow {
@@ -831,11 +879,13 @@ func devinRecoveredEraMessages(
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	partition, err := partitionDevinSubagentMessageNodes(ctx, rows)
+	chain := devinMainChainRows(rows, meta)
+	partition, err := partitionDevinSubagentMessageNodes(
+		ctx, rows, devinMainChainRootNodeID(chain, meta),
+	)
 	if err != nil {
 		return nil, err
 	}
-	chain := devinMainChainRows(rows, meta)
 	var out []ParsedMessage
 	for _, row := range devinRecoveredEraRows(rows, chain, meta) {
 		if _, excluded := partition.ExcludedNodeIDs[row.NodeID]; excluded {
@@ -973,12 +1023,19 @@ func parseDevinToolCall(tc gjson.Result) (ParsedToolCall, bool) {
 		return ParsedToolCall{}, false
 	}
 	input := tc.Get("function.arguments")
-	if !input.Exists() {
-		input = toolCallInput(tc)
-	}
 	inputJSON := input.Raw
 	if input.Type == gjson.String {
 		inputJSON = input.Str
+	}
+	// An absent arguments field and an explicitly empty one are the same
+	// case: fall back to the alternate input encodings (input/arguments at
+	// the call level) either way.
+	if inputJSON == "" {
+		input = toolCallInput(tc)
+		inputJSON = input.Raw
+		if input.Type == gjson.String {
+			inputJSON = input.Str
+		}
 	}
 	return ParsedToolCall{
 		ToolUseID: firstNonEmpty(tc.Get("id").Str, tc.Get("tool_call_id").Str),
@@ -1169,6 +1226,14 @@ func devinRecoverErasFromSummarizedFrom(
 
 	seenNodeIDs := make(map[int64]bool, len(rows))
 	seenMessageIDs := make(map[string]bool, len(rows))
+	// A prior era can share a message_id with a node that survived on the
+	// main chain (pending/committed twins persist across the re-root); seed
+	// the chain's ids so no logical message is emitted twice.
+	for _, row := range chain {
+		if mid := devinNodeMessageID(row.ChatMessage); mid != "" {
+			seenMessageIDs[mid] = true
+		}
+	}
 	var out []devinMessageNodeRow
 
 	for eraIdx, era := range priorEras {
@@ -1304,7 +1369,7 @@ func devinRecoveredEraRows(
 			if inChain[child.NodeID] {
 				continue
 			}
-			if gjson.Get(child.ChatMessage, "role").Str != "system" {
+			if !devinEraSiblingRoot(child, children) {
 				continue
 			}
 			roots = append(roots, child)
@@ -1377,6 +1442,55 @@ func devinRecoveredEraRows(
 		}
 	}
 	return out
+}
+
+// devinEraSiblingRoot reports whether an off-chain child of a main-chain node
+// can head a recovered pre-continuation era. Era roots are re-captured system
+// context blocks, so the head must be a system node; subagent and summarizer
+// marker roots head their own trees and never start an era. A system child
+// that matches no known context-block shape qualifies only when its subtree
+// actually carries a conversation -- a stray system node with no dialogue
+// beneath it is metadata noise, not a previous thread.
+func devinEraSiblingRoot(
+	root devinMessageNodeRow,
+	children map[int64][]devinMessageNodeRow,
+) bool {
+	if gjson.Get(root.ChatMessage, "role").Str != "system" {
+		return false
+	}
+	if devinRootMarkerKind(devinNodeText(root.ChatMessage)) != devinMessageNodeRootNone {
+		return false
+	}
+	if devinIsBoilerplateSystemPrompt(root.ChatMessage) ||
+		devinNodeContinuationSummary(root.ChatMessage) {
+		return true
+	}
+	return devinSubtreeHasConversation(root, children)
+}
+
+// devinSubtreeHasConversation reports whether the subtree hanging off root
+// contains at least one conversational (non-system) node.
+func devinSubtreeHasConversation(
+	root devinMessageNodeRow,
+	children map[int64][]devinMessageNodeRow,
+) bool {
+	visited := map[int64]bool{root.NodeID: true}
+	stack := []devinMessageNodeRow{root}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		switch gjson.Get(cur.ChatMessage, "role").Str {
+		case "user", "assistant", "agent", "tool":
+			return true
+		}
+		for _, kid := range children[cur.NodeID] {
+			if !visited[kid.NodeID] {
+				visited[kid.NodeID] = true
+				stack = append(stack, kid)
+			}
+		}
+	}
+	return false
 }
 
 func devinDBRole(role string) (RoleType, bool, bool) {

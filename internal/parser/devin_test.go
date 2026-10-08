@@ -2,6 +2,7 @@ package parser
 
 import (
 	"database/sql"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1330,6 +1331,459 @@ func TestParseDevinSessionPrefersMessageNodesOverFullTranscript(t *testing.T) {
 	assert.True(t, msgs[4].IsCompactBoundary)
 	assert.Equal(t, "post-compaction work", msgs[5].Content)
 	assert.Equal(t, 1, sess.UserMessageCount)
+}
+
+// A malformed chat_message inside one subagent tree must not abort the whole
+// session: the broken tree is dropped with a log line, sibling trees still
+// emit, and the main chain parses from message_nodes.
+func TestParseDevinSessionSkipsMalformedSubagentTree(t *testing.T) {
+	const sessionID = "session-broken-subagent"
+	fixture := newDevinTestFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Broken subagent",
+		WorkingDirectory: "/tmp/broken-subagent",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103210)),
+		MainChainID:      new(int64(2)),
+	})
+	// The export stays available but is not needed: the node chain wins.
+	fixture.writeTranscript(t, sessionID, `{
+		"steps":[
+			{"step_id":"step-1","source":"user","timestamp":"2024-01-01T10:00:01Z","message":"transcript fallback"}
+		]
+	}`)
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"nodes main prompt"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ParentNodeID: new(int64(1)), ChatMessage: `{"role":"assistant","content":"nodes main answer"}`, CreatedAt: 1704103202},
+		// Broken subagent tree: the first user prompt is unparsable JSON.
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 10, ChatMessage: `{"role":"system","content":"You are a subagent of Devin\nHandle the lookup."}`, CreatedAt: 1704103203},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 11, ParentNodeID: new(int64(10)), ChatMessage: `not valid JSON`, CreatedAt: 1704103204},
+		// A healthy sibling tree still emits.
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 20, ChatMessage: `{"role":"system","content":"You are a subagent of Devin\nHandle the report."}`, CreatedAt: 1704103205},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 21, ParentNodeID: new(int64(20)), ChatMessage: `{"role":"user","content":"healthy subagent prompt"}`, CreatedAt: 1704103206},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 22, ParentNodeID: new(int64(21)), ChatMessage: `{"role":"assistant","content":"healthy subagent answer"}`, CreatedAt: 1704103207},
+	)
+
+	buf := captureLog(t)
+	sess, msgs, subagents, err := parseDevinSessionWithSubagents(
+		t.Context(), fixture.DBPath, sessionID, "local",
+	)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "nodes main prompt", msgs[0].Content)
+	assert.Equal(t, "nodes main answer", msgs[1].Content)
+	require.Len(t, subagents, 1)
+	assert.Equal(t, sessionID+":agent-20", subagents[0].Session.SourceSessionID)
+	require.Len(t, subagents[0].Messages, 3)
+	assertLogContains(t, buf, "dropping malformed subagent message tree", "root node 10")
+}
+
+// When the main chain also carries an invalid node, the session still falls
+// back to the export; the healthy subagent tree parsed beforehand is kept.
+func TestParseDevinSessionFallsBackToTranscriptWhenSubagentAndChainNodesAreInvalid(t *testing.T) {
+	const sessionID = "session-broken-chain-and-subagent"
+	fixture := newDevinTestFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Broken chain",
+		WorkingDirectory: "/tmp/broken-chain",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103210)),
+		MainChainID:      new(int64(2)),
+	})
+	fixture.writeTranscript(t, sessionID, `{
+		"steps":[
+			{"step_id":"step-1","source":"user","timestamp":"2024-01-01T10:00:01Z","message":"exported request"},
+			{"step_id":"step-2","source":"agent","timestamp":"2024-01-01T10:00:05Z","message":"exported answer"}
+		]
+	}`)
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"nodes prompt"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ParentNodeID: new(int64(1)), ChatMessage: `not valid JSON`, CreatedAt: 1704103202},
+		// One broken subagent tree and one healthy one.
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 10, ChatMessage: `{"role":"system","content":"You are a subagent of Devin\nHandle the lookup."}`, CreatedAt: 1704103203},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 11, ParentNodeID: new(int64(10)), ChatMessage: `also broken`, CreatedAt: 1704103204},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 20, ChatMessage: `{"role":"system","content":"You are a subagent of Devin\nHandle the report."}`, CreatedAt: 1704103205},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 21, ParentNodeID: new(int64(20)), ChatMessage: `{"role":"user","content":"healthy subagent prompt"}`, CreatedAt: 1704103206},
+	)
+
+	buf := captureLog(t)
+	sess, msgs, subagents, err := parseDevinSessionWithSubagents(
+		t.Context(), fixture.DBPath, sessionID, "local",
+	)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "exported request", msgs[0].Content)
+	assert.Equal(t, "exported answer", msgs[1].Content)
+	require.Len(t, subagents, 1)
+	assert.Equal(t, sessionID+":agent-20", subagents[0].Session.SourceSessionID)
+	assertLogContains(t, buf, "dropping malformed subagent message tree", "root node 10")
+}
+
+// A failure reading message_nodes -- a locked or otherwise transiently
+// unreadable live database (SQLITE_BUSY past the busy timeout), a scan
+// error -- must not override a good export: the transcript still parses.
+// The corrupt created_at value below fails rows.Scan, which exercises the
+// same error path as a busy database.
+func TestParseDevinSessionFallsBackToTranscriptWhenMessageNodesReadFails(t *testing.T) {
+	const sessionID = "session-node-read-fails"
+	fixture := newDevinTestFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Node read fails",
+		WorkingDirectory: "/tmp/node-read-fails",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103210)),
+		MainChainID:      new(int64(1)),
+	})
+	fixture.writeTranscript(t, sessionID, `{
+		"steps":[
+			{"step_id":"step-1","source":"user","timestamp":"2024-01-01T10:00:01Z","message":"exported request"},
+			{"step_id":"step-2","source":"agent","timestamp":"2024-01-01T10:00:05Z","message":"exported answer"}
+		]
+	}`)
+	// SQLite stores the TEXT value verbatim in the INTEGER column, and
+	// scanning it into int64 fails mid-query.
+	execDevinTestSQL(t, fixture.DBPath, `
+		INSERT INTO message_nodes (session_id, node_id, chat_message, created_at)
+		VALUES ('session-node-read-fails', 1, '{"role":"user","content":"x"}', 'not-a-timestamp')
+	`)
+
+	sess, msgs, err := parseDevinSession(t.Context(), fixture.DBPath, sessionID, "local")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "exported request", msgs[0].Content)
+	assert.Equal(t, "exported answer", msgs[1].Content)
+}
+
+// The main session root is a parentless system node too. A root prompt that
+// merely quotes the subagent/summarizer markers must not be partitioned away
+// -- that would empty the whole session.
+func TestParseDevinSessionKeepsMainChainWhoseRootQuotesSubagentMarkers(t *testing.T) {
+	tests := []struct {
+		name         string
+		rootContent  string
+		mainChainID  *int64
+		wantMessages int
+	}{
+		{
+			name:         "markers mentioned mid-prompt",
+			rootContent:  "You are Devin, an interactive command line agent.\n\nAvailable subagent profiles:\n- explorer: You are a subagent of Devin that searches code.\n- You are a Summarizer agent.",
+			mainChainID:  new(int64(3)),
+			wantMessages: 3,
+		},
+		{
+			name:         "marker at start of resolved chain root",
+			rootContent:  "You are a subagent of Devin\nActually the main session prompt.",
+			mainChainID:  new(int64(3)),
+			wantMessages: 3,
+		},
+		{
+			// Without sessions.main_chain_id the chain falls back to the flat
+			// node list; the earliest parentless node is still the session's
+			// own root and is never a subagent tree.
+			name:         "marker at start without main_chain_id",
+			rootContent:  "You are a subagent of Devin\nActually the main session prompt.",
+			mainChainID:  nil,
+			wantMessages: 3,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			const sessionID = "session-marker-root"
+			fixture := newDevinTestFixture(t, devinSessionRow{
+				ID:               sessionID,
+				Title:            "Marker root",
+				WorkingDirectory: "/tmp/marker-root",
+				Model:            "db-model",
+				CreatedAt:        new(int64(1704103200)),
+				LastActivityAt:   new(int64(1704103210)),
+				MainChainID:      tc.mainChainID,
+			})
+			rootJSON, err := json.Marshal(map[string]any{
+				"role":    "system",
+				"content": tc.rootContent,
+			})
+			require.NoError(t, err)
+			fixture.insertMessageNodes(t,
+				devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: string(rootJSON), CreatedAt: 1704103201},
+				devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ParentNodeID: new(int64(1)), ChatMessage: `{"role":"user","content":"main prompt"}`, CreatedAt: 1704103202},
+				devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 3, ParentNodeID: new(int64(2)), ChatMessage: `{"role":"assistant","content":"main answer"}`, CreatedAt: 1704103203},
+			)
+
+			sess, msgs, subagents, err := parseDevinSessionWithSubagents(
+				t.Context(), fixture.DBPath, sessionID, "local",
+			)
+			require.NoError(t, err)
+			require.NotNil(t, sess)
+			require.Len(t, msgs, tc.wantMessages)
+			assert.Equal(t, "main prompt", msgs[1].Content)
+			assert.Equal(t, "main answer", msgs[2].Content)
+			assert.Empty(t, subagents)
+		})
+	}
+}
+
+// A marker quoted mid-text inside a later parentless system node (a detached
+// context block, an era re-root header) is not a tree root either: only the
+// prefix anchor separates it from a real "You are a subagent of Devin"
+// prompt, since it is neither the chain root nor the earliest root.
+func TestParseDevinSessionIgnoresMarkerQuotedInLaterParentlessNode(t *testing.T) {
+	const sessionID = "session-quoted-marker"
+	fixture := newDevinTestFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Quoted marker",
+		WorkingDirectory: "/tmp/quoted-marker",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103210)),
+		// No MainChainID: the flat-node fallback emits every kept row, so an
+		// over-eager exclusion would lose the context block outright.
+	})
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"system","content":"You are Devin, an interactive command line agent."}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ParentNodeID: new(int64(1)), ChatMessage: `{"role":"user","content":"main prompt"}`, CreatedAt: 1704103202},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 3, ParentNodeID: new(int64(2)), ChatMessage: `{"role":"assistant","content":"main answer"}`, CreatedAt: 1704103203},
+		// A detached context block quoting both markers mid-text.
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 4, ChatMessage: `{"role":"system","content":"Context recap.\nAvailable subagent profiles:\n- explorer: You are a subagent of Devin that searches code.\n- You are a Summarizer agent."}`, CreatedAt: 1704103204},
+	)
+
+	sess, msgs, subagents, err := parseDevinSessionWithSubagents(
+		t.Context(), fixture.DBPath, sessionID, "local",
+	)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.Len(t, msgs, 4)
+	assert.Contains(t, msgs[3].Content, "Context recap")
+	assert.Contains(t, msgs[3].Content, "subagent of Devin")
+	assert.Empty(t, subagents)
+}
+
+// Devin persists pending and committed states of one logical message under a
+// shared message_id. Inside a subagent tree the committed copy (higher
+// node_id) must win, and its tokens count only once.
+func TestParseDevinSessionSubagentTreeDeduplicatesPendingCommittedTwins(t *testing.T) {
+	const sessionID = "session-subagent-twins"
+	fixture := newDevinTestFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Subagent twins",
+		WorkingDirectory: "/tmp/subagent-twins",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103210)),
+		MainChainID:      new(int64(1)),
+	})
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"message_id":"m-main","role":"user","content":"main prompt"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 10, ChatMessage: `{"message_id":"m-sub-root","role":"system","content":"You are a subagent of Devin\nHandle the task."}`, CreatedAt: 1704103202},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 11, ParentNodeID: new(int64(10)), ChatMessage: `{"message_id":"m-sub-user","role":"user","content":"subtask prompt"}`, CreatedAt: 1704103203},
+		// Pending twin (lower node_id) must lose to the committed copy.
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 12, ParentNodeID: new(int64(11)), ChatMessage: `{"message_id":"m-sub-answer","role":"assistant","content":"pending draft","metadata":{"metrics":{"output_tokens":3}}}`, CreatedAt: 1704103204},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 13, ParentNodeID: new(int64(11)), ChatMessage: `{"message_id":"m-sub-answer","role":"assistant","content":"committed answer","metadata":{"metrics":{"output_tokens":7}}}`, CreatedAt: 1704103204},
+	)
+
+	sess, msgs, subagents, err := parseDevinSessionWithSubagents(
+		t.Context(), fixture.DBPath, sessionID, "local",
+	)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.Len(t, msgs, 1)
+
+	require.Len(t, subagents, 1)
+	sub := subagents[0]
+	require.Len(t, sub.Messages, 3)
+	assert.Equal(t, RoleSystem, sub.Messages[0].Role)
+	assert.Equal(t, "subtask prompt", sub.Messages[1].Content)
+	assert.Equal(t, "committed answer", sub.Messages[2].Content)
+	for _, m := range sub.Messages {
+		assert.NotContains(t, m.Content, "pending draft")
+	}
+	assert.True(t, sub.Session.HasTotalOutputTokens)
+	assert.Equal(t, 7, sub.Session.TotalOutputTokens)
+}
+
+// End-to-end coverage of subagent session emission: the derived session key
+// and virtual path, the parent link, exclusion of the tree's nodes from the
+// parent messages, deduplication of identical tree copies, and the fate of a
+// marker root that recorded no descendants.
+func TestParseDevinSessionEmitsSubagentSessions(t *testing.T) {
+	const sessionID = "session-subagent-emission"
+	fixture := newDevinTestFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Subagent emission",
+		WorkingDirectory: "/tmp/subagent-emission",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103210)),
+		MainChainID:      new(int64(3)),
+	})
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"message_id":"m-root","role":"system","content":"You are Devin, an interactive command line agent."}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ParentNodeID: new(int64(1)), ChatMessage: `{"message_id":"m-user","role":"user","content":"main task"}`, CreatedAt: 1704103202},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 3, ParentNodeID: new(int64(2)), ChatMessage: `{"message_id":"m-answer","role":"assistant","content":"spawned a subagent"}`, CreatedAt: 1704103203},
+
+		// Subagent tree rooted at node 10.
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 10, ChatMessage: `{"message_id":"m-subA-root","role":"system","content":"You are a subagent of Devin\nWork on task A."}`, CreatedAt: 1704103204},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 11, ParentNodeID: new(int64(10)), ChatMessage: `{"message_id":"m-subA-user","role":"user","content":"subtask A prompt"}`, CreatedAt: 1704103205},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 12, ParentNodeID: new(int64(11)), ChatMessage: `{"message_id":"m-subA-answer","role":"assistant","content":"subtask A reply"}`, CreatedAt: 1704103206},
+
+		// A second disconnected copy of the same run keeps the first user
+		// prompt's message_id; the later copy (higher root id) wins.
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 20, ChatMessage: `{"message_id":"m-subA-root2","role":"system","content":"You are a subagent of Devin\nWork on task A."}`, CreatedAt: 1704103207},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 21, ParentNodeID: new(int64(20)), ChatMessage: `{"message_id":"m-subA-user","role":"user","content":"subtask A prompt"}`, CreatedAt: 1704103208},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 22, ParentNodeID: new(int64(21)), ChatMessage: `{"message_id":"m-subA-answer2","role":"assistant","content":"subtask A final reply"}`, CreatedAt: 1704103209},
+
+		// A marker root with no descendants stays out of the parent stream
+		// and is not emitted as a session.
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 30, ChatMessage: `{"message_id":"m-subB-root","role":"system","content":"You are a subagent of Devin\nAbandoned spawn."}`, CreatedAt: 1704103210},
+	)
+
+	sess, msgs, subagents, err := parseDevinSessionWithSubagents(
+		t.Context(), fixture.DBPath, sessionID, "local",
+	)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+
+	// Parent session carries only its own chain.
+	require.Len(t, msgs, 3)
+	for _, m := range msgs {
+		assert.NotContains(t, m.Content, "subtask A")
+		assert.NotContains(t, m.Content, "subagent of Devin")
+	}
+
+	// The two tree copies collapse into one emitted session.
+	require.Len(t, subagents, 1)
+	sub := subagents[0].Session
+	assert.Equal(t, "devin:"+sessionID+":agent-20", sub.ID)
+	assert.Equal(t, sessionID+":agent-20", sub.SourceSessionID)
+	assert.Equal(t, "devin:"+sessionID, sub.ParentSessionID)
+	assert.Equal(t, RelSubagent, sub.RelationshipType)
+	assert.Equal(t,
+		devinSubagentVirtualSourcePath(VirtualSourcePath(fixture.DBPath, sessionID), 20),
+		sub.File.Path,
+	)
+	assert.Equal(t, AgentDevin, sub.Agent)
+	assert.Equal(t, "subtask A prompt", sub.FirstMessage)
+	assert.Equal(t, 1, sub.UserMessageCount)
+	require.Len(t, subagents[0].Messages, 3)
+	assert.Equal(t, "subtask A final reply", subagents[0].Messages[2].Content)
+}
+
+// The provider's Parse outcome includes one result per emitted subagent
+// session, linked to the parent through ParentSessionID.
+func TestDevinProviderParseEmitsSubagentResults(t *testing.T) {
+	const sessionID = "session-subagent-results"
+	fixture := newDevinTestFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Subagent results",
+		WorkingDirectory: "/tmp/subagent-results",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103210)),
+		MainChainID:      new(int64(1)),
+	})
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"main prompt"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 10, ChatMessage: `{"role":"system","content":"You are a subagent of Devin\nWork."}`, CreatedAt: 1704103202},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 11, ParentNodeID: new(int64(10)), ChatMessage: `{"role":"user","content":"subtask prompt"}`, CreatedAt: 1704103203},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 12, ParentNodeID: new(int64(11)), ChatMessage: `{"role":"assistant","content":"subtask reply"}`, CreatedAt: 1704103204},
+	)
+
+	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{fixture.Root}})
+	require.True(t, ok)
+
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: sessionID})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+	require.NoError(t, err)
+	require.True(t, outcome.ResultSetComplete)
+	require.Len(t, outcome.Results, 2)
+
+	main := outcome.Results[0].Result.Session
+	assert.Equal(t, "devin:"+sessionID, main.ID)
+	sub := outcome.Results[1].Result.Session
+	assert.Equal(t, "devin:"+sessionID+":agent-10", sub.ID)
+	assert.Equal(t, main.ID, sub.ParentSessionID)
+	assert.Equal(t, RelSubagent, sub.RelationshipType)
+	assert.Len(t, outcome.Results[1].Result.Messages, 3)
+}
+
+// A bare marker root with no descendants is neither emitted as a session nor
+// leaked into the parent message stream, even when the main chain cannot be
+// resolved and parsing falls back to the flat node list.
+func TestParseDevinSessionBareMarkerRootStaysInvisible(t *testing.T) {
+	const sessionID = "session-bare-marker-root"
+	fixture := newDevinTestFixture(t, devinSessionRow{
+		ID:               sessionID,
+		Title:            "Bare marker root",
+		WorkingDirectory: "/tmp/bare-marker-root",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103200)),
+		LastActivityAt:   new(int64(1704103210)),
+		// No MainChainID: the flat-node fallback includes every row.
+	})
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"main prompt"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ParentNodeID: new(int64(1)), ChatMessage: `{"role":"assistant","content":"main answer"}`, CreatedAt: 1704103202},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 30, ChatMessage: `{"role":"system","content":"You are a subagent of Devin\nAbandoned spawn."}`, CreatedAt: 1704103203},
+	)
+
+	sess, msgs, subagents, err := parseDevinSessionWithSubagents(
+		t.Context(), fixture.DBPath, sessionID, "local",
+	)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.Len(t, msgs, 2)
+	for _, m := range msgs {
+		assert.NotContains(t, m.Content, "subagent of Devin")
+	}
+	assert.Empty(t, subagents)
+}
+
+// An empty function.arguments string is the same case as a missing one: the
+// call-level input/arguments encodings are consulted either way.
+func TestParseDevinToolCallFallsBackWhenFunctionArgumentsEmpty(t *testing.T) {
+	tests := []struct {
+		name      string
+		toolCall  string
+		wantInput string
+	}{
+		{
+			name:      "empty arguments falls back to input",
+			toolCall:  `{"id":"c1","function":{"name":"shell_command","arguments":""},"input":{"command":"ls -la"}}`,
+			wantInput: `{"command":"ls -la"}`,
+		},
+		{
+			name:      "empty arguments falls back to arguments",
+			toolCall:  `{"id":"c1","function":{"name":"shell_command","arguments":""},"arguments":{"command":"ls"}}`,
+			wantInput: `{"command":"ls"}`,
+		},
+		{
+			name:      "missing arguments falls back to input",
+			toolCall:  `{"id":"c1","function":{"name":"shell_command"},"input":{"command":"pwd"}}`,
+			wantInput: `{"command":"pwd"}`,
+		},
+		{
+			name:      "populated arguments win",
+			toolCall:  `{"id":"c1","function":{"name":"shell_command","arguments":"{\"command\":\"make\"}"},"input":{"command":"ls"}}`,
+			wantInput: `{"command":"make"}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			call, ok := parseDevinToolCall(gjson.Parse(tc.toolCall))
+			require.True(t, ok)
+			assert.Equal(t, "shell_command", call.ToolName)
+			assert.JSONEq(t, tc.wantInput, call.InputJSON)
+		})
+	}
 }
 
 func TestParseDevinSessionRecoversMultiGenerationCompactedRoots(t *testing.T) {

@@ -55,6 +55,51 @@ func TestDirectSearchContentRedacts(t *testing.T) {
 		"reveal should show full secret: %q", rev.Matches[0].Snippet)
 }
 
+// TestDirectSearchContentFTSSourceGuard covers the fts source gate's split
+// by backend. A NewReadOnlyBackend store (the PostgreSQL/DuckDB/ClickHouse
+// read stores, which index only message content) rejects non-messages
+// sources instead of silently narrowing Sources to messages, while the
+// direct SQLite backend passes them through to searchContentFTS, which
+// honors Sources via the messages_fts and tool_content_fts indexes.
+func TestDirectSearchContentFTSSourceGuard(t *testing.T) {
+	t.Parallel()
+
+	roStore := &fakeContentStore{}
+	ro := service.NewReadOnlyBackend(roStore)
+	_, err := ro.SearchContent(t.Context(), service.ContentSearchRequest{
+		Pattern: "test", Mode: "fts",
+		Sources: []string{"tool_result"},
+		Limit:   50,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "searches messages only")
+	assert.Contains(t, err.Error(), `"tool_result"`)
+
+	// A messages-only selection passes the gate and reaches the store.
+	_, err = ro.SearchContent(t.Context(), service.ContentSearchRequest{
+		Pattern: "test", Mode: "fts",
+		Sources: []string{"messages"},
+		Limit:   50,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"messages"}, roStore.lastFilter.Sources)
+
+	// On SQLite the same request is not a source error: it either runs or,
+	// in a build without the fts5 module, reports fts as unavailable —
+	// both mean the gate let the tool_result source through.
+	d := dbtest.OpenTestDB(t)
+	direct := service.NewDirectBackend(d, nil)
+	_, err = direct.SearchContent(t.Context(), service.ContentSearchRequest{
+		Pattern: "test", Mode: "fts",
+		Sources: []string{"tool_result"},
+		Limit:   50,
+	})
+	if err != nil {
+		assert.NotContains(t, err.Error(), "messages only",
+			"SQLite fts must not reject tool sources")
+	}
+}
+
 // fakeContentStore is a minimal db.Store fake for context-enrichment tests:
 // only SearchContent and GetMessagesWindow are implemented; every other
 // Store method comes from the embedded nil interface and would panic if a

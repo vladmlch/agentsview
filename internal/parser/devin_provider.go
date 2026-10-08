@@ -327,16 +327,36 @@ func (s devinSourceSet) FindSource(
 	if err := ctx.Err(); err != nil {
 		return SourceRef{}, false, err
 	}
-	reqParentSessionID, reqSubagentNodeID, reqIsSubagent := parseDevinSubagentRawSessionID(req.RawSessionID)
+	parentSessionID, subagentNodeID, isSubagent := parseDevinSubagentRawSessionID(req.RawSessionID)
+	ref, ok, err := s.findSourceInterpreted(ctx, req, parentSessionID, subagentNodeID, isSubagent)
+	if ok || err != nil || !isSubagent {
+		return ref, ok, err
+	}
+	// The :agent-<n> suffix is AgentsView's derived key, not a
+	// producer-supplied id, so a real session row can carry the same shape.
+	// When the subagent interpretation finds nothing, retry the raw session
+	// id literally before reporting a miss.
+	return s.findSourceInterpreted(ctx, req, "", 0, false)
+}
 
+// findSourceInterpreted resolves a source under one interpretation of the
+// request's raw session id: either a subagent's derived key (parent session
+// id plus tree root node id) or a literal session id.
+func (s devinSourceSet) findSourceInterpreted(
+	ctx context.Context,
+	req FindSourceRequest,
+	parentSessionID string,
+	subagentNodeID int64,
+	isSubagent bool,
+) (SourceRef, bool, error) {
 	for _, path := range []string{req.StoredFilePath, req.FingerprintKey} {
 		if path == "" {
 			continue
 		}
 		rawSessionID := req.RawSessionID
-		parentSessionID := reqParentSessionID
-		subagentNodeID := reqSubagentNodeID
-		isSubagent := reqIsSubagent
+		pathParentSessionID := parentSessionID
+		pathSubagentNodeID := subagentNodeID
+		pathIsSubagent := isSubagent
 
 		for _, root := range s.roots {
 			ref, ok := s.sourceRef(root, path, true)
@@ -344,16 +364,16 @@ func (s devinSourceSet) FindSource(
 				continue
 			}
 			src := ref.Opaque.(devinSource)
-			if !isSubagent {
+			if !pathIsSubagent {
 				if _, pathSessionID, nodeID, subOk := parseDevinSubagentVirtualSourcePath(path); subOk {
-					parentSessionID = pathSessionID
-					subagentNodeID = nodeID
-					isSubagent = true
+					pathParentSessionID = pathSessionID
+					pathSubagentNodeID = nodeID
+					pathIsSubagent = true
 				}
 			}
 			targetSessionID := rawSessionID
-			if isSubagent {
-				targetSessionID = parentSessionID
+			if pathIsSubagent {
+				targetSessionID = pathParentSessionID
 			}
 			if targetSessionID != "" && src.SessionID != targetSessionID {
 				continue
@@ -367,8 +387,8 @@ func (s devinSourceSet) FindSource(
 					continue
 				}
 			}
-			if isSubagent {
-				exists, err := devinSubagentExists(ctx, src.DBPath, src.SessionID, subagentNodeID)
+			if pathIsSubagent {
+				exists, err := devinSubagentExists(ctx, src.DBPath, src.SessionID, pathSubagentNodeID)
 				if err != nil {
 					return SourceRef{}, false, err
 				}
@@ -379,12 +399,8 @@ func (s devinSourceSet) FindSource(
 			return ref, true, nil
 		}
 	}
-	rawSessionID := req.RawSessionID
-	parentSessionID := reqParentSessionID
-	subagentNodeID := reqSubagentNodeID
-	isSubagent := reqIsSubagent
 
-	lookupSessionID := rawSessionID
+	lookupSessionID := req.RawSessionID
 	if isSubagent {
 		lookupSessionID = parentSessionID
 	}
@@ -536,7 +552,56 @@ func devinFingerprintHash(ctx context.Context,
 	if _, err := io.Copy(h, f); err != nil {
 		return "", newDevinTranscriptError("hash", err)
 	}
+	// message_nodes is still the live representation and wins at parse time,
+	// so node-only changes must move the fingerprint even while an export
+	// file exists. The digest is one aggregate query, much cheaper than
+	// hashing every chat_message payload.
+	if err := devinAppendMessageNodesDigest(ctx, h, dbPath, meta.RawSessionID); err != nil {
+		return "", err
+	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// devinAppendMessageNodesDigest mixes a cheap aggregate over message_nodes
+// into the fingerprint: row count, newest row/timestamp, and total payload
+// length. That catches appended and in-place-edited nodes without hashing
+// every payload; an in-place rewrite preserving both row count and total
+// length still slips through, which is accepted for a hint. A database
+// without a usable message_nodes table contributes an empty digest.
+func devinAppendMessageNodesDigest(ctx context.Context, h io.Writer, dbPath, rawSessionID string) error {
+	db, err := openDevinDB(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	var requiredColumns int
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		  FROM pragma_table_info('message_nodes')
+		 WHERE name IN ('row_id', 'session_id', 'node_id', 'parent_node_id', 'chat_message', 'created_at')
+	`).Scan(&requiredColumns); err != nil {
+		return err
+	}
+	var nodeCount, maxCreatedAt, maxRowID, contentBytes int64
+	if requiredColumns == 6 {
+		if err := db.QueryRowContext(ctx, `
+			SELECT COUNT(*),
+			       COALESCE(MAX(created_at), 0),
+			       COALESCE(MAX(row_id), 0),
+			       COALESCE(SUM(LENGTH(chat_message)), 0)
+			  FROM message_nodes
+			 WHERE session_id = ?
+		`, rawSessionID).Scan(&nodeCount, &maxCreatedAt, &maxRowID, &contentBytes); err != nil {
+			return err
+		}
+	}
+	_, err = fmt.Fprintf(
+		h,
+		"message_nodes\x00count\x00%d\x00max_created\x00%d\x00max_row\x00%d\x00chat_bytes\x00%d\x00",
+		nodeCount, maxCreatedAt, maxRowID, contentBytes,
+	)
+	return err
 }
 
 func devinAppendMessageNodesFingerprint(ctx context.Context, h io.Writer, dbPath, rawSessionID string) error {

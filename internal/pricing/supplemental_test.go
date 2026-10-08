@@ -373,6 +373,7 @@ func TestSupplementalPricing_DevinAndAntigravityModels(t *testing.T) {
 		{"gemini-3.8-flash-high", "gemini-3.8-flash"},
 		{"gemini-3.8-flash-medium", "gemini-3.8-flash"},
 		{"gemini-3.8-flash-exp-a", "gemini-3.8-flash"},
+		{"gemini-3.7-flash-exp-b", "gemini-3.7-flash"},
 	} {
 		canon := CanonicalModelForDate(tc.reported, time.Now())
 		assert.Equal(t, tc.canonical, canon, "CanonicalModelForDate(%q)", tc.reported)

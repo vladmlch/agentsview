@@ -3431,8 +3431,9 @@ func (e *Engine) resyncBuildLocked(
 		log.Printf("resync: pre-sync copied %d trashed sessions", len(ids))
 	}
 	// The temp DB is not swapped into production until the end,
-	// so avoid per-row FTS trigger work during the bulk load and
-	// rebuild the index once all message rows are final.
+	// so drop the message FTS tables for the bulk load: every write
+	// would otherwise pay the batched index maintenance for rows the
+	// rebuild is about to reindex wholesale anyway.
 	ftsDropped := false
 	if newDB.HasFTS(ctx) {
 		tFTS := time.Now()
@@ -12503,9 +12504,10 @@ func (e *Engine) processProviderFile(
 	sourceForceReplace := false
 	if !forceSourceCwdParse && !codexForceFullParse &&
 		!codexProvenUnchanged && !codexAuditDeepVerify {
-		if mtime, fresh, forceReplace, contentVerified := e.providerSingleSessionFresh(
+		mtime, fresh, forceReplace, contentVerified := e.providerSingleSessionFresh(
 			ctx, provider, source, file,
-		); fresh {
+		)
+		if fresh {
 			if !verifiedStateOK || contentVerified {
 				if verifiedStateOK {
 					e.promoteVerifiedSource(verifiedCapture)
@@ -16785,8 +16787,9 @@ func (e *Engine) tryIncrementalJSONL(
 			if verdict == parser.ClaudeSplitFound {
 				var err error
 				update, err = e.tryClaudeSplitSuffixUpdate(
-					ctx, file, inc, first.ClaudeMessageID, runStart,
+					ctx, file, inc, info, first.ClaudeMessageID, runStart,
 					newOffset, incMtime, incHash, parseFn,
+					checkpoint, hashState, resumeOK,
 				)
 				if err != nil {
 					lease.Release()
@@ -16900,12 +16903,16 @@ func (e *Engine) tryClaudeSplitSuffixUpdate(
 	ctx context.Context,
 	file parser.DiscoveredFile,
 	inc *db.IncrementalInfo,
+	info os.FileInfo,
 	messageID string,
 	runStart int64,
 	newOffset int64,
 	incMtime int64,
 	incHash string,
 	parseFn incrementalParseFunc,
+	checkpoint *db.ParserCheckpoint,
+	hashState []byte,
+	resumeOK bool,
 ) (*incrementalUpdate, error) {
 	// The ranged write recounts the session from stored rows. Usage-only
 	// storage drops most user rows while message counts still follow the
@@ -16921,7 +16928,7 @@ func (e *Engine) tryClaudeSplitSuffixUpdate(
 	scanInc.FileSize = runStart
 	scanInc.NextOrdinal = runOrdinal
 	suffix, links, toolCallUpdates, messageUsageUpdates, endedAt, consumed,
-		terminationStatus, _, err := parseFn(file.Path, &scanInc)
+		terminationStatus, cursor, err := parseFn(file.Path, &scanInc)
 	if err != nil {
 		// Re-parsing from the run's start can be declined by the same
 		// fallbacks the window parse has: a queued command sorting ahead
@@ -16950,6 +16957,45 @@ func (e *Engine) tryClaudeSplitSuffixUpdate(
 	if inc.FirstMessage == "" && chunkHasRealUserPrompt(suffix) {
 		return nil, nil
 	}
+	// Advance the resumable checkpoint the same way the plain-append path
+	// does. The ranged write replaces the stored run rows but commits the
+	// same byte prefix, so the hash state resumed through newOffset and the
+	// cursor the suffix parse ended on both describe [0, newOffset). Without
+	// this the surviving checkpoint keeps the pre-write offset and the next
+	// sync marks it inconsistent, forcing a whole-transcript parse after
+	// every open-run re-parse.
+	var nextCheckpoint *db.ParserCheckpoint
+	var nextCheckpointBlobs *db.ParserCheckpointBlobs
+	if checkpoint != nil && len(cursor) > 0 && hashState != nil && resumeOK {
+		anchorDigest, anchorErr := codexCheckpointAnchorDigest(
+			file.Path, newOffset,
+		)
+		if anchorErr != nil {
+			log.Printf(
+				"building codex checkpoint %s: %v", file.Path, anchorErr,
+			)
+		} else {
+			inode, device := getFileIdentity(file.Path, info)
+			changeTime, _ := fileChangeTime(file.Path, info)
+			built, blobs := buildCodexCheckpoint(
+				inc.ID,
+				string(file.Agent),
+				e.effectiveSourcePath(file.Path),
+				uint64(inode),
+				uint64(device),
+				incMtime,
+				changeTime,
+				newOffset,
+				cursor,
+				hashState,
+				incHash,
+				nextParsedOrdinal(runOrdinal, suffix),
+				anchorDigest,
+			)
+			nextCheckpoint = built
+			nextCheckpointBlobs = &blobs
+		}
+	}
 	return &incrementalUpdate{
 		agent:              file.Agent,
 		sessionID:          inc.ID,
@@ -16967,6 +17013,8 @@ func (e *Engine) tryClaudeSplitSuffixUpdate(
 		fileHash:           incHash,
 		nextOrdinal:        nextParsedOrdinal(runOrdinal, suffix),
 		lastEntryUUID:      lastParsedSourceUUID(inc.LastEntryUUID, suffix),
+		checkpoint:         nextCheckpoint,
+		checkpointBlobs:    nextCheckpointBlobs,
 		suffixReplace:      true,
 		replaceFromOrdinal: runOrdinal,
 	}, nil
@@ -19165,7 +19213,7 @@ func (e *Engine) writeStagedFullParse(
 			}
 			combined := append(
 				append([]db.SecretFinding(nil), findings...),
-				pw.staged.Findings(s.ID, positions)...,
+				pw.staged.Findings(ctx, s.ID, positions)...,
 			)
 			update.SecretLeakCount = definiteFindingCount(combined)
 			return update, combined, nil

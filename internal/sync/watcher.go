@@ -163,6 +163,16 @@ func isSQLiteSHMPath(path string) bool {
 	return strings.HasSuffix(path, "-shm")
 }
 
+// sqliteWALBasePath folds a SQLite WAL sibling path back to the database
+// path it describes; every other path passes through unchanged. "-shm"
+// events are dropped entirely by isSQLiteSHMPath: only the database file
+// and its WAL carry committed writes, while readers — including this
+// process's own scans — rewrite the shared-memory index, so honoring it
+// would make each scan schedule the next one.
+func sqliteWALBasePath(path string) string {
+	return strings.TrimSuffix(path, "-wal")
+}
+
 func (p *pendingWatchBatch) Add(path string) {
 	if isSQLiteSHMPath(path) {
 		return
@@ -216,6 +226,10 @@ func (p *pendingWatchBatch) AddCreatedSubtreePath(path, root string) bool {
 }
 
 func (p *pendingWatchBatch) AddRename(rename WatchRename) {
+	if isSQLiteSHMPath(rename.Path) {
+		return
+	}
+	rename.Path = sqliteWALBasePath(rename.Path)
 	if rename.Path == "" {
 		return
 	}
@@ -233,6 +247,10 @@ func (p *pendingWatchBatch) AddRename(rename WatchRename) {
 }
 
 func (p *pendingWatchBatch) AddReconcileRoot(root string) {
+	if isSQLiteSHMPath(root) {
+		return
+	}
+	root = sqliteWALBasePath(root)
 	if root == "" {
 		return
 	}
@@ -272,7 +290,7 @@ func (p *pendingWatchBatch) AddBackendEvent(event backendEvent) bool {
 			return wasFullSync || !p.fullSync
 		}
 		rename := pendingBackendRename{
-			Path:     event.Path,
+			Path:     sqliteWALBasePath(event.Path),
 			Root:     event.Root,
 			ItemType: event.ItemType,
 		}

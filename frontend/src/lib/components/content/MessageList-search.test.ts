@@ -255,6 +255,9 @@ describe("MessageList search visibility", () => {
     // directly before the final-output row, and both claim the output
     // ordinal — mounting the match must center the row that actually
     // renders the search block, not the preview that claims it first.
+    // The turn starts expanded so the preview row mounts beside the
+    // output row; that is the layout where the first claimant lies.
+    ui.setAutoCollapseAssistantTurns(false);
     messages.messages = [
       message(0, "prompt", { role: "user" }),
       message(1, "[Thinking]\nplan\n[/Thinking]\nintermediate", {
@@ -267,10 +270,10 @@ describe("MessageList search visibility", () => {
       message(3, "needle final answer"),
     ];
     messages.messageCount = 4;
-    // Keep the final-output row out of the rendered window wherever it
-    // lands (collapsed index 2; expanded index 4 once the search overlay
-    // hides the thinking/tool events) so the reveal must mount it; the
-    // preview event row stays mounted and owns no blocks.
+    // Keep the final-output row out of the rendered window (index 4 once
+    // the search overlay hides the thinking/tool events) so the reveal
+    // must scroll it into view; the preview event row stays mounted and
+    // owns no blocks.
     virtualizerMock.hiddenIndexes = [2, 4];
     component = mount(MessageList, { target: document.body });
     await tick();
@@ -286,6 +289,123 @@ describe("MessageList search visibility", () => {
       align: "center",
     });
     expect(virtualizerMock.scrollToIndex).not.toHaveBeenCalledWith(previewIndex, expect.anything());
+  });
+
+  it("expands the owning turn to reveal a folded match", async () => {
+    // A collapsed turn still renders its final-output row, but the
+    // reveal opens the turn so the member context mounts around the
+    // match — the scroll then centers the output row in the expanded
+    // layout.
+    messages.messages = [
+      message(0, "prompt", { role: "user" }),
+      message(1, "[Thinking]\nplan\n[/Thinking]\nintermediate", {
+        has_thinking: true,
+      }),
+      message(2, "", {
+        has_tool_use: true,
+        tool_calls: [{ category: "", tool_name: "Read", result_content: "data" }],
+      }),
+      message(3, "needle final answer"),
+    ];
+    messages.messageCount = 4;
+    // Hide the output row from the rendered window (expanded index 4)
+    // so the reveal must scroll rather than relying on a mounted row.
+    virtualizerMock.hiddenIndexes = [2, 4];
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    await search();
+    await settleReveal();
+
+    // Expanded layout under the search overlay:
+    // [user, header, msg1 event, msg3 preview event, final output]
+    expect(virtualizerMock.scrollToIndex).toHaveBeenCalledWith(4, {
+      align: "center",
+    });
+    const header = document.querySelector(".turn-header");
+    expect(header).not.toBeNull();
+    expect(header!.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("applies a mid-search filter change to the DOM without losing the index", async () => {
+    // Thinking is saved-visible and the turn starts expanded, so its row
+    // mounts without a reveal — the filter toggle itself drives the DOM.
+    ui.setAutoCollapseAssistantTurns(false);
+    ui.setBlockVisible("thinking", true);
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await search();
+    // The index covers hidden types: all four matches count, and the
+    // current result is the visible user text.
+    expect(inSessionSearch.total).toBe(4);
+    expect(inSessionSearch.countForBlock("1:thinking:0")).toBe(1);
+    await settleReveal();
+    expect(inSessionSearch.resolvedCurrent?.blockKey).toBe("0:text:0");
+    expect(document.querySelectorAll(".thinking-header").length).toBeGreaterThan(0);
+    expect(
+      document.querySelector('[data-search-current="true"]')?.getAttribute("data-search-block"),
+    ).toBe("0:text:0");
+
+    // Hiding the type unmounts its rows while the match stays indexed,
+    // and the current highlight does not move.
+    ui.setBlockVisible("thinking", false);
+    await tick();
+    await vi.advanceTimersByTimeAsync(50);
+    await tick();
+    expect(inSessionSearch.total).toBe(4);
+    expect(inSessionSearch.countForBlock("1:thinking:0")).toBe(1);
+    expect(document.querySelectorAll(".thinking-header")).toHaveLength(0);
+    expect(inSessionSearch.resolvedCurrent?.blockKey).toBe("0:text:0");
+    expect(
+      document.querySelector('[data-search-current="true"]')?.getAttribute("data-search-block"),
+    ).toBe("0:text:0");
+
+    // Re-enabling the type remounts the row.
+    ui.setBlockVisible("thinking", true);
+    await tick();
+    await vi.advanceTimersByTimeAsync(50);
+    await tick();
+    expect(document.querySelectorAll(".thinking-header").length).toBeGreaterThan(0);
+    expect(
+      document.querySelector('[data-search-current="true"]')?.getAttribute("data-search-block"),
+    ).toBe("0:text:0");
+  });
+
+  it("clears the current highlight while the current match's type is suppressed, then restores it", async () => {
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await search();
+    // Navigate to the tool-output match inside the revealed tool type.
+    inSessionSearch.next();
+    inSessionSearch.next();
+    inSessionSearch.next();
+    await settleReveal();
+    expect(inSessionSearch.resolvedCurrent?.blockKey).toBe("2:tool-output:0");
+    expect(
+      document.querySelector('[data-search-current="true"]')?.getAttribute("data-search-block"),
+    ).toBe("2:tool-output:0");
+
+    // Suppressing the type unmounts the block: the match stays indexed and
+    // current, but no element carries the current marker.
+    inSessionSearch.noteManualBlockFilterChange("tool", false);
+    ui.setBlockVisible("tool", false);
+    await tick();
+    await vi.advanceTimersByTimeAsync(50);
+    await tick();
+    expect(inSessionSearch.countForBlock("2:tool-output:0")).toBe(1);
+    expect(document.querySelector(".tool-block")).toBeNull();
+    expect(document.querySelector("[data-search-current]")).toBeNull();
+
+    // Re-enabling remounts the block and the same match takes the
+    // highlight back without re-navigating.
+    inSessionSearch.noteManualBlockFilterChange("tool", true);
+    ui.setBlockVisible("tool", true);
+    await tick();
+    await settleReveal();
+    expect(inSessionSearch.resolvedCurrent?.blockKey).toBe("2:tool-output:0");
+    expect(
+      document.querySelector('[data-search-current="true"]')?.getAttribute("data-search-block"),
+    ).toBe("2:tool-output:0");
   });
 
   it("opens a truncated prompt's disclosure so a tail match mounts and highlights", async () => {

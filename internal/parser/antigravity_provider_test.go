@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,8 +39,11 @@ func TestAntigravityProviderSourceMethods(t *testing.T) {
 	assert.True(t, plan.Roots[1].Recursive)
 	assert.Equal(t, 1, plan.Roots[1].MaxDepth,
 		"generated brain trees stay unwatched")
-	assert.Equal(t, []string{"*/.system_generated/logs"}, plan.Roots[1].ExtraDirectories,
-		"the plaintext transcript directory stays watched")
+	assert.Equal(t, []string{
+		"*/.system_generated/logs",
+		"*/.system_generated/subagents",
+	}, plan.Roots[1].ExtraDirectories,
+		"transcript and subagent-descriptor directories stay watched below MaxDepth")
 	assert.Equal(t, filepath.Join(root, "conversations"), plan.Roots[2].Path)
 	assert.False(t, plan.Roots[2].Recursive)
 	assert.Equal(t, filepath.Clean(root), filepath.Clean(plan.Roots[3].Path))
@@ -1819,4 +1824,146 @@ func TestAntigravityWatchPlanAndSummaryChange(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 	assert.Equal(t, filepath.Join(root, "conversations", id+".db"), sources[0].DisplayPath)
+}
+
+// writeAntigravitySummariesDB creates root's conversation_summaries.db
+// with one row per conversation_id -> workspace_uris entry.
+func writeAntigravitySummariesDB(
+	t *testing.T, root string, rows map[string]string,
+) {
+	t.Helper()
+	dbPath := filepath.Join(root, "conversation_summaries.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = db.Exec("CREATE TABLE conversation_summaries (conversation_id text primary key, workspace_uris text, title text)")
+	require.NoError(t, err)
+	for id, ws := range rows {
+		_, err = db.Exec(
+			"INSERT INTO conversation_summaries (conversation_id, workspace_uris, title) VALUES (?, ?, '')",
+			id, ws,
+		)
+		require.NoError(t, err)
+	}
+	require.NoError(t, db.Close())
+}
+
+// countAntigravitySummaryOpens swaps the summary index's database-open
+// hook with a counter for opens under root and restores it on cleanup.
+// The path filter keeps the count correct while unrelated parallel
+// tests open their own summaries databases.
+func countAntigravitySummaryOpens(
+	t *testing.T, root string,
+) *atomic.Int64 {
+	t.Helper()
+	opens := &atomic.Int64{}
+	orig := antigravitySummaryDBReader
+	antigravitySummaryDBReader = func(
+		ctx context.Context, path string, opts sqliteReadOptions,
+		fn func(db *sql.DB) error,
+	) error {
+		if filepath.Clean(filepath.Dir(path)) == filepath.Clean(root) {
+			opens.Add(1)
+		}
+		return orig(ctx, path, opts, fn)
+	}
+	t.Cleanup(func() { antigravitySummaryDBReader = orig })
+	return opens
+}
+
+// TestAntigravitySummarySHMEventDoesNotRescan pins the journal rule the
+// conversations root already follows: conversation_summaries.db-shm is
+// the index a scan's own read-only open rewrites, so routing it would
+// make every scan schedule the next one -- a self-exciting loop of
+// summary reloads and source refingerprints. The event must neither
+// rescan the database nor return sources; the -wal sidecar folds onto
+// the base path and still triggers exactly one scan.
+func TestAntigravitySummarySHMEventDoesNotRescan(t *testing.T) {
+	root := t.TempDir()
+	id := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	writeAntigravityIDEProviderFixture(t, root, id)
+	writeAntigravitySummariesDB(t, root, map[string]string{
+		id: `["file:///tmp/proj"]`,
+	})
+
+	provider := newAntigravityTestProvider(t, root)
+	opens := countAntigravitySummaryOpens(t, root)
+
+	changed, err := provider.SourcesForChangedPath(
+		t.Context(),
+		ChangedPathRequest{
+			Path:      filepath.Join(root, "conversation_summaries.db-shm"),
+			EventKind: "write",
+		},
+	)
+	require.NoError(t, err)
+	assert.Empty(t, changed,
+		"the -shm index rewrite must not route sources for refingerprint")
+	assert.Zero(t, opens.Load(),
+		"an -shm event must not trigger a summaries scan")
+
+	changed, err = provider.SourcesForChangedPath(
+		t.Context(),
+		ChangedPathRequest{
+			Path:      filepath.Join(root, "conversation_summaries.db-wal"),
+			EventKind: "write",
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, changed, 1)
+	assert.Equal(t,
+		filepath.Join(root, "conversations", id+".db"),
+		changed[0].DisplayPath)
+	assert.Equal(t, int64(1), opens.Load(),
+		"a -wal event folds onto the base path and scans once")
+}
+
+// TestAntigravitySummaryMissSharedAcrossSources guards the per-root
+// miss cache. Every source lookup used to reopen
+// conversation_summaries.db on a miss, so a root whose database knows
+// none of its sessions paid one open -- busy-timeout plus a possible
+// scratch copy -- per source per pass. The scan's single open is now
+// shared by every source of the root.
+func TestAntigravitySummaryMissSharedAcrossSources(t *testing.T) {
+	root := t.TempDir()
+	mustMkdir(t, filepath.Join(root, "conversations"))
+	ids := []string{
+		"11111111-2222-4333-8444-555555555551",
+		"22222222-3333-4444-8555-666666666662",
+		"33333333-4444-4555-8666-777777777773",
+	}
+	for _, id := range ids {
+		createAntigravityTestDB(t,
+			filepath.Join(root, "conversations", id+".db"))
+	}
+	// The database exists but knows none of the session ids: every
+	// per-source lookup is a miss.
+	writeAntigravitySummariesDB(t, root, map[string]string{
+		"99999999-9999-4999-8999-999999999999": `["file:///tmp/other"]`,
+	})
+
+	provider := newAntigravityTestProvider(t, root)
+	opens := countAntigravitySummaryOpens(t, root)
+
+	sources, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, sources, 3)
+	assert.Equal(t, int64(1), opens.Load(),
+		"one summaries scan per root must serve every source lookup")
+	for _, source := range sources {
+		assert.Empty(t, source.ProjectHint)
+	}
+
+	// A later changed-path lookup on the same scanned root must not
+	// reopen the database either.
+	changed, err := provider.SourcesForChangedPath(
+		t.Context(),
+		ChangedPathRequest{
+			Path:      sources[0].DisplayPath + "-wal",
+			EventKind: "write",
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, changed, 1)
+	assert.Equal(t, int64(1), opens.Load(),
+		"a scanned root's lookups never reopen the database")
 }

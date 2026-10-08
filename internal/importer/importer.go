@@ -72,7 +72,7 @@ type ftsSuspender interface {
 	RebuildFTS(ctx context.Context) error
 }
 
-// lazyFTS suspends FTS triggers on first call to suspend()
+// lazyFTS suspends FTS maintenance on first call to suspend()
 // and rebuilds on restore(). If suspend() is never called
 // (no message work happened), restore() is a no-op. This
 // avoids the expensive FTS rebuild when re-importing an
@@ -302,7 +302,7 @@ func upsertConversation(
 	}
 
 	// Suspend FTS before first message-changing operation to
-	// avoid per-row trigger overhead during bulk work.
+	// avoid per-batch index maintenance during bulk work.
 	fts.suspend(ctx)
 
 	if err := store.ReplaceSessionMessages(ctx, s.ID, msgs); err != nil {
@@ -485,7 +485,7 @@ func upsertChatGPTConversation(
 	// replacement would delete and reinsert archived rows, changing message
 	// IDs and risking pins that cannot be re-matched without source UUIDs. A
 	// fill- or repair-only import is an update too. In-place text updates
-	// reindex through the update trigger, so only inserts suspend the index.
+	// are reindexed by the write itself, so only inserts suspend the index.
 	if len(msgs) > len(archived) {
 		fts.suspend(ctx)
 	}

@@ -34,7 +34,6 @@ func (s junieIndexSummary) sessionSummary() junieSessionSummary {
 	return junieSessionSummary{
 		projectDir: s.ProjectDir,
 		taskName:   s.TaskName,
-		lifecycle:  strings.ToUpper(s.Status),
 		createdAt:  junieMillisTimestamp(s.CreatedAt),
 		updatedAt:  junieMillisTimestamp(s.UpdatedAt),
 	}
@@ -43,6 +42,14 @@ func (s junieIndexSummary) sessionSummary() junieSessionSummary {
 type junieTranscriptMessage struct {
 	ParsedMessage
 	active bool
+	// seq is the transcript line number that produced this message; it orders
+	// assembled output by file position, which stays a strict total order even
+	// when timestamps are missing or equal.
+	seq int
+	// opensTurn marks a user prompt that starts a new agent turn: assistant
+	// blocks written after it belong to a separate message even when they
+	// share the taskID of earlier output.
+	opensTurn bool
 }
 
 type junieBlock struct {
@@ -72,23 +79,29 @@ type junieBlock struct {
 }
 
 type junieAgentStream struct {
-	id        string
-	name      string
-	kind      string
-	stepID    string
-	blocks    map[string]*junieBlock
-	blockOrd  []string
-	request   string
-	requestTS time.Time
-	usage     []ParsedUsageEvent
-	cwd       string
-	taskName  string
-	firstTS   time.Time
-	lastTS    time.Time
-	notes     []ParsedMessage
-	cancelled bool
-	failed    bool
-	state     string
+	id      string
+	name    string
+	kind    string
+	stepID  string
+	stepIDs map[string]bool
+	// stepIDCanonical reports whether stepID came from a -request/-spawned
+	// marker step rather than a bare stepId; once set, later markers must not
+	// reseat the stream's canonical step.
+	stepIDCanonical bool
+	blocks          map[string]*junieBlock
+	blockOrd        []string
+	request         string
+	requestTS       time.Time
+	requestSeq      int
+	usage           []ParsedUsageEvent
+	cwd             string
+	taskName        string
+	firstTS         time.Time
+	lastTS          time.Time
+	notes           []junieTranscriptMessage
+	cancelled       bool
+	failed          bool
+	state           string
 }
 
 func newJunieAgentStream(id string) *junieAgentStream {
@@ -248,11 +261,11 @@ func (s *junieParserState) consumeEvent(event gjson.Result, lineNumber int) erro
 
 	switch event.Get("kind").Str {
 	case "UserPromptEvent":
-		s.consumeUserPrompt(event, timestamp)
+		s.consumeUserPrompt(event, timestamp, lineNumber)
 	case "UserResponseEvent":
-		s.appendMessage(RoleUser, event.Get("prompt").Str, timestamp)
+		s.appendMessage(RoleUser, event.Get("prompt").Str, timestamp, lineNumber)
 	case "UserAsyncResponseEvent":
-		s.consumeAsyncResponse(event, timestamp)
+		s.consumeAsyncResponse(event, timestamp, lineNumber)
 	case "UserMessagesCommittedToHistory":
 		s.setUserMessagesActive(event.Get("userMessageIds"), true)
 	case "UserMessagesDroppedFromHistory", "UserMessagesFailedInHistory":
@@ -261,16 +274,14 @@ func (s *junieParserState) consumeEvent(event gjson.Result, lineNumber int) erro
 		s.sessionName = event.Get("name").Str
 		s.sessionNameFound = true
 	case "SystemMessageEvent":
-		s.consumeSystemMessage(event, timestamp)
+		s.consumeSystemMessage(event, timestamp, lineNumber)
 	case "CancelAgentEvent":
-		s.consumeAgentLifecycleEvent(event, timestamp, "CancelAgentEvent")
+		s.consumeAgentLifecycleEvent(event, timestamp, "CancelAgentEvent", lineNumber)
 	case "AgentTaskFailedEvent", "AgentFailureEvent":
-		s.consumeAgentLifecycleEvent(event, timestamp, event.Get("kind").Str)
+		s.consumeAgentLifecycleEvent(event, timestamp, event.Get("kind").Str, lineNumber)
 	case "TaskState":
-		st := event.Get("state").Str
-		if s.lastTaskState != "CANCELLED" && s.lastTaskState != "CANCELED" && s.lastTaskState != "FAILED" {
-			s.lastTaskState = st
-		} else if st == "CANCELLED" || st == "CANCELED" || st == "FAILED" {
+		st := strings.ToUpper(event.Get("state").Str)
+		if !junieTerminalTaskState(s.lastTaskState) || junieTerminalTaskState(st) {
 			s.lastTaskState = st
 		}
 	case "SessionA2uxEvent":
@@ -279,7 +290,15 @@ func (s *junieParserState) consumeEvent(event gjson.Result, lineNumber int) erro
 	return nil
 }
 
-func (s *junieParserState) consumeUserPrompt(event gjson.Result, timestamp time.Time) {
+// junieTerminalTaskState reports whether a task state is terminal-failed:
+// once reached, it must not be overwritten by a resumed in-flight state.
+func junieTerminalTaskState(state string) bool {
+	return state == "CANCELLED" || state == "CANCELED" || state == "FAILED"
+}
+
+func (s *junieParserState) consumeUserPrompt(
+	event gjson.Result, timestamp time.Time, lineNumber int,
+) {
 	content := firstNonEmptyJSONLString(
 		event.Get("presentablePrompt").Str,
 		event.Get("prompt").Str,
@@ -292,17 +311,21 @@ func (s *junieParserState) consumeUserPrompt(event gjson.Result, timestamp time.
 		s.entries[index].Timestamp = timestamp
 		s.entries[index].active = active
 		s.entries[index].SourceUUID = requestID
+		s.entries[index].opensTurn = true
 		return
 	}
-	index := s.appendMessage(RoleUser, content, timestamp)
+	index := s.appendMessage(RoleUser, content, timestamp, lineNumber)
 	s.entries[index].active = active
 	s.entries[index].SourceUUID = requestID
+	s.entries[index].opensTurn = true
 	if requestID != "" {
 		s.userMessages[requestID] = index
 	}
 }
 
-func (s *junieParserState) consumeAsyncResponse(event gjson.Result, timestamp time.Time) {
+func (s *junieParserState) consumeAsyncResponse(
+	event gjson.Result, timestamp time.Time, lineNumber int,
+) {
 	var responses []string
 	for _, entry := range event.Get("entries").Array() {
 		response := strings.TrimSpace(strings.Join([]string{
@@ -313,10 +336,12 @@ func (s *junieParserState) consumeAsyncResponse(event gjson.Result, timestamp ti
 			responses = append(responses, response)
 		}
 	}
-	s.appendMessage(RoleUser, strings.Join(responses, "\n\n"), timestamp)
+	s.appendMessage(RoleUser, strings.Join(responses, "\n\n"), timestamp, lineNumber)
 }
 
-func (s *junieParserState) consumeSystemMessage(event gjson.Result, timestamp time.Time) {
+func (s *junieParserState) consumeSystemMessage(
+	event gjson.Result, timestamp time.Time, lineNumber int,
+) {
 	text := strings.TrimSpace(event.Get("text").Str)
 	details := strings.TrimSpace(event.Get("details").Str)
 	if details != "" && details != text {
@@ -332,11 +357,12 @@ func (s *junieParserState) consumeSystemMessage(event gjson.Result, timestamp ti
 			SourceSubtype: event.Get("level").Str,
 		},
 		active: strings.TrimSpace(text) != "",
+		seq:    lineNumber,
 	})
 }
 
 func (s *junieParserState) consumeAgentLifecycleEvent(
-	event gjson.Result, timestamp time.Time, kind string,
+	event gjson.Result, timestamp time.Time, kind string, lineNumber int,
 ) {
 	targetAgent := firstNonEmptyJSONLString(
 		event.Get("agent.id").Str, event.Get("agentId").Str,
@@ -362,6 +388,7 @@ func (s *junieParserState) consumeAgentLifecycleEvent(
 			SourceSubtype: kind,
 		},
 		active: strings.TrimSpace(text) != "",
+		seq:    lineNumber,
 	}
 	st := findJunieStream(s.streams, targetAgent, stepID)
 	switch {
@@ -373,7 +400,7 @@ func (s *junieParserState) consumeAgentLifecycleEvent(
 			st.failed = true
 			st.state = "FAILED"
 		}
-		st.notes = append(st.notes, msg.ParsedMessage)
+		st.notes = append(st.notes, msg)
 	case targetAgent != "" && targetAgent != "main":
 		st = newJunieAgentStream(targetAgent)
 		if kind == "CancelAgentEvent" {
@@ -385,7 +412,7 @@ func (s *junieParserState) consumeAgentLifecycleEvent(
 		}
 		s.streams[targetAgent] = st
 		s.streamOrder = append(s.streamOrder, targetAgent)
-		st.notes = append(st.notes, msg.ParsedMessage)
+		st.notes = append(st.notes, msg)
 	default:
 		if kind == "CancelAgentEvent" {
 			s.lastTaskState = "CANCELLED"
@@ -407,10 +434,12 @@ func (s *junieParserState) consumeA2UXEvent(
 	}
 	if agentID == "" {
 		if ae.Get("agent.kind").Str == "BuiltInAgent" {
+			// Only a -request/-spawned marker step identifies the agent: a
+			// bare stepId would mint a stream per step and split one agent's
+			// output across many sessions.
 			agentID = firstNonEmptyJSONLString(
 				ae.Get("agent.name").Str,
-				strings.TrimSuffix(strings.TrimSuffix(
-					ae.Get("stepId").Str, "-request"), "-spawned"),
+				junieStepMarkerID(ae.Get("stepId").Str),
 				"subagent",
 			)
 		} else {
@@ -442,17 +471,25 @@ func (s *junieParserState) consumeA2UXEvent(
 	}
 	if agentID != "main" {
 		if rawStepID := ae.Get("stepId").Str; rawStepID != "" {
-			if strings.HasSuffix(rawStepID, "-request") ||
-				strings.HasSuffix(rawStepID, "-spawned") {
-				stream.stepID = strings.TrimSuffix(strings.TrimSuffix(
-					rawStepID, "-request"), "-spawned")
-			} else if stream.stepID == "" {
-				stream.stepID = rawStepID
+			if stream.stepIDs == nil {
+				stream.stepIDs = make(map[string]bool)
+			}
+			stream.stepIDs[rawStepID] = true
+			trimmed := junieTrimStepMarker(rawStepID)
+			isMarker := trimmed != rawStepID
+			if isMarker {
+				stream.stepIDs[trimmed] = true
+			}
+			if stream.stepID == "" || (isMarker && !stream.stepIDCanonical) {
+				// A marker-derived canonical step overrides a bare first-seen
+				// stepId; once canonical, later markers must not reseat it.
+				stream.stepID = trimmed
+				stream.stepIDCanonical = isMarker
 			}
 		}
 	}
 	taskID := event.Get("taskId").Str
-	eventState := event.Get("event.state").Str
+	eventState := strings.ToUpper(event.Get("event.state").Str)
 	if eventState == "CANCELLED" || eventState == "CANCELED" {
 		if agentID == "main" {
 			s.lastTaskState = "CANCELLED"
@@ -462,7 +499,7 @@ func (s *junieParserState) consumeA2UXEvent(
 		}
 	} else if eventState == "FAILED" || eventState == "ERROR" {
 		if agentID == "main" {
-			if s.lastTaskState == "" || s.lastTaskState == "COMPLETED" {
+			if !junieTerminalTaskState(s.lastTaskState) {
 				s.lastTaskState = "FAILED"
 			}
 		} else {
@@ -486,9 +523,9 @@ func (s *junieParserState) consumeA2UXEvent(
 		junieUpsertBlock(stream, ae, kind, taskID, eventState, lineNumber, timestamp)
 	case "CustomAgentBlockUpdatedEvent",
 		"SubagentSpawnedEvent":
-		if agentID == "main" {
-			junieUpsertBlock(stream, ae, kind, taskID, eventState, lineNumber, timestamp)
-		}
+		// A non-main agent spawning its own subagent still records the call in
+		// that agent's stream; dropping it would lose the child spawn entirely.
+		junieUpsertBlock(stream, ae, kind, taskID, eventState, lineNumber, timestamp)
 	case "AgentTaskNameUpdatedEvent":
 		name := strings.TrimSpace(firstNonEmptyJSONLString(
 			ae.Get("name").Str, ae.Get("taskName").Str))
@@ -515,13 +552,17 @@ func (s *junieParserState) consumeA2UXEvent(
 			ae.Get("message").Str, ae.Get("reason").Str,
 			ae.Get("errorCode").Str, fallback,
 		)
-		stream.notes = append(stream.notes, ParsedMessage{
-			Role:          RoleSystem,
-			IsSystem:      true,
-			Content:       text,
-			ContentLength: len(text),
-			Timestamp:     timestamp,
-			SourceSubtype: kind,
+		stream.notes = append(stream.notes, junieTranscriptMessage{
+			ParsedMessage: ParsedMessage{
+				Role:          RoleSystem,
+				IsSystem:      true,
+				Content:       text,
+				ContentLength: len(text),
+				Timestamp:     timestamp,
+				SourceSubtype: kind,
+			},
+			active: strings.TrimSpace(text) != "",
+			seq:    lineNumber,
 		})
 		if kind == "CancelAgentEvent" {
 			if agentID == "main" {
@@ -532,7 +573,7 @@ func (s *junieParserState) consumeA2UXEvent(
 			}
 		} else {
 			if agentID == "main" {
-				if s.lastTaskState == "" || s.lastTaskState == "COMPLETED" {
+				if !junieTerminalTaskState(s.lastTaskState) {
 					s.lastTaskState = "FAILED"
 				}
 			} else {
@@ -553,7 +594,7 @@ func junieUpsertBlock(
 	if stepID == "" {
 		stepID = kind + "#" + ae.Raw[:min(len(ae.Raw), 64)]
 	}
-	status := firstNonEmptyJSONLString(ae.Get("status").Str, eventState)
+	status := strings.ToUpper(firstNonEmptyJSONLString(ae.Get("status").Str, eventState))
 	cancelled := ae.Get("cancelled").Bool() ||
 		status == "CANCELLED" ||
 		status == "CANCELED" ||
@@ -610,8 +651,17 @@ func junieUpsertBlock(
 		if stream.request == "" {
 			stream.request = b.text
 			stream.requestTS = ts
+			stream.requestSeq = seq
 		}
-		stream.stepID = strings.TrimSuffix(stepID, "-request")
+		if stream.stepIDs == nil {
+			stream.stepIDs = make(map[string]bool)
+		}
+		stream.stepIDs[stepID] = true
+		stream.stepIDs[strings.TrimSuffix(stepID, "-request")] = true
+		if stream.stepID == "" || !stream.stepIDCanonical {
+			stream.stepID = strings.TrimSuffix(stepID, "-request")
+			stream.stepIDCanonical = true
+		}
 		return
 	}
 	if existing, ok := stream.blocks[stepID]; ok {
@@ -661,6 +711,21 @@ func (s *junieParserState) consumeModelUsage(
 	return nil
 }
 
+// junieTrimStepMarker strips the synthetic -request/-spawned marker suffixes
+// that identify a subagent's canonical step.
+func junieTrimStepMarker(stepID string) string {
+	return strings.TrimSuffix(strings.TrimSuffix(stepID, "-request"), "-spawned")
+}
+
+// junieStepMarkerID returns the canonical step only when a marker suffix was
+// actually present, so a bare stepId is not mistaken for an agent identifier.
+func junieStepMarkerID(stepID string) string {
+	if trimmed := junieTrimStepMarker(stepID); trimmed != stepID {
+		return trimmed
+	}
+	return ""
+}
+
 func junieRewriteUsageSession(
 	stream *junieAgentStream, fullID string,
 ) []ParsedUsageEvent {
@@ -674,8 +739,13 @@ func junieRewriteUsageSession(
 }
 
 func junieAssembleMessages(
-	stream *junieAgentStream, extra []ParsedMessage,
+	stream *junieAgentStream, extra []junieTranscriptMessage,
 ) []ParsedMessage {
+	type sequencedMessage struct {
+		seq int
+		msg ParsedMessage
+	}
+
 	var taskIDs []string
 	byTask := make(map[string][]*junieBlock)
 	for _, stepID := range stream.blockOrd {
@@ -685,31 +755,69 @@ func junieAssembleMessages(
 		}
 		if _, seen := byTask[b.taskID]; !seen {
 			taskIDs = append(taskIDs, b.taskID)
-			byTask[b.taskID] = []*junieBlock{b}
-			continue
 		}
 		byTask[b.taskID] = append(byTask[b.taskID], b)
 	}
 
-	var merged []ParsedMessage
-	merged = append(merged, extra...)
-	for _, taskID := range taskIDs {
-		if msg, ok := junieAssistantMessage(byTask[taskID], stream); ok {
-			merged = append(merged, msg)
+	// A user prompt whose transcript line falls between two blocks of one
+	// task splits the task's assistant output into separate messages:
+	// content written after the prompt must not surface ahead of it. Inline
+	// question answers and lifecycle notes do not open a new turn.
+	cuts := make([]int, 0, len(extra))
+	for _, entry := range extra {
+		if entry.opensTurn {
+			cuts = append(cuts, entry.seq)
 		}
 	}
-	merged = append(merged, stream.notes...)
+	sort.Ints(cuts)
 
-	sort.SliceStable(merged, func(i, j int) bool {
-		if merged[i].Timestamp.IsZero() || merged[j].Timestamp.IsZero() {
-			return false
-		}
-		return merged[i].Timestamp.Before(merged[j].Timestamp)
-	})
-	for i := range merged {
-		merged[i].Ordinal = i
+	var merged []sequencedMessage
+	for _, entry := range extra {
+		merged = append(merged, sequencedMessage{seq: entry.seq, msg: entry.ParsedMessage})
 	}
-	return merged
+	for _, taskID := range taskIDs {
+		blocks := byTask[taskID]
+		sort.SliceStable(blocks, func(i, j int) bool {
+			return blocks[i].seq < blocks[j].seq
+		})
+		runStart := 0
+		for i := 1; i <= len(blocks); i++ {
+			if i < len(blocks) && !junieSeqBetween(cuts, blocks[i-1].seq, blocks[i].seq) {
+				continue
+			}
+			if msg, ok := junieAssistantMessage(blocks[runStart:i], stream); ok {
+				merged = append(merged, sequencedMessage{
+					seq: blocks[runStart].seq, msg: msg,
+				})
+			}
+			runStart = i
+		}
+	}
+	for _, note := range stream.notes {
+		merged = append(merged, sequencedMessage{seq: note.seq, msg: note.ParsedMessage})
+	}
+
+	// Order by file position (the transcript line that produced each
+	// element). Unlike timestamps it is a strict total order — line numbers
+	// are never missing or equal — and it preserves the file's interleaving
+	// of user prompts, assistant output, and lifecycle notes even when
+	// timestampMs is absent.
+	sort.SliceStable(merged, func(i, j int) bool {
+		return merged[i].seq < merged[j].seq
+	})
+	messages := make([]ParsedMessage, len(merged))
+	for i := range merged {
+		messages[i] = merged[i].msg
+		messages[i].Ordinal = i
+	}
+	return messages
+}
+
+// junieSeqBetween reports whether a sorted boundary list holds a position
+// strictly between two transcript lines.
+func junieSeqBetween(cuts []int, lo, hi int) bool {
+	i := sort.SearchInts(cuts, lo+1)
+	return i < len(cuts) && cuts[i] < hi
 }
 
 func junieAssistantMessage(
@@ -816,11 +924,17 @@ func junieToolCall(b *junieBlock) (ParsedToolCall, bool) {
 			ResultEvents: event(b.details),
 		}, true
 	case "McpBlockUpdatedEvent":
+		inputJSON := strings.TrimSpace(b.input)
+		if inputJSON != "" && !json.Valid([]byte(inputJSON)) {
+			// Some MCP blocks carry raw text instead of a JSON payload; wrap it
+			// so InputJSON stays a valid JSON object for storage and UI decode.
+			inputJSON = input(map[string]any{"input": b.input})
+		}
 		return ParsedToolCall{
 			ToolUseID:    b.taskID + ":" + b.stepID,
 			ToolName:     b.toolName,
 			Category:     "Tool",
-			InputJSON:    b.input,
+			InputJSON:    inputJSON,
 			ResultEvents: event(b.details),
 		}, true
 	case "ToolBlockUpdatedEvent":
@@ -841,16 +955,19 @@ func junieToolCall(b *junieBlock) (ParsedToolCall, bool) {
 		}, true
 	case "CustomAgentBlockUpdatedEvent", "SubagentSpawnedEvent":
 		var events []ParsedToolResultEvent
-		if b.cancelled {
+		switch {
+		case b.cancelled:
 			events = []ParsedToolResultEvent{{
 				Status:    "cancelled",
 				Timestamp: b.ts,
 			}}
-		} else if b.status != "" && b.status != "IN_PROGRESS" && b.status != "STARTED" {
-			events = event("")
-		}
-		if events == nil {
+		case b.status == "":
 			events = completed("")
+		default:
+			// IN_PROGRESS/STARTED map to a "running" result event, keeping the
+			// spawn call unresolved so the parent classifies as
+			// tool_call_pending until the subagent reports a terminal state.
+			events = event("")
 		}
 		return ParsedToolCall{
 			ToolUseID: b.taskID + ":" + b.stepID,
@@ -899,15 +1016,18 @@ func junieResultStatus(status string) string {
 }
 
 func (s *junieParserState) appendMessage(
-	role RoleType, content string, timestamp time.Time,
+	role RoleType, content string, timestamp time.Time, seq int,
 ) int {
 	s.entries = append(s.entries, junieTranscriptMessage{
-		Role:          role,
-		Content:       content,
-		Timestamp:     timestamp,
-		IsSystem:      role == RoleSystem,
-		ContentLength: len(content),
-		active:        strings.TrimSpace(content) != "",
+		ParsedMessage: ParsedMessage{
+			Role:          role,
+			Content:       content,
+			Timestamp:     timestamp,
+			IsSystem:      role == RoleSystem,
+			ContentLength: len(content),
+		},
+		active: strings.TrimSpace(content) != "",
+		seq:    seq,
 	})
 	return len(s.entries) - 1
 }
@@ -930,14 +1050,14 @@ func (s *junieParserState) parentResult(
 	if main == nil {
 		main = newJunieAgentStream("main")
 	}
-	var extra []ParsedMessage
+	var extra []junieTranscriptMessage
 	userCount := 0
 	firstMessage := ""
 	for _, entry := range s.entries {
 		if !entry.active || strings.TrimSpace(entry.Content) == "" {
 			continue
 		}
-		extra = append(extra, entry.ParsedMessage)
+		extra = append(extra, entry)
 		if entry.Role == RoleUser && !entry.IsSystem {
 			userCount++
 			if firstMessage == "" {
@@ -948,7 +1068,12 @@ func (s *junieParserState) parentResult(
 	messages := junieAssembleMessages(main, extra)
 
 	hasActivity := len(main.blocks) > 0 || len(main.usage) > 0
-	if len(messages) == 0 && len(s.entries) == 0 && !hasActivity && !s.sessionNameFound && summary.taskName == "" && stateTaskName == "" {
+	// A wholly empty or unrecognized stream may be a partial rewrite and stays
+	// skipped. An external name from index.jsonl/state.json must not rescue it
+	// into a title-only session: with ForceReplace that would erase previously
+	// stored messages. Recognized empty projections still emit so replacement
+	// can clear stale rows.
+	if len(messages) == 0 && len(s.entries) == 0 && !hasActivity && !s.sessionNameFound {
 		return nil, nil, false
 	}
 	if userCount == 0 && !hasActivity && !s.sessionNameFound && !summaryPresent && summary.taskName == "" && stateTaskName == "" {
@@ -1040,16 +1165,9 @@ func (s *junieParserState) parentResult(
 		},
 	}
 	session.IsTruncated = s.lastLineBad
-	stopReason := ""
-	switch {
-	case s.lastTaskState == "COMPLETED":
-		stopReason = "task_complete"
-	case summary.lifecycle == "FINISHED" || summary.lifecycle == "COMPLETED":
-		stopReason = "task_complete"
-	}
+	stopReason := junieStopReason(s.lastTaskState, summary.lifecycle)
 	isCancelledOrFailed := s.lastTaskState == "CANCELLED" || s.lastTaskState == "CANCELED" || s.lastTaskState == "FAILED" ||
-		summary.lifecycle == "CANCELLED" || summary.lifecycle == "CANCELED" || summary.lifecycle == "FAILED" ||
-		main.cancelled || main.failed || main.state == "CANCELLED" || main.state == "CANCELED" || main.state == "FAILED"
+		summary.lifecycle == "CANCELLED" || summary.lifecycle == "CANCELED" || summary.lifecycle == "FAILED"
 	if isCancelledOrFailed {
 		session.TerminationStatus = TerminationTruncated
 	} else {
@@ -1058,6 +1176,33 @@ func (s *junieParserState) parentResult(
 	applyUsageEventTokenTotals(session, usageEvents)
 	session.UsageEvents = usageEvents
 	return session, messages, false
+}
+
+// junieStopReason maps a terminal task state or sidecar lifecycle to the
+// canonical stop reason used by termination classification.
+func junieStopReason(lastTaskState, lifecycle string) string {
+	if lastTaskState == "COMPLETED" ||
+		lifecycle == "FINISHED" || lifecycle == "COMPLETED" {
+		return "task_complete"
+	}
+	return ""
+}
+
+// foldOrphanStream merges a subagent stream that produced no session of its
+// own back into the parent state: model usage joins the main stream and
+// lifecycle notes become parent transcript entries so a failure or
+// cancellation note is never silently dropped.
+func (s *junieParserState) foldOrphanStream(stream *junieAgentStream) {
+	if stream == nil {
+		return
+	}
+	main := s.streams["main"]
+	if main == nil {
+		main = newJunieAgentStream("main")
+		s.streams["main"] = main
+	}
+	main.usage = append(main.usage, stream.usage...)
+	s.entries = append(s.entries, stream.notes...)
 }
 
 func (s *junieParserState) results(
@@ -1071,6 +1216,31 @@ func (s *junieParserState) results(
 		fileSize = info.Size()
 		mtime = info.ModTime().UnixNano()
 	}
+
+	// Finish subagent streams before the parent: streams that produce no
+	// session of their own (no request, no emitted blocks) fold their usage
+	// and notes back into the parent result.
+	type subOutcome struct {
+		sess *ParsedSession
+		msgs []ParsedMessage
+	}
+	var subs []subOutcome
+	emitted := map[string]bool{}
+	for _, agentID := range s.streamOrder {
+		stream := s.streams[agentID]
+		sub, subMsgs, ok := junieFinishSubagent(
+			ctx, fullID+"--"+agentID, fullID, path, info,
+			stream, summary, summaryPresent, machine, "",
+			stateCwd, rawID+"--"+agentID,
+		)
+		if !ok {
+			s.foldOrphanStream(stream)
+			continue
+		}
+		emitted[agentID] = true
+		subs = append(subs, subOutcome{sess: sub, msgs: subMsgs})
+	}
+
 	sess, msgs, isStub := s.parentResult(
 		ctx, path, machine, rawID, fileSize, mtime, summary, summaryPresent, stateCwd, stateTaskName,
 	)
@@ -1085,39 +1255,30 @@ func (s *junieParserState) results(
 			Session: *sess, Messages: msgs, UsageEvents: sess.UsageEvents,
 		})
 	}
-	emitted := map[string]bool{}
-	for _, agentID := range s.streamOrder {
-		stream := s.streams[agentID]
-		sub, subMsgs, ok := junieFinishSubagent(
-			ctx, fullID+"--"+agentID, fullID, path, info,
-			stream, summary, summaryPresent, machine, "",
-			stateCwd, rawID+"--"+agentID,
-		)
-		if !ok {
-			continue
-		}
-		emitted[agentID] = true
+	for _, sub := range subs {
 		results = append(results, ParseResult{
-			Session: *sub, Messages: subMsgs, UsageEvents: sub.UsageEvents,
+			Session: *sub.sess, Messages: sub.msgs, UsageEvents: sub.sess.UsageEvents,
 		})
 	}
 	if len(results) > 0 && results[0].Session.ID == fullID {
 		junieLinkSubagentCalls(results, s.streams, emitted, rawID)
 		if results[0].Session.TerminationStatus == TerminationToolCallPending {
-			stopReason := ""
-			switch {
-			case s.lastTaskState == "COMPLETED":
-				stopReason = "task_complete"
-			case summary.lifecycle == "FINISHED" || summary.lifecycle == "COMPLETED":
-				stopReason = "task_complete"
-			}
 			results[0].Session.TerminationStatus = Classify(
-				results[0].Messages, stopReason, s.lastLineBad,
+				results[0].Messages,
+				junieStopReason(s.lastTaskState, summary.lifecycle),
+				s.lastLineBad,
 			)
 		}
 	}
 	return results, excluded, nil
 }
+
+// errJunieSidecarNotRegular marks a sidecar (summary.json, state.json) that is
+// present but not a regular file — a symlink, a directory, or a device node.
+// Companion fingerprinting silently skips such files, so parsing must treat
+// them as absent too; otherwise a clean fingerprint would be followed by a
+// permanent parse failure.
+var errJunieSidecarNotRegular = errors.New("junie sidecar is not a regular file")
 
 func readJunieSidecarFile(
 	sessionDir, name string, openRoot junieRootOpener,
@@ -1133,7 +1294,7 @@ func readJunieSidecarFile(
 		return nil, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, errors.New("junie sidecar is not a regular file")
+		return nil, errJunieSidecarNotRegular
 	}
 	f, err := openJuniePinnedFile(root, rel, info)
 	if err != nil {
@@ -1148,7 +1309,8 @@ func junieLoadSidecarMeta(
 ) error {
 	raw, err := readJunieSidecarFile(sessionDir, junieSummaryFile, openRoot)
 	if err != nil {
-		if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
+		if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) ||
+			errors.Is(err, errJunieSidecarNotRegular) {
 			return nil
 		}
 		return err
@@ -1164,7 +1326,7 @@ func junieLoadSidecarMeta(
 		summary.projectDir = v
 	}
 	if v := firstNonEmptyJSONLString(s.Get("lifecycle").Str, s.Get("status").Str, s.Get("state").Str); v != "" {
-		summary.lifecycle = v
+		summary.lifecycle = strings.ToUpper(v)
 	}
 	if t := junieTimestamp(s.Get("createdAt")); !t.IsZero() {
 		summary.createdAt = t
@@ -1231,9 +1393,17 @@ func junieTimestampFromID(id string) time.Time {
 			hour := (int(sub[7]-'0') * 10) + int(sub[8]-'0')
 			min := (int(sub[9]-'0') * 10) + int(sub[10]-'0')
 			sec := (int(sub[11]-'0') * 10) + int(sub[12]-'0')
-			if mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31 &&
-				hour >= 0 && hour <= 23 && min >= 0 && min <= 59 && sec >= 0 && sec <= 59 {
-				return time.Date(2000+yy, time.Month(mm), dd, hour, min, sec, 0, time.UTC)
+			if mm < 1 || mm > 12 || dd < 1 || dd > 31 ||
+				hour > 23 || min > 59 || sec > 59 {
+				continue
+			}
+			// time.Date normalizes out-of-range components; a candidate whose
+			// round-trip differs from its input (Feb 30, Apr 31, ...) is not a
+			// real timestamp embedded in the session ID.
+			t := time.Date(2000+yy, time.Month(mm), dd, hour, min, sec, 0, time.UTC)
+			if t.Year() == 2000+yy && int(t.Month()) == mm && t.Day() == dd &&
+				t.Hour() == hour && t.Minute() == min && t.Second() == sec {
+				return t
 			}
 		}
 	}

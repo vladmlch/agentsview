@@ -259,15 +259,19 @@ ORDER BY (
 ) DESC, s.id
 LIMIT 1;
 
--- Drop FTS5 sync triggers before the bulk delete. Each
--- DELETE FROM messages otherwise fires messages_ad which
--- runs an FTS5 'delete' command, and that trips
--- "constraint failed (19)" at scale. We rebuild the FTS
--- index after the deletes and restore the triggers at
--- the end so the test DB still supports in-session search.
+-- Drop the legacy FTS5 sync triggers before the bulk delete.
+-- Current archives maintain messages_fts from the write path and
+-- carry no row-level triggers, but a source DB produced by an
+-- older release may still have them: each DELETE FROM messages
+-- would fire messages_ad, which runs an FTS5 'delete' command,
+-- and that trips "constraint failed (19)" at scale. We rebuild
+-- the FTS index after the deletes instead.
 DROP TRIGGER IF EXISTS messages_ai;
 DROP TRIGGER IF EXISTS messages_ad;
 DROP TRIGGER IF EXISTS messages_au;
+DROP TRIGGER IF EXISTS messages_cjk_ai;
+DROP TRIGGER IF EXISTS messages_cjk_ad;
+DROP TRIGGER IF EXISTS messages_cjk_au;
 
 DELETE FROM tool_calls WHERE session_id IN (
   SELECT id FROM sessions
@@ -342,25 +346,11 @@ UPDATE tool_result_events
 SET content = replace(replace(content, r.from_text, r.to_text), r.encoded_from_text, '-home-user')
 FROM screenshot_redactions r;
 
--- Rebuild FTS index from the surviving messages.
+-- Rebuild FTS index from the surviving messages. Message writes
+-- no longer fire sync triggers (the write path batches FTS
+-- updates itself), so nothing is restored here: recreating the
+-- old triggers would double-index every later write.
 INSERT INTO messages_fts(messages_fts) VALUES('rebuild');
-
--- Restore FTS sync triggers so future inserts/updates
--- keep the index current.
-CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(rowid, content)
-        VALUES (new.id, new.content);
-END;
-CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, content)
-        VALUES('delete', old.id, old.content);
-END;
-CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, content)
-        VALUES('delete', old.id, old.content);
-    INSERT INTO messages_fts(rowid, content)
-        VALUES (new.id, new.content);
-END;
 
 -- Update stats
 INSERT OR REPLACE INTO stats (key, value) VALUES
@@ -468,6 +458,22 @@ Refactored the review submission API to accept batch requests. Previously each f
 One short session updated the API documentation in `docs/api.md` to reflect the new batch endpoint and its request/response schema.',
 '2026-02-18T16:20:00.000Z');
 SQL
+
+# The optional CJK index keeps its own tokenized copy of message text and
+# is not covered by the messages_fts rebuild above. Rebuilding it here
+# would need the 'simple' tokenizer extension, which the sqlite3 CLI does
+# not load, so drop the table and its freshness markers instead: the next
+# writable agentsview open recreates and backfills it via ensureCJKFTS.
+if [[ $(sqlite3 "$OUTPUT" \
+  "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'messages_cjk_fts';") == "1" ]]; then
+  sqlite3 "$OUTPUT" \
+    "DROP TABLE messages_cjk_fts;
+     DELETE FROM stats WHERE key = 'messages_cjk_fts_fingerprint_v1';"
+fi
+if [[ $(sqlite3 "$OUTPUT" \
+  "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'messages_cjk_fts_pending_sessions';") == "1" ]]; then
+  sqlite3 "$OUTPUT" "DELETE FROM messages_cjk_fts_pending_sessions;"
+fi
 
 # The mapping delete above journals tombstones in current archives, so clear
 # that journal last. Older valid archives predate the table and its triggers.

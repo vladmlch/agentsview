@@ -995,12 +995,18 @@ describe("buildGroupSections (metadata and perGroupSessions)", () => {
       { key: "cursor-ide", totalCount: 1245 },
       { key: "claude", totalCount: 50 },
     ];
-    const loadedGroup = makeGroup("cursor-ide", 2);
+    // Two chained sessions collapse into a single SessionGroup.
+    const root = makeSession({ id: "cursor-root", agent: "cursor-ide" });
+    const child = makeSession({
+      id: "cursor-child",
+      agent: "cursor-ide",
+      parent_session_id: "cursor-root",
+    });
     const perGroupSessions = new Map([
       [
         "cursor-ide",
         {
-          groups: [loadedGroup],
+          sessions: [root, child],
           totalCount: 1245,
           hasMore: true,
         },
@@ -1011,12 +1017,47 @@ describe("buildGroupSections (metadata and perGroupSessions)", () => {
 
     const cursorSection = result.find((s) => s.label === "cursor-ide")!;
     expect(cursorSection.groups).toHaveLength(1);
+    expect(cursorSection.sessionCount).toBe(2);
     expect(cursorSection.totalCount).toBe(1245);
     expect(cursorSection.hasMore).toBe(true);
 
     const claudeSection = result.find((s) => s.label === "claude")!;
     expect(claudeSection.groups).toHaveLength(0);
     expect(claudeSection.totalCount).toBe(50);
+  });
+
+  it("merges cached and flat-list sessions instead of letting the cache mask the list", () => {
+    // Regression guard: a deep-linked session appended to the flat list
+    // must stay visible even when the label has a per-group cache entry.
+    const metadata = [{ key: "claude", totalCount: 3 }];
+    const flatGroup = makeGroup("claude", 1, "deep-link");
+    const cached = [
+      makeSession({ id: "cached-1", agent: "claude" }),
+      makeSession({ id: "cached-2", agent: "claude" }),
+    ];
+    const perGroupSessions = new Map([
+      ["claude", { sessions: cached, totalCount: 3, hasMore: false }],
+    ]);
+
+    const result = buildGroupSections([flatGroup], "agent", metadata, perGroupSessions);
+
+    const section = result.find((s) => s.label === "claude")!;
+    const ids = section.groups.flatMap((g) => g.sessions.map((s) => s.id));
+    expect(ids.sort()).toEqual(["cached-1", "cached-2", "deep-link-session-0"]);
+    expect(section.sessionCount).toBe(3);
+  });
+
+  it("keeps a cache-only label visible when it holds loaded rows", () => {
+    const cached = [makeSession({ id: "cached-1", agent: "claude" })];
+    const perGroupSessions = new Map([
+      ["claude", { sessions: cached, totalCount: 1, hasMore: false }],
+    ]);
+
+    const result = buildGroupSections([], "agent", undefined, perGroupSessions);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]!.label).toBe("claude");
+    expect(result[0]!.groups).toHaveLength(1);
   });
 });
 
@@ -1067,6 +1108,50 @@ describe("buildDisplayItems (group-loading and group-load-more)", () => {
     expect(items[2]!.label).toBe("cursor-ide");
     expect(items[2]!.count).toBe(1244);
     expect(items[2]!.top).toBe(HEADER_HEIGHT + ITEM_HEIGHT);
+  });
+
+  it("counts remaining sessions, not groups, for the load-more label", () => {
+    // A multi-session continuation chain collapses into ONE group row,
+    // but totalCount is in sessions — subtracting group count would
+    // overstate the remainder.
+    const root = makeSession({ id: "chain-root", agent: "claude" });
+    const cont = makeSession({
+      id: "chain-cont",
+      agent: "claude",
+      parent_session_id: "chain-root",
+    });
+    const sections = [
+      {
+        label: "claude",
+        groups: buildSessionGroups([root, cont]),
+        sessionCount: 2,
+        totalCount: 10,
+        hasMore: true,
+      },
+    ];
+
+    const items = buildDisplayItems([], sections, "agent", new Set(), new Set());
+
+    const more = items.find((i) => i.type === "group-load-more")!;
+    expect(more.count).toBe(8);
+  });
+
+  it("emits group-error instead of load-more when a section failed with no rows", () => {
+    const sections = [
+      {
+        label: "claude",
+        groups: [],
+        totalCount: 0,
+        hasMore: false,
+        error: true,
+      },
+    ];
+
+    const items = buildDisplayItems([], sections, "agent", new Set(), new Set());
+
+    expect(items).toHaveLength(2);
+    expect(items[1]!.type).toBe("group-error");
+    expect(items[1]!.label).toBe("claude");
   });
 });
 

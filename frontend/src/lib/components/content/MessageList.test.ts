@@ -1366,4 +1366,186 @@ describe("MessageList follow cancellation", () => {
     expect(document.querySelector(".turn-header")?.getAttribute("aria-expanded")).toBe("true");
     expect(document.body.textContent).toContain("hello world");
   });
+
+  it("renders the unread divider once above a multi-event ordinal's first row", async () => {
+    // One assistant message fans out into thinking, tool, message-preview,
+    // and final-output rows — every one reports its source ordinal. The
+    // divider belongs above the first carrier only; repeating it on each
+    // sibling row paints the same boundary several times.
+    ui.setAutoCollapseAssistantTurns(false);
+    messages.messages = [
+      { ...makeMessage(0), role: "user" },
+      {
+        ...makeMessage(1),
+        role: "assistant",
+        has_thinking: true,
+        has_tool_use: true,
+        content: "[Thinking]\nplan\n[/Thinking]\nanswer body",
+        content_length: 42,
+        tool_calls: [{ category: "", tool_name: "Read", result_content: "data" }],
+      },
+    ];
+    messages.messageCount = 2;
+    messages.activeSessionToken = "current";
+    messages.activeSessionUnreadOrdinal = 1;
+    setVirtualRows(8);
+    readProgress.baseline("s1", "previous", 0);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    const carriers = [...document.querySelectorAll(".virtual-row")].filter((row) =>
+      row.querySelector('[data-message-ordinal="1"]'),
+    );
+    expect(carriers.length).toBeGreaterThan(1);
+    const dividers = document.querySelectorAll(".read-progress-divider");
+    expect(dividers).toHaveLength(1);
+    expect(dividers[0]!.closest(".virtual-row")?.getAttribute("data-index")).toBe(
+      carriers[0]!.getAttribute("data-index"),
+    );
+
+    // Flush the progress raf before unmounting: the mocked raf is a real
+    // timeout the component's destroy cannot cancel, so a pending callback
+    // would fire inside the next test and write read progress there.
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+  });
+
+  it("scrolls to the final-output row and expands its owning turn", async () => {
+    messages.messages = [
+      { ...makeMessage(0), role: "user" },
+      { ...makeMessage(1), role: "assistant" },
+      { ...makeMessage(2), role: "assistant" },
+    ];
+    messages.messageCount = 3;
+    messages.activeSessionToken = "current";
+    // Once the owning turn expands its rows become: prompt, header,
+    // msg1 event, msg2 preview, final output.
+    setVirtualRows(5);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    expect(document.querySelector(".turn-header")?.getAttribute("aria-expanded")).toBe("false");
+
+    const api = component as ReturnType<typeof mount> & {
+      scrollToOrdinal: (ordinal: number) => void;
+    };
+    ui.selectOrdinal(2);
+    api.scrollToOrdinal(2);
+    await vi.waitFor(() => {
+      expect(virtualizerMock.scrollToIndex).toHaveBeenCalledWith(
+        4,
+        expect.objectContaining({ align: "start" }),
+      );
+    });
+
+    // Expanding the turn reveals the member events for follow-up
+    // navigation; the scroll lands on the output row that renders the
+    // selected content, not on the first preview claimant.
+    const turnKey = `s1:turn:${messages.messages[1]!.id}`;
+    expect(turnCollapse.isTurnExpanded(turnKey, false)).toBe(true);
+    expect(document.querySelector(".turn-header")?.getAttribute("aria-expanded")).toBe("true");
+    expect(document.querySelector(".virtual-row.selected")?.getAttribute("data-index")).toBe("4");
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+  });
+
+  it("lands ordinal navigation on the final-output row, not its preview", async () => {
+    ui.setAutoCollapseAssistantTurns(false);
+    messages.messages = [
+      { ...makeMessage(0), role: "user" },
+      {
+        ...makeMessage(1),
+        role: "assistant",
+        has_thinking: true,
+        content: "[Thinking]\nplan\n[/Thinking]\nmid answer",
+        content_length: 40,
+      },
+      { ...makeMessage(2), role: "assistant", content: "final answer" },
+    ];
+    messages.messageCount = 3;
+    messages.activeSessionToken = "current";
+    // Expanded chronological rows: prompt, header, msg1 thinking, msg1
+    // message, msg2 preview event, final output.
+    setVirtualRows(6);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    const api = component as ReturnType<typeof mount> & {
+      scrollToOrdinal: (ordinal: number) => void;
+    };
+    ui.selectOrdinal(2);
+    api.scrollToOrdinal(2);
+    await vi.waitFor(() => {
+      expect(virtualizerMock.scrollToIndex).toHaveBeenCalledWith(
+        5,
+        expect.objectContaining({ align: "start" }),
+      );
+    });
+    // The preview event row claims the same ordinal first but renders no
+    // content — the outline belongs on the row that does.
+    expect(document.querySelector(".virtual-row.selected")?.getAttribute("data-index")).toBe("5");
+
+    ui.selectOrdinal(1);
+    api.scrollToOrdinal(1);
+    await vi.waitFor(() => {
+      expect(virtualizerMock.scrollToIndex).toHaveBeenCalledWith(
+        2,
+        expect.objectContaining({ align: "start" }),
+      );
+    });
+    expect(document.querySelector(".virtual-row.selected")?.getAttribute("data-index")).toBe("2");
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+  });
+
+  it("counts no grouped members read while their row is unmounted", async () => {
+    messages.messages = [
+      { ...makeMessage(0), role: "user" },
+      {
+        ...makeMessage(1),
+        role: "assistant",
+        has_tool_use: true,
+        content: "",
+        content_length: 0,
+        tool_calls: [{ category: "", tool_name: "Read", result_content: "a" }],
+      },
+      {
+        ...makeMessage(2),
+        role: "assistant",
+        has_tool_use: true,
+        content: "",
+        content_length: 0,
+        tool_calls: [{ category: "", tool_name: "Bash", result_content: "b" }],
+      },
+      { ...makeMessage(3), role: "assistant", content: "done" },
+    ];
+    messages.messageCount = 4;
+    messages.activeSessionToken = "current";
+    messages.activeSessionUnreadOrdinal = 1;
+    messages.hasOlder = false;
+    ui.setAutoCollapseAssistantTurns(false);
+    // Expanded turn rows: prompt, header, tool rollup (ordinals 1,2),
+    // final output. Only the output row is mounted.
+    virtualizerMock.getVirtualItems.mockReturnValue([
+      { index: 3, key: "row-3", start: 0, end: 100 },
+    ]);
+    readProgress.baseline("s1", "previous", 3);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+    expect(readProgress.get("s1")?.token).toBe("previous");
+
+    // The virtualizer reports the rollup row in range but its DOM never
+    // mounted (the list re-render has not run yet): no member markers
+    // exist, so the group contributes nothing — not all of its member
+    // ordinals, which would mark unseen work read.
+    virtualizerMock.getVirtualItems.mockReturnValue([
+      { index: 2, key: "row-2", start: 0, end: 100 },
+      { index: 3, key: "row-3", start: 100, end: 200 },
+    ]);
+    document.querySelector<HTMLElement>(".message-list-scroll")?.dispatchEvent(new Event("scroll"));
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")?.token).toBe("previous");
+  });
 });

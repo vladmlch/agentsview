@@ -162,42 +162,72 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 		f.Sequence = signals.SequenceFactFor(row)
 		modified[f.CallPos] = f
 
-		// Only the events this transaction inserted need scanning:
-		// previously stored events already carry findings, and rescanning
-		// the call's whole history makes repeated late outputs quadratic.
-		// When any event exists the full compute scans events instead of
-		// the result_content summary, so the summary-derived finding must
-		// go and the inserted events are scanned with their real indexes.
+		// Findings follow the canonical stored-content scan
+		// (scanStoredSecretFindingsTx): when the call stores result events
+		// they carry the findings and result_content is display-only; when
+		// it stores none, the summary is the only scanned copy. The events
+		// this transaction inserted cannot distinguish "nothing new to
+		// store" from "the call has no events at all": an idempotent replay
+		// or a subagent-only update on a call that still has events must not
+		// scan the summary on top of the event findings, or every repeated
+		// update duplicates them under the tool_result kind.
 		events := q.InsertedResultEvents(u.Position)
-		if len(events) == 0 {
-			if fact.ResultContent != "" {
-				deleteKeys = append(deleteKeys, db.FindingDeleteKey{
+		hasStoredEvents := len(events) > 0
+		if !hasStoredEvents {
+			stored, err := q.CallResultEvents(
+				ctx, fact.MessageOrdinal, fact.CallIndex,
+			)
+			if err != nil {
+				return nil, err
+			}
+			hasStoredEvents = len(stored) > 0
+		}
+		if !hasStoredEvents {
+			// Collapsed representation: the summary is the scanned copy, so
+			// rebuild its findings and drop any event-scoped findings a
+			// collapse inside this transaction orphaned.
+			deleteKeys = append(deleteKeys,
+				db.FindingDeleteKey{
 					MessageOrdinal: fact.MessageOrdinal,
 					CallIndex:      fact.CallIndex,
 					LocationKind:   "tool_result",
+				},
+				db.FindingDeleteKey{
+					MessageOrdinal: fact.MessageOrdinal,
+					CallIndex:      fact.CallIndex,
+					LocationKind:   "tool_result_event",
+				},
+			)
+			if fact.ResultContent == "" {
+				continue
+			}
+			secretScanBytes.Add(int64(len(fact.ResultContent)))
+			matches := secrets.ScanDefinite(fact.ResultContent)
+			for _, match := range matches {
+				callIdx := fact.CallIndex
+				insertFindings = append(insertFindings, db.SecretFinding{
+					SessionID:      m.sessionID,
+					RuleName:       match.Rule,
+					Confidence:     match.Confidence,
+					LocationKind:   "tool_result",
+					MessageOrdinal: fact.MessageOrdinal,
+					CallIndex:      &callIdx,
+					EventIndex:     nil,
+					MatchStart:     match.Start,
+					MatchEnd:       match.End,
+					MatchIndex:     match.Index,
+					RedactedMatch:  match.Redacted,
+					RulesVersion:   secrets.DefiniteRulesVersion(),
 				})
-				secretScanBytes.Add(int64(len(fact.ResultContent)))
-				matches := secrets.ScanDefinite(fact.ResultContent)
-				for _, match := range matches {
-					callIdx := fact.CallIndex
-					insertFindings = append(insertFindings, db.SecretFinding{
-						SessionID:      m.sessionID,
-						RuleName:       match.Rule,
-						Confidence:     match.Confidence,
-						LocationKind:   "tool_result",
-						MessageOrdinal: fact.MessageOrdinal,
-						CallIndex:      &callIdx,
-						EventIndex:     nil,
-						MatchStart:     match.Start,
-						MatchEnd:       match.End,
-						MatchIndex:     match.Index,
-						RedactedMatch:  match.Redacted,
-						RulesVersion:   secrets.DefiniteRulesVersion(),
-					})
-				}
 			}
 			continue
 		}
+		// The call stores events: they are the canonical scanned copies, so
+		// any summary-derived finding must go. Only the events this
+		// transaction inserted need scanning: previously stored events
+		// already carry findings, and rescanning the call's whole history
+		// makes repeated late outputs quadratic. The inserted events are
+		// scanned with their real indexes.
 		deleteKeys = append(deleteKeys, db.FindingDeleteKey{
 			MessageOrdinal: fact.MessageOrdinal,
 			CallIndex:      fact.CallIndex,

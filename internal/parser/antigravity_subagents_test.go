@@ -572,3 +572,214 @@ func TestAntigravityFingerprintTracksSubagentDescriptor(t *testing.T) {
 	assert.NotEqual(t, afterCreate.Hash, afterRemove.Hash,
 		"descriptor removal must change the child fingerprint")
 }
+
+// createAntigravityMultiSpawnEdgeDB writes a .db with a user step, one
+// planner-response step carrying one tool call per toolNames entry,
+// then one result step per resultSteps entry whose payload carries that
+// step's strings.
+func createAntigravityMultiSpawnEdgeDB(
+	t *testing.T, path string,
+	toolNames []string, resultSteps [][]string,
+) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", path)
+	require.NoError(t, err, "open")
+	defer db.Close()
+	createAntigravityStepTables(t, db)
+
+	ts := encodePB([]pbField{
+		{num: 1, wire: pbWireVarint, varint: 1779000000},
+	})
+	userPayload := encodePB([]pbField{
+		{num: 5, wire: pbWireBytes, bytes: ts},
+		{num: 17, wire: pbWireBytes,
+			bytes: []byte("spawn helpers for this task please")},
+	})
+	plannerFields := []pbField{
+		{num: 5, wire: pbWireBytes, bytes: ts},
+		{num: 17, wire: pbWireBytes,
+			bytes: []byte("delegating to subagents now")},
+	}
+	for i, name := range toolNames {
+		toolCall := encodePB([]pbField{
+			{num: 3, wire: pbWireBytes, bytes: []byte(name)},
+			{num: 4, wire: pbWireBytes,
+				bytes: []byte(fmt.Sprintf(
+					"99999999-8888-4777-a666-%012d", i+1))},
+		})
+		plannerFields = append(plannerFields, pbField{
+			num: 8, wire: pbWireBytes, bytes: toolCall,
+		})
+	}
+	plannerPayload := encodePB(plannerFields)
+
+	mustExec(t, db,
+		`INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)`,
+		0, 14, userPayload)
+	mustExec(t, db,
+		`INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)`,
+		1, 15, plannerPayload)
+	for i, resultStrings := range resultSteps {
+		resultFields := []pbField{{num: 5, wire: pbWireBytes, bytes: ts}}
+		for j, s := range resultStrings {
+			resultFields = append(resultFields, pbField{
+				num: 17 + j, wire: pbWireBytes, bytes: []byte(s),
+			})
+		}
+		mustExec(t, db,
+			`INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)`,
+			2+i, 132, encodePB(resultFields))
+	}
+}
+
+// findAllAntigravityTestToolCalls returns every tool call with the
+// given name across the parsed messages.
+func findAllAntigravityTestToolCalls(
+	t *testing.T, msgs []ParsedMessage, name string,
+) []ParsedToolCall {
+	t.Helper()
+	var calls []ParsedToolCall
+	for _, m := range msgs {
+		for _, c := range m.ToolCalls {
+			if c.ToolName == name {
+				calls = append(calls, c)
+			}
+		}
+	}
+	return calls
+}
+
+// TestAntigravityInvokeSubagentAmbiguousSpawnNoEdge pins the strict
+// pairing rule: several invoke_subagent calls in one planner step, or
+// several marked result steps inside the window, cannot be matched to
+// spawned ids positionally -- result order is not guaranteed to follow
+// call order, and a marked step in the window can belong to a different
+// call. A guessed edge is worse than none because the archive linker
+// repoints the child's parent_session_id from it, overriding the
+// authoritative descriptor link.
+func TestAntigravityInvokeSubagentAmbiguousSpawnNoEdge(t *testing.T) {
+	first := "aaaaaaaa-1111-4222-8333-444444444441"
+	second := "bbbbbbbb-2222-4333-8444-555555555552"
+	marked := `Created the following subagents: ` +
+		`[{"conversationId":"` + first + `"},` +
+		`{"conversationId":"` + second + `"}]`
+
+	t.Run("two calls one marked step", func(t *testing.T) {
+		root := t.TempDir()
+		id := "23456789-abcd-4ef0-8234-56789abcdef0"
+		mustMkdir(t, filepath.Join(root, "conversations"))
+		dbPath := filepath.Join(root, "conversations", id+".db")
+		createAntigravityMultiSpawnEdgeDB(t, dbPath,
+			[]string{"invoke_subagent", "invoke_subagent"},
+			[][]string{{marked}})
+
+		_, msgs, _, err := parseAntigravityTestSession(t,
+			dbPath, "", "test-machine")
+		require.NoError(t, err)
+		calls := findAllAntigravityTestToolCalls(t, msgs, "invoke_subagent")
+		require.Len(t, calls, 2,
+			"both invoke_subagent calls must decode")
+		for _, call := range calls {
+			assert.Empty(t, call.SubagentSessionID,
+				"an ambiguous batch pairing must not emit an edge")
+		}
+	})
+
+	t.Run("one call two marked steps", func(t *testing.T) {
+		root := t.TempDir()
+		id := "3456789a-bcde-4f01-8345-6789abcdef01"
+		mustMkdir(t, filepath.Join(root, "conversations"))
+		dbPath := filepath.Join(root, "conversations", id+".db")
+		createAntigravityMultiSpawnEdgeDB(t, dbPath,
+			[]string{"invoke_subagent"},
+			[][]string{{marked}, {marked}})
+
+		_, msgs, _, err := parseAntigravityTestSession(t,
+			dbPath, "", "test-machine")
+		require.NoError(t, err)
+		call := findAntigravityTestToolCall(t, msgs, "invoke_subagent")
+		assert.Empty(t, call.SubagentSessionID,
+			"several marked steps in the window are ambiguous")
+	})
+}
+
+// TestAntigravityInvokeSubagentSnakeCaseLinked: older builds wrote the
+// child key as "conversation_id" instead of "conversationId"; both
+// spellings appear in real payloads and must resolve to the same spawn
+// edge.
+func TestAntigravityInvokeSubagentSnakeCaseLinked(t *testing.T) {
+	childID := "66666666-7777-4888-8999-000000000000"
+	result := `Created the following subagents: ` +
+		`[{"conversation_id":"` + childID + `"}]`
+
+	root := t.TempDir()
+	id := "12345678-9abc-4def-8123-456789abcdef"
+	mustMkdir(t, filepath.Join(root, "conversations"))
+	dbPath := filepath.Join(root, "conversations", id+".db")
+	createAntigravitySpawnEdgeDB(t, dbPath, "invoke_subagent",
+		[]string{result})
+
+	_, msgs, _, err := parseAntigravityTestSession(t,
+		dbPath, "", "test-machine")
+	require.NoError(t, err)
+	call := findAntigravityTestToolCall(t, msgs, "invoke_subagent")
+	assert.Equal(t,
+		antigravityIDPrefix+childID, call.SubagentSessionID)
+}
+
+// TestAntigravitySubagentDescriptorCycleDropped: descriptor validation
+// rejects only direct self links, so a cyclic pair -- A claimed by B
+// while B is claimed by A -- must not emit parent edges at all. A cycle
+// makes every member somebody's child and drops all of them from the
+// sidebar roots.
+func TestAntigravitySubagentDescriptorCycleDropped(t *testing.T) {
+	root := t.TempDir()
+	idA := "aaaaaaaa-1111-4222-8333-0000000000aa"
+	idB := "bbbbbbbb-2222-4333-8444-0000000000bb"
+	mustMkdir(t, filepath.Join(root, "conversations"))
+	dbA := filepath.Join(root, "conversations", idA+".db")
+	dbB := filepath.Join(root, "conversations", idB+".db")
+	createAntigravityTestDB(t, dbA)
+	createAntigravityTestDB(t, dbB)
+	writeAntigravitySubagentDescriptor(t, root, idB, idA,
+		antigravitySubagentDescriptorBody(idA, "role-a"))
+	writeAntigravitySubagentDescriptor(t, root, idA, idB,
+		antigravitySubagentDescriptorBody(idB, "role-b"))
+
+	provider := newAntigravityTestProvider(t, root)
+	for _, dbPath := range []string{dbA, dbB} {
+		sess, _, _, err := provider.parseSession(
+			t.Context(), dbPath, "", "test-machine",
+		)
+		require.NoError(t, err)
+		assert.Empty(t, sess.ParentSessionID,
+			"a cyclic descriptor claim must not become a parent edge")
+		assert.Equal(t, RelNone, sess.RelationshipType)
+	}
+}
+
+// TestAntigravitySubagentDescriptorChainNotCyclic covers the non-cyclic
+// chain: A claimed by B, B claimed by C -- each edge resolves normally.
+func TestAntigravitySubagentDescriptorChainNotCyclic(t *testing.T) {
+	root := t.TempDir()
+	idA := "aaaaaaaa-1111-4222-8333-00000000000a"
+	idB := "bbbbbbbb-2222-4333-8444-00000000000b"
+	idC := "cccccccc-3333-4444-8555-00000000000c"
+	mustMkdir(t, filepath.Join(root, "conversations"))
+	dbA := filepath.Join(root, "conversations", idA+".db")
+	createAntigravityTestDB(t, dbA)
+	createAntigravityTestDB(t,
+		filepath.Join(root, "conversations", idB+".db"))
+	writeAntigravitySubagentDescriptor(t, root, idB, idA,
+		antigravitySubagentDescriptorBody(idA, "role-a"))
+	writeAntigravitySubagentDescriptor(t, root, idC, idB,
+		antigravitySubagentDescriptorBody(idB, "role-b"))
+
+	provider := newAntigravityTestProvider(t, root)
+	sess, _, _, err := provider.parseSession(
+		t.Context(), dbA, "", "test-machine",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, antigravityIDPrefix+idB, sess.ParentSessionID)
+	assert.Equal(t, RelSubagent, sess.RelationshipType)
+}

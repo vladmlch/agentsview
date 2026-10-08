@@ -16,11 +16,11 @@ import {
   projectSessionScope,
   type SessionScope,
 } from "../search/session-scope.js";
+import { ALL_BLOCK_TYPES, ui } from "./ui.svelte.js";
 import type { BlockType } from "./ui.svelte.js";
 import { messages } from "./messages.svelte.js";
 import { sessions } from "./sessions.svelte.js";
 import { settings } from "./settings.svelte.js";
-import { ui } from "./ui.svelte.js";
 
 export type { SearchCursor } from "../search/navigation.js";
 
@@ -45,12 +45,21 @@ export interface SearchView {
   /**
    * Saved block-visibility set. Writers MUST reassign the Set rather than
    * mutate it in place: the filter-diff effect below snapshots the previous
-   * reference, so in-place mutation is not observable as a change.
+   * contents, so in-place mutation is not observable as a change.
+   * When `isBlockVisible` is defined it supersedes this set entirely.
    */
   visibleBlocks?: ReadonlySet<BlockType>;
   hasBlockFilters?: boolean;
   renderUnknownXmlBlocksAsPreformatted?: boolean;
-  /** Saved block-visibility predicate; preferred over `visibleBlocks` when defined. */
+  /**
+   * Saved block-visibility predicate — an alternative representation of
+   * `visibleBlocks`, not an overlay on top of it. When defined, the store
+   * materializes it over `ALL_BLOCK_TYPES` and feeds that single set to
+   * the reveal computation, the manual-suppression diff, and the scope
+   * projection, so a predicate-only view behaves exactly like a
+   * set-backed one. The predicate must read reactive ($state) sources
+   * for its changes to be observed, just like the Set it replaces.
+   */
   isBlockVisible?(type: BlockType): boolean;
 }
 
@@ -80,6 +89,22 @@ export class InSessionSearchStore {
   /** Snapshot the `visibleBlocks` diff effect compares against each run. */
   private previousVisibleBlocks: ReadonlySet<BlockType> | undefined;
 
+  /**
+   * The single source of saved block visibility: `visibleBlocks` as given,
+   * or `isBlockVisible` materialized over `ALL_BLOCK_TYPES` when only the
+   * predicate is provided. `undefined` means the view declares no saved
+   * filter and every type renders. Reveals, the suppression diff, and the
+   * scope projection all read this so the two view shapes stay equivalent.
+   */
+  private savedVisibleBlocks: ReadonlySet<BlockType> | undefined = $derived.by(() => {
+    const view = this.view;
+    if (view.isBlockVisible) {
+      // Call through `view` so a method predicate keeps its receiver.
+      return new Set(ALL_BLOCK_TYPES.filter((type) => view.isBlockVisible!(type)));
+    }
+    return view.visibleBlocks;
+  });
+
   private historyIncomplete = $derived(
     this.source.hasOlder || this.source.historyComplete === false,
   );
@@ -92,12 +117,15 @@ export class InSessionSearchStore {
    */
   scope: SessionScope | null = $derived.by(() => {
     if (!this.source.sessionId) return null;
+    const saved = this.savedVisibleBlocks;
     return projectSessionScope({
       messages: this.source.messages,
       sessionId: this.source.sessionId,
       transcriptMode: this.view.transcriptMode,
-      visibleBlocks: this.view.visibleBlocks,
-      hasBlockFilters: this.view.hasBlockFilters,
+      visibleBlocks: saved,
+      hasBlockFilters:
+        this.view.hasBlockFilters ??
+        (saved !== undefined && saved.size < ALL_BLOCK_TYPES.length),
       keepAnswerBeforeTrailingTools: keepsAnswerBeforeTrailingTools(
         settings.sessionProviders,
         sessions.activeSession?.agent,
@@ -130,7 +158,7 @@ export class InSessionSearchStore {
    */
   revealedBlockTypes: ReadonlySet<BlockType> = $derived.by(() => {
     if (!this.isOpen) return EMPTY_BLOCK_TYPES;
-    const saved = this.view.visibleBlocks;
+    const saved = this.savedVisibleBlocks;
     if (saved === undefined) return EMPTY_BLOCK_TYPES;
     let revealed: Set<BlockType> | null = null;
     for (const match of this.matches) {
@@ -210,7 +238,7 @@ export class InSessionSearchStore {
       });
 
       $effect(() => {
-        const saved = this.view.visibleBlocks;
+        const saved = this.savedVisibleBlocks;
         const open = this.isOpen;
         untrack(() => {
           const previous = this.previousVisibleBlocks;
@@ -373,10 +401,8 @@ export class InSessionSearchStore {
    * the same saved-or-revealed rule inside the scope projection.
    */
   isBlockEffectivelyVisible(type: BlockType): boolean {
-    const saved = this.view.visibleBlocks;
-    const savedVisible = this.view.isBlockVisible
-      ? this.view.isBlockVisible(type)
-      : saved === undefined || saved.has(type);
+    const saved = this.savedVisibleBlocks;
+    const savedVisible = saved === undefined || saved.has(type);
     return savedVisible || this.revealedBlockTypes.has(type);
   }
 

@@ -1,6 +1,7 @@
 <!-- ABOUTME: Copy, pin, and fork controls for one source message. -->
 <!-- ABOUTME: Shared by standalone message headers and assistant-turn event rows. -->
 <script lang="ts">
+  import { onDestroy } from "svelte";
   import type { Session } from "../../api/types.js";
   import type { DbMessage as Message } from "../../api/generated/index.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
@@ -119,6 +120,14 @@
       forkFeedback = "";
     }, 2000);
   }
+
+  /* This row-level control mounts per message row; pending feedback timers
+   * must not fire after the row is destroyed. */
+  onDestroy(() => {
+    clearTimeout(copyTimer);
+    clearTimeout(pinTimer);
+    clearTimeout(forkTimer);
+  });
 </script>
 
 <CopyButton

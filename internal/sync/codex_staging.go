@@ -336,6 +336,39 @@ func (s *codexStagingSink) Close() error {
 	return err
 }
 
+// Reset clears every sink-owned channel so a second parse pass starts from
+// an empty staging state. The embedded collecting reset covers messages,
+// call refs, and ordinals; the staged side must additionally clear the
+// occurrence counters and call-key indexes, the findings and their pending
+// coordinates, the per-call summary and content-failure verdicts, the
+// event sequence, the sticky staging error, and the staged rows themselves
+// — otherwise a reparsed session would keep its first pass's dedup state,
+// findings, and scratch rows on top of the second pass's.
+func (s *codexStagingSink) Reset() {
+	s.CodexCollectingSink.Reset()
+	s.currentCallKey = make(map[string]string)
+	s.callKeyByPosition = make(map[parser.ParsedToolCallPosition]string)
+	s.callOccurrences = make(map[string]int)
+	s.categoryByCallKey = make(map[string]string)
+	s.findings = nil
+	s.findingPos = nil
+	s.eventByCallKey = make(map[string]int64)
+	s.eventSeq = 0
+	s.singleSummaries = nil
+	s.contentFailures = nil
+	s.stageErr = nil
+	s.validationStats = db.ValidationStats{}
+	if s.scratch != nil {
+		// The interface carries no context; the scratch pool is a single
+		// connection to a private file, so a plain DELETE cannot block.
+		if _, err := s.scratch.ExecContext(
+			context.Background(), `DELETE FROM stage_events`,
+		); err != nil {
+			s.fail(err)
+		}
+	}
+}
+
 // Path returns the staging file path for ATTACH-based publishing.
 func (s *codexStagingSink) Path() string {
 	return s.path
@@ -794,45 +827,154 @@ func (s *codexStagingSink) addEventFindings(
 	}
 }
 
-func (s *codexStagingSink) isCollapsedSingleEvent(ctx context.Context, stageKey string) bool {
-	if s.scratch == nil {
-		return false
+// stagedCallAggregate holds the per-call aggregates the collapse decision
+// is made from. With exactly one staged row, MIN picks that row's fields.
+type stagedCallAggregate struct {
+	eventCount   int
+	soleContent  string
+	soleStatus   string
+	soleAgent    string
+	soleSubagent string
+	soleDigest   []byte
+	participates int
+	blanked      int
+}
+
+// loadStagedCallAggregates reads the grouped per-call aggregates for the
+// given stage keys with chunked IN queries, so neither the findings pass
+// nor the event publish pays one query per call. Stage keys absent from
+// the result have no staged rows.
+func (s *codexStagingSink) loadStagedCallAggregates(
+	ctx context.Context, stageKeys []string,
+) (map[string]stagedCallAggregate, error) {
+	out := make(map[string]stagedCallAggregate, len(stageKeys))
+	if s.scratch == nil || len(stageKeys) == 0 {
+		return out, nil
 	}
-	var eventCount int
-	var soleContent string
-	var hasMetadata int
-	var participates int
-	var blanked int
-	err := s.scratch.QueryRowContext(ctx, `
-		SELECT COUNT(*),
+	seen := make(map[string]struct{}, len(stageKeys))
+	unique := make([]string, 0, len(stageKeys))
+	for _, key := range stageKeys {
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, key)
+	}
+	// SQLite's bound-parameter limit calls for chunked IN lists.
+	const chunkSize = 500
+	for start := 0; start < len(unique); start += chunkSize {
+		chunk := unique[start:min(start+chunkSize, len(unique))]
+		var sb strings.Builder
+		sb.WriteString(`SELECT call_key, COUNT(*),
 		       COALESCE(MIN(content), ''),
-		       MAX(CASE WHEN COALESCE(agent_id, '') != '' OR COALESCE(subagent_session_id, '') != '' THEN 1 ELSE 0 END),
-		       MIN(summary_participates),
-		       MAX(blanked)
+		       COALESCE(MIN(status), ''),
+		       COALESCE(MIN(agent_id), ''),
+		       COALESCE(MIN(subagent_session_id), ''),
+		       MIN(raw_content_digest),
+		       MIN(summary_participates), MAX(blanked)
 		FROM stage_events
-		WHERE call_key = ?
-	`, stageKey).Scan(&eventCount, &soleContent, &hasMetadata, &participates, &blanked)
-	if err != nil || eventCount != 1 || hasMetadata != 0 || participates != 1 || blanked != 0 {
-		return false
+		WHERE call_key IN (`)
+		args := make([]any, 0, len(chunk))
+		for i, key := range chunk {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteByte('?')
+			args = append(args, key)
+		}
+		sb.WriteString(`) GROUP BY call_key`)
+		rows, err := s.scratch.QueryContext(ctx, sb.String(), args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var key string
+			var agg stagedCallAggregate
+			if err := rows.Scan(
+				&key, &agg.eventCount, &agg.soleContent, &agg.soleStatus,
+				&agg.soleAgent, &agg.soleSubagent, &agg.soleDigest,
+				&agg.participates, &agg.blanked,
+			); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			out[key] = agg
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
 	}
-	if s.blocked[s.categoryByCallKey[stageKey]] {
-		return false
+	return out, nil
+}
+
+// collapsedSingleEventKeys decides for every aggregated call whether the
+// staged rows collapse into the call's result summary under exactly the
+// rules db.ResultContentDuplicatesSingleEvent applies on the direct write
+// path: one event, content identical to the (nonempty) summary, a
+// collapsible status, no agent or subagent identity, and a raw-content
+// digest matching the summary unless the summary carries an image marker.
+// Blanked and non-participating events never collapse — their stored
+// content is not the summary — and neither do blocked categories.
+func (s *codexStagingSink) collapsedSingleEventKeys(
+	ctx context.Context,
+	aggs map[string]stagedCallAggregate,
+) (map[string]bool, error) {
+	collapsed := make(map[string]bool)
+	for stageKey, agg := range aggs {
+		if agg.eventCount != 1 || agg.participates != 1 || agg.blanked != 0 {
+			continue
+		}
+		if s.blocked[s.categoryByCallKey[stageKey]] {
+			continue
+		}
+		summary, _, err := s.ResolveSummary(ctx, stageKey)
+		if err != nil {
+			return nil, err
+		}
+		if !db.ResultContentDuplicatesSingleEvent(
+			summary, []db.ToolResultEvent{{
+				Content:           agg.soleContent,
+				Status:            agg.soleStatus,
+				AgentID:           agg.soleAgent,
+				SubagentSessionID: agg.soleSubagent,
+				RawContentDigest:  agg.soleDigest,
+			}},
+		) {
+			continue
+		}
+		collapsed[stageKey] = true
 	}
-	summary, _, err := s.ResolveSummary(ctx, stageKey)
-	if err != nil || summary == "" || summary != soleContent {
-		return false
-	}
-	return true
+	return collapsed, nil
 }
 
 // Findings returns the staged event findings with session, ordinal, and
 // call coordinates stamped from the final message model.
 func (s *codexStagingSink) Findings(
+	ctx context.Context,
 	sessionID string,
 	positions map[string]db.StagedToolCallPosition,
 ) []db.SecretFinding {
 	out := make([]db.SecretFinding, len(s.findings))
-	ctx := context.Background()
+	stageKeys := make([]string, 0, len(s.findings))
+	for i := range s.findings {
+		if _, ok := positions[s.findingPos[i].stageKey]; ok {
+			stageKeys = append(stageKeys, s.findingPos[i].stageKey)
+		}
+	}
+	aggs, err := s.loadStagedCallAggregates(ctx, stageKeys)
+	if err != nil {
+		log.Printf("codex staged findings aggregates: %v", err)
+		aggs = nil
+	}
+	collapsed, err := s.collapsedSingleEventKeys(ctx, aggs)
+	if err != nil {
+		log.Printf("codex staged findings collapse: %v", err)
+		collapsed = nil
+	}
 	for i, f := range s.findings {
 		f.SessionID = sessionID
 		stageKey := s.findingPos[i].stageKey
@@ -841,7 +983,7 @@ func (s *codexStagingSink) Findings(
 			f.MessageOrdinal = pos.Ordinal
 			callIdx := pos.CallIndex
 			f.CallIndex = &callIdx
-			if s.isCollapsedSingleEvent(ctx, stageKey) {
+			if collapsed[stageKey] {
 				f.LocationKind = "tool_result"
 				f.EventIndex = nil
 			} else {
@@ -868,24 +1010,29 @@ func (s *codexStagingSink) InsertEventsTx(
 	if s.stageErr != nil {
 		return s.stageErr
 	}
+	stageKeys := make([]string, 0, len(messageOrdinals))
+	for stageKey := range messageOrdinals {
+		stageKeys = append(stageKeys, stageKey)
+	}
+	// One grouped aggregate read covers every call's collapse decision;
+	// collapsing calls are skipped instead of inserting their sole event.
+	aggs, err := s.loadStagedCallAggregates(ctx, stageKeys)
+	if err != nil {
+		return fmt.Errorf(
+			"counting staged events for %s: %w", sessionID, err,
+		)
+	}
+	collapsed, err := s.collapsedSingleEventKeys(ctx, aggs)
+	if err != nil {
+		return fmt.Errorf(
+			"deciding staged event collapse for %s: %w", sessionID, err,
+		)
+	}
 	for stageKey, pos := range messageOrdinals {
-		var eventCount int
-		var soleStoredContent string
-		if err := s.scratch.QueryRowContext(ctx, `
-			SELECT COUNT(*),
-			       COALESCE(MIN(CASE WHEN blanked = 1 THEN '' ELSE content END), '')
-			FROM stage_events
-			WHERE call_key = ?
-		`, stageKey).Scan(&eventCount, &soleStoredContent); err != nil {
-			return fmt.Errorf(
-				"counting staged events for %s/%s: %w",
-				sessionID, pos.ToolUseID, err,
-			)
-		}
-		if eventCount == 0 {
+		if _, hasRows := aggs[stageKey]; !hasRows {
 			continue
 		}
-		if s.isCollapsedSingleEvent(ctx, stageKey) {
+		if collapsed[stageKey] {
 			continue
 		}
 		if _, err := tx.ExecContext(ctx, `

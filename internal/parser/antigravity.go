@@ -277,13 +277,10 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 
 	var cwd string
 	var sessionTitle string
-	if sum, ok := p.sources.summaries.lookup(root, id); ok {
-		if project == "" {
-			project = sum.project
-		}
-		cwd = sum.cwd
-		sessionTitle = sum.title
-	} else if sum, ok := lookupAntigravitySummaryContext(ctx, filepath.Join(root, "conversation_summaries.db"), id); ok {
+	// The index's own lookup already opens conversation_summaries.db once
+	// per root (shared scan) under ctx; a second direct probe here would
+	// double the open cost on every miss.
+	if sum, ok := p.sources.summaries.lookup(ctx, root, id); ok {
 		if project == "" {
 			project = sum.project
 		}
@@ -316,16 +313,24 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 	// then the agy-reader sidecar's parentCascadeId (mirroring the CLI
 	// convention: parser sets ParentSessionID with the provider prefix).
 	// The descriptor also supplies the session name from the subagent
-	// role.
+	// role. A claim whose descriptor chain cycles back to this session
+	// (A parents B while B parents A) is refused: emitting the edge
+	// would make every cycle member somebody's child and drop all of
+	// them from the sidebar roots.
 	if d, ok := p.sources.subagentDescriptor(root, id); ok {
-		sess.ParentSessionID = antigravityIDPrefix + d.parentID
-		sess.RelationshipType = RelSubagent
+		if !p.sources.subagentChainCycles(root, id, d.parentID) {
+			sess.ParentSessionID = antigravityIDPrefix + d.parentID
+			sess.RelationshipType = RelSubagent
+		}
 		if name := d.sessionName(); name != "" {
 			sess.SessionName = name
 			sess.SessionNamePresent = true
 		}
 	} else if tErr == nil && tRes.parentCascadeID != "" &&
-		!strings.EqualFold(tRes.parentCascadeID, id) {
+		!strings.EqualFold(tRes.parentCascadeID, id) &&
+		!p.sources.subagentChainCycles(
+			root, id, canonicalAgyCascadeID(tRes.parentCascadeID),
+		) {
 		sess.ParentSessionID = antigravityIDPrefix + tRes.parentCascadeID
 		sess.RelationshipType = RelSubagent
 	}
@@ -1589,9 +1594,10 @@ var antigravityMetadataEnvelopes = regexp.MustCompile(
 // cleanAntigravityPrompt extracts the human-authored prompt from Antigravity's
 // prompt-envelope format. Antigravity IDE and CLI wrap user turns in
 // <USER_REQUEST>...</USER_REQUEST> and append runtime-injected metadata blocks
-// (<ADDITIONAL_METADATA>, <USER_SETTINGS_CHANGE>). If an outer <USER_REQUEST>
-// envelope is present, its inner text is returned; any metadata blocks are
-// stripped. Prompts without the envelope are preserved unchanged.
+// (<ADDITIONAL_METADATA>, <USER_SETTINGS_CHANGE>, <SYSTEM_INFORMATION>). If an
+// outer <USER_REQUEST> envelope is present, its inner text is returned; any
+// metadata blocks are stripped. Prompts without the envelope are preserved
+// unchanged.
 func cleanAntigravityPrompt(content string) string {
 	trimmed := strings.TrimSpace(content)
 	if trimmed == "" {
@@ -1603,10 +1609,15 @@ func cleanAntigravityPrompt(content string) string {
 		if lastIdx := strings.LastIndex(inner, "</USER_REQUEST>"); lastIdx >= 0 {
 			inner = inner[:lastIdx]
 		} else {
+			// No closing tag: cut at the earliest metadata envelope the
+			// same way antigravityMetadataEnvelopes strips all three.
 			if idx := strings.Index(inner, "<ADDITIONAL_METADATA>"); idx >= 0 {
 				inner = inner[:idx]
 			}
 			if idx := strings.Index(inner, "<USER_SETTINGS_CHANGE>"); idx >= 0 {
+				inner = inner[:idx]
+			}
+			if idx := strings.Index(inner, "<SYSTEM_INFORMATION>"); idx >= 0 {
 				inner = inner[:idx]
 			}
 		}

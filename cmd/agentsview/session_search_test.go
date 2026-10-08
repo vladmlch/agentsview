@@ -167,11 +167,20 @@ func TestSessionSearchExcludeSessionDropsMatches(t *testing.T) {
 }
 
 func TestSessionSearchFTSWithToolSource(t *testing.T) {
-	cmd := newSessionSearchCommand()
-	cmd.SetArgs([]string{"needle", "--fts", "--in", "tool_result"})
-	err := cmd.Execute()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "messages only")
+	// --fts accepts tool sources: SQLite's fts covers tool_input and
+	// tool_result through tool_content_fts. Read stores that index only
+	// message content reject the combination in the service layer with a
+	// backend-named error, so the CLI must not gate it here.
+	for _, sources := range [][]string{
+		{"tool_result"},
+		{"tool_input"},
+		{"messages", "tool_result"},
+	} {
+		mode, err := resolveContentSearchMode(
+			false, true, false, false, sources)
+		require.NoError(t, err)
+		assert.Equal(t, "fts", mode)
+	}
 }
 
 func TestResolveContentSearchModeMapping(t *testing.T) {

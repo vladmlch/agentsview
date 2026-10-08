@@ -201,6 +201,128 @@ func TestSyncJuniePartialAndTitleOnlyRewrites(t *testing.T) {
 	assert.Equal(t, "Title only", *sess.SessionName)
 }
 
+func TestSyncJunieContentlessRewriteWithExternalNamePreservesMessages(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		withIndex bool
+		withState bool
+	}{
+		{"index taskName", true, false},
+		{"state.json task name", false, true},
+		{"index and state", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			sessionID := "session-rewrite-named"
+			sessionDir := filepath.Join(root, sessionID)
+			require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+			eventsPath := filepath.Join(sessionDir, "events.jsonl")
+			require.NoError(t, os.WriteFile(eventsPath, []byte(
+				`{"kind":"UserPromptEvent","requestId":"req-1","prompt":"Keep me","timestampMs":1704067200000}`+"\n",
+			), 0o600))
+			if tc.withIndex {
+				require.NoError(t, os.WriteFile(filepath.Join(root, "index.jsonl"), []byte(
+					`{"sessionId":"`+sessionID+`","taskName":"Indexed title","projectDir":"/work/demo"}`+"\n",
+				), 0o600))
+			}
+			if tc.withState {
+				require.NoError(t, os.WriteFile(filepath.Join(sessionDir, "state.json"), []byte(
+					`{"event":{"agentEvent":{"blob":"{\"currentDirectory\":\"/work/demo\",\"lastAgentState\":{\"issue\":{\"name\":\"State title\"}}}"}}}`,
+				), 0o600))
+			}
+
+			database := openTestDB(t)
+			engine := NewEngine(t.Context(), database, EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{parser.AgentJunie: {root}},
+				Machine:   "test",
+			})
+			t.Cleanup(engine.Close)
+
+			first := engine.SyncAll(t.Context(), nil)
+			require.Equal(t, 1, first.Synced)
+			require.Zero(t, first.Failed)
+			messages, err := database.GetMessages(t.Context(), "junie:"+sessionID, 0, 100, true)
+			require.NoError(t, err)
+			require.Len(t, messages, 1)
+
+			// Truncating the stream to nothing or to unrecognized records must
+			// not erase the stored messages via a title-only replacement.
+			for _, rewrite := range [][]byte{
+				nil,
+				[]byte(`{"kind":"UnknownEvent","timestampMs":1704067200500}` + "\n"),
+			} {
+				require.NoError(t, os.WriteFile(eventsPath, rewrite, 0o600))
+				skipped := engine.SyncAll(t.Context(), nil)
+				require.Zero(t, skipped.Synced)
+				require.Zero(t, skipped.Failed)
+				messages, err = database.GetMessages(t.Context(), "junie:"+sessionID, 0, 100, true)
+				require.NoError(t, err)
+				require.Len(t, messages, 1, "contentless rewrite must preserve stored messages")
+				assert.Equal(t, "Keep me", messages[0].Content)
+				sess, err := database.GetSessionFull(t.Context(), "junie:"+sessionID)
+				require.NoError(t, err)
+				require.NotNil(t, sess, "contentless rewrite must not purge the session")
+			}
+		})
+	}
+}
+
+func TestSyncJunieSymlinkedSummaryJSONDoesNotError(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-sidecar-link")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	eventsPath := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(eventsPath, []byte(
+		`{"kind":"UserPromptEvent","requestId":"req-1","prompt":"Hi","timestampMs":1704067200000}`+"\n",
+	), 0o600))
+
+	outside := filepath.Join(t.TempDir(), "elsewhere.json")
+	require.NoError(t, os.WriteFile(outside, []byte(
+		`{"taskName":"Leaked","lifecycle":"CANCELLED"}`+"\n",
+	), 0o600))
+	if err := os.Symlink(outside, filepath.Join(sessionDir, "summary.json")); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	database := openTestDB(t)
+	engine := NewEngine(t.Context(), database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentJunie: {root}},
+		Machine:   "test",
+	})
+	t.Cleanup(engine.Close)
+
+	// A non-regular companion is skipped by fingerprinting; parsing must treat
+	// it as absent instead of leaving the session in a permanent error state.
+	first := engine.SyncAll(t.Context(), nil)
+	require.Equal(t, 1, first.Synced)
+	require.Zero(t, first.Failed)
+	messages, err := database.GetMessages(t.Context(), "junie:session-sidecar-link", 0, 100, true)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	sess, err := database.GetSessionFull(t.Context(), "junie:session-sidecar-link")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	assert.Nil(t, sess.SessionName, "symlinked sidecar must not contribute a title")
+
+	unchanged := engine.SyncAll(t.Context(), nil)
+	require.Zero(t, unchanged.Synced)
+	require.Equal(t, 1, unchanged.Skipped)
+	require.Zero(t, unchanged.Failed)
+
+	// Replacing the symlink with a regular summary.json folds it back in.
+	require.NoError(t, os.Remove(filepath.Join(sessionDir, "summary.json")))
+	require.NoError(t, os.WriteFile(filepath.Join(sessionDir, "summary.json"), []byte(
+		`{"taskName":"Real title"}`+"\n",
+	), 0o600))
+	resynced := engine.SyncAll(t.Context(), nil)
+	require.Equal(t, 1, resynced.Synced)
+	require.Zero(t, resynced.Failed)
+	sess, err = database.GetSessionFull(t.Context(), "junie:session-sidecar-link")
+	require.NoError(t, err)
+	require.NotNil(t, sess.SessionName)
+	assert.Equal(t, "Real title", *sess.SessionName)
+}
+
 func TestJunieIndexChangedPathWorkIsArchiveBounded(t *testing.T) {
 	for _, sessionCount := range []int{2, 128} {
 		t.Run(fmt.Sprintf("sessions-%d", sessionCount), func(t *testing.T) {

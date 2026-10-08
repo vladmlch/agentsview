@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -346,9 +347,9 @@ func TestSubagentLinkResultEventInheritsChild(t *testing.T) {
 }
 
 // TestSubagentLinkKeepsDedupedSummary pins the incremental link path: a
-// linked result that repeats the call's single stored event must not
-// re-inflate result_content, while a summary the event does not carry is
-// stored as before.
+// linked result that repeats the call's single content-bearing event must
+// not re-inflate result_content, while a summary the event does not carry
+// is stored as before.
 func TestSubagentLinkKeepsDedupedSummary(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "s-link", "proj")
@@ -415,7 +416,10 @@ func TestSubagentLinkKeepsDedupedSummary(t *testing.T) {
 	require.Len(t, msgs[0].ToolCalls, 1)
 	assert.Equal(t, "agent finished", msgs[0].ToolCalls[0].ResultContent)
 	assert.Equal(t, "agent-child", msgs[0].ToolCalls[0].SubagentSessionID)
-	assert.Empty(t, msgs[0].ToolCalls[0].ResultEvents, "no redundant single event stored")
+	require.Len(t, msgs[0].ToolCalls[0].ResultEvents, 2,
+		"the started sibling carries execution timing the collapse would lose")
+	assert.Equal(t, "started", msgs[0].ToolCalls[0].ResultEvents[0].Status)
+	assert.Equal(t, "completed", msgs[0].ToolCalls[0].ResultEvents[1].Status)
 
 	link("agent finished with a longer final report")
 	content, length = stored()
@@ -556,4 +560,319 @@ func TestOmittedResultContentLengthRoundTrips(t *testing.T) {
 		assert.Equal(t, summary, got.ResultContent)
 		assert.Equal(t, len(summary), got.ResultContentLength)
 	})
+}
+
+// TestResultContentDuplicatesSingleEventStatusGate pins the status side of
+// the collapse contract. A collapsed call reads as an implicitly completed
+// result, so only an empty or "completed" status is equivalent to the
+// summary. Every other status carries information the summary cannot
+// express — the failure verdict signals read, the terminal marker activity
+// reports and execution timing read — and must keep its event row.
+func TestResultContentDuplicatesSingleEventStatusGate(t *testing.T) {
+	const summary = "output"
+	for _, tc := range []struct {
+		name   string
+		status string
+		want   bool
+	}{
+		{"empty status collapses", "", true},
+		{"completed collapses", "completed", true},
+		{"errored keeps its event", "errored", false},
+		{"cancelled keeps its event", "cancelled", false},
+		{"denied keeps its event", "denied", false},
+		{"error keeps its event", "error", false},
+		{"failed keeps its event", "failed", false},
+		{"failure keeps its event", "failure", false},
+		{"started keeps its event", "started", false},
+		{"running keeps its event", "running", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := []ToolResultEvent{{
+				Source:        "function_call_output",
+				Status:        tc.status,
+				Content:       summary,
+				ContentLength: len(summary),
+				Timestamp:     "2024-01-01T10:00:00Z",
+			}}
+			assert.Equal(t, tc.want,
+				ResultContentDuplicatesSingleEvent(summary, events),
+				"duplicate verdict")
+			assert.Equal(t, !tc.want,
+				ShouldPersistToolResultEvents(summary, events),
+				"persist verdict")
+		})
+	}
+}
+
+// TestToolCallResultStorageKeepsFailureMetadata covers the storage half of
+// the status gate end to end: a single errored event whose content equals
+// the summary must keep its row in tool_result_events, with the status,
+// source, and timestamp a downstream consumer reads.
+func TestToolCallResultStorageKeepsFailureMetadata(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s-err", "proj")
+	require.NoError(t, d.InsertMessages(t.Context(), []Message{{
+		SessionID: "s-err", Ordinal: 0, Role: "assistant",
+		Content: "running a tool", HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID:           "s-err",
+			ToolName:            "Bash",
+			Category:            "Bash",
+			ToolUseID:           "call_err",
+			ResultContent:       "boom",
+			ResultContentLength: len("boom"),
+			ResultEvents: []ToolResultEvent{{
+				Source:        "function_call_output",
+				Status:        "errored",
+				Content:       "boom",
+				ContentLength: len("boom"),
+				Timestamp:     "2024-01-01T10:00:00Z",
+			}},
+		}},
+	}}))
+
+	msgs, err := d.GetMessages(t.Context(), "s-err", 0, 10, true)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.Len(t, msgs[0].ToolCalls, 1)
+	call := msgs[0].ToolCalls[0]
+	assert.Equal(t, "boom", call.ResultContent)
+	require.Len(t, call.ResultEvents, 1,
+		"an errored event must not collapse into result_content")
+	assert.Equal(t, "errored", call.ResultEvents[0].Status)
+	assert.Equal(t, "function_call_output", call.ResultEvents[0].Source)
+	assert.Equal(t, "boom", call.ResultEvents[0].Content)
+	assert.Equal(t, "2024-01-01T10:00:00Z", call.ResultEvents[0].Timestamp)
+}
+
+// captureSignalQuery is a SignalMaintainer stub that records which result
+// events the write transaction reports as inserted for the call under test
+// and what the in-transaction stored-events view holds, then declines so
+// the write falls back to signal invalidation.
+type captureSignalQuery struct {
+	inserted []ToolResultEvent
+	stored   []ToolResultEvent
+}
+
+func (c *captureSignalQuery) MaintainTx(
+	ctx context.Context, q SignalQuery,
+) (*SignalDelta, error) {
+	c.inserted = append(c.inserted, q.InsertedResultEvents(
+		ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
+	)...)
+	stored, err := q.CallResultEvents(ctx, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	c.stored = stored
+	return nil, nil
+}
+
+// TestLateErroredResultMaterializesCollapsedCall pins the late-update half
+// of the collapse contract: when a call's single event was collapsed into
+// result_content, a later update replaying the same bytes with a meaningful
+// status must materialize event rows instead of being swallowed by the
+// identical-summary early return. The stored rows are what signals, the
+// activity report, and execution timing read.
+func TestLateErroredResultMaterializesCollapsedCall(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s-late", "proj")
+	require.NoError(t, d.InsertMessages(t.Context(), []Message{{
+		SessionID: "s-late", Ordinal: 0, Role: "assistant",
+		Content: "running", HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID:           "s-late",
+			ToolName:            "Bash",
+			Category:            "Bash",
+			ToolUseID:           "call_late",
+			ResultContent:       "done",
+			ResultContentLength: len("done"),
+			ResultEvents: []ToolResultEvent{{
+				Source:        "function_call_output",
+				Status:        "completed",
+				Content:       "done",
+				ContentLength: len("done"),
+			}},
+		}},
+	}}))
+
+	msgs, err := d.GetMessages(t.Context(), "s-late", 0, 10, true)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.Len(t, msgs[0].ToolCalls, 1)
+	require.Empty(t, msgs[0].ToolCalls[0].ResultEvents,
+		"the completed single event must collapse first")
+
+	// The signal maintainer runs inside the write transaction; a capture
+	// stub proves the materialized rows — including the implicit completed
+	// event the summary is restored as — reach the findings scanner.
+	capture := &captureSignalQuery{}
+	_, err = d.WriteSessionIncremental(t.Context(), "s-late", nil,
+		IncrementalSessionUpdate{
+			MsgCount:    1,
+			NextOrdinal: 1,
+			ToolCallResultUpdates: []ToolCallResultUpdate{{
+				ToolUseID: "call_late",
+				Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
+				Events: []ToolResultEvent{{
+					ToolUseID:     "call_late",
+					Source:        "function_call_output",
+					Status:        "errored",
+					Content:       "done",
+					ContentLength: len("done"),
+					Timestamp:     "2024-01-01T10:05:00Z",
+				}},
+			}},
+			SignalMaintainer: capture,
+		})
+	require.NoError(t, err)
+
+	require.Len(t, capture.inserted, 2,
+		"both materialized events must be visible to the findings scanner")
+	assert.Equal(t, "completed", capture.inserted[0].Status,
+		"the synthesized summary event must be scanned for findings")
+	assert.Equal(t, 0, capture.inserted[0].EventIndex)
+	assert.Equal(t, "errored", capture.inserted[1].Status)
+	assert.Equal(t, 1, capture.inserted[1].EventIndex)
+	require.Len(t, capture.stored, 2,
+		"the canonical stored-events view must see both rows")
+
+	msgs, err = d.GetMessages(t.Context(), "s-late", 0, 10, true)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.Len(t, msgs[0].ToolCalls, 1)
+	call := msgs[0].ToolCalls[0]
+	assert.Equal(t, "done", call.ResultContent)
+	require.Len(t, call.ResultEvents, 2,
+		"a late errored status must materialize event rows")
+	assert.Equal(t, "completed", call.ResultEvents[0].Status,
+		"the collapsed summary materializes as the implicit completed event")
+	assert.Equal(t, 0, call.ResultEvents[0].EventIndex)
+	assert.Equal(t, "errored", call.ResultEvents[1].Status,
+		"the late status must reach storage")
+	assert.Equal(t, 1, call.ResultEvents[1].EventIndex)
+	assert.Equal(t, "done", call.ResultEvents[1].Content)
+	assert.Equal(t, "2024-01-01T10:05:00Z", call.ResultEvents[1].Timestamp)
+}
+
+// TestLateCompletedResultStaysCollapsed pins the opposite half: replaying
+// the same bytes with a collapsible status is still a no-op — the call must
+// not grow event rows on an idempotent late update.
+func TestLateCompletedResultStaysCollapsed(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s-idem", "proj")
+	require.NoError(t, d.InsertMessages(t.Context(), []Message{{
+		SessionID: "s-idem", Ordinal: 0, Role: "assistant",
+		Content: "running", HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID:           "s-idem",
+			ToolName:            "Bash",
+			Category:            "Bash",
+			ToolUseID:           "call_idem",
+			ResultContent:       "done",
+			ResultContentLength: len("done"),
+			ResultEvents: []ToolResultEvent{{
+				Source:        "function_call_output",
+				Status:        "completed",
+				Content:       "done",
+				ContentLength: len("done"),
+			}},
+		}},
+	}}))
+
+	for i := 0; i < 2; i++ {
+		_, err := d.WriteSessionIncremental(t.Context(), "s-idem", nil,
+			IncrementalSessionUpdate{
+				MsgCount:    1,
+				NextOrdinal: 1,
+				ToolCallResultUpdates: []ToolCallResultUpdate{{
+					ToolUseID: "call_idem",
+					Position: ToolCallPosition{
+						MessageOrdinal: 0, CallIndex: 0,
+					},
+					Events: []ToolResultEvent{{
+						ToolUseID:     "call_idem",
+						Source:        "function_call_output",
+						Status:        "completed",
+						Content:       "done",
+						ContentLength: len("done"),
+						Timestamp:     "2024-01-01T10:05:00Z",
+					}},
+				}},
+			})
+		require.NoError(t, err)
+	}
+
+	msgs, err := d.GetMessages(t.Context(), "s-idem", 0, 10, true)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.Len(t, msgs[0].ToolCalls, 1)
+	call := msgs[0].ToolCalls[0]
+	assert.Equal(t, "done", call.ResultContent)
+	assert.Empty(t, call.ResultEvents,
+		"an identical completed replay must not grow event rows")
+}
+
+// TestToolContentIsErrorCoversFailureStatuses pins parity between the
+// event-status failure vocabulary and the tool_content.is_error flag the
+// has_error search filter reads: an errored (and, by extension, cancelled
+// or denied) event must mark its tool_content row.
+func TestToolContentIsErrorCoversFailureStatuses(t *testing.T) {
+	d := testDB(t)
+	if !d.HasFTS(t.Context()) {
+		t.Skip("tool_content triggers require fts5")
+	}
+	insertSession(t, d, "s-fts", "proj")
+	calls := []ToolCall{}
+	for _, status := range []string{
+		"errored", "cancelled", "denied", "error", "failed", "failure",
+	} {
+		calls = append(calls, ToolCall{
+			SessionID:           "s-fts",
+			ToolName:            "Bash",
+			Category:            "Bash",
+			ToolUseID:           "call_" + status,
+			ResultContent:       "failed " + status,
+			ResultContentLength: len("failed " + status),
+			ResultEvents: []ToolResultEvent{{
+				ToolUseID:     "call_" + status,
+				Source:        "function_call_output",
+				Status:        status,
+				Content:       "failed " + status,
+				ContentLength: len("failed " + status),
+			}},
+		})
+	}
+	require.NoError(t, d.InsertMessages(t.Context(), []Message{{
+		SessionID:  "s-fts",
+		Ordinal:    0,
+		Role:       "assistant",
+		Content:    "running tools",
+		HasToolUse: true,
+		ToolCalls:  calls,
+	}}))
+
+	rows, err := d.Reader().Query(t.Context(), `
+		SELECT COALESCE(tre.status, ''), tc.is_error
+		FROM tool_content tc
+		JOIN tool_result_events tre ON tre.id = tc.source_id
+		WHERE tc.source_kind = 'event'
+		ORDER BY tre.id`)
+	require.NoError(t, err)
+	defer rows.Close()
+	got := map[string]int{}
+	for rows.Next() {
+		var status string
+		var isError int
+		require.NoError(t, rows.Scan(&status, &isError))
+		got[status] = isError
+	}
+	require.NoError(t, rows.Err())
+	require.Len(t, got, 6, "every failure-status event must keep its row")
+	for _, status := range []string{
+		"errored", "cancelled", "denied", "error", "failed", "failure",
+	} {
+		assert.Equal(t, 1, got[status],
+			"status %q must flag tool_content.is_error", status)
+	}
 }

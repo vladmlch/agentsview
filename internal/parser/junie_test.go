@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1320,4 +1321,316 @@ func TestJunieSubagentEndedAtFallbackToFileMtime(t *testing.T) {
 	require.Len(t, outcome.Results, 2)
 	sub := outcome.Results[1].Result.Session
 	assert.Equal(t, mtime, sub.EndedAt.UTC())
+}
+
+func TestJunieSymlinkedSummaryJSONIsIgnored(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-sidecar-link")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Hi","timestampMs":1704067200000}`+"\n",
+	), 0o600))
+
+	outside := filepath.Join(t.TempDir(), "elsewhere.json")
+	require.NoError(t, os.WriteFile(outside, []byte(
+		`{"taskName":"Leaked","lifecycle":"CANCELLED"}`+"\n",
+	), 0o600))
+	if err := os.Symlink(outside, filepath.Join(sessionDir, "summary.json")); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	// The companion is left out of the fingerprint, so parsing must treat it
+	// as absent too instead of failing on every sync.
+	provider, ok := NewProvider(AgentJunie, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	sources, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	fingerprint, err := provider.Fingerprint(t.Context(), sources[0])
+	require.NoError(t, err)
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
+		Source: sources[0], Fingerprint: fingerprint, Machine: "local",
+	})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	sess := outcome.Results[0].Result.Session
+	assert.Empty(t, sess.SessionName, "symlinked sidecar must not contribute a title")
+	assert.NotEqual(t, TerminationTruncated, sess.TerminationStatus,
+		"symlinked sidecar must not contribute lifecycle state")
+	require.Len(t, outcome.Results[0].Result.Messages, 1)
+	assert.Equal(t, "Hi", outcome.Results[0].Result.Messages[0].Content)
+}
+
+func TestJunieEmptyRewriteWithExternalNameIsSkipped(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		content []byte
+	}{
+		{"empty file", nil},
+		{"unrecognized record", []byte(
+			`{"kind":"UnknownEvent","timestampMs":1704067200500}` + "\n")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			sessionID := "session-260101-120000-abcd"
+			sessionDir := filepath.Join(root, sessionID)
+			require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+			path := filepath.Join(sessionDir, "events.jsonl")
+			require.NoError(t, os.WriteFile(path, tt.content, 0o600))
+			require.NoError(t, os.WriteFile(filepath.Join(root, "index.jsonl"), []byte(
+				`{"sessionId":"`+sessionID+`","taskName":"Indexed title","projectDir":"/work/demo"}`+"\n",
+			), 0o600))
+			require.NoError(t, os.WriteFile(filepath.Join(sessionDir, "state.json"), []byte(
+				`{"event":{"agentEvent":{"blob":"{\"currentDirectory\":\"/work/demo\",\"lastAgentState\":{\"issue\":{\"name\":\"State title\"}}}"}}}`,
+			), 0o600))
+
+			outcome := parseJunieProviderOutcome(t, path, "local")
+			assert.Empty(t, outcome.Results,
+				"a contentless rewrite must not emit a title-only session that force-replaces stored messages")
+			assert.Empty(t, outcome.ExcludedSessionIDs,
+				"a contentless rewrite is a skip, not a stub exclusion")
+		})
+	}
+}
+
+func TestJunieRecognizedEmptyProjectionStillReplaces(t *testing.T) {
+	// Records that produced a name but no messages are a recognized empty
+	// projection: force replacement must still clear stale rows.
+	root := t.TempDir()
+	sessionID := "session-260101-120000-abcd"
+	sessionDir := filepath.Join(root, sessionID)
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(
+		`{"kind":"SessionTitleSetEvent","name":"Title only"}`+"\n",
+	), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "index.jsonl"), []byte(
+		`{"sessionId":"`+sessionID+`","taskName":"Indexed title"}`+"\n",
+	), 0o600))
+
+	outcome := parseJunieProviderOutcome(t, path, "local")
+	require.Len(t, outcome.Results, 1)
+	assert.Equal(t, "Title only", outcome.Results[0].Result.Session.SessionName)
+	assert.Empty(t, outcome.Results[0].Result.Messages)
+}
+
+func TestJunieZeroTimestampMessagesKeepFileOrder(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-nosessionts")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	// No timestampMs anywhere: ordering must follow the file position, not the
+	// unstable zero-timestamp comparison.
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"first question"}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"MarkdownBlockUpdatedEvent","stepId":"s1","text":"first answer"}}}` + "\n" +
+			`{"kind":"UserPromptEvent","requestId":"r2","prompt":"second question"}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"MarkdownBlockUpdatedEvent","stepId":"s2","text":"second answer"}}}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	_, messages := parseJunieProviderSession(t, path, "local")
+	require.Len(t, messages, 4)
+	assert.Equal(t, RoleUser, messages[0].Role)
+	assert.Equal(t, "first question", messages[0].Content)
+	assert.Equal(t, RoleAssistant, messages[1].Role)
+	assert.Equal(t, "first answer", messages[1].Content)
+	assert.Equal(t, RoleUser, messages[2].Role)
+	assert.Equal(t, "second question", messages[2].Content)
+	assert.Equal(t, RoleAssistant, messages[3].Role)
+	assert.Equal(t, "second answer", messages[3].Content)
+	for i, m := range messages {
+		assert.Equal(t, i, m.Ordinal)
+	}
+}
+
+func TestJunieEqualTimestampMessagesKeepFileOrder(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-samets")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"first question","timestampMs":1704067200000}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"MarkdownBlockUpdatedEvent","stepId":"s1","text":"first answer"}},"timestampMs":1704067200000}` + "\n" +
+			`{"kind":"UserPromptEvent","requestId":"r2","prompt":"second question","timestampMs":1704067200000}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"MarkdownBlockUpdatedEvent","stepId":"s2","text":"second answer"}},"timestampMs":1704067200000}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	_, messages := parseJunieProviderSession(t, path, "local")
+	require.Len(t, messages, 4)
+	assert.Equal(t, "first question", messages[0].Content)
+	assert.Equal(t, "first answer", messages[1].Content)
+	assert.Equal(t, "second question", messages[2].Content)
+	assert.Equal(t, "second answer", messages[3].Content)
+}
+
+func TestJunieSummaryJSONLifecycleCaseInsensitive(t *testing.T) {
+	for _, lifecycle := range []string{"cancelled", "Cancelled", "failed"} {
+		t.Run(lifecycle, func(t *testing.T) {
+			root := t.TempDir()
+			sessionDir := filepath.Join(root, "session-260101-120000-abcd")
+			require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+			path := filepath.Join(sessionDir, "events.jsonl")
+			require.NoError(t, os.WriteFile(path, []byte(
+				`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Hi","timestampMs":1704067200000}`+"\n"+
+					`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"s1","result":"ok"}},"timestampMs":1704067200100}`+"\n",
+			), 0o600))
+			require.NoError(t, os.WriteFile(filepath.Join(sessionDir, "summary.json"),
+				[]byte(fmt.Sprintf(`{"taskName":"T","lifecycle":%q}`, lifecycle)), 0o600))
+
+			sess, _ := parseJunieProviderSession(t, path, "local")
+			assert.Equal(t, TerminationTruncated, sess.TerminationStatus)
+		})
+	}
+}
+
+func TestJunieMcpBlockNonJSONInputStaysValid(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-260101-120000-abcd")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Do","timestampMs":1704067200000}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"McpBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"sm","toolName":"ijproxy/find","input":"not a json payload","status":"COMPLETED","details":"done"}},"timestampMs":1704067200100}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	_, messages := parseJunieProviderSession(t, path, "local")
+	var call *ParsedToolCall
+	for i := range messages {
+		for j := range messages[i].ToolCalls {
+			call = &messages[i].ToolCalls[j]
+		}
+	}
+	require.NotNil(t, call)
+	assert.True(t, json.Valid([]byte(call.InputJSON)),
+		"non-JSON MCP input must be wrapped so InputJSON stays decodable")
+	assert.Contains(t, call.InputJSON, "not a json payload")
+}
+
+func TestJunieInvalidIDTimestampFallsBackToMtime(t *testing.T) {
+	root := t.TempDir()
+	// 260230 decodes as February 30 — a nonexistent date that must not produce
+	// a normalized March timestamp.
+	sessionDir := filepath.Join(root, "session-260230-101112-abcd")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Hi"}`+"\n",
+	), 0o600))
+	mtime := time.Date(2026, 7, 4, 9, 0, 0, 0, time.UTC)
+	require.NoError(t, os.Chtimes(path, mtime, mtime))
+
+	sess, _ := parseJunieProviderSession(t, path, "local")
+	assert.Equal(t, mtime, sess.StartedAt.UTC())
+}
+
+func TestJunieOrphanSubagentFoldsIntoParent(t *testing.T) {
+	root := t.TempDir()
+	sessionID := "session-260101-120000-abcd"
+	sessionDir := filepath.Join(root, sessionID)
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	// The agent-9 stream carries only model usage and a failure note — no
+	// request, no blocks — so it cannot emit its own session. Its usage and
+	// the failure note must fold into the parent instead of disappearing.
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Hi","timestampMs":1704067200000}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"LlmResponseMetadataEvent","agent":{"kind":"BuiltInAgent","id":"agent-9"},"modelUsage":[{"model":"gpt-4.1-mini","cost":0.0003,"inputTokens":70,"outputTokens":3,"time":0}]}},"timestampMs":1704067200100}` + "\n" +
+			`{"kind":"AgentTaskFailedEvent","agent":{"id":"agent-9"},"reason":"worker died","timestampMs":1704067200200}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","agent":{"kind":"MainAgent","id":"main"},"stepId":"s1","result":"partial"}},"timestampMs":1704067200300}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	outcome := parseJunieProviderOutcome(t, path, "local")
+	require.Len(t, outcome.Results, 1, "orphan stream must not emit its own session")
+	parent := outcome.Results[0].Result
+	require.Len(t, parent.Session.UsageEvents, 1)
+	assert.Equal(t, "junie:"+sessionID, parent.Session.UsageEvents[0].SessionID)
+	assert.Equal(t, "gpt-4.1-mini", parent.Session.UsageEvents[0].Model)
+
+	var note *ParsedMessage
+	for i := range parent.Messages {
+		if parent.Messages[i].IsSystem && parent.Messages[i].SourceSubtype == "AgentTaskFailedEvent" {
+			note = &parent.Messages[i]
+		}
+	}
+	require.NotNil(t, note, "blockless subagent failure note must fold into the parent")
+	assert.Equal(t, "worker died", note.Content)
+}
+
+func TestJunieAmbiguousAgentNameDoesNotMisattribute(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-260101-120000-abcd")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Hi","timestampMs":1704067200000}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"MarkdownBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-1","name":"dup"},"stepId":"a-request","text":"work A"}},"timestampMs":1704067200100}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-1","name":"dup"},"stepId":"a-res","result":"done A"}},"timestampMs":1704067200200}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"MarkdownBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-2","name":"dup"},"stepId":"b-request","text":"work B"}},"timestampMs":1704067200300}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-2","name":"dup"},"stepId":"b-res","result":"done B"}},"timestampMs":1704067200400}` + "\n" +
+			// The failure targets the ambiguous name "dup": it must not land on
+			// either of the two same-named streams.
+			`{"kind":"AgentTaskFailedEvent","agent":{"name":"dup"},"reason":"worker died","timestampMs":1704067200500}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	outcome := parseJunieProviderOutcome(t, path, "local")
+	require.Len(t, outcome.Results, 3)
+	parent := outcome.Results[0].Result
+	var parentNote *ParsedMessage
+	for i := range parent.Messages {
+		if parent.Messages[i].IsSystem && parent.Messages[i].SourceSubtype == "AgentTaskFailedEvent" {
+			parentNote = &parent.Messages[i]
+		}
+	}
+	require.NotNil(t, parentNote, "ambiguous target must fold the failure note into the parent")
+	assert.Equal(t, "worker died", parentNote.Content)
+	for _, result := range outcome.Results[1:] {
+		for _, m := range result.Result.Messages {
+			assert.NotEqual(t, "AgentTaskFailedEvent", m.SourceSubtype,
+				"failure note must not be attributed to a same-named stream")
+		}
+	}
+}
+
+func TestJunieSpawnedSubagentBlockStaysInChildStream(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-260101-120000-abcd")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	// A non-main agent spawns its own subagent: the spawn call must be
+	// recorded in that agent's stream, not dropped and not moved to the
+	// parent's transcript.
+	events := []byte(
+		`{"kind":"UserPromptEvent","requestId":"r1","prompt":"Hi","timestampMs":1704067200000}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"MarkdownBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-1","name":"orchestrator"},"stepId":"o-request","text":"orchestrate"}},"timestampMs":1704067200100}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"SubagentSpawnedEvent","agent":{"kind":"BuiltInAgent","id":"agent-1","name":"orchestrator"},"stepId":"o-spawn-spawned","name":"inner","task":"inner job"}},"timestampMs":1704067200200}` + "\n" +
+			`{"kind":"SessionA2uxEvent","taskId":"t1","event":{"agentEvent":{"kind":"ResultBlockUpdatedEvent","agent":{"kind":"BuiltInAgent","id":"agent-1","name":"orchestrator"},"stepId":"o-res","result":"spawned inner"}},"timestampMs":1704067200300}` + "\n",
+	)
+	path := filepath.Join(sessionDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(path, events, 0o600))
+
+	outcome := parseJunieProviderOutcome(t, path, "local")
+	require.Len(t, outcome.Results, 2)
+	parent := outcome.Results[0].Result
+	for _, m := range parent.Messages {
+		for _, call := range m.ToolCalls {
+			assert.NotEqual(t, "Task", call.Category,
+				"non-main spawn events must not leak into the parent transcript")
+		}
+	}
+	sub := outcome.Results[1].Result
+	var spawnCall *ParsedToolCall
+	for i := range sub.Messages {
+		for j := range sub.Messages[i].ToolCalls {
+			if sub.Messages[i].ToolCalls[j].Category == "Task" {
+				spawnCall = &sub.Messages[i].ToolCalls[j]
+			}
+		}
+	}
+	require.NotNil(t, spawnCall, "the child's spawn call must stay in its own stream")
+	assert.Equal(t, "inner", spawnCall.ToolName)
 }

@@ -24,6 +24,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/signals"
 )
 
 const projectIdentityRemoteScrubCompletedKey = "project_identity_remote_scrub_v1"
@@ -647,6 +648,24 @@ const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
 const toolCallFieldBackfillStatsKey = "tool_call_field_backfill_v1"
 
+// toolContentFailureStatusRepairStatsKey marks the one-time repair that
+// re-flags tool_content.is_error for event rows stored before the column
+// used the full signals.FailureEventStatuses vocabulary.
+const toolContentFailureStatusRepairStatsKey = "tool_content_failure_status_repair_v1"
+
+// toolContentFailureStatusList renders signals.FailureEventStatuses as a
+// comma-separated SQL literal list. Every IN (...) clause that flags
+// tool_content.is_error is built from it, so the has_error search filter
+// and signals.IsFailure can never drift on which event statuses mean
+// failure.
+var toolContentFailureStatusList = func() string {
+	quoted := make([]string, len(signals.FailureEventStatuses))
+	for i, status := range signals.FailureEventStatuses {
+		quoted[i] = "'" + status + "'"
+	}
+	return strings.Join(quoted, ",")
+}()
+
 const (
 	walJournalSizeLimitBytes = 256 * 1024 * 1024
 	walCheckpointThreshold   = 512 * 1024 * 1024
@@ -777,7 +796,7 @@ DROP TRIGGER IF EXISTS tool_result_events_fts_ad;
 DROP TRIGGER IF EXISTS tool_result_events_fts_au;
 `
 
-const toolContentTriggersCreatesSQL = `
+var toolContentTriggersCreatesSQL = `
 CREATE TRIGGER IF NOT EXISTS tool_calls_fts_ai AFTER INSERT ON tool_calls BEGIN
     INSERT INTO tool_content(source_kind, source_id, session_id, message_id,
         ordinal, location, tool_name, tool_use_id, content, file_path,
@@ -838,7 +857,7 @@ CREATE TRIGGER IF NOT EXISTS tool_result_events_fts_ai AFTER INSERT ON tool_resu
         '', CASE WHEN json_valid(new.content) THEN CAST(COALESCE(
             json_extract(new.content,'$.exit_code'),
             json_extract(new.content,'$.exitCode')) AS INTEGER) END,
-        CASE WHEN lower(new.status) IN ('error','failed','failure') OR
+        CASE WHEN lower(new.status) IN (` + toolContentFailureStatusList + `) OR
                        (json_valid(new.content) AND COALESCE(
                            json_extract(new.content,'$.is_error'),0))
              THEN 1 ELSE 0 END);
@@ -859,7 +878,7 @@ CREATE TRIGGER IF NOT EXISTS tool_result_events_fts_au AFTER UPDATE ON tool_resu
         '', CASE WHEN json_valid(new.content) THEN CAST(COALESCE(
             json_extract(new.content,'$.exit_code'),
             json_extract(new.content,'$.exitCode')) AS INTEGER) END,
-        CASE WHEN lower(new.status) IN ('error','failed','failure') OR
+        CASE WHEN lower(new.status) IN (` + toolContentFailureStatusList + `) OR
                        (json_valid(new.content) AND COALESCE(
                            json_extract(new.content,'$.is_error'),0))
              THEN 1 ELSE 0 END);
@@ -4367,6 +4386,9 @@ func (db *DB) backfillToolContentFTSLocked(ctx context.Context, w *writerHandle)
 	).Scan(&count); err != nil || count == 0 {
 		return nil
 	}
+	if err := repairToolContentFailureStatusesLocked(ctx, w); err != nil {
+		return err
+	}
 	var tcCount int
 	if err := w.QueryRowContext(ctx, "SELECT count(*) FROM tool_content").Scan(&tcCount); err != nil {
 		return nil
@@ -4374,6 +4396,9 @@ func (db *DB) backfillToolContentFTSLocked(ctx context.Context, w *writerHandle)
 	if tcCount > 0 {
 		return nil
 	}
+	// Mirrors the tool_content triggers exactly: same exit_code extraction,
+	// same is_error vocabulary, and the same tool_name resolution that
+	// falls back to call_index when an event carries no tool_use_id.
 	if _, err := w.ExecContext(ctx, `
 		INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
 			message_id, ordinal, location, tool_name, tool_use_id, content, file_path)
@@ -4383,23 +4408,89 @@ func (db *DB) backfillToolContentFTSLocked(ctx context.Context, w *writerHandle)
 		FROM tool_calls tc JOIN messages m ON m.id=tc.message_id
 		WHERE COALESCE(tc.input_json,'') <> '';
 		INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
-			message_id, ordinal, location, tool_name, tool_use_id, content, file_path)
+			message_id, ordinal, location, tool_name, tool_use_id, content,
+			file_path, exit_code, is_error)
 		SELECT 'call', tc.id, tc.session_id, tc.message_id, m.ordinal,
 			'tool_result', tc.tool_name, COALESCE(tc.tool_use_id,''),
-			COALESCE(tc.result_content,''), COALESCE(tc.file_path,'')
+			COALESCE(tc.result_content,''), COALESCE(tc.file_path,''),
+			CASE WHEN json_valid(tc.result_content) THEN CAST(COALESCE(
+				json_extract(tc.result_content,'$.exit_code'),
+				json_extract(tc.result_content,'$.exitCode')) AS INTEGER) END,
+			CASE WHEN json_valid(tc.result_content) AND
+			           COALESCE(json_extract(tc.result_content,'$.is_error'),0)
+			     THEN 1 ELSE 0 END
 		FROM tool_calls tc JOIN messages m ON m.id=tc.message_id
 		WHERE COALESCE(tc.result_content,'') <> '';
 		INSERT OR IGNORE INTO tool_content(source_kind, source_id, session_id,
-			ordinal, location, tool_name, tool_use_id, content, is_error)
+			ordinal, location, tool_name, tool_use_id, content, file_path,
+			exit_code, is_error)
 		SELECT 'event', tre.id, tre.session_id, tre.tool_call_message_ordinal,
 			'tool_result', COALESCE((SELECT tc.tool_name FROM tool_calls tc
-			 WHERE tc.session_id=tre.session_id AND tc.tool_use_id=tre.tool_use_id
-			 AND COALESCE(tre.tool_use_id,'')<>'' ORDER BY tc.id LIMIT 1),''),
-			COALESCE(tre.tool_use_id,''), tre.content,
-			CASE WHEN lower(tre.status) IN ('error','failed','failure') THEN 1 ELSE 0 END
+			 WHERE tc.session_id=tre.session_id AND
+			   ((COALESCE(tre.tool_use_id,'')<>'' AND
+			     tc.tool_use_id=tre.tool_use_id) OR
+			    (COALESCE(tre.tool_use_id,'')='' AND
+			     tc.call_index=tre.call_index))
+			 ORDER BY tc.id LIMIT 1),''),
+			COALESCE(tre.tool_use_id,''), tre.content, '',
+			CASE WHEN json_valid(tre.content) THEN CAST(COALESCE(
+				json_extract(tre.content,'$.exit_code'),
+				json_extract(tre.content,'$.exitCode')) AS INTEGER) END,
+			CASE WHEN lower(tre.status) IN (`+toolContentFailureStatusList+`) OR
+			           (json_valid(tre.content) AND COALESCE(
+			               json_extract(tre.content,'$.is_error'),0))
+			     THEN 1 ELSE 0 END
 		FROM tool_result_events tre;
 		INSERT INTO tool_content_fts(tool_content_fts) VALUES('rebuild')`); err != nil {
 		return fmt.Errorf("backfilling tool content FTS: %w", err)
+	}
+	return nil
+}
+
+// repairToolContentFailureStatusesLocked re-flags tool_content.is_error
+// for event rows written before is_error used the full
+// signals.FailureEventStatuses vocabulary: errored, cancelled, and denied
+// statuses previously produced is_error=0 rows that has_error search
+// cannot see. The repair is idempotent and runs once per database behind
+// a stats sentinel — new rows are always written by triggers built from
+// the same status list, so later Opens skip the unindexed scan.
+func repairToolContentFailureStatusesLocked(
+	ctx context.Context, w *writerHandle,
+) error {
+	var done int
+	if err := w.QueryRowContext(ctx,
+		`SELECT count(*) FROM stats WHERE key = ? AND value != 0`,
+		toolContentFailureStatusRepairStatsKey,
+	).Scan(&done); err != nil {
+		return fmt.Errorf(
+			"probing tool_content failure status repair marker: %w", err,
+		)
+	}
+	if done != 0 {
+		return nil
+	}
+	if _, err := w.ExecContext(ctx,
+		`UPDATE tool_content SET is_error = 1
+		 WHERE source_kind = 'event' AND is_error = 0
+		   AND source_id IN (
+		     SELECT id FROM tool_result_events
+		     WHERE lower(status) IN (`+toolContentFailureStatusList+`)
+		        OR (json_valid(content) AND
+		            COALESCE(json_extract(content,'$.is_error'),0))
+		   )`); err != nil {
+		return fmt.Errorf(
+			"repairing tool_content.is_error failure statuses: %w", err,
+		)
+	}
+	if _, err := w.ExecContext(ctx,
+		`INSERT INTO stats (key, value)
+		 VALUES (?, 1)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		toolContentFailureStatusRepairStatsKey,
+	); err != nil {
+		return fmt.Errorf(
+			"storing tool_content failure status repair marker: %w", err,
+		)
 	}
 	return nil
 }
@@ -5307,7 +5398,7 @@ func (db *DB) init(ctx context.Context, progress OpenProgressFunc) error {
 		// IF NOT EXISTS skips the module lookup for an existing
 		// table, so an archive indexed by an fts5 build opens on an
 		// executable without fts5 and every message write then fails
-		// inside the messages triggers. Refuse the open instead.
+		// inside the batched FTS synchronization. Refuse the open instead.
 		if err := db.checkFTSModuleLoads(ctx, w); err != nil {
 			return err
 		}

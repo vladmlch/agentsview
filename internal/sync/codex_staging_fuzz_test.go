@@ -198,7 +198,7 @@ func TestCodexStagedPublishFailureKeepsPriorContent(t *testing.T) {
 					)
 					combined := append(
 						append([]db.SecretFinding(nil), findings...),
-						failing.Findings(row.ID, positions)...,
+						failing.Findings(t.Context(), row.ID, positions)...,
 					)
 					update.SecretLeakCount = definiteFindingCount(combined)
 					return update, combined, nil
@@ -240,7 +240,7 @@ func TestCodexStagedPublishFailureKeepsPriorContent(t *testing.T) {
 			)
 			combined := append(
 				append([]db.SecretFinding(nil), findings...),
-				staged.Findings(row.ID, positions)...,
+				staged.Findings(t.Context(), row.ID, positions)...,
 			)
 			update.SecretLeakCount = definiteFindingCount(combined)
 			return update, combined, nil
