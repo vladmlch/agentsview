@@ -258,20 +258,21 @@ func cursorIDEBatchMemberPresent(ctx context.Context,
 }
 
 // cursorIDEMemberTokens lists composers for the base's changed-path merge.
+// The dedupe wrapper keeps the ascending stream intact when the read falls
+// back to a scratch copy mid-iteration.
 func cursorIDEMemberTokens(
 	ctx context.Context, src multiSessionSource,
 	yield func(multiSessionMemberToken) error,
 ) error {
-	conn, err := openCursorIDEDB(src.Container)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	return listCursorIDEComposerTokens(ctx, conn, func(id, token string) error {
-		return yield(multiSessionMemberToken{
-			Path:     VirtualSourcePath(src.Container, id),
-			MemberID: id,
-			Token:    token,
+	yield = dedupeRestartedStream(yield,
+		func(member multiSessionMemberToken) string { return member.Path })
+	return withCursorIDEDB(ctx, src.Container, func(conn *sql.DB) error {
+		return listCursorIDEComposerTokens(ctx, conn, func(id, token string) error {
+			return yield(multiSessionMemberToken{
+				Path:     VirtualSourcePath(src.Container, id),
+				MemberID: id,
+				Token:    token,
+			})
 		})
 	})
 }
@@ -316,12 +317,21 @@ func cursorIDEParseContainerEach(
 		}
 		return err
 	}
+	// lastYielded survives a mid-iteration lock fallback, which restarts the
+	// listing against the scratch copy from its first composer: ids at or
+	// below it were already parsed and yielded, and a composer inserted
+	// between the two runs that sorts below it is left for the next pass —
+	// re-emitting either would break the ascending-order stream downstream.
+	var lastYielded string
 	return withCursorIDEDB(ctx, src.Container, func(conn *sql.DB) error {
 		ids, err := listCursorIDEComposerIDs(ctx, conn)
 		if err != nil {
 			return err
 		}
 		for _, id := range ids {
+			if id <= lastYielded {
+				continue
+			}
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -337,6 +347,7 @@ func cursorIDEParseContainerEach(
 			if err := yield(*result); err != nil {
 				return err
 			}
+			lastYielded = id
 		}
 		return nil
 	})

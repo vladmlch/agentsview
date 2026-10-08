@@ -187,6 +187,39 @@
     }
   }
 
+  /** The event a plain ordinal navigation should land on: the turn's
+   *  final output when its message produced one — its content lives on
+   *  the always-mounted `final-output` row while the expanded-turn
+   *  sibling stays a static preview — else the first event carrying the
+   *  ordinal. A `blockKey` resolves deeper through `blockOwnerEvent`. */
+  function landingEvent(
+    turn: AssistantTurnItem,
+    ordinal: number,
+  ): TurnEvent | null {
+    const output = turn.finalOutput;
+    if (output && output.ordinals.includes(ordinal)) return output;
+    return (
+      turn.events.find((event) => event.ordinals.includes(ordinal)) ??
+      null
+    );
+  }
+
+  /** The row an event's content renders on: the `final-output` row for
+   *  the turn's output event, else the event's own `turn-event` row. */
+  function rowIndexForEvent(
+    turn: AssistantTurnItem,
+    event: TurnEvent,
+  ): number {
+    return event.key === turn.finalOutput?.key
+      ? transcriptRows.findIndex(
+          (row) =>
+            row.kind === "final-output" && row.turn.key === turn.key,
+        )
+      : transcriptRows.findIndex(
+          (row) => row.kind === "turn-event" && row.event.key === event.key,
+        );
+  }
+
   /** Expand the owning disclosure — a truncated prompt, the assistant
    *  turn, and the child event disclosure when one keys it — so a scroll
    *  target folded inside any of them has a mountable row before the
@@ -209,8 +242,9 @@
     if (!owner) return;
     turnCollapse.setTurnExpanded(owner.turn.key, true);
     const event = blockKey
-      ? (blockOwnerEvent(owner.turn, ordinal, blockKey) ?? owner.event)
-      : owner.event;
+      ? (blockOwnerEvent(owner.turn, ordinal, blockKey) ??
+        landingEvent(owner.turn, ordinal))
+      : landingEvent(owner.turn, ordinal);
     // Rollups and system rows own no `isEventExpanded` disclosure; their
     // member blocks self-disclose through the search-collapsed path.
     if (event && event.kind !== "tool-rollup" && event.kind !== "system") {
@@ -299,35 +333,28 @@
     return fallback;
   }
 
-  /** Row that actually mounts the match's search block — resolved through
-   *  the same owner-event path `expandOrdinalTarget` uses. A match owned
-   *  by the turn's final-output event lives on the `final-output` row:
-   *  its `turn-event` preview mounts no search blocks, and centering that
-   *  first ordinal claimant can leave the output row outside the rendered
-   *  window so `findSearchBlock` never sees the block. Any other event's
-   *  match lands on its own `turn-event` row rather than an earlier
-   *  same-message claimant (e.g. thinking before text). Falls back to
-   *  `findRowIndex` when no precise row exists — filtered event, focused
-   *  mode, or an owner with no mounted row. */
-  function searchMountRowIndex(ordinal: number, blockKey?: string): number {
+  /** Row that actually renders the ordinal's content — resolved through
+   *  the same owner-event path `expandOrdinalTarget` uses. The final
+   *  output's ordinal lives on the `final-output` row: its `turn-event`
+   *  preview mounts no content, and landing on that first ordinal
+   *  claimant can leave the output row outside the rendered window. Any
+   *  other event lands on its own `turn-event` row rather than an earlier
+   *  same-message claimant (e.g. thinking before text). A `blockKey`
+   *  narrows the target to the exact event when one ordinal spans
+   *  several. Falls back to `findRowIndex` when no precise row exists —
+   *  filtered event, focused mode, or an owner with no mounted row. */
+  function landingRowIndex(ordinal: number, blockKey?: string): number {
     const owner =
       ui.transcriptMode === "normal"
         ? findOrdinalOwner(sessionScope.items, ordinal)
         : null;
     if (owner) {
       const event = blockKey
-        ? (blockOwnerEvent(owner.turn, ordinal, blockKey) ?? owner.event)
-        : owner.event;
+        ? (blockOwnerEvent(owner.turn, ordinal, blockKey) ??
+          landingEvent(owner.turn, ordinal))
+        : landingEvent(owner.turn, ordinal);
       if (event) {
-        const index =
-          event.key === owner.turn.finalOutput?.key
-            ? transcriptRows.findIndex(
-                (row) =>
-                  row.kind === "final-output" && row.turn.key === owner.turn.key,
-              )
-            : transcriptRows.findIndex(
-                (row) => row.kind === "turn-event" && row.event.key === event.key,
-              );
+        const index = rowIndexForEvent(owner.turn, event);
         if (index >= 0) return index;
       }
     }
@@ -342,12 +369,29 @@
       : row.progressOrdinals;
   }
 
-  /** Exactly one row carries the selection outline: the row rendering the
-   *  selected ordinal, with the collapsed header as fallback — the same
-   *  resolution `findRowIndex` uses for scrolling. */
-  let selectedRowIndex = $derived(
-    ui.selectedOrdinal === null ? -1 : findRowIndex(ui.selectedOrdinal),
-  );
+  /** Row the user last clicked — keeps the selection outline on the
+   *  clicked row instead of moving it to the ordinal's canonical landing
+   *  row. Scoped to its ordinal: programmatic selection of a different
+   *  ordinal ignores it. */
+  let clickedRowSelection: { ordinal: number; key: string } | null =
+    $state(null);
+
+  /** Exactly one row carries the selection outline: the clicked row while
+   *  its ordinal stays selected, else the ordinal's landing row — the
+   *  same resolution `scrollToOrdinal` uses, so the outline and the
+   *  scroll target never diverge. */
+  let selectedRowIndex = $derived.by(() => {
+    const ordinal = ui.selectedOrdinal;
+    if (ordinal === null) return -1;
+    const clicked = clickedRowSelection;
+    if (clicked && clicked.ordinal === ordinal) {
+      const index = transcriptRows.findIndex(
+        (row) => row.key === clicked.key,
+      );
+      if (index >= 0) return index;
+    }
+    return landingRowIndex(ordinal);
+  });
 
   function rowTimestamp(row: TranscriptRow): string | null {
     switch (row.kind) {
@@ -469,10 +513,13 @@
 
       // Multi-ordinal rows (tool groups and turn rollups) expose
       // per-member ordinal markers so only the members actually inside
-      // the viewport count. Every other row counts its progress ordinals
-      // outright — a collapsed turn header's empty list adds nothing.
+      // the viewport count. A missing row element or absent markers
+      // contributes nothing — the conservative direction, so a transient
+      // DOM gap never marks unseen members read. Every other row counts
+      // its progress ordinals outright — a collapsed turn header's empty
+      // list adds nothing.
       const ordinals = transcriptRow.progressOrdinals.length > 1
-        ? (visibleMarkedOrdinals(row.index) ?? transcriptRow.progressOrdinals)
+        ? visibleMarkedOrdinals(row.index)
         : transcriptRow.progressOrdinals;
       for (const ordinal of ordinals) {
         visibleOrdinals.add(ordinal);
@@ -529,20 +576,20 @@
   }
 
   /** Member ordinals whose `data-message-ordinal` marker is inside the
-   *  viewport for one virtual row. Returns `null` when the row exposes no
-   *  markers at all, so callers can fall back to the row's progress
-   *  ordinals — distinct from an empty list, which means the row has
-   *  markers but none are on screen. */
+   *  viewport for one virtual row. A missing row element or a row without
+   *  markers yields an empty list — conservative on purpose, so a
+   *  transient DOM gap marks nothing read instead of counting the whole
+   *  group. */
   function visibleMarkedOrdinals(
     rowIndex: number,
-  ): number[] | null {
-    if (!containerRef) return null;
+  ): number[] {
+    if (!containerRef) return [];
     const row = containerRef.querySelector<HTMLElement>(
       `.virtual-row[data-index="${rowIndex}"]`,
     );
-    if (!row) return null;
+    if (!row) return [];
     const markers = row.querySelectorAll<HTMLElement>("[data-message-ordinal]");
-    if (markers.length === 0) return null;
+    if (markers.length === 0) return [];
     const rootRect = containerRef.getBoundingClientRect();
     const ordinals: number[] = [];
     for (const node of markers) {
@@ -785,11 +832,14 @@
   async function scrollToOrdinalInternal(ordinal: number) {
     const reqId = ++lastScrollRequest;
     activeFollowScrollRequest = null;
+    // Programmatic navigation targets the landing row; only a fresh click
+    // may pin the outline to a specific row again.
+    clickedRowSelection = null;
 
     // Expanding the owning turn/event re-derives transcriptRows, so it
     // must happen before the destination index is looked up.
     expandOrdinalTarget(ordinal);
-    const rowIndex = findRowIndex(ordinal);
+    const rowIndex = landingRowIndex(ordinal);
     if (rowIndex >= 0) {
       scrollToDisplayIndex(rowIndex, 0, 0, reqId);
       return;
@@ -807,7 +857,7 @@
     if (reqId !== lastScrollRequest) return;
 
     expandOrdinalTarget(ordinal);
-    const loadedRowIndex = findRowIndex(ordinal);
+    const loadedRowIndex = landingRowIndex(ordinal);
     if (loadedRowIndex < 0) return;
     scrollToDisplayIndex(loadedRowIndex, 0, 0, reqId);
   }
@@ -991,7 +1041,7 @@
         // a large turn expansion — a top-aligned row can be pushed just
         // above the fold as estimates converge.
         expandOrdinalTarget(match.ordinal, match.blockKey);
-        const index = searchMountRowIndex(match.ordinal, match.blockKey);
+        const index = landingRowIndex(match.ordinal, match.blockKey);
         if (index < 0) return Promise.resolve(false);
         return scrollToDisplayIndex(index, 0, 0, reqId, "center");
       },
@@ -1024,6 +1074,7 @@
       if (!match) return;
       const reqId = ++lastScrollRequest;
       activeFollowScrollRequest = null;
+      clickedRowSelection = null;
       ui.selectOrdinal(match.ordinal);
       ui.setFollowLatest(false);
       void revealSearchMatch(match, sessionId, reqId).catch((error: unknown) => {
@@ -1071,11 +1122,12 @@
           unreadBoundary === marker.ordinal + 1
         ? marker.ordinal
         : unreadBoundary;
-      for (const row of rows) {
-        for (const ordinal of orderedRowOrdinals(row)) {
+      for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+        for (const ordinal of orderedRowOrdinals(rows[rowIndex]!)) {
           if (ordinal <= dividerBoundary) {
             return {
               ordinal,
+              rowIndex,
               label: m.read_progress_earlier_messages(),
             };
           }
@@ -1084,11 +1136,12 @@
       return null;
     }
 
-    for (const row of rows) {
-      for (const ordinal of orderedRowOrdinals(row)) {
+    for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+      for (const ordinal of orderedRowOrdinals(rows[rowIndex]!)) {
         if (ordinal >= unreadBoundary) {
           return {
             ordinal,
+            rowIndex,
             label: m.read_progress_new_messages(),
           };
         }
@@ -1139,8 +1192,13 @@
       {#each virtualizer.instance?.getVirtualItems() ?? [] as virtualRow (virtualRow.key)}
         {@const row = rowAt(virtualRow.index)}
         {#if row}
+          <!-- One divider per transcript: the scan above resolves the
+              first row whose rendered ordinals cross the boundary, so a
+              multi-event ordinal (thinking + message + tool + output all
+              sharing one source ordinal) shows it once, above that row's
+              first carrier only. -->
           {@const dividerHere = readProgressDivider !== null &&
-            rowRendersOrdinal(row, readProgressDivider.ordinal)}
+            virtualRow.index === readProgressDivider.rowIndex}
           <!-- svelte-ignore a11y_click_events_have_key_events -->
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
@@ -1152,7 +1210,9 @@
             onclick={() => {
               const sel = window.getSelection();
               if (sel && sel.toString().length > 0) return;
-              ui.selectOrdinal(row.ordinals[0]!);
+              const ordinal = row.ordinals[0]!;
+              clickedRowSelection = { ordinal, key: row.key };
+              ui.selectOrdinal(ordinal);
             }}
           >
             {#if row.kind === "display"}

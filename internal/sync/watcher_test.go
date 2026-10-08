@@ -517,6 +517,42 @@ func TestPendingWatchBatch_FiltersShmAndFoldsWal(t *testing.T) {
 	assert.Equal(t, []string{"/data/opencode.db"}, batch.Paths)
 }
 
+func TestPendingWatchBatch_FiltersShmAndFoldsWalInRenamesAndRoots(t *testing.T) {
+	pending := newPendingWatchBatch(10, 10_000)
+
+	// The public rename/root entries apply the same sidecar rules as paths:
+	// a -shm rename or root carries no committed writes and is dropped, while
+	// a -wal sibling folds onto its database path.
+	pending.AddRename(WatchRename{Path: "/data/x.db-shm", Root: "/data", ItemType: ItemIsFile})
+	pending.AddReconcileRoot("/data/y.db-shm")
+	pending.AddRename(WatchRename{Path: "/data/x.db-wal", Root: "/data", ItemType: ItemIsFile})
+	pending.AddReconcileRoot("/data/y.db-wal")
+
+	// Backend rename events take the same path.
+	pending.AddBackendEvent(backendEvent{
+		Path: "/data/z.db-wal", Root: "/data",
+		Op: backendOpRename, ItemType: backendItemFile,
+	})
+	pending.AddBackendEvent(backendEvent{
+		Path: "/data/q.db-shm", Root: "/data",
+		Op: backendOpRename, ItemType: backendItemFile,
+	})
+	// A reconcile-root change whose path is a sidecar must not leak into
+	// roots when the event carries no real root.
+	pending.AddBackendEvent(backendEvent{
+		Path: "/data/q.db-shm", Op: backendOpReconcileRootChange,
+	})
+
+	batch, ok := pending.Take()
+	require.True(t, ok)
+	assert.Equal(t, []WatchRename{
+		{Path: "/data/x.db", Root: "/data", ItemType: ItemIsFile},
+		{Path: "/data/z.db", Root: "/data", ItemType: ItemIsFile},
+	}, batch.Renames)
+	assert.Equal(t, []string{"/data/y.db"}, batch.ReconcileRoots)
+	assert.Empty(t, batch.Paths)
+}
+
 func TestWatchBatchAccumulatorMergesAndSortsPublicWork(t *testing.T) {
 	accumulator := NewWatchBatchAccumulator(nil)
 	rename := WatchRename{

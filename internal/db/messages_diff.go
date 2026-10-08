@@ -337,7 +337,7 @@ func messageDiffNeedsPinRemapTx(ctx context.Context,
 
 // applySessionMessageDiffTx persists a planned diff: changed rows
 // are updated in place (keeping rowids, so pins survive and the FTS
-// triggers reindex only those rows), their tool rows are rebuilt,
+// sync reindexes only those rows), their tool rows are rebuilt,
 // and new ordinals are inserted through the normal insert path.
 func applySessionMessageDiffTx(ctx context.Context,
 	tx *sql.Tx, sessionID string, plan messageDiffPlan,

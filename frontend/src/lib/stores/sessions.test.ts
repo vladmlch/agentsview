@@ -3758,7 +3758,7 @@ describe("SessionsStore on-demand group loading", () => {
         limit: 100,
       }),
     );
-    const state = sessions.getGroupState("cursor-ide");
+    const state = sessions.getGroupState("agent", "cursor-ide");
     expect(state).toBeDefined();
     expect(state!.sessions).toHaveLength(1);
     expect(state!.sessions[0]!.id).toBe("cursor-1");
@@ -3791,7 +3791,7 @@ describe("SessionsStore on-demand group loading", () => {
         limit: 100,
       }),
     );
-    const state = sessions.getGroupState("cursor-ide");
+    const state = sessions.getGroupState("agent", "cursor-ide");
     expect(state!.sessions).toHaveLength(2);
     expect(state!.sessions.map((s) => s.id)).toEqual(["cursor-1", "cursor-2"]);
     expect(state!.nextCursor).toBeNull();
@@ -3806,11 +3806,207 @@ describe("SessionsStore on-demand group loading", () => {
     });
 
     await sessions.loadGroupSessions("agent", "cursor-ide");
-    expect(sessions.getGroupSessions("cursor-ide")).toHaveLength(1);
+    expect(sessions.getGroupSessions("agent", "cursor-ide")).toHaveLength(1);
 
     sessions.clearGroupSessionsCache();
-    expect(sessions.getGroupSessions("cursor-ide")).toHaveLength(0);
-    expect(sessions.getGroupState("cursor-ide")).toBeUndefined();
+    expect(sessions.getGroupSessions("agent", "cursor-ide")).toHaveLength(0);
+    expect(sessions.getGroupState("agent", "cursor-ide")).toBeUndefined();
+  });
+});
+
+describe("SessionsStore group-session cache", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    storageData.clear();
+    starred.filterOnly = false;
+    starred.ids = new Set();
+    mockSidebarIndex();
+    vi.mocked(SessionsService.getApiV1SessionsSidebarIndex).mockImplementation(
+      (params) => api.getSidebarSessionIndex(params),
+    );
+    vi.mocked(SessionsService.getApiV1SessionsById).mockImplementation(
+      ({ id }) => api.getSession(id),
+    );
+  });
+
+  it("flags a failed first page as an error and retries on the next call", async () => {
+    const sessions = createSessionsStore();
+
+    vi.mocked(api.getSidebarSessionIndex).mockRejectedValueOnce(
+      new Error("boom"),
+    );
+    await sessions.loadGroupSessions("agent", "claude");
+
+    const failed = sessions.getGroupState("agent", "claude");
+    expect(failed).toBeDefined();
+    expect(failed!.loading).toBe(false);
+    expect(failed!.error).toBe(true);
+
+    vi.mocked(api.getSidebarSessionIndex).mockResolvedValueOnce({
+      sessions: [makeSkinnyRow({ id: "c-1", agent: "claude" })],
+      total: 1,
+      next_cursor: null,
+    });
+    await sessions.loadGroupSessions("agent", "claude");
+
+    expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+    const state = sessions.getGroupState("agent", "claude")!;
+    expect(state.error).toBeUndefined();
+    expect(state.sessions.map((s) => s.id)).toEqual(["c-1"]);
+    expect(state.nextCursor).toBeNull();
+  });
+
+  it("keeps agent and project caches with equal labels separate", async () => {
+    const sessions = createSessionsStore();
+
+    vi.mocked(api.getSidebarSessionIndex)
+      .mockResolvedValueOnce({
+        sessions: [makeSkinnyRow({ id: "agent-row" })],
+        total: 1,
+        next_cursor: null,
+      })
+      .mockResolvedValueOnce({
+        sessions: [makeSkinnyRow({ id: "project-row" })],
+        total: 2,
+        next_cursor: null,
+      });
+
+    await sessions.loadGroupSessions("agent", "shared-name");
+    await sessions.loadGroupSessions("project", "shared-name");
+
+    expect(
+      sessions.getGroupState("agent", "shared-name")!.sessions[0]!.id,
+    ).toBe("agent-row");
+    expect(
+      sessions.getGroupState("project", "shared-name")!.sessions[0]!.id,
+    ).toBe("project-row");
+    expect(api.getSidebarSessionIndex).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ agent: "shared-name" }),
+    );
+    expect(api.getSidebarSessionIndex).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ project: "shared-name" }),
+    );
+  });
+
+  it("restarts loadMoreGroupSessions after a rejected cursor", async () => {
+    const sessions = createSessionsStore();
+
+    vi.mocked(api.getSidebarSessionIndex)
+      .mockResolvedValueOnce({
+        sessions: [makeSkinnyRow({ id: "c-1" })],
+        total: 3,
+        next_cursor: "stale-cursor",
+      })
+      .mockRejectedValueOnce(new ApiError(400, "invalid cursor"))
+      .mockResolvedValueOnce({
+        sessions: [makeSkinnyRow({ id: "c-1" }), makeSkinnyRow({ id: "c-2" })],
+        total: 3,
+        next_cursor: null,
+      });
+
+    await sessions.loadGroupSessions("agent", "claude");
+    await sessions.loadMoreGroupSessions("agent", "claude");
+
+    const state = sessions.getGroupState("agent", "claude")!;
+    expect(state.error).toBeUndefined();
+    expect(state.nextCursor).toBeNull();
+    expect(state.sessions.map((s) => s.id)).toEqual(["c-1", "c-2"]);
+  });
+
+  it("bumps groupSessionsEpoch when the cache is cleared", () => {
+    const sessions = createSessionsStore();
+    const epoch = sessions.groupSessionsEpoch;
+
+    sessions.clearGroupSessionsCache();
+
+    expect(sessions.groupSessionsEpoch).toBe(epoch + 1);
+    expect(sessions.groupSessionsCache.size).toBe(0);
+  });
+
+  it("keeps group entries across a same-signature reload and refreshes their rows", async () => {
+    const sessions = createSessionsStore();
+
+    mockSidebarIndex([makeSkinnyRow({ id: "flat-1" })]);
+    await sessions.load();
+
+    vi.mocked(api.getSidebarSessionIndex).mockResolvedValueOnce({
+      sessions: [
+        makeSkinnyRow({ id: "g-1", agent: "claude", message_count: 2 }),
+      ],
+      total: 1,
+      next_cursor: null,
+    });
+    await sessions.loadGroupSessions("agent", "claude");
+    expect(sessions.getGroupState("agent", "claude")).toBeDefined();
+
+    // Same filter signature: the cache survives and its rows pick up
+    // fresh index values.
+    mockSidebarIndex([
+      makeSkinnyRow({ id: "flat-1" }),
+      makeSkinnyRow({ id: "g-1", agent: "claude", message_count: 42 }),
+    ]);
+    await sessions.load();
+
+    const state = sessions.getGroupState("agent", "claude")!;
+    expect(state.sessions[0]!.message_count).toBe(42);
+
+    // A signature-changing reload clears the cache.
+    sessions.setMachineFilter("workstation");
+    await sessions.load();
+
+    expect(sessions.getGroupState("agent", "claude")).toBeUndefined();
+  });
+
+  it("navigateToSession reuses a hydrated row from the group cache", async () => {
+    const sessions = createSessionsStore();
+
+    mockSidebarIndex([]);
+    await sessions.load();
+
+    vi.mocked(api.getSidebarSessionIndex).mockResolvedValueOnce({
+      sessions: [makeSkinnyRow({ id: "sub-1", agent: "claude" })],
+      total: 1,
+      next_cursor: null,
+    });
+    await sessions.loadGroupSessions("agent", "claude");
+
+    vi.mocked(api.getSession).mockResolvedValue(
+      makeSession({ id: "sub-1", first_message: "hydrated" }),
+    );
+    await sessions.hydrateVisibleSessions(["sub-1"]);
+    expect(api.getSession).toHaveBeenCalledTimes(1);
+
+    await sessions.navigateToSession("sub-1");
+
+    expect(api.getSession).toHaveBeenCalledTimes(1);
+    expect(sessions.sessions.some((s) => s.id === "sub-1")).toBe(true);
+    expect(sessions.activeSession?.first_message).toBe("hydrated");
+  });
+
+  it("reports hasNonMetadataFilters for filters beyond the metadata scope", async () => {
+    const sessions = createSessionsStore();
+    expect(sessions.hasNonMetadataFilters).toBe(false);
+
+    sessions.filters = { ...sessions.filters, machine: "workstation" };
+    expect(sessions.hasNonMetadataFilters).toBe(true);
+
+    sessions.filters = { ...sessions.filters, machine: "", project: "p" };
+    expect(sessions.hasNonMetadataFilters).toBe(true);
+
+    sessions.filters = {
+      ...sessions.filters,
+      project: "",
+      recentlyActive: true,
+    };
+    expect(sessions.hasNonMetadataFilters).toBe(true);
+
+    sessions.filters = { ...sessions.filters, recentlyActive: false };
+    expect(sessions.hasNonMetadataFilters).toBe(false);
+
+    starred.filterOnly = true;
+    expect(sessions.hasNonMetadataFilters).toBe(true);
   });
 });
 

@@ -82,6 +82,10 @@ export interface GroupSessionsState {
   nextCursor: string | null;
   total: number;
   loading: boolean;
+  /** True when the group's first-page load failed. A failed entry must
+   *  stay retryable, so it never satisfies the "already loaded" early
+   *  return in loadGroupSessions the way an empty result would. */
+  error?: boolean;
 }
 
 export interface Filters {
@@ -337,6 +341,11 @@ class SessionsStore {
   private navigateRead = new LatestRead();
   private refreshRead = new LatestRead();
   private childSessionsRead = new LatestRead();
+  /** Filter signature that produced the current first page. Per-group
+   *  cache entries are only valid while the flat list runs under the
+   *  same signature, so a signature change clears them — but a
+   *  same-signature refresh keeps them instead of forcing N refetches. */
+  private appliedSidebarSignature: string | null = null;
 
   private liveRefreshStarted = false;
   private unsubEvents: (() => void) | null = null;
@@ -346,13 +355,7 @@ class SessionsStore {
   get activeSession(): Session | undefined {
     let session = this.sessions.find((s) => s.id === this.activeSessionId);
     if (!session && this.activeSessionId) {
-      for (const groupState of this.groupSessionsCache.values()) {
-        const found = groupState.sessions.find((s) => s.id === this.activeSessionId);
-        if (found) {
-          session = found;
-          break;
-        }
-      }
+      session = this.sessionFromGroupCache(this.activeSessionId);
     }
     return session?.is_index_only ? undefined : session;
   }
@@ -503,7 +506,12 @@ class SessionsStore {
     this.sidebarAbort?.abort();
     const controller = new AbortController();
     this.sidebarAbort = controller;
-    const promise = this.loadSidebarPage(params, controller.signal);
+    const promise = this.loadSidebarPage(
+      params,
+      controller.signal,
+      signature,
+      options.force === true,
+    );
     this.sidebarLoadPromise = promise;
     this.sidebarLoadSignature = signature;
     try {
@@ -524,7 +532,12 @@ class SessionsStore {
     void this.load();
   }
 
-  private async loadSidebarPage(params: SidebarIndexParams, signal: AbortSignal) {
+  private async loadSidebarPage(
+    params: SidebarIndexParams,
+    signal: AbortSignal,
+    signature: string,
+    force = false,
+  ) {
     const version = ++this.loadVersion;
     const indexVersion = this.sidebarIndexVersion + 1;
     // Keep the existing list visible during reloads, but mark
@@ -544,7 +557,17 @@ class SessionsStore {
       if (this.loadVersion !== version) return;
 
       this.sidebarIndexVersion = indexVersion;
-      this.clearGroupSessionsCache();
+      // Per-group pages were fetched under the previous filter
+      // signature, so a signature change invalidates them wholesale.
+      // A same-signature reload (live refresh, safety net) instead
+      // patches cached rows in place — clearing here used to drop every
+      // loaded group page and trigger N refetches per refresh.
+      if (force || signature !== this.appliedSidebarSignature) {
+        this.clearGroupSessionsCache();
+      } else {
+        this.refreshGroupSessionsFromIndex(index.sessions);
+      }
+      this.appliedSidebarSignature = signature;
       this.hydratedSessionsByVersion.set(indexVersion, new Map());
       this.sidebarHydrationEpochByVersion.set(indexVersion, 0);
       this.pruneSidebarHydrationVersions(indexVersion);
@@ -687,22 +710,24 @@ class SessionsStore {
         is_index_only: false,
       };
     }
-    for (const [key, groupState] of this.groupSessionsCache.entries()) {
-      const gIdx = groupState.sessions.findIndex((s) => s.id === hydrated.id);
-      if (gIdx >= 0) {
-        const current = groupState.sessions[gIdx]!;
-        const updated = [...groupState.sessions];
-        updated[gIdx] = {
-          ...current,
-          ...hydrated,
-          display_name: hydrated.display_name ?? current.display_name,
-          is_teammate: hydrated.is_teammate ?? current.is_teammate,
-          is_index_only: false,
-        };
-        this.groupSessionsCache.set(key, {
-          ...groupState,
-          sessions: updated,
-        });
+    for (const modeCache of this.groupSessionsCache.values()) {
+      for (const [key, groupState] of modeCache.entries()) {
+        const gIdx = groupState.sessions.findIndex((s) => s.id === hydrated.id);
+        if (gIdx >= 0) {
+          const current = groupState.sessions[gIdx]!;
+          const updated = [...groupState.sessions];
+          updated[gIdx] = {
+            ...current,
+            ...hydrated,
+            display_name: hydrated.display_name ?? current.display_name,
+            is_teammate: hydrated.is_teammate ?? current.is_teammate,
+            is_index_only: false,
+          };
+          modeCache.set(key, {
+            ...groupState,
+            sessions: updated,
+          });
+        }
       }
     }
   }
@@ -794,39 +819,109 @@ class SessionsStore {
     }
   }
 
-  groupSessionsCache: Map<string, GroupSessionsState> = $state(new Map());
+  /** Lazily loaded per-section pages, keyed by grouping mode first so a
+   *  label shared between agents and projects never shows the other
+   *  mode's sessions. */
+  groupSessionsCache: Map<"agent" | "project", Map<string, GroupSessionsState>> = $state(
+    new Map(),
+  );
+  /** Bumped whenever the cache is cleared; lets observers reset
+   *  cursor-based dedup state that would otherwise suppress the first
+   *  reload of a group. */
+  groupSessionsEpoch: number = $state(0);
   private groupSessionsInflight: Map<string, Promise<void>> = new Map();
   private groupSessionsVersion = 0;
 
-  getGroupSessions(key: string): Session[] {
-    return this.groupSessionsCache.get(key)?.sessions ?? [];
+  private groupModeCache(mode: "agent" | "project"): Map<string, GroupSessionsState> {
+    let inner = this.groupSessionsCache.get(mode);
+    if (!inner) {
+      inner = new Map();
+      this.groupSessionsCache.set(mode, inner);
+    }
+    return inner;
   }
 
-  getGroupState(key: string): GroupSessionsState | undefined {
-    return this.groupSessionsCache.get(key);
+  private groupInflightKey(mode: "agent" | "project", key: string): string {
+    return `${mode}\u0000${key}`;
   }
 
-  isGroupLoading(key: string): boolean {
-    return this.groupSessionsCache.get(key)?.loading ?? false;
+  getGroupSessions(mode: "agent" | "project", key: string): Session[] {
+    return this.groupSessionsCache.get(mode)?.get(key)?.sessions ?? [];
+  }
+
+  getGroupState(mode: "agent" | "project", key: string): GroupSessionsState | undefined {
+    return this.groupSessionsCache.get(mode)?.get(key);
+  }
+
+  isGroupLoading(mode: "agent" | "project", key: string): boolean {
+    return this.groupSessionsCache.get(mode)?.get(key)?.loading ?? false;
+  }
+
+  /** Find a session inside the per-group caches, optionally restricted
+   *  to one grouping mode. */
+  sessionFromGroupCache(id: string, mode?: "agent" | "project"): Session | undefined {
+    const caches = mode
+      ? [this.groupSessionsCache.get(mode)]
+      : [...this.groupSessionsCache.values()];
+    for (const cache of caches) {
+      if (!cache) continue;
+      for (const state of cache.values()) {
+        const found = state.sessions.find((s) => s.id === id);
+        if (found) return found;
+      }
+    }
+    return undefined;
   }
 
   clearGroupSessionsCache() {
     this.groupSessionsVersion++;
     this.groupSessionsInflight.clear();
     this.groupSessionsCache = new Map();
+    this.groupSessionsEpoch++;
+  }
+
+  /** Refresh cached group rows in place after a sidebar index reload
+   *  that ran under the same filter signature. Index fields win while
+   *  hydrated fields survive, mirroring loadSidebarPage's own merge. */
+  private refreshGroupSessionsFromIndex(rows: SidebarSessionIndexRow[]) {
+    if (this.groupSessionsCache.size === 0) return;
+    const rowById = new Map(rows.map((row) => [row.id, row]));
+    for (const modeCache of this.groupSessionsCache.values()) {
+      for (const [key, state] of modeCache.entries()) {
+        let changed = false;
+        const sessions = state.sessions.map((s) => {
+          const row = rowById.get(s.id);
+          if (!row) return s;
+          changed = true;
+          return sidebarIndexRowToSession(row, s);
+        });
+        if (changed) {
+          modeCache.set(key, { ...state, sessions });
+        }
+      }
+    }
   }
 
   async loadGroupSessions(mode: "agent" | "project", key: string, force = false): Promise<void> {
-    const existing = this.groupSessionsCache.get(key);
-    if (!force && existing && (existing.sessions.length > 0 || !existing.nextCursor)) {
+    const existing = this.groupSessionsCache.get(mode)?.get(key);
+    // A failed entry does not count as "loaded": `error` keeps the
+    // section retryable instead of bricking it behind an empty,
+    // cursor-less state that the early return would never let through.
+    if (
+      !force &&
+      existing &&
+      !existing.error &&
+      (existing.sessions.length > 0 || !existing.nextCursor)
+    ) {
       return;
     }
-    const inflight = this.groupSessionsInflight.get(key);
+    const inflightKey = this.groupInflightKey(mode, key);
+    const inflight = this.groupSessionsInflight.get(inflightKey);
     if (inflight) return inflight;
 
     const version = this.groupSessionsVersion;
-    const promise = (async () => {
-      this.groupSessionsCache.set(key, {
+    const run = async () => {
+      this.groupModeCache(mode).set(key, {
         sessions: existing?.sessions ?? [],
         nextCursor: existing?.nextCursor ?? null,
         total: existing?.total ?? 0,
@@ -834,53 +929,76 @@ class SessionsStore {
       });
 
       try {
-        const signal = this.routeSignal();
-        const params: SidebarIndexParams = {
-          ...this.apiParams,
-          agent: mode === "agent" ? key : this.apiParams.agent,
-          project: mode === "project" ? key : this.apiParams.project,
-          limit: 100,
-        };
-        const index = await SessionsService.getApiV1SessionsSidebarIndex(params, { signal });
-        if (version !== this.groupSessionsVersion) return;
-
-        const existingById = new Map((existing?.sessions ?? []).map((s) => [s.id, s]));
-        const mapped = index.sessions.map((row) => sidebarIndexRowToSession(row, existingById.get(row.id)));
-
-        this.groupSessionsCache.set(key, {
-          sessions: mapped,
-          nextCursor: index.next_cursor ?? null,
-          total: index.total,
-          loading: false,
-        });
-      } catch (err) {
-        if (!isAbortError(err) && version === this.groupSessionsVersion) {
-          this.groupSessionsCache.set(key, {
-            sessions: existing?.sessions ?? [],
-            nextCursor: existing?.nextCursor ?? null,
-            total: existing?.total ?? 0,
-            loading: false,
-          });
-        }
+        await this.fetchGroupFirstPage(mode, key, existing, version);
       } finally {
-        this.groupSessionsInflight.delete(key);
+        // Conditional delete: a superseded in-flight promise must not
+        // remove a newer request's entry after a cache clear.
+        if (this.groupSessionsInflight.get(inflightKey) === promise) {
+          this.groupSessionsInflight.delete(inflightKey);
+        }
       }
-    })();
+    };
+    const promise = run();
 
-    this.groupSessionsInflight.set(key, promise);
+    this.groupSessionsInflight.set(inflightKey, promise);
     return promise;
   }
 
+  /** Fetch page one for a group into the cache. Shared by
+   *  loadGroupSessions and the invalid-cursor restart inside
+   *  loadMoreGroupSessions — the latter already owns this label's
+   *  in-flight slot, so routing through loadGroupSessions would return
+   *  that same promise and await it from inside itself. */
+  private async fetchGroupFirstPage(
+    mode: "agent" | "project",
+    key: string,
+    existing: GroupSessionsState | undefined,
+    version: number,
+  ): Promise<void> {
+    try {
+      const signal = this.routeSignal();
+      const params: SidebarIndexParams = {
+        ...this.apiParams,
+        agent: mode === "agent" ? key : this.apiParams.agent,
+        project: mode === "project" ? key : this.apiParams.project,
+        limit: 100,
+      };
+      const index = await SessionsService.getApiV1SessionsSidebarIndex(params, { signal });
+      if (version !== this.groupSessionsVersion) return;
+
+      const existingById = new Map((existing?.sessions ?? []).map((s) => [s.id, s]));
+      const mapped = index.sessions.map((row) => sidebarIndexRowToSession(row, existingById.get(row.id)));
+
+      this.groupModeCache(mode).set(key, {
+        sessions: mapped,
+        nextCursor: index.next_cursor ?? null,
+        total: index.total,
+        loading: false,
+      });
+    } catch {
+      if (version === this.groupSessionsVersion) {
+        this.groupModeCache(mode).set(key, {
+          sessions: existing?.sessions ?? [],
+          nextCursor: existing?.nextCursor ?? null,
+          total: existing?.total ?? 0,
+          loading: false,
+          error: true,
+        });
+      }
+    }
+  }
+
   async loadMoreGroupSessions(mode: "agent" | "project", key: string): Promise<void> {
-    const existing = this.groupSessionsCache.get(key);
+    const existing = this.groupSessionsCache.get(mode)?.get(key);
     if (!existing || !existing.nextCursor || existing.loading) return;
 
-    const inflight = this.groupSessionsInflight.get(key);
+    const inflightKey = this.groupInflightKey(mode, key);
+    const inflight = this.groupSessionsInflight.get(inflightKey);
     if (inflight) return inflight;
 
     const version = this.groupSessionsVersion;
-    const promise = (async () => {
-      this.groupSessionsCache.set(key, {
+    const run = async () => {
+      this.groupModeCache(mode).set(key, {
         ...existing,
         loading: true,
       });
@@ -909,25 +1027,48 @@ class SessionsStore {
           }
         }
 
-        this.groupSessionsCache.set(key, {
+        this.groupModeCache(mode).set(key, {
           sessions: merged,
           nextCursor: index.next_cursor ?? null,
           total: index.total,
           loading: false,
         });
       } catch (err) {
-        if (!isAbortError(err) && version === this.groupSessionsVersion) {
-          this.groupSessionsCache.set(key, {
-            ...existing,
-            loading: false,
-          });
+        if (version !== this.groupSessionsVersion) return;
+        if (
+          err instanceof ApiError &&
+          err.status === 400 &&
+          err.message === "invalid cursor"
+        ) {
+          // Cursor went stale — restart the group from page one like the
+          // flat loadMore does for the top-level list. Fetch inline:
+          // loadGroupSessions would return this label's own in-flight
+          // promise, deadlocking the retry on itself. The dead cursor is
+          // dropped so a failed restart never hands it to a later call.
+          await this.fetchGroupFirstPage(
+            mode,
+            key,
+            { ...existing, nextCursor: null },
+            version,
+          );
+          return;
         }
+        // Also reached on abort: either way the group is no longer
+        // loading, so restore the previous state rather than leaving a
+        // stuck spinner that would block every later attempt.
+        this.groupModeCache(mode).set(key, {
+          ...existing,
+          loading: false,
+        });
       } finally {
-        this.groupSessionsInflight.delete(key);
+        if (this.groupSessionsInflight.get(inflightKey) === promise) {
+          this.groupSessionsInflight.delete(inflightKey);
+        }
       }
-    })();
+    };
+    const promise = run();
 
-    this.groupSessionsInflight.set(key, promise);
+    this.groupSessionsInflight.set(inflightKey, promise);
     return promise;
   }
 
@@ -1052,16 +1193,25 @@ class SessionsStore {
       await this.hydrateSelectedIndexOnlySession(id);
       return;
     }
+    // A hydrated row already sitting in a per-group cache (e.g. a
+    // subagent inside an expanded section) is reused instead of
+    // refetched; it still joins the flat list so ungrouped views and
+    // navigation helpers see it.
+    const cached = this.sessionFromGroupCache(id);
+    if (cached && !cached.is_index_only) {
+      this.sessions = [...this.sessions, cached];
+      this.markActiveSessionFound(id);
+      return;
+    }
     const signal = this.navigateRead.begin();
     const entry = { id, promise: Promise.resolve() };
     entry.promise = (async () => {
       try {
         const session = await SessionsService.getApiV1SessionsById({ id }, { signal });
         if (this.activeSessionId === id && this.navigateRead.isCurrent(signal)) {
-          const idx = this.sessions.findIndex((s) => s.id === id);
-          if (idx >= 0) {
-            this.mergeHydratedSession(session);
-          } else {
+          // mergeHydratedSession also upgrades a skinny cached copy.
+          this.mergeHydratedSession(session);
+          if (!this.sessions.some((s) => s.id === id)) {
             this.sessions = [...this.sessions, session];
           }
           this.markActiveSessionFound(id);
@@ -1242,6 +1392,23 @@ class SessionsStore {
         };
       }
     }
+    // Per-group cache entries carry their own copies — without this they
+    // keep a stale health basis after the flat row is enriched.
+    for (const modeCache of this.groupSessionsCache.values()) {
+      for (const [key, groupState] of modeCache.entries()) {
+        const gIdx = groupState.sessions.findIndex((s) => s.id === id);
+        if (gIdx < 0) continue;
+        const s = groupState.sessions[gIdx]!;
+        if (s.health_score_basis !== undefined || detail.basis == null) continue;
+        const updated = [...groupState.sessions];
+        updated[gIdx] = {
+          ...s,
+          health_score_basis: detail.basis,
+          health_penalties: detail.penalties ?? undefined,
+        };
+        modeCache.set(key, { ...groupState, sessions: updated });
+      }
+    }
   }
 
   navigateSession(delta: number, filter?: (s: Session) => boolean) {
@@ -1418,6 +1585,30 @@ class SessionsStore {
     );
   }
 
+  /** True when any filter the agents/projects metadata endpoints cannot
+   *  express is active — everything except include_one_shot and
+   *  include_automated. While set, group sections must be built from the
+   *  filtered list: metadata counts are unfiltered and would render
+   *  phantom sections and wrong badges. */
+  get hasNonMetadataFilters(): boolean {
+    const f = this.filters;
+    return !!(
+      f.project ||
+      f.machine ||
+      f.agent ||
+      f.termination ||
+      f.date ||
+      f.dateFrom ||
+      f.dateTo ||
+      f.recentlyActive ||
+      f.hideUnknownProject ||
+      f.minMessages > 0 ||
+      f.maxMessages > 0 ||
+      f.minUserMessages > 0 ||
+      starred.filterOnly
+    );
+  }
+
   clearSessionFilters(options: ClearSessionFiltersOptions = {}) {
     const project = this.filters.project;
     const wasOneShot = this.filters.includeOneShot;
@@ -1542,13 +1733,10 @@ class SessionsStore {
   invalidateFilterCaches() {
     this.clearGroupSessionsCache();
     this.invalidateProjectCache();
-    this.agentsVersion++;
-    this.agentsLoaded = false;
-    this.agentsPromise = null;
+    this.invalidateAgentCache();
     this.machinesVersion++;
     this.machinesLoaded = false;
     this.machinesPromise = null;
-    this.loadAgents();
     this.loadMachines();
     sync.loadStats(this.metadataParams);
   }
@@ -1558,6 +1746,13 @@ class SessionsStore {
     this.projectsLoaded = false;
     this.projectsPromise = null;
     this.loadProjects();
+  }
+
+  invalidateAgentCache() {
+    this.agentsVersion++;
+    this.agentsLoaded = false;
+    this.agentsPromise = null;
+    this.loadAgents();
   }
 
   /** Remove one or all entries from the undo toast list. */
@@ -1612,17 +1807,18 @@ class SessionsStore {
       }
       this.sessions[idx] = merged;
     }
-    for (const [key, groupState] of this.groupSessionsCache.entries()) {
-      const gIdx = groupState.sessions.findIndex((s) => s.id === id);
-      if (gIdx !== -1) {
-        const current = groupState.sessions[gIdx]!;
-        const merged = { ...current, ...updated };
-        if (displayName === null && updated.display_name === undefined) {
-          merged.display_name = undefined;
-        }
-        const updatedSessions = [...groupState.sessions];
-        updatedSessions[gIdx] = merged;
-        this.groupSessionsCache.set(key, {
+    for (const modeCache of this.groupSessionsCache.values()) {
+      for (const [key, groupState] of modeCache.entries()) {
+        if (!groupState.sessions.some((s) => s.id === id)) continue;
+        const updatedSessions = groupState.sessions.map((s) => {
+          if (s.id !== id) return s;
+          const merged = { ...s, ...updated };
+          if (displayName === null && updated.display_name === undefined) {
+            merged.display_name = undefined;
+          }
+          return merged;
+        });
+        modeCache.set(key, {
           ...groupState,
           sessions: updatedSessions,
         });
@@ -1689,6 +1885,9 @@ class SessionsStore {
     }
     if (event.scope === "sessions" || event.scope === "sync") {
       this.invalidateProjectCache();
+      // Agent metadata feeds grouped-section headers the same way
+      // projects do; leaving it stale produced phantom/missing sections.
+      this.invalidateAgentCache();
       this.scheduleIndexRefresh();
       this.bumpActiveSessionUsageVersion();
       this.refreshActiveChildSessions();
@@ -1729,6 +1928,7 @@ class SessionsStore {
     this.sidebarAbort = null;
     this.sidebarLoadPromise = null;
     this.sidebarLoadSignature = null;
+    this.appliedSidebarSignature = null;
     this.routeAbort?.abort();
     this.routeAbort = null;
     this.navigateRead.cancel();

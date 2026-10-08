@@ -976,8 +976,7 @@ const SemanticOverfetchMin = 200
 
 // validateSemanticSources returns a SearchInputError unless f.Sources is
 // empty or exactly {"messages"}: semantic (and hybrid) search only indexes
-// message content, mirroring the --fts messages-only restriction enforced
-// upstream for fts mode.
+// message content, so tool sources are rejected rather than ignored.
 func validateSemanticSources(f ContentSearchFilter) error {
 	for _, s := range f.Sources {
 		if s != "messages" {

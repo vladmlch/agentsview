@@ -585,6 +585,11 @@ func (db *DB) resolveSessionExportFilter(
 func buildSessionExportFilterForAlias(
 	f SessionFilter, qualifier string,
 ) (string, []any) {
+	// Session export reports the stored archive: a session whose source
+	// file vanished still carries exportable rows, so the sidebar's
+	// source-missing exclusion does not apply. The materialized activity
+	// sort and every page query share this filter.
+	f.IncludeSourceMissing = true
 	b := NewQueryBuilder(SQLiteQueryDialect(), 0)
 	where := buildSessionFilterWithBuilder(f, b, qualifier)
 	return where, b.Args()

@@ -271,6 +271,157 @@ func TestIncrementalMaintainerScansOnlyInsertedResultEvents(t *testing.T) {
 		"the inserted event's finding must land with its real index")
 }
 
+// TestIncrementalMaintainerDoesNotRescanSummaryForStoredEvents pins the
+// canonical scan rule (scanStoredSecretFindingsTx): result_content is read
+// only when the call has no stored events. An idempotent replay — an update
+// that inserted no rows — on a call that still has events must not scan the
+// summary, or every repeat would add a 'tool_result' finding on top of the
+// 'tool_result_event' findings and duplicate the leak.
+func TestIncrementalMaintainerDoesNotRescanSummaryForStoredEvents(t *testing.T) {
+	secret := "AKIA" + "7QHWN2DKR4FYPLJM"
+
+	m := newTestMaintainer("rev", secrets.DefiniteRulesVersion(), nil)
+	m.resultUpdates = []db.ToolCallResultUpdate{{
+		ToolUseID: "call_0",
+		Position:  db.ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
+	}}
+	state := signals.SeedIncrementalState(
+		[]signals.ToolCallRow{{
+			ToolName:       "exec_command",
+			Category:       "Bash",
+			InputJSON:      "{}",
+			ResultContent:  secret,
+			MessageOrdinal: 0,
+			CallIndex:      0,
+			EventStatus:    "completed",
+		}},
+		nil, "", "", nil, nil, 0, 0, 0,
+	)
+	blob, err := state.MarshalBinary()
+	require.NoError(t, err)
+	q := &fakeSignalQuery{
+		sess: &db.Session{
+			QualitySignalVersion: db.CurrentQualitySignalVersion,
+		},
+		state: db.SessionSignalState{
+			State:              blob,
+			TranscriptRevision: "rev",
+			SignalVersion:      db.CurrentQualitySignalVersion,
+		},
+		hasState: true,
+		revision: "rev",
+		callFacts: []db.ToolCallSignalFact{{
+			MessageOrdinal: 0,
+			CallIndex:      0,
+			ToolName:       "exec_command",
+			Category:       "Bash",
+			InputJSON:      "{}",
+			ResultContent:  secret,
+			ToolUseID:      "call_0",
+			EventStatus:    "completed",
+		}},
+		// The call stores an event row; the replayed update inserted
+		// nothing (inserted is empty).
+		callEvents: []db.ToolResultEvent{{
+			ToolUseID:     "call_0",
+			Source:        "function_call_output",
+			Status:        "completed",
+			Content:       secret,
+			ContentLength: len(secret),
+			EventIndex:    0,
+		}},
+	}
+
+	delta, err := m.MaintainTx(t.Context(), q)
+	require.NoError(t, err)
+	require.NotNil(t, delta)
+	for _, finding := range delta.InsertFindings {
+		assert.NotEqual(t, "tool_result", finding.LocationKind,
+			"a call with stored events must not gain summary findings")
+	}
+	var resultDeletes int
+	for _, key := range delta.DeleteFindingKeys {
+		if key.LocationKind == "tool_result" {
+			resultDeletes++
+		}
+	}
+	assert.Equal(t, 1, resultDeletes,
+		"the stale summary finding must still be cleared")
+}
+
+// TestIncrementalMaintainerScansCollapsedSummary is the companion rule:
+// when the call has no stored events — the collapsed representation — the
+// result_content summary is the canonical scanned copy, so its findings
+// land as 'tool_result' and any event-scoped findings a collapse inside
+// the transaction orphaned are removed.
+func TestIncrementalMaintainerScansCollapsedSummary(t *testing.T) {
+	secret := "AKIA" + "7QHWN2DKR4FYPLJM"
+
+	m := newTestMaintainer("rev", secrets.DefiniteRulesVersion(), nil)
+	m.resultUpdates = []db.ToolCallResultUpdate{{
+		ToolUseID: "call_0",
+		Position:  db.ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
+	}}
+	state := signals.SeedIncrementalState(
+		[]signals.ToolCallRow{{
+			ToolName:       "exec_command",
+			Category:       "Bash",
+			InputJSON:      "{}",
+			ResultContent:  secret,
+			MessageOrdinal: 0,
+			CallIndex:      0,
+		}},
+		nil, "", "", nil, nil, 0, 0, 0,
+	)
+	blob, err := state.MarshalBinary()
+	require.NoError(t, err)
+	q := &fakeSignalQuery{
+		sess: &db.Session{
+			QualitySignalVersion: db.CurrentQualitySignalVersion,
+		},
+		state: db.SessionSignalState{
+			State:              blob,
+			TranscriptRevision: "rev",
+			SignalVersion:      db.CurrentQualitySignalVersion,
+		},
+		hasState: true,
+		revision: "rev",
+		callFacts: []db.ToolCallSignalFact{{
+			MessageOrdinal: 0,
+			CallIndex:      0,
+			ToolName:       "exec_command",
+			Category:       "Bash",
+			InputJSON:      "{}",
+			ResultContent:  secret,
+			ToolUseID:      "call_0",
+		}},
+		// No stored events and nothing inserted: the call collapsed into
+		// result_content.
+	}
+
+	delta, err := m.MaintainTx(t.Context(), q)
+	require.NoError(t, err)
+	require.NotNil(t, delta)
+
+	var summaryFindings int
+	for _, finding := range delta.InsertFindings {
+		if finding.LocationKind == "tool_result" {
+			summaryFindings++
+		}
+	}
+	assert.Equal(t, 1, summaryFindings,
+		"the collapsed summary is the scanned copy")
+
+	var eventDeletes int
+	for _, key := range delta.DeleteFindingKeys {
+		if key.LocationKind == "tool_result_event" {
+			eventDeletes++
+		}
+	}
+	assert.Equal(t, 1, eventDeletes,
+		"a collapse must delete orphaned event findings")
+}
+
 func TestIncrementalMaintainerTargetsDuplicateCallIDOccurrence(t *testing.T) {
 	first := db.ToolCallPosition{MessageOrdinal: 0, CallIndex: 0}
 	second := db.ToolCallPosition{MessageOrdinal: 1, CallIndex: 0}

@@ -183,6 +183,11 @@ func ForEachOpenCodeSessionWatermarkMeta(
 		return nil
 	}
 
+	// The stream must stay strictly ascending for the changed-path merge;
+	// a mid-iteration lock fallback restarts the query on the scratch copy
+	// from its first row, so replayed ids are filtered out.
+	yield = dedupeRestartedStream(yield,
+		func(meta OpenCodeSessionMeta) string { return meta.SessionID })
 	return withOpenCodeDB(ctx, dbPath, func(db *sql.DB) error {
 		composite, err := openCodeCompositeMtimeSupportedCached(ctx, db, dbPath)
 		if err != nil {
@@ -254,6 +259,11 @@ func ForEachOpenCodeSessionMeta(
 		return nil
 	}
 
+	// The stream must stay strictly ascending for the changed-path merge;
+	// a mid-iteration lock fallback restarts the query on the scratch copy
+	// from its first row, so replayed ids are filtered out.
+	yield = dedupeRestartedStream(yield,
+		func(meta OpenCodeSessionMeta) string { return meta.SessionID })
 	return withOpenCodeDB(ctx, dbPath, func(db *sql.DB) error {
 		composite, err := openCodeCompositeMtimeSupportedCached(ctx, db, dbPath)
 		if err != nil {

@@ -1048,32 +1048,32 @@ func TestCurrentDataVersionDevinMessageNodeTokenUsage(t *testing.T) {
 }
 
 func TestCurrentDataVersionDevinMessageNodeThinking(t *testing.T) {
-	assert.GreaterOrEqual(t, CurrentDataVersion(), 123,
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 126,
 		"Devin message_nodes thinking objects require re-parsing to restore dropped thinking text")
 }
 
 func TestCurrentDataVersionDevinMultiGenerationCompaction(t *testing.T) {
-	assert.GreaterOrEqual(t, CurrentDataVersion(), 129,
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 132,
 		"Devin multi-generation compaction context recovery requires re-parsing sessions to unwind disconnected root trees")
 }
 
 func TestCurrentDataVersionCodexContinuationHistory(t *testing.T) {
-	assert.GreaterOrEqual(t, CurrentDataVersion(), 130,
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 133,
 		"Codex continuation history stitching requires re-parsing paginated rollouts to recover full history")
 }
 
 func TestCurrentDataVersionJunieSessionIndexing(t *testing.T) {
-	assert.GreaterOrEqual(t, CurrentDataVersion(), 132,
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 135,
 		"Junie session indexing requires re-parsing to ingest events.jsonl block-update streams")
 }
 
 func TestCurrentDataVersionAntigravityThinkingPricing(t *testing.T) {
-	assert.GreaterOrEqual(t, CurrentDataVersion(), 133,
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 136,
 		"Antigravity thinking pricing requires re-pricing sessions with reasoning tokens")
 }
 
 func TestCurrentDataVersionCursorContextTokens(t *testing.T) {
-	assert.GreaterOrEqual(t, CurrentDataVersion(), 134,
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 137,
 		"Cursor context tokens distribution requires re-parsing sessions to populate per-message context tokens")
 }
 

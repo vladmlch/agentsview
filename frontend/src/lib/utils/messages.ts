@@ -31,6 +31,12 @@ const VISIBLE_SYSTEM_SUBTYPES = new Set([
   "interrupted",
   "task_notification",
   "stop_hook",
+  // Merge prep for #2106: the peer_message subtype is not emitted locally
+  // yet, but listing it here is inert and keeps upstream peer notifications
+  // visible after the merge. Deliberately absent from
+  // MID_TURN_SYSTEM_SUBTYPES: mid-turn handling would fold the card into a
+  // collapsed turn and drop the row in focused mode.
+  "peer_message",
 ]);
 
 /**

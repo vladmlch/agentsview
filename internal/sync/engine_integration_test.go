@@ -15858,7 +15858,9 @@ func TestIncrementalSync_CodexExecAppendRetainsEvents(t *testing.T) {
 	call := msgs[1].ToolCalls[0]
 	assert.Equal(t, "exec_command", call.ToolName, "tool name")
 	assert.Equal(t, "done", call.ResultContent, "result_content")
-	require.Empty(t, call.ResultEvents)
+	require.Empty(t, call.ResultEvents,
+		"a status-free single output event collapses into result_content "+
+			"by design; only meaningful statuses keep a stored row")
 	afterIncremental, err := env.db.GetSessionFull(
 		t.Context(), "codex:inc-cx-exec",
 	)

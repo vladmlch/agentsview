@@ -1,8 +1,17 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import type { DbMessage as Message } from "../../api/generated/index.js";
+  import type {
+    AssistantTurnItem,
+    TurnEvent,
+  } from "../../utils/assistant-turns.js";
   import type { TranscriptRow } from "../../utils/transcript-rows.js";
-  import { collectSearchBlocks } from "../../search/block-text.js";
+  import { blockOwnerEvent } from "../../utils/transcript-rows.js";
+  import {
+    collectSearchBlocks,
+    type SearchBlock,
+  } from "../../search/block-text.js";
+  import type { MarkdownRenderOptions } from "../../utils/markdown.js";
   import { blockTypeForKind } from "../../search/session-scope.js";
   import { nearestOverviewMatch, overviewLocations, overviewTicks, overviewY } from "../../search/overview.js";
   import { ui } from "../../stores/ui.svelte.js";
@@ -21,40 +30,75 @@
   let width = $state(0);
   let height = $state(0);
 
-  /** Messages a match can land on for one row. The first rendered row of
-   *  a source message claims it (`taken`), so a message behind several
-   *  events emits its blocks exactly once; a turn header adopts the
-   *  members no child or final-output row renders, so matches inside a
-   *  collapsed or filtered turn still pin to its visible header band. */
-  function rowMessages(
-    row: TranscriptRow,
-    claimed: ReadonlySet<number>,
-    taken: Set<number>,
-  ): Message[] {
-    let mine: Message[];
-    switch (row.kind) {
-      case "display":
-        mine = row.item.kind === "message"
-          ? [row.item.message]
-          : row.item.messages;
-        break;
-      case "turn-header":
-        mine = row.turn.messages.filter(
-          (message) => !claimed.has(message.ordinal),
-        );
-        break;
-      default: {
-        // The header's empty-tuple progressOrdinals widens here; every
-        // other row kind carries a plain number list.
-        const rendered: readonly number[] = row.progressOrdinals;
-        mine = row.turn.messages.filter((message) =>
-          rendered.includes(message.ordinal),
-        );
+  /** Search blocks of `event`'s covered messages that resolve to this
+   *  event via the same ownership rule search navigation applies. */
+  function blocksOwnedByEvent(
+    turn: AssistantTurnItem,
+    event: TurnEvent,
+    options: MarkdownRenderOptions,
+    visible: (message: Message, block: SearchBlock) => boolean,
+  ): SearchBlock[] {
+    const blocks: SearchBlock[] = [];
+    for (const message of turn.messages) {
+      if (!event.ordinals.includes(message.ordinal)) continue;
+      for (const block of collectSearchBlocks(message, options)) {
+        if (
+          blockOwnerEvent(turn, block.ordinal, block.key) === event &&
+          visible(message, block)
+        ) {
+          blocks.push(block);
+        }
       }
     }
-    const fresh = mine.filter((message) => !taken.has(message.ordinal));
-    for (const message of fresh) taken.add(message.ordinal);
-    return fresh;
+    return blocks;
+  }
+
+  /** Search blocks a match can land on for one row. Display rows own
+   *  their item's blocks. Turn-event and final-output rows own only the
+   *  blocks their event renders: one source message can span a thinking
+   *  row and a message row, so claiming whole messages would pin a text
+   *  match on the first claiming (e.g. thinking) band. The final output's
+   *  preview twin mounts no search blocks — the output row owns them.
+   *  A turn header adopts the blocks whose owner event has no rendered
+   *  row, so matches inside a collapsed or filtered turn still pin to
+   *  its visible header band. */
+  function rowBlocks(
+    row: TranscriptRow,
+    mountedEventKeys: ReadonlySet<string>,
+    options: MarkdownRenderOptions,
+    visible: (message: Message, block: SearchBlock) => boolean,
+  ): SearchBlock[] {
+    switch (row.kind) {
+      case "display": {
+        const itemMessages =
+          row.item.kind === "message" ? [row.item.message] : row.item.messages;
+        return itemMessages.flatMap((message) =>
+          collectSearchBlocks(message, options).filter((block) =>
+            visible(message, block),
+          ),
+        );
+      }
+      case "turn-event":
+        if (row.event.key === row.turn.finalOutput?.key) return [];
+        return blocksOwnedByEvent(row.turn, row.event, options, visible);
+      case "final-output":
+        return blocksOwnedByEvent(row.turn, row.event, options, visible);
+      default: {
+        const blocks: SearchBlock[] = [];
+        for (const message of row.turn.messages) {
+          for (const block of collectSearchBlocks(message, options)) {
+            const owner = blockOwnerEvent(row.turn, block.ordinal, block.key);
+            if (
+              (owner === null || !mountedEventKeys.has(owner.key)) &&
+              visible(message, block)
+            ) {
+              blocks.push(block);
+            }
+          }
+        }
+        return blocks;
+      }
+    }
   }
 
   let locations = $derived.by(() => {
@@ -63,21 +107,31 @@
     const scope = inSessionSearch.scope;
     const revealed = inSessionSearch.revealedBlockTypes;
     const total = totalSize;
-    const renderUnknownXmlBlocksAsPreformatted = ui.renderUnknownXmlBlocksAsPreformatted;
+    const options: MarkdownRenderOptions = {
+      renderUnknownXmlBlocksAsPreformatted: ui.renderUnknownXmlBlocksAsPreformatted,
+    };
     return untrack(() => {
-      const claimed = new Set<number>();
+      /* Events whose blocks already pin to their own rendered row —
+       * every turn-event row except the final output's static preview,
+       * plus the final-output row itself. */
+      const mountedEventKeys = new Set<string>();
       for (const row of ordered) {
-        for (const ordinal of row.progressOrdinals) claimed.add(ordinal);
+        if (row.kind === "turn-event") {
+          if (row.event.key !== row.turn.finalOutput?.key) {
+            mountedEventKeys.add(row.event.key);
+          }
+        } else if (row.kind === "final-output") {
+          mountedEventKeys.add(row.event.key);
+        }
       }
-      const taken = new Set<number>();
+      const visible = (message: Message, block: SearchBlock) =>
+        (scope?.allowsBlock(message, block.kind) ?? false) ||
+        revealed.has(blockTypeForKind(block.kind, message.role));
       return overviewLocations(ordered.map((row, index) => {
         const offset = rowOffset(index);
         const end = index + 1 < ordered.length ? rowOffset(index + 1) : total;
-        const messages = rowMessages(row, claimed, taken);
-        return { offset, size: Math.max(1, end - offset), blocks: messages.flatMap((message) =>
-          collectSearchBlocks(message, { renderUnknownXmlBlocksAsPreformatted })
-            .filter((block) => (scope?.allowsBlock(message, block.kind) ?? false)
-              || revealed.has(blockTypeForKind(block.kind, message.role)))) };
+        return { offset, size: Math.max(1, end - offset),
+          blocks: rowBlocks(row, mountedEventKeys, options, visible) };
       }), matches);
     });
   });

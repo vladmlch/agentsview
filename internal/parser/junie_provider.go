@@ -25,10 +25,12 @@ type junieSourceSet struct {
 
 var errInvalidJunieIndex = errors.New("invalid Junie index")
 
+// junieIndexSummary is the per-session row of index.jsonl. The row's "status"
+// field is intentionally not modelled: a status-only index flip must neither
+// change the fingerprint nor schedule watcher work.
 type junieIndexSummary struct {
 	ProjectDir string `json:"projectDir,omitempty"`
 	TaskName   string `json:"taskName,omitempty"`
-	Status     string `json:"status,omitempty"`
 	CreatedAt  int64  `json:"createdAt,omitempty"`
 	UpdatedAt  int64  `json:"updatedAt,omitempty"`
 }
@@ -529,7 +531,6 @@ func parseJunieIndexSummary(line string) junieIndexSummary {
 	return junieIndexSummary{
 		ProjectDir: summary.projectDir,
 		TaskName:   summary.taskName,
-		Status:     summary.lifecycle,
 		CreatedAt:  createdAt,
 		UpdatedAt:  updatedAt,
 	}

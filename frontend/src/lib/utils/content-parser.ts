@@ -258,6 +258,35 @@ function codeBlockMatches(text: string): Match[] {
   return matches;
 }
 
+/** Offset of the first unclosed fence's opening run, when the text ends
+ *  inside a code block that was never closed. Scans openings in the same
+ *  order codeBlockMatches does; per CommonMark an opening with no valid
+ *  closing line makes the rest of the text code, so markers past this
+ *  offset stay literal like the ones inside closed fences. */
+function unclosedFenceStart(text: string): number | undefined {
+  let pos = 0;
+  while (pos < text.length) {
+    const start = text.indexOf("```", pos);
+    if (start < 0) return undefined;
+    if (!atFenceLineStart(text, start)) {
+      pos = start + 1;
+      continue;
+    }
+    const fenceLen = countBackticks(text, start);
+    const infoStart = start + fenceLen;
+    const lineEnd = text.indexOf("\n", infoStart);
+    if (lineEnd < 0) return start;
+    if (text.slice(infoStart, lineEnd).includes("`")) {
+      pos = infoStart;
+      continue;
+    }
+    const close = closingFence(text, lineEnd + 1, fenceLen);
+    if (close === undefined) return start;
+    pos = close.end;
+  }
+  return undefined;
+}
+
 function extractMatches(text: string, parseTools = true): Match[] {
   const matches: Match[] = [];
 
@@ -265,10 +294,15 @@ function extractMatches(text: string, parseTools = true): Match[] {
   // false-positive marker matches inside backtick-quoted
   // text (e.g. `` `[Thinking]` `` in prose).
   const codeSpans = scanInlineCodeSpans(text);
+  // An unclosed fence swallows the rest of the text as code; markers
+  // inside it stay literal like the ones inside closed code blocks.
+  const unclosed = unclosedFenceStart(text);
+  const inUnclosedFence = (pos: number): boolean =>
+    unclosed !== undefined && pos >= unclosed;
 
   // Marked blocks first (explicit [/Thinking] delimiters)
   for (const m of text.matchAll(THINKING_MARKED_RE)) {
-    if (insideInlineCode(m.index!, codeSpans)) continue;
+    if (insideInlineCode(m.index!, codeSpans) || inUnclosedFence(m.index!)) continue;
     matches.push({
       start: m.index!,
       end: m.index! + m[0].length,
@@ -283,7 +317,7 @@ function extractMatches(text: string, parseTools = true): Match[] {
   for (const m of text.matchAll(THINKING_LEGACY_RE)) {
     const start = m.index!;
     const end = start + m[0].length;
-    if (insideInlineCode(start, codeSpans)) continue;
+    if (insideInlineCode(start, codeSpans) || inUnclosedFence(start)) continue;
     const overlaps = matches.some((o) => start >= o.start && start < o.end);
     if (overlaps) continue;
     matches.push({
@@ -300,7 +334,7 @@ function extractMatches(text: string, parseTools = true): Match[] {
   for (const m of text.matchAll(SKILL_RE)) {
     const start = m.index!;
     const end = start + m[0].length;
-    if (insideInlineCode(start, codeSpans)) continue;
+    if (insideInlineCode(start, codeSpans) || inUnclosedFence(start)) continue;
     const overlaps = matches.some((o) => start >= o.start && start < o.end);
     if (overlaps) continue;
     matches.push({
@@ -318,7 +352,7 @@ function extractMatches(text: string, parseTools = true): Match[] {
   for (const m of text.matchAll(SKILL_XML_RE)) {
     const start = m.index!;
     const end = start + m[0].length;
-    if (insideInlineCode(start, codeSpans)) continue;
+    if (insideInlineCode(start, codeSpans) || inUnclosedFence(start)) continue;
     const overlaps = matches.some((o) => start >= o.start && start < o.end);
     if (overlaps) continue;
     matches.push({
@@ -334,7 +368,7 @@ function extractMatches(text: string, parseTools = true): Match[] {
 
   if (parseTools) {
     for (const m of text.matchAll(TOOL_RE)) {
-      if (insideInlineCode(m.index!, codeSpans)) continue;
+      if (insideInlineCode(m.index!, codeSpans) || inUnclosedFence(m.index!)) continue;
       const toolName = m[1] ?? "";
       const toolArgs = (m[2] ?? "").trim();
       const displayName = TOOL_ALIASES[toolName] ?? toolName;
@@ -624,9 +658,13 @@ export function splitPromptAttachments(text: string): {
 } {
   const codeSpans = scanInlineCodeSpans(text);
   const fenceRanges = codeBlockMatches(text).map((match) => [match.start, match.end] as const);
+  // An unclosed fence swallows the rest of the prompt as code, so its
+  // markers stay literal exactly like ones inside closed fences.
+  const unclosed = unclosedFenceStart(text);
   const insideCode = (start: number, end: number): boolean =>
     codeSpans.some(([s, e]) => start < e && end > s) ||
-    fenceRanges.some(([s, e]) => start < e && end > s);
+    fenceRanges.some(([s, e]) => start < e && end > s) ||
+    (unclosed !== undefined && start >= unclosed);
 
   const hits: { start: number; end: number; marker: string }[] = [];
   for (const match of text.matchAll(PROMPT_ATTACHMENT_LINE_RE)) {

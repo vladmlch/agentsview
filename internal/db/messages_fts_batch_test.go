@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -109,6 +110,131 @@ func TestBatchFTSIndexing_Operations(t *testing.T) {
 	err = d.getReader().QueryRow(t.Context(), `SELECT count(*) FROM messages_fts`).Scan(&totalFTS)
 	require.NoError(t, err)
 	assert.Equal(t, 0, totalFTS, "messages_fts should be empty after deleting session")
+}
+
+func assertFTSMatchCount(t *testing.T, d *DB, token string, want int) {
+	t.Helper()
+	var count int
+	err := d.getReader().QueryRow(t.Context(), `
+		SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?
+	`, token).Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, want, count, "unexpected messages_fts hits for %q", token)
+}
+
+func assertFTSRowCount(t *testing.T, d *DB, want int) {
+	t.Helper()
+	var count int
+	err := d.getReader().QueryRow(t.Context(),
+		`SELECT count(*) FROM messages_fts`,
+	).Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, want, count, "unexpected messages_fts row count")
+}
+
+// A ranged replacement deletes the session's tail rows and reinserts new
+// ones that reuse the same rowids, so the deleted rows' FTS entries must
+// be retired or the stale tokens glue onto the new content.
+func TestBatchFTSIndexing_RangedReplace(t *testing.T) {
+	t.Parallel()
+	d := testDB(t)
+	requireFTS(t, d)
+
+	const (
+		sessionID = "session-fts-ranged"
+		keepToken = "rangedkeepalpha"
+		oldToken  = "rangedoldbeta"
+		newToken  = "rangednewgamma"
+	)
+	insertSession(t, d, sessionID, "proj")
+	insertMessages(t, d,
+		userMsg(sessionID, 0, "kept message "+keepToken),
+		asstMsg(sessionID, 1, "old tail "+oldToken),
+		asstMsg(sessionID, 2, "second old tail "+oldToken),
+	)
+
+	from := 1
+	_, err := d.WriteSessionIncremental(t.Context(), sessionID, []Message{
+		asstMsg(sessionID, 1, "replacement tail "+newToken),
+	}, IncrementalSessionUpdate{
+		NextOrdinal:        2,
+		ReplaceFromOrdinal: &from,
+	})
+	require.NoError(t, err)
+
+	// The deleted tail must leave no FTS entries behind.
+	assertNoFTSLeak(t, d, oldToken)
+	// Rows before fromOrdinal keep their index entries.
+	assertFTSMatchCount(t, d, keepToken, 1)
+	// The replacement row is indexed under its recycled rowid.
+	assertFTSMatchCount(t, d, newToken, 1)
+	// Exactly one index entry per surviving message.
+	assertFTSRowCount(t, d, 2)
+}
+
+// Completing a truncated stored row updates its content in place, so the
+// FTS entry must be reindexed or the appended tail stays unsearchable.
+func TestBatchFTSIndexing_ExtendTruncatedText(t *testing.T) {
+	t.Parallel()
+	d := testDB(t)
+	requireFTS(t, d)
+
+	const (
+		sessionID = "session-fts-extend"
+		stemToken = "extendstemalpha"
+		tailToken = "extendtailbeta"
+	)
+	stored := "the reply was " + stemToken
+	full := stored + " and finished with " + tailToken
+
+	_, err := d.WriteSessionBatchAtomic(t.Context(), []SessionBatchWrite{{
+		Session:         extendTestSession(sessionID, 1),
+		Messages:        []Message{extendTestMsg(sessionID, 0, stored)},
+		ReplaceMessages: true,
+	}})
+	require.NoError(t, err)
+	assertFTSMatchCount(t, d, stemToken, 1)
+	assertFTSMatchCount(t, d, tailToken, 0)
+
+	_, err = d.WriteSessionBatchAtomic(t.Context(), []SessionBatchWrite{{
+		Session:            extendTestSession(sessionID, 1),
+		Messages:           []Message{extendTestMsg(sessionID, 0, full)},
+		CompleteStoredRows: true,
+	}})
+	require.NoError(t, err)
+
+	// The completed tail is now indexed, with exactly one entry for the row.
+	assertFTSMatchCount(t, d, tailToken, 1)
+	assertFTSRowCount(t, d, 1)
+}
+
+// The orphan/trash copies bulk-insert messages with INSERT...SELECT and
+// must index the copied rows themselves.
+func TestBatchFTSIndexing_OrphanCopy(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	const (
+		sessionID = "orphan-fts"
+		token     = "orphanftsalpha"
+	)
+	srcPath := filepath.Join(dir, "old.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	requireFTS(t, srcDB)
+	insertSession(t, srcDB, sessionID, "proj")
+	insertMessages(t, srcDB, userMsg(sessionID, 0, "archived "+token))
+	require.NoError(t, srcDB.Close())
+
+	dstPath := filepath.Join(dir, "new.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer func() { require.NoError(t, dstDB.Close()) }()
+	requireFTS(t, dstDB)
+
+	count, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+	assertFTSMatchCount(t, dstDB, token, 1)
+	assertFTSRowCount(t, dstDB, 1)
 }
 
 func TestLegacyTriggersDroppedOnOpen(t *testing.T) {

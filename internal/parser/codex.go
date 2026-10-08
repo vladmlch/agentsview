@@ -429,6 +429,11 @@ func (b *codexSessionBuilder) handleSessionMeta(
 			payload.Get("source.subagent.thread_spawn.agent_path").Str,
 		)
 	}
+	// A later session_meta replaces lineage claims from an earlier one:
+	// without the reset a meta carrying no parent would keep a stale
+	// parentSessionID and relationship type from its predecessor.
+	b.parentSessionID = ""
+	b.relationshipType = RelNone
 	forkedFromID := strings.TrimSpace(payload.Get("forked_from_id").Str)
 	if forkedFromID != "" {
 		canonicalParent := forkedFromID
@@ -1710,8 +1715,8 @@ func (p *codexProvider) resolveCanonicalParentID(
 		if err != nil {
 			break
 		}
-		if header.Get("history_mode").Str == "paginated" {
-			hb := header.Get("history_base")
+		if header.Get("payload.history_mode").Str == "paginated" {
+			hb := header.Get("payload.history_base")
 			if hb.Exists() && hb.Type != gjson.Null {
 				nextID := strings.TrimSpace(hb.Get("thread_id").Str)
 				if nextID != "" && nextID != curr {
@@ -1789,12 +1794,12 @@ func (p *codexProvider) parentTurnResolver(
 		if err != nil && !errors.Is(err, errCodexIncrementalNeedsFullParse) {
 			return nil, false
 		}
-		if parentHeader, headErr := readCodexSessionMetaHeader(parentPath); headErr == nil && parentHeader.Get("history_mode").Str == "paginated" {
-			pBase := parentHeader.Get("history_base")
+		if parentHeader, headErr := readCodexSessionMetaHeader(parentPath); headErr == nil && parentHeader.Get("payload.history_mode").Str == "paginated" {
+			pBase := parentHeader.Get("payload.history_base")
 			if pBase.Exists() && pBase.Type != gjson.Null {
 				nextID := strings.TrimSpace(pBase.Get("thread_id").Str)
 				if nextID != "" {
-					chain, chainErr := p.resolveContinuationChain(ctx, parentPath, nextID, pBase.Get("end_ordinal_exclusive").Int())
+					chain, chainErr := p.resolveContinuationChain(ctx, parentPath, nextID, codexContinuationBoundary(parentHeader, pBase))
 					if chainErr == nil {
 						for _, seg := range chain {
 							_ = collectTurns(seg.path)
@@ -1909,6 +1914,11 @@ type codexContinuationSegment struct {
 	endOrdinalExclusive int64
 }
 
+// readCodexSessionMetaHeader returns the first session_meta envelope in a
+// Codex transcript — the whole line rather than just its payload, so
+// callers can also reach the record's shared ordinal — across both the
+// JSONL and multi-line JSON container layouts. Returns a null result when
+// no meta exists.
 func readCodexSessionMetaHeader(path string) (gjson.Result, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -1922,7 +1932,7 @@ func readCodexSessionMetaHeader(path string) (gjson.Result, error) {
 		return gjson.Result{}, err
 	}
 	if gjson.Get(string(line), "type").Str == codexTypeSessionMeta {
-		return gjson.Get(string(line), "payload"), nil
+		return gjson.Parse(string(line)), nil
 	}
 	if _, seekErr := f.Seek(0, io.SeekStart); seekErr == nil {
 		dec := json.NewDecoder(f)
@@ -1937,16 +1947,64 @@ func readCodexSessionMetaHeader(path string) (gjson.Result, error) {
 				if err := json.Unmarshal(trimmed, &items); err == nil {
 					for _, item := range items {
 						if gjson.Get(string(item), "type").Str == codexTypeSessionMeta {
-							return gjson.Get(string(item), "payload"), nil
+							return gjson.Parse(string(item)), nil
 						}
 					}
 				}
 			} else if gjson.Get(string(raw), "type").Str == codexTypeSessionMeta {
-				return gjson.Get(string(raw), "payload"), nil
+				return gjson.Parse(string(raw)), nil
 			}
 		}
 	}
 	return gjson.Result{}, nil
+}
+
+// codexContinuationBoundary resolves the shared-numbering ordinal where a
+// continuation file's own records take over from its parent segment:
+// history_base.end_ordinal_exclusive when written, else the meta record's
+// own ordinal — Codex numbers the continuation meta exactly at the
+// boundary — else zero, which bounds nothing in.
+func codexContinuationBoundary(metaEnvelope, historyBase gjson.Result) int64 {
+	if end := historyBase.Get("end_ordinal_exclusive"); end.Exists() {
+		return end.Int()
+	}
+	return metaEnvelope.Get("ordinal").Int()
+}
+
+// loadCodexContinuationSegments resolves and feeds the paginated-history
+// segment chain referenced by a session_meta envelope. It is shared by the
+// snapshot pass, the multi-line JSON fallback, and the incremental-prefix
+// seed scan so all three see identical continuation state.
+func (p *codexProvider) loadCodexContinuationSegments(
+	ctx context.Context, path, metaLine string,
+	b *codexSessionBuilder, malformedLines *int,
+) error {
+	payload := gjson.Get(metaLine, "payload")
+	if payload.Get("history_mode").Str != "paginated" {
+		return nil
+	}
+	historyBase := payload.Get("history_base")
+	if !historyBase.Exists() || historyBase.Type == gjson.Null {
+		return nil
+	}
+	threadID := strings.TrimSpace(historyBase.Get("thread_id").Str)
+	if threadID == "" {
+		return nil
+	}
+	metaEnvelope := gjson.Parse(metaLine)
+	chain, err := p.resolveContinuationChain(
+		ctx, path, threadID,
+		codexContinuationBoundary(metaEnvelope, historyBase),
+	)
+	if err != nil {
+		return err
+	}
+	for _, seg := range chain {
+		if err := p.feedContinuationSegment(ctx, seg, b, malformedLines); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *codexProvider) resolveContinuationChain(
@@ -1984,10 +2042,10 @@ func (p *codexProvider) resolveContinuationChain(
 		if err != nil {
 			break
 		}
-		if parentHeader.Get("history_mode").Str != "paginated" {
+		if parentHeader.Get("payload.history_mode").Str != "paginated" {
 			break
 		}
-		pBase := parentHeader.Get("history_base")
+		pBase := parentHeader.Get("payload.history_base")
 		if !pBase.Exists() || pBase.Type == gjson.Null {
 			break
 		}
@@ -1996,7 +2054,7 @@ func (p *codexProvider) resolveContinuationChain(
 			break
 		}
 		currThreadID = nextThreadID
-		currEndOrd = pBase.Get("end_ordinal_exclusive").Int()
+		currEndOrd = codexContinuationBoundary(parentHeader, pBase)
 		currPath = parentPath
 	}
 
@@ -2033,16 +2091,44 @@ func (p *codexProvider) feedContinuationSegment(
 			break
 		}
 		if !gjson.Valid(line) {
-			if malformedLines != nil {
+			var terminator [1]byte
+			if _, err := f.ReadAt(terminator[:], lr.bytesRead-1); err != nil {
+				return fmt.Errorf(
+					"checking codex segment line terminator: %w", err,
+				)
+			}
+			// Same live-tail rule as the main pass: only terminated
+			// malformed records count, plus an unterminated tail when the
+			// caller owns a stable snapshot, so a still-growing segment
+			// cannot inflate the malformed counter.
+			if malformedLines != nil &&
+				(terminator[0] == '\n' || p.Config.StableSourceSnapshots) {
 				*malformedLines++
 			}
 			continue
 		}
-		if seg.endOrdinalExclusive > 0 {
-			ordResult := gjson.Get(line, "ordinal")
-			if ordResult.Exists() && ordResult.Int() >= seg.endOrdinalExclusive {
-				break
+		// The boundary is expressed in the shared ordinal numbering; a zero
+		// or absent end_ordinal_exclusive resolves to "no parent records",
+		// so the trim still applies rather than replaying the segment's
+		// whole tail a second time. Lines without an ordinal cannot be
+		// placed against the boundary and keep feeding.
+		if ordResult := gjson.Get(line, "ordinal"); ordResult.Exists() &&
+			ordResult.Int() >= seg.endOrdinalExclusive {
+			break
+		}
+		if gjson.Get(line, "type").Str == codexTypeSessionMeta {
+			// The segment's own session_meta describes the segment, not
+			// the leaf session: feeding it through handleSessionMeta would
+			// arm the fork gate with the segment's lineage and suppress
+			// leaf records against foreign turn ids. Only its timestamp
+			// still bounds the merged transcript's span.
+			if ts := parseTimestamp(gjson.Get(line, "timestamp").Str); !ts.IsZero() {
+				if b.startedAt.IsZero() {
+					b.startedAt = ts
+				}
+				b.endedAt = ts
 			}
+			continue
 		}
 		b.processLine(ctx, line)
 	}
@@ -2072,6 +2158,7 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 	)
 	b.resolveCanonicalParent = p.canonicalParentResolver(ctx, path)
 	malformedLines := 0
+	validRecords := 0
 	continuationLoaded := false
 
 	for {
@@ -2096,27 +2183,13 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 			}
 			continue
 		}
+		validRecords++
 		if !continuationLoaded && gjson.Get(line, "type").Str == codexTypeSessionMeta {
 			continuationLoaded = true
-			payload := gjson.Get(line, "payload")
-			if payload.Get("history_mode").Str == "paginated" {
-				historyBase := payload.Get("history_base")
-				if historyBase.Exists() && historyBase.Type != gjson.Null {
-					threadID := strings.TrimSpace(historyBase.Get("thread_id").Str)
-					if threadID != "" {
-						chain, chainErr := p.resolveContinuationChain(
-							ctx, path, threadID, historyBase.Get("end_ordinal_exclusive").Int(),
-						)
-						if chainErr != nil {
-							return nil, nil, codexCursorState{}, false, nil, "", "", chainErr
-						}
-						for _, seg := range chain {
-							if err := p.feedContinuationSegment(ctx, seg, b, &malformedLines); err != nil {
-								return nil, nil, codexCursorState{}, false, nil, "", "", err
-							}
-						}
-					}
-				}
+			if err := p.loadCodexContinuationSegments(
+				ctx, path, line, b, &malformedLines,
+			); err != nil {
+				return nil, nil, codexCursorState{}, false, nil, "", "", err
 			}
 		}
 		if b.processLine(ctx, line) {
@@ -2130,7 +2203,14 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 			fmt.Errorf("reading codex %s: %w", path, err)
 	}
 
-	if b.sessionID == "" && malformedLines > 0 {
+	// A snapshot that produced no valid single-line record may still be a
+	// multi-line JSON document or an array of records, so retry it as a
+	// JSON stream. The fallback must stay below "any valid record": for
+	// ordinary JSONL with a damaged or missing session_meta the first
+	// pass's salvaged lines are authoritative, while the decoder stops at
+	// the first undecodable record and would republish a truncated
+	// session in their place.
+	if validRecords == 0 && malformedLines > 0 {
 		if _, seekErr := f.Seek(0, io.SeekStart); seekErr == nil {
 			sink.Reset()
 			tee = newCodexHashAnchorTee(io.LimitReader(f, info.Size()))
@@ -2155,61 +2235,29 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 					break
 				}
 				trimmed := bytes.TrimSpace(raw)
+				var records []json.RawMessage
 				if bytes.HasPrefix(trimmed, []byte("[")) {
 					var items []json.RawMessage
 					if err := json.Unmarshal(trimmed, &items); err == nil {
-						for _, item := range items {
-							line := string(item)
-							if !continuationLoaded && gjson.Get(line, "type").Str == codexTypeSessionMeta {
-								continuationLoaded = true
-								payload := gjson.Get(line, "payload")
-								if payload.Get("history_mode").Str == "paginated" {
-									historyBase := payload.Get("history_base")
-									if historyBase.Exists() && historyBase.Type != gjson.Null {
-										threadID := strings.TrimSpace(historyBase.Get("thread_id").Str)
-										if threadID != "" {
-											chain, chainErr := p.resolveContinuationChain(
-												ctx, path, threadID, historyBase.Get("end_ordinal_exclusive").Int(),
-											)
-											if chainErr == nil {
-												for _, seg := range chain {
-													_ = p.feedContinuationSegment(ctx, seg, b, &malformedLines)
-												}
-											}
-										}
-									}
-								}
-							}
-							if b.processLine(ctx, line) {
-								return nil, nil, codexCursorState{}, false, nil, "", "", nil
-							}
-						}
-					}
-					continue
-				}
-				line := string(raw)
-				if !continuationLoaded && gjson.Get(line, "type").Str == codexTypeSessionMeta {
-					continuationLoaded = true
-					payload := gjson.Get(line, "payload")
-					if payload.Get("history_mode").Str == "paginated" {
-						historyBase := payload.Get("history_base")
-						if historyBase.Exists() && historyBase.Type != gjson.Null {
-							threadID := strings.TrimSpace(historyBase.Get("thread_id").Str)
-							if threadID != "" {
-								chain, chainErr := p.resolveContinuationChain(
-									ctx, path, threadID, historyBase.Get("end_ordinal_exclusive").Int(),
-								)
-								if chainErr == nil {
-									for _, seg := range chain {
-										_ = p.feedContinuationSegment(ctx, seg, b, &malformedLines)
-									}
-								}
-							}
-						}
+						records = items
 					}
 				}
-				if b.processLine(ctx, line) {
-					return nil, nil, codexCursorState{}, false, nil, "", "", nil
+				if records == nil {
+					records = []json.RawMessage{raw}
+				}
+				for _, record := range records {
+					line := string(record)
+					if !continuationLoaded && gjson.Get(line, "type").Str == codexTypeSessionMeta {
+						continuationLoaded = true
+						if err := p.loadCodexContinuationSegments(
+							ctx, path, line, b, &malformedLines,
+						); err != nil {
+							return nil, nil, codexCursorState{}, false, nil, "", "", err
+						}
+					}
+					if b.processLine(ctx, line) {
+						return nil, nil, codexCursorState{}, false, nil, "", "", nil
+					}
 				}
 			}
 		}
@@ -2612,6 +2660,11 @@ func (p *codexProvider) seedCodexIncrementalState(ctx context.Context,
 	seed, err := seedCodexIncrementalStateFromReader(ctx,
 		io.LimitReader(f, offset),
 		p.parentTurnResolver(ctx, path),
+		func(metaLine string, b *codexSessionBuilder) error {
+			return p.loadCodexContinuationSegments(
+				ctx, path, metaLine, b, nil,
+			)
+		},
 	)
 	if err != nil {
 		return codexIncrementalSeed{}, fmt.Errorf(
@@ -2624,6 +2677,7 @@ func (p *codexProvider) seedCodexIncrementalState(ctx context.Context,
 func seedCodexIncrementalStateFromReader(ctx context.Context,
 	r io.Reader,
 	resolveParentTurns codexParentTurnResolver,
+	loadContinuation func(metaLine string, b *codexSessionBuilder) error,
 ) (codexIncrementalSeed, error) {
 	sink := newCodexSeedSink()
 	b := newCodexSessionBuilder(
@@ -2631,6 +2685,7 @@ func seedCodexIncrementalStateFromReader(ctx context.Context,
 	)
 	lr := newLineReader(r, maxLineSize)
 	defer releaseLineReader(lr)
+	continuationLoaded := false
 	for {
 		line, ok := lr.next()
 		if !ok {
@@ -2638,6 +2693,13 @@ func seedCodexIncrementalStateFromReader(ctx context.Context,
 		}
 		if !gjson.Valid(line) {
 			continue
+		}
+		if !continuationLoaded && loadContinuation != nil &&
+			gjson.Get(line, "type").Str == codexTypeSessionMeta {
+			continuationLoaded = true
+			if err := loadContinuation(line, b); err != nil {
+				return codexIncrementalSeed{}, err
+			}
 		}
 		b.processLine(ctx, line)
 	}
@@ -2876,6 +2938,11 @@ func (p *codexProvider) parseSessionFromSnapshot(ctx context.Context,
 			return seedCodexIncrementalStateFromReader(ctx,
 				io.NewSectionReader(f, 0, offset),
 				p.parentTurnResolver(ctx, path),
+				func(metaLine string, b *codexSessionBuilder) error {
+					return p.loadCodexContinuationSegments(
+						ctx, path, metaLine, b, nil,
+					)
+				},
 			)
 		},
 		committedUsageTarget,

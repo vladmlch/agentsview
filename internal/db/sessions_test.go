@@ -329,6 +329,66 @@ func TestUpsertSessionDoesNotAdvanceDataVersion(t *testing.T) {
 		"after re-upsert, data_version (must be preserved across UpsertSession)")
 }
 
+// TestIncrementalWritesDoNotAdvanceDataVersion pins the same contract
+// for the incremental writers that
+// TestUpsertSessionDoesNotAdvanceDataVersion documents for UpsertSession:
+// a tail append or a ranged tail replacement never reparses the stored
+// prefix, so it must not stamp the row current. A stale marker (the
+// v-1 pin left by needsRetry writes and by the cwd/restore demotions)
+// has to survive so the next sync still reparses the file under the
+// current parser.
+func TestIncrementalWritesDoNotAdvanceDataVersion(t *testing.T) {
+	stale := CurrentDataVersion() - 1
+
+	t.Run("append", func(t *testing.T) {
+		d := testDB(t)
+		insertSession(t, d, "inc-dv-append", "proj")
+		require.NoError(t, d.SetSessionDataVersion(
+			t.Context(), "inc-dv-append", stale,
+		))
+
+		ended := "2024-01-15T10:30:00Z"
+		require.NoError(t, d.UpdateSessionIncremental(t.Context(),
+			"inc-dv-append", IncrementalSessionUpdate{
+				EndedAt:      &ended,
+				MsgCount:     2,
+				UserMsgCount: 1,
+				FileSize:     2048,
+				FileMtime:    200,
+				NextOrdinal:  2,
+			}))
+		assert.Equal(t, stale,
+			d.GetSessionDataVersion(t.Context(), "inc-dv-append"),
+			"incremental append must not advance data_version")
+	})
+
+	t.Run("ranged replace", func(t *testing.T) {
+		d := testDB(t)
+		insertSession(t, d, "inc-dv-replace", "proj")
+		insertMessages(t, d,
+			userMsg("inc-dv-replace", 0, "kept"),
+			asstMsg("inc-dv-replace", 1, "old tail"),
+		)
+		require.NoError(t, d.SetSessionDataVersion(
+			t.Context(), "inc-dv-replace", stale,
+		))
+
+		from := 1
+		_, err := d.WriteSessionIncremental(t.Context(), "inc-dv-replace",
+			[]Message{asstMsg("inc-dv-replace", 1, "new tail")},
+			IncrementalSessionUpdate{
+				MsgCount:           2,
+				UserMsgCount:       1,
+				NextOrdinal:        2,
+				ReplaceFromOrdinal: &from,
+			})
+		require.NoError(t, err)
+		assert.Equal(t, stale,
+			d.GetSessionDataVersion(t.Context(), "inc-dv-replace"),
+			"ranged replacement must not advance data_version")
+	})
+}
+
 func TestSetSessionDataVersionsIsAtomic(t *testing.T) {
 	d := testDB(t)
 	for _, id := range []string{"source-main", "source-fork"} {

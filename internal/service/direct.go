@@ -951,6 +951,18 @@ func (b *directBackend) UsagePairwiseComparison(
 // than getting a page that quietly carries less than requested.
 const maxContentSearchContext = 10
 
+// ftsBackendLabel names the read store in fts source-gate errors. Stores
+// implementing db.MemoryBackendNamer report their dialect ("postgres",
+// "duckdb", "clickhouse"); anything else falls back to a generic label.
+func ftsBackendLabel(store db.Store) string {
+	if named, ok := store.(db.MemoryBackendNamer); ok {
+		if name := named.MemoryBackendName(); name != "" {
+			return name
+		}
+	}
+	return "current"
+}
+
 // SearchContent maps the transport-neutral request to a
 // db.ContentSearchFilter, calls the store, and redacts secret-shaped
 // spans from each snippet unless Reveal is set. When Context > 0, each
@@ -959,11 +971,24 @@ const maxContentSearchContext = 10
 func (b *directBackend) SearchContent(
 	ctx context.Context, req ContentSearchRequest,
 ) (*ContentSearchResult, error) {
-	if req.Mode == "terms" {
+	// terms is messages-only on every backend. fts is messages-only on the
+	// PostgreSQL, DuckDB, and ClickHouse read stores, which otherwise narrow
+	// Sources to {"messages"} silently; SQLite's searchContentFTS honors all
+	// three sources through the messages_fts and tool_content_fts indexes, so
+	// the fts gate applies only when local is nil (a NewReadOnlyBackend
+	// store). Naming the backend in the error tells the caller where the
+	// limit actually is.
+	if req.Mode == "terms" || (req.Mode == "fts" && b.local == nil) {
+		modeLabel := req.Mode
+		if req.Mode == "fts" {
+			modeLabel = fmt.Sprintf(
+				"fts on the %s backend", ftsBackendLabel(b.db))
+		}
 		for _, s := range req.Sources {
 			if s != "messages" {
 				return nil, &db.SearchInputError{Msg: fmt.Sprintf(
-					"search: %s searches messages only (got source %q)", req.Mode, s)}
+					"search: %s searches messages only (got source %q)",
+					modeLabel, s)}
 			}
 		}
 		req.Sources = []string{"messages"}

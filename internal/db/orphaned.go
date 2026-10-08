@@ -27,7 +27,9 @@ func execWithoutCancel(
 // CopyOrphanedDataFrom copies sessions (and their messages
 // and tool_calls) that exist in the source database but not
 // in this database. This preserves archived sessions whose
-// source files no longer exist on disk.
+// source files no longer exist on disk. The copy maintains the
+// active message FTS tables itself, so callers do not need to
+// rebuild the index after it returns.
 //
 // Orphaned sessions are identified by ID-diff: any session
 // present in the source but absent from the target after a
@@ -227,6 +229,13 @@ func (d *DB) CopyOrphanedDataFromExcluding(
 		if err := clearCopiedSelfParents(ctx, tx, "_orphaned_ids"); err != nil {
 			return nil, err
 		}
+		// Index the copied messages only after the sanitize and
+		// archive-content passes above wrote their final content.
+		if err := indexCopiedSessionMessagesFTSTx(
+			ctx, tx, "_orphaned_ids",
+		); err != nil {
+			return nil, fmt.Errorf("indexing orphaned messages: %w", err)
+		}
 	}
 	if err := retainConversationTombstonesTx(ctx, tx); err != nil {
 		return nil, fmt.Errorf("retaining conversation tombstones: %w", err)
@@ -252,7 +261,9 @@ func (d *DB) CopyOrphanedDataFromExcluding(
 // messages from the source database. ResyncAll calls this before
 // parsing into a fresh DB so UpsertSession can see trashed rows
 // and reject source-file writes that would otherwise overwrite
-// the user's trash. It returns the copied session IDs.
+// the user's trash. It returns the copied session IDs. The copy
+// maintains the active message FTS tables itself, so callers do
+// not need to rebuild the index after it returns.
 func (d *DB) CopyTrashedDataFrom(sourcePath string) ([]string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -337,6 +348,13 @@ func (d *DB) CopyTrashedDataFrom(sourcePath string) ([]string, error) {
 	); err != nil {
 		return nil, fmt.Errorf("projecting trashed data: %w", err)
 	}
+	// Index the copied messages only after the sanitize and
+	// archive-content passes above wrote their final content.
+	if err := indexCopiedSessionMessagesFTSTx(
+		ctx, tx, "_trashed_ids",
+	); err != nil {
+		return nil, fmt.Errorf("indexing trashed messages: %w", err)
+	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("committing trashed copy: %w", err)
@@ -362,6 +380,41 @@ func copiedSessionIDs(ctx context.Context, queryer interface {
 		ids = append(ids, id)
 	}
 	return ids, rows.Err()
+}
+
+// indexCopiedSessionMessagesFTSTx inserts FTS rows for the copied sessions'
+// messages. The copy path bulk-inserts through INSERT...SELECT, bypassing
+// the Go write path that keeps the FTS tables synchronized, and the
+// sanitize/archive-content passes in the same transaction still rewrite
+// the copied content, so the index is populated once at the end of the
+// copy. Callers that dropped FTS for the bulk load see no active tables
+// here and rebuild the index wholesale instead.
+func indexCopiedSessionMessagesFTSTx(
+	ctx context.Context, tx *sql.Tx, tempIDsTable string,
+) error {
+	active, err := activeFTSTablesTx(tx)
+	if err != nil {
+		return err
+	}
+	for _, table := range active {
+		// The copied rows carry freshly auto-assigned ids, so no index
+		// entry can exist for them yet — an unconditional bulk insert
+		// mirrors insertMessagesTx. A NOT EXISTS probe against the FTS
+		// table itself cannot express "already indexed": these are
+		// external-content tables, where a rowid lookup without MATCH
+		// reads through to the content table and would suppress every
+		// insert.
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO `+table+`(rowid, content)
+			 SELECT m.id, m.content FROM main.messages m
+			 WHERE m.session_id IN (SELECT id FROM `+tempIDsTable+`)`,
+		); err != nil {
+			return fmt.Errorf(
+				"indexing copied messages in %s: %w", table, err,
+			)
+		}
+	}
+	return nil
 }
 
 // CopySyncStateFrom copies durable synchronization authority from the source

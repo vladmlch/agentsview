@@ -1,8 +1,11 @@
 package parser
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"log"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,24 +34,16 @@ type devinParsedSubagent struct {
 	Messages []ParsedMessage
 }
 
-type devinSubagentParseError struct {
-	RootNodeID int64
-	Err        error
-}
-
-func (e *devinSubagentParseError) Error() string {
-	return fmt.Sprintf(
-		"parsing Devin subagent root node %d: %v", e.RootNodeID, e.Err,
-	)
-}
-
-func (e *devinSubagentParseError) Unwrap() error {
-	return e.Err
-}
-
+// partitionDevinSubagentMessageNodes splits a session's message-node forest
+// into subagent trees and the node ids they claim. mainChainRootID is the
+// resolved main chain's root (-1 when unresolved); it and the earliest
+// parentless node -- the session's own head in any Devin database -- are never
+// treated as subagent or summarizer roots, so a root prompt merely quoting
+// the markers cannot empty the session.
 func partitionDevinSubagentMessageNodes(
 	ctx context.Context,
 	rows []devinMessageNodeRow,
+	mainChainRootID int64,
 ) (devinSubagentNodePartition, error) {
 	partition := devinSubagentNodePartition{
 		ExcludedNodeIDs: make(map[int64]struct{}),
@@ -60,12 +55,15 @@ func partitionDevinSubagentMessageNodes(
 	indexByNodeID := make(map[int64]int, len(rows))
 	childrenByParent := make(map[int64][]int64, len(rows))
 	treeIndexByPromptMessageID := make(map[string]int)
+	earliestRootID := int64(-1)
 	for i, row := range rows {
 		indexByNodeID[row.NodeID] = i
 		if row.ParentNodeID.Valid {
 			childrenByParent[row.ParentNodeID.Int64] = append(
 				childrenByParent[row.ParentNodeID.Int64], row.NodeID,
 			)
+		} else if earliestRootID < 0 {
+			earliestRootID = row.NodeID
 		}
 	}
 
@@ -74,6 +72,9 @@ func partitionDevinSubagentMessageNodes(
 			return devinSubagentNodePartition{}, err
 		}
 		if row.ParentNodeID.Valid {
+			continue
+		}
+		if row.NodeID == mainChainRootID || row.NodeID == earliestRootID {
 			continue
 		}
 		kind := devinMessageNodeRootKind(ctx, row.ChatMessage)
@@ -180,10 +181,22 @@ func devinMessageNodeRootKind(
 		return devinMessageNodeRootNone
 	}
 	content, _, _, _, _, _ := ExtractTextContent(ctx, message.Get("content"))
+	return devinRootMarkerKind(content)
+}
+
+// devinRootMarkerKind anchors the subagent/summarizer markers at the start of
+// the node's text. Devin writes these prompts as the first line of the tree
+// root; an unanchored match would also fire on the main session's own system
+// prompt whenever it quotes the marker (for example inside an embedded
+// subagent profile list).
+func devinRootMarkerKind(text string) devinMessageNodeRoot {
+	text = strings.TrimSpace(text)
+	text = strings.Trim(text, "'\"")
+	text = strings.TrimSpace(text)
 	switch {
-	case strings.Contains(content, devinSubagentRootMarker):
+	case strings.HasPrefix(text, devinSubagentRootMarker):
 		return devinMessageNodeRootSubagent
-	case strings.Contains(content, devinSummarizerRootMarker):
+	case strings.HasPrefix(text, devinSummarizerRootMarker):
 		return devinMessageNodeRootSummarizer
 	default:
 		return devinMessageNodeRootNone
@@ -206,7 +219,16 @@ func parseDevinSubagentNodeTrees(
 			ctx, rawSessionID, machine, meta, parentFile, tree,
 		)
 		if err != nil {
-			return nil, err
+			if ctx.Err() != nil {
+				return nil, err
+			}
+			// A malformed node inside one tree must not take the whole
+			// session down: drop that tree and keep the rest.
+			log.Printf(
+				"devin: dropping malformed subagent message tree (root node %d): %v",
+				tree.RootNodeID, err,
+			)
+			continue
 		}
 		if ok {
 			parsed = append(parsed, child)
@@ -230,7 +252,7 @@ func parseDevinSubagentNodeTree(
 		lastStepAt   = time.Time{}
 		userMsgCount int
 	)
-	for _, row := range tree.Rows {
+	for _, row := range devinSubagentTreeRows(tree.Rows) {
 		if err := ctx.Err(); err != nil {
 			return devinParsedSubagent{}, false, err
 		}
@@ -238,10 +260,7 @@ func parseDevinSubagentNodeTree(
 			rawSessionID, row, len(messages), model,
 		)
 		if err != nil {
-			return devinParsedSubagent{}, false, &devinSubagentParseError{
-				RootNodeID: tree.RootNodeID,
-				Err:        err,
-			}
+			return devinParsedSubagent{}, false, err
 		}
 		if !ok {
 			continue
@@ -302,6 +321,93 @@ func parseDevinSubagentNodeTree(
 	}
 	accumulateMessageTokenUsage(&session, messages)
 	return devinParsedSubagent{Session: session, Messages: messages}, true, nil
+}
+
+// devinSubagentTreeRows resolves a subagent tree down to its surviving
+// spine, the same way era recovery walks a recovered thread. Devin persists
+// pending and committed states of one logical message as sibling nodes
+// sharing a message_id; the higher node_id is the final write and wins.
+// Siblings with distinct message_ids are alternate timelines (retries,
+// edited turns); the deepest subtree is the line the subagent actually
+// continued on. Nodes without a message_id always emit. The result keeps
+// conversation order: root first, then the resolved child, and so on.
+func devinSubagentTreeRows(treeRows []devinMessageNodeRow) []devinMessageNodeRow {
+	inTree := make(map[int64]bool, len(treeRows))
+	for _, row := range treeRows {
+		inTree[row.NodeID] = true
+	}
+	children := make(map[int64][]devinMessageNodeRow, len(treeRows))
+	var root devinMessageNodeRow
+	found := false
+	for _, row := range treeRows {
+		if row.ParentNodeID.Valid && inTree[row.ParentNodeID.Int64] {
+			children[row.ParentNodeID.Int64] = append(
+				children[row.ParentNodeID.Int64], row,
+			)
+			continue
+		}
+		root = row
+		found = true
+	}
+	if !found {
+		return nil
+	}
+
+	depthMemo := make(map[int64]int, len(treeRows))
+	visiting := make(map[int64]bool)
+	var depth func(id int64) int
+	depth = func(id int64) int {
+		if d, ok := depthMemo[id]; ok {
+			return d
+		}
+		if visiting[id] {
+			return 0
+		}
+		visiting[id] = true
+		d := 1
+		for _, child := range children[id] {
+			if cd := depth(child.NodeID) + 1; cd > d {
+				d = cd
+			}
+		}
+		delete(visiting, id)
+		depthMemo[id] = d
+		return d
+	}
+
+	seenMessageIDs := make(map[string]bool, len(treeRows))
+	var out []devinMessageNodeRow
+	cur := root
+	for walked := 0; walked <= len(treeRows); walked++ {
+		mid := devinNodeMessageID(cur.ChatMessage)
+		if mid == "" || !seenMessageIDs[mid] {
+			out = append(out, cur)
+			if mid != "" {
+				seenMessageIDs[mid] = true
+			}
+		}
+		kids := children[cur.NodeID]
+		if len(kids) == 0 {
+			break
+		}
+		distinct := make(map[string]bool, len(kids))
+		for _, kid := range kids {
+			distinct[devinNodeMessageID(kid.ChatMessage)] = true
+		}
+		if len(distinct) == 1 {
+			// pending/committed twins of one logical message: the committed
+			// copy (higher node_id) wins.
+			cur = slices.MaxFunc(kids, func(a, b devinMessageNodeRow) int {
+				return cmp.Compare(a.NodeID, b.NodeID)
+			})
+			continue
+		}
+		// Alternate timelines: keep the line the run continued furthest on.
+		cur = slices.MaxFunc(kids, func(a, b devinMessageNodeRow) int {
+			return cmp.Compare(depth(a.NodeID), depth(b.NodeID))
+		})
+	}
+	return out
 }
 
 func devinSubagentRawSessionID(parentSessionID string, rootNodeID int64) string {
@@ -378,7 +484,9 @@ func devinSubagentExists(
 	if len(rows) == 0 {
 		return false, nil
 	}
-	partition, err := partitionDevinSubagentMessageNodes(ctx, rows)
+	// No session metadata is available here, so the resolved main-chain root
+	// is unknown (-1); the earliest parentless node is still never a subagent.
+	partition, err := partitionDevinSubagentMessageNodes(ctx, rows, -1)
 	if err != nil {
 		return false, err
 	}

@@ -15,9 +15,17 @@ import (
 //
 // In the current model, single-event results are stored directly in
 // tool_calls.result_content with 0 rows in tool_result_events when the event
-// content matches the tool call's result summary. Genuine multi-event calls
-// (events > 1 or event content differs from summary) persist rows in
-// tool_result_events.
+// content matches the tool call's result summary and the event's remaining
+// metadata adds nothing the collapsed representation implies: a completed or
+// absent status, no agent or subagent identity, and no sibling events.
+// Genuine multi-event calls (events > 1 or event content differs from
+// summary) persist rows in tool_result_events.
+//
+// The collapse consciously drops the event's timestamp, source, and
+// event_index — the summary carries none of them — but never drops a
+// meaningful status: an errored, cancelled, or denied result keeps its
+// event row so failure detection, the activity report's terminal-event
+// index, tool execution timing, and tool_content.is_error keep working.
 //
 // For legacy pre-v123 data where result_content was cleared and a single event
 // was stored in tool_result_events, RestoreToolCallResultContent and
@@ -39,14 +47,32 @@ func SoleToolResultContent(events []ToolResultEvent) (ToolResultEvent, bool) {
 	return sole, found
 }
 
+// collapsibleToolResultStatus reports whether an event status carries no
+// information beyond what the collapsed representation implies. A call with
+// no event rows reads as an implicitly completed result, so only an empty or
+// "completed" status is equivalent to the collapse. Every other status —
+// terminal failures (errored, cancelled, denied), in-flight markers
+// (started, running), and any status introduced later — must keep its event
+// row: signals read the last stored event's status, the activity report and
+// execution timing read stored rows, and tool_content.is_error is computed
+// from them. Every collapse decision routes through
+// ResultContentDuplicatesSingleEvent or this predicate directly, so the
+// staged publishing path's checks stay aligned with the write path.
+func collapsibleToolResultStatus(status string) bool {
+	return status == "" || status == "completed"
+}
+
 // ResultContentDuplicatesSingleEvent reports whether a summary repeats the
-// content of the call's only result event verbatim without dropping subagent,
-// multi-agent, or distinct raw provider identity.
+// content of the call's only result event verbatim without dropping
+// metadata a consumer reads: status, subagent, multi-agent, or distinct raw
+// provider identity. Event timestamp, source, and event_index are
+// consciously dropped by the collapse — the summary carries none of them.
 func ResultContentDuplicatesSingleEvent(
 	summary string, events []ToolResultEvent,
 ) bool {
 	if summary == "" || len(events) != 1 ||
 		events[0].Content != summary ||
+		!collapsibleToolResultStatus(events[0].Status) ||
 		events[0].SubagentSessionID != "" ||
 		events[0].AgentID != "" {
 		return false
@@ -65,9 +91,12 @@ func ResultContentDuplicatesSingleEvent(
 
 // ShouldPersistToolResultEvents reports whether a call's result events must be
 // persisted to tool_result_events. Single-event results whose content matches
-// the call's result summary are stored directly on the tool call, leaving 0 rows
-// in tool_result_events. Only multi-event calls or single events whose content
-// diverges from the summary are persisted.
+// the call's result summary and whose status is empty or "completed" are
+// stored directly on the tool call, leaving 0 rows in tool_result_events.
+// Multi-event calls, single events whose content diverges from the summary,
+// and single events carrying a meaningful status (errored, cancelled,
+// denied, started, ...) are persisted so downstream consumers keep seeing
+// the metadata.
 func ShouldPersistToolResultEvents(
 	summary string, events []ToolResultEvent,
 ) bool {

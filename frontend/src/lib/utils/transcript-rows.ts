@@ -160,6 +160,69 @@ export function flattenTranscriptRows(
   return rows;
 }
 
+/** The child event that renders `blockKey` inside `turn`. One source
+ *  ordinal can span several events of the same message (thinking, text,
+ *  tool segments), so a search match resolves by block kind and segment
+ *  index rather than the first ordinal hit. Returns `null` when no event
+ *  maps. Kept in sync with the ownership helper `MessageList` applies for
+ *  search navigation — the find overview rail uses this copy to pin
+ *  matches to the event row that renders them. */
+export function blockOwnerEvent(
+  turn: AssistantTurnItem,
+  ordinal: number,
+  blockKey: string,
+): TurnEvent | null {
+  const parts = blockKey.split(":");
+  const kind = parts[1] ?? "";
+  // `${ordinal}:${kind}:${index}` carries the enriched segment index
+  // for text/code/thinking/skill blocks; `seg`-prefixed or fractional
+  // trailing parts parse to NaN and only degrade to kind matching.
+  const segmentIndex = Number(parts[2]);
+  const hasSegmentIndex = Number.isInteger(segmentIndex);
+  const candidates = turn.events.filter((event) =>
+    event.ordinals.includes(ordinal),
+  );
+  const byKinds = (...kinds: TurnEvent["kind"][]) =>
+    candidates.find((event) => kinds.includes(event.kind)) ?? null;
+  const bySegmentIndex = (kind: TurnEvent["kind"]) =>
+    candidates.find(
+      (event) =>
+        hasSegmentIndex &&
+        event.kind === kind &&
+        event.segmentIndex === segmentIndex,
+    ) ?? null;
+  // Adjacent text/code segments merge into one event covering
+  // [segmentIndex, segmentIndex + segments.length); an index from a
+  // later segment still belongs to that run's disclosure.
+  const inRun = (kind: TurnEvent["kind"]) =>
+    candidates.find(
+      (event) =>
+        hasSegmentIndex &&
+        event.kind === kind &&
+        event.segmentIndex !== undefined &&
+        segmentIndex >= event.segmentIndex &&
+        segmentIndex < event.segmentIndex + (event.segments?.length ?? 1),
+    ) ?? null;
+  switch (kind) {
+    case "text":
+    case "code":
+      return inRun("message") ?? byKinds("message");
+    case "thinking":
+      return bySegmentIndex("thinking") ?? byKinds("thinking");
+    case "skill":
+      return bySegmentIndex("skill") ?? byKinds("skill");
+    case "tool-input":
+    case "tool-output":
+    case "tool-history":
+      // The nested input/output/history sections share the owning
+      // tool event's row; the reveal only needs the row mounted —
+      // `searchCollapsed` discloses the matching section itself.
+      return byKinds("tool", "tool-rollup");
+    default:
+      return null;
+  }
+}
+
 /**
  * Maps a source message ordinal to the turn and child event that own
  * it — the seam navigation and search reveal use to expand the owning

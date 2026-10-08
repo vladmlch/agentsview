@@ -564,17 +564,23 @@ type SessionFilter struct {
 	// sessions keep the one-shot exclusion unchanged; every other caller
 	// (session list, substring/regex/fts search) leaves this false.
 	ChildExemptOneShot bool
-	ExcludeAutomated   bool     // exclude sessions where is_automated = 1
-	AutomatedScope     string   // "", "human", "all", or "automated"
-	IncludeChildren    bool     // include subagent sessions (for sidebar grouping)
-	IncludeEmpty       bool     // include zero-message sessions for project mapping
-	IncludeOrphans     bool     // promote orphan child rows to sidebar roots
-	IncludeSource      bool     // include the session source file path in list rows
-	Outcome            []string // filter by outcome values
-	HealthGrade        []string // filter by health grade values
-	MinToolFailures    *int     // minimum tool_failure_signal_count
-	HasSecret          bool     // only sessions with current secret_leak_count > 0
-	Starred            bool     // only sessions starred by the user
+	ExcludeAutomated   bool   // exclude sessions where is_automated = 1
+	AutomatedScope     string // "", "human", "all", or "automated"
+	IncludeChildren    bool   // include subagent sessions (for sidebar grouping)
+	IncludeEmpty       bool   // include zero-message sessions for project mapping
+	IncludeOrphans     bool   // promote orphan child rows to sidebar roots
+	IncludeSource      bool   // include the session source file path in list rows
+	// IncludeSourceMissing keeps sessions whose source file was reported
+	// missing (source_missing_at set). Sidebar, listing, and child paths
+	// leave it false so vanished sources stay hidden; archive-report
+	// paths such as session export set it because a stored session
+	// remains exportable content regardless of source availability.
+	IncludeSourceMissing bool
+	Outcome              []string // filter by outcome values
+	HealthGrade          []string // filter by health grade values
+	MinToolFailures      *int     // minimum tool_failure_signal_count
+	HasSecret            bool     // only sessions with current secret_leak_count > 0
+	Starred              bool     // only sessions starred by the user
 	// SecretsRulesVersions limits HasSecret to sessions scanned by one of these
 	// current scanner versions. Empty preserves raw DB semantics for tests and
 	// direct store callers that explicitly want unversioned counts.
@@ -3106,7 +3112,10 @@ func updateSessionIncrementalTx(ctx context.Context,
 			has_total_output_tokens = ?,
 			has_peak_context_tokens = ?,
 			termination_status = ?,
-			data_version = ?,
+			-- data_version is deliberately untouched: an incremental
+			-- write does not reparse the stored prefix, so only the
+			-- full-rewrite caller may mark the row current via
+			-- SetSessionDataVersion.
 			-- Mark the row as last written by the incremental-append path.
 			-- The full-replace writer (upsertSessionArgs) resets this to
 			-- false; parse-diff reads it to classify benign
@@ -3119,7 +3128,7 @@ func updateSessionIncrementalTx(ctx context.Context,
 		update.NextOrdinal, lastEntryUUID,
 		update.TotalOutputTokens, update.PeakContextTokens,
 		update.HasTotalOutputTokens, update.HasPeakContextTokens,
-		update.TerminationStatus, CurrentDataVersion(), id,
+		update.TerminationStatus, id,
 	)
 	if err != nil {
 		return fmt.Errorf(
@@ -3227,7 +3236,8 @@ func replaceSessionIncrementalTx(ctx context.Context,
 			next_ordinal = ?,
 			last_entry_uuid = ?,
 			termination_status = ?,
-			data_version = ?,
+			-- See updateSessionIncrementalTx: data_version advances only
+			-- via SetSessionDataVersion after a full-format rewrite.
 			last_write_incremental = 1
 		WHERE id = ?`,
 		update.EndedAt,
@@ -3238,8 +3248,7 @@ func replaceSessionIncrementalTx(ctx context.Context,
 		recomputePeak, id, added.peakContext,
 		recomputePeak, id, added.hasContext,
 		update.FileSize, update.FileMtime, update.FileHash,
-		update.NextOrdinal, lastEntryUUID, update.TerminationStatus,
-		CurrentDataVersion(), id,
+		update.NextOrdinal, lastEntryUUID, update.TerminationStatus, id,
 	)
 	if err != nil {
 		return fmt.Errorf(

@@ -2,6 +2,7 @@ package signals
 
 import (
 	"regexp"
+	"slices"
 	"strings"
 
 	"go.kenn.io/agentsview/internal/parser"
@@ -62,13 +63,23 @@ func ComputeToolHealth(calls []ToolCallRow) ToolHealthSignals {
 	return s
 }
 
+// FailureEventStatuses is the canonical vocabulary of provider
+// result-event statuses that mark a call as failed. IsFailure consults it
+// before falling back to content heuristics, and the tool_content.is_error
+// column is computed from the same list so `has_error` search results and
+// failure detection agree.
+var FailureEventStatuses = []string{
+	"cancelled", "denied", "error", "errored", "failed", "failure",
+}
+
 // IsFailure returns true when a tool call represents a failure,
 // either by event status, by a pre-computed content verdict, or
 // by content heuristics.
 func IsFailure(c ToolCallRow) bool {
 	if c.EventStatus != "" {
-		return c.EventStatus == "errored" ||
-			c.EventStatus == "cancelled" || c.EventStatus == "error" || c.EventStatus == "denied"
+		return slices.Contains(
+			FailureEventStatuses, strings.ToLower(c.EventStatus),
+		)
 	}
 	if c.ContentFailureKnown || c.ContentFailure {
 		return c.ContentFailure

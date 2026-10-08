@@ -12,7 +12,10 @@ import (
 )
 
 // findJunieStream matches an event target identifier or stepId to an existing
-// subagent stream in streams.
+// subagent stream in streams. Heuristic matches (step, name, block
+// membership) resolve only when they identify a single stream: an ambiguous
+// match must not attach a lifecycle note to the wrong agent, so the caller
+// falls back to a dedicated stream or the parent transcript instead.
 func findJunieStream(
 	streams map[string]*junieAgentStream,
 	targetAgent, stepID string,
@@ -20,43 +23,59 @@ func findJunieStream(
 	if targetAgent == "main" {
 		return streams["main"]
 	}
-	cleanStep := strings.TrimSuffix(strings.TrimSuffix(stepID, "-request"), "-spawned")
-	// 1. Exact match on targetAgent as stream ID
+	cleanStep := junieTrimStepMarker(stepID)
+	unique := func(match func(*junieAgentStream) bool) *junieAgentStream {
+		var found *junieAgentStream
+		for _, st := range streams {
+			if st.id == "main" || !match(st) {
+				continue
+			}
+			if found != nil && found != st {
+				return nil
+			}
+			found = st
+		}
+		return found
+	}
+	// 1. Exact match on targetAgent as stream ID.
 	if targetAgent != "" {
 		if st := streams[targetAgent]; st != nil {
 			return st
 		}
 	}
-	// 2. Exact match on stepID as stream stepID
-	if cleanStep != "" {
-		for _, st := range streams {
-			if st.id != "main" && (st.stepID == cleanStep || st.stepID == stepID) {
-				return st
-			}
-		}
-	}
-	// 3. Match by name or taskName
-	if targetAgent != "" {
-		for _, st := range streams {
-			if st.id != "main" && (st.name == targetAgent || st.taskName == targetAgent) {
-				return st
-			}
-		}
-		// Match targetAgent against stream stepID
-		for _, st := range streams {
-			if st.id != "main" && (st.stepID == targetAgent || strings.TrimSuffix(targetAgent, "-request") == st.stepID) {
-				return st
-			}
-		}
-	}
-	// 4. Check if stepID is in any stream's blocks
+	// 2. Match stepID against the stream's canonical step or any step it has
+	// already recorded.
 	if stepID != "" {
-		for _, st := range streams {
-			if st.id != "main" {
-				if _, ok := st.blocks[stepID]; ok {
-					return st
-				}
-			}
+		if st := unique(func(st *junieAgentStream) bool {
+			return st.stepID == cleanStep || st.stepID == stepID ||
+				st.stepIDs[stepID] || st.stepIDs[cleanStep]
+		}); st != nil {
+			return st
+		}
+	}
+	// 3. Match by name or taskName — only when unambiguous.
+	if targetAgent != "" {
+		if st := unique(func(st *junieAgentStream) bool {
+			return st.name == targetAgent || st.taskName == targetAgent
+		}); st != nil {
+			return st
+		}
+		// Match targetAgent against stream step markers.
+		if st := unique(func(st *junieAgentStream) bool {
+			return st.stepID == targetAgent ||
+				strings.TrimSuffix(targetAgent, "-request") == st.stepID ||
+				st.stepIDs[targetAgent]
+		}); st != nil {
+			return st
+		}
+	}
+	// 4. Check if stepID is already recorded as a block in some stream.
+	if stepID != "" {
+		if st := unique(func(st *junieAgentStream) bool {
+			_, ok := st.blocks[stepID]
+			return ok
+		}); st != nil {
+			return st
 		}
 	}
 	return nil
@@ -74,13 +93,16 @@ func junieFinishSubagent(
 		return nil, nil, false
 	}
 
-	var extra []ParsedMessage
+	var extra []junieTranscriptMessage
 	if stream.request != "" {
-		extra = append(extra, ParsedMessage{
-			Role:          RoleUser,
-			Content:       stream.request,
-			ContentLength: len(stream.request),
-			Timestamp:     stream.requestTS,
+		extra = append(extra, junieTranscriptMessage{
+			ParsedMessage: ParsedMessage{
+				Role:          RoleUser,
+				Content:       stream.request,
+				ContentLength: len(stream.request),
+				Timestamp:     stream.requestTS,
+			},
+			seq: stream.requestSeq,
 		})
 	}
 	msgs := junieAssembleMessages(stream, extra)
@@ -250,13 +272,15 @@ func junieLinkSubagentCalls(
 
 			matchedAgent := ""
 			if callPrefix != "" {
-				// 1. Exact match on stepID or agentID
+				// 1. Exact match on stepID, any recorded step, or agentID
 				for _, agentID := range subIDs {
 					if linkedSubagents[agentID] {
 						continue
 					}
 					st := streams[agentID]
-					if st != nil && (st.stepID == callPrefix || agentID == callPrefix || agentID == callStepID) {
+					if st != nil && (st.stepID == callPrefix || agentID == callPrefix ||
+						agentID == callStepID || st.stepIDs[callPrefix] ||
+						st.stepIDs[callStepID]) {
 						matchedAgent = agentID
 						break
 					}

@@ -88,7 +88,7 @@ func (p *antigravityProvider) Parse(
 	if err := ctx.Err(); err != nil {
 		return ParseOutcome{}, err
 	}
-	src, ok := p.sources.sourceFromRef(req.Source)
+	src, ok := p.sources.sourceFromRef(ctx, req.Source)
 	if !ok {
 		return ParseOutcome{}, errors.New("antigravity source path unavailable")
 	}
@@ -154,95 +154,129 @@ type antigravitySummary struct {
 	project       string
 }
 
+// antigravitySummaryDBReader is the database-open hook the summary
+// index runs a scan through. It is a package variable so tests can
+// count how many times a pass opens the database.
+var antigravitySummaryDBReader = WithSQLiteReadOnly
+
 type antigravitySummaryIndex struct {
 	mu      sync.RWMutex
 	entries map[string]antigravitySummary
+	// scannedRoots marks roots whose conversation_summaries.db scan
+	// completed -- found, absent, or unreadable alike. On a scanned root
+	// an entries miss is definitive, so per-source lookups never reopen
+	// the database: one scan's open is shared by every source of the
+	// root instead of multiplying the busy-timeout plus scratch-copy
+	// cost across the discover pass.
+	scannedRoots map[string]struct{}
 }
 
 func newAntigravitySummaryIndex() *antigravitySummaryIndex {
 	return &antigravitySummaryIndex{
-		entries: make(map[string]antigravitySummary),
+		entries:      make(map[string]antigravitySummary),
+		scannedRoots: make(map[string]struct{}),
 	}
 }
 
-func (x *antigravitySummaryIndex) lookup(root, id string) (antigravitySummary, bool) {
-	return x.lookupContext(context.Background(), root, id)
-}
-
-func (x *antigravitySummaryIndex) lookupContext(ctx context.Context, root, id string) (antigravitySummary, bool) {
+func (x *antigravitySummaryIndex) lookup(
+	ctx context.Context, root, id string,
+) (antigravitySummary, bool) {
 	if x == nil || id == "" {
 		return antigravitySummary{}, false
 	}
 	cleanRoot := filepath.Clean(root)
 	key := cleanRoot + "\x00" + id
 	x.mu.RLock()
-	s, ok := x.entries[key]
+	sum, ok := x.entries[key]
+	_, scanned := x.scannedRoots[cleanRoot]
 	x.mu.RUnlock()
-	if ok {
-		return s, true
+	if ok || scanned {
+		return sum, ok
 	}
-	sum, found := lookupAntigravitySummaryContext(ctx, filepath.Join(cleanRoot, "conversation_summaries.db"), id)
-	if !found {
-		return antigravitySummary{}, false
-	}
-	x.mu.Lock()
-	x.entries[key] = sum
-	x.mu.Unlock()
-	return sum, true
+	// First touch of a root no scan has covered yet (a stored-path or
+	// changed-path ref built before any discovery pass): load the whole
+	// root once rather than probing the database per source.
+	x.scan(ctx, root)
+	x.mu.RLock()
+	sum, ok = x.entries[key]
+	x.mu.RUnlock()
+	return sum, ok
 }
 
-func (x *antigravitySummaryIndex) scan(root string) {
+// scan reloads root's conversation_summaries.db into the index. A scan
+// is a complete snapshot: on success it replaces the root's cached rows
+// so deleted summaries do not linger, and it always marks the root
+// scanned (unless ctx was cancelled) so lookup-triggered rescans stay
+// bounded at one database open per root. A failed scan keeps the stale
+// rows; the next Discover pass or summaries-file event retries the
+// load.
+func (x *antigravitySummaryIndex) scan(ctx context.Context, root string) {
 	if x == nil || root == "" {
 		return
 	}
-	dbPath := filepath.Join(root, "conversation_summaries.db")
-	if !IsRegularFile(dbPath) {
-		return
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	_ = WithSQLiteReadOnly(context.Background(), dbPath, sqliteReadOptions{busyTimeoutMS: 3000}, func(db *sql.DB) error {
-		rows, err := db.Query("SELECT conversation_id, COALESCE(workspace_uris, ''), COALESCE(title, '') FROM conversation_summaries WHERE conversation_id != ''")
-		if err != nil {
-			rows, err = db.Query("SELECT conversation_id, COALESCE(workspace_uris, '') FROM conversation_summaries WHERE conversation_id != ''")
-			if err != nil {
-				return err
-			}
-		}
-		defer rows.Close()
+	cleanRoot := filepath.Clean(root)
+	dbPath := filepath.Join(root, "conversation_summaries.db")
+	batch := make(map[string]antigravitySummary)
+	// An absent database is a complete (empty) snapshot.
+	loaded := true
+	if IsRegularFile(dbPath) {
+		loaded = antigravitySummaryDBReader(
+			ctx, dbPath, sqliteReadOptions{busyTimeoutMS: 3000},
+			func(db *sql.DB) error {
+				rows, err := db.QueryContext(ctx, "SELECT conversation_id, COALESCE(workspace_uris, ''), COALESCE(title, '') FROM conversation_summaries WHERE conversation_id != ''")
+				if err != nil {
+					rows, err = db.QueryContext(ctx, "SELECT conversation_id, COALESCE(workspace_uris, '') FROM conversation_summaries WHERE conversation_id != ''")
+					if err != nil {
+						return err
+					}
+				}
+				defer rows.Close()
 
-		cleanRoot := filepath.Clean(root)
-		cols, _ := rows.Columns()
-		hasTitle := len(cols) >= 3
+				cols, _ := rows.Columns()
+				hasTitle := len(cols) >= 3
 
-		batch := make(map[string]antigravitySummary)
-		for rows.Next() {
-			var id, ws, title string
-			var scanErr error
-			if hasTitle {
-				scanErr = rows.Scan(&id, &ws, &title)
-			} else {
-				scanErr = rows.Scan(&id, &ws)
-			}
-			if scanErr != nil || id == "" {
-				continue
-			}
-			cwd, project := parseAntigravityWorkspaceURI(ws)
-			batch[cleanRoot+"\x00"+id] = antigravitySummary{
-				workspaceURIs: ws,
-				title:         title,
-				cwd:           cwd,
-				project:       project,
+				for rows.Next() {
+					var id, ws, title string
+					var scanErr error
+					if hasTitle {
+						scanErr = rows.Scan(&id, &ws, &title)
+					} else {
+						scanErr = rows.Scan(&id, &ws)
+					}
+					if scanErr != nil || id == "" {
+						continue
+					}
+					cwd, project := parseAntigravityWorkspaceURI(ws)
+					batch[cleanRoot+"\x00"+id] = antigravitySummary{
+						workspaceURIs: ws,
+						title:         title,
+						cwd:           cwd,
+						project:       project,
+					}
+				}
+				return rows.Err()
+			},
+		) == nil
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if loaded {
+		prefix := cleanRoot + "\x00"
+		for key := range x.entries {
+			if strings.HasPrefix(key, prefix) {
+				delete(x.entries, key)
 			}
 		}
-		if err := rows.Err(); err != nil {
-			return err
+		for key, sum := range batch {
+			x.entries[key] = sum
 		}
-		x.mu.Lock()
-		for k, v := range batch {
-			x.entries[k] = v
-		}
-		x.mu.Unlock()
-		return nil
-	})
+	}
+	if ctx.Err() == nil {
+		x.scannedRoots[cleanRoot] = struct{}{}
+	}
 }
 
 func parseAntigravityWorkspaceURI(raw string) (cwd, project string) {
@@ -302,9 +336,9 @@ func (s antigravitySourceSet) Discover(ctx context.Context) ([]SourceRef, error)
 			return nil, err
 		}
 		s.subagents.scan(root)
-		s.summaries.scan(root)
+		s.summaries.scan(ctx, root)
 		for _, path := range s.discoverSessionPaths(root) {
-			source, ok := s.sourceRef(root, path, false)
+			source, ok := s.sourceRef(ctx, root, path, false)
 			if ok {
 				addJSONLSource(source, &sources, seen)
 			}
@@ -320,7 +354,7 @@ func (s antigravitySourceSet) DiscoverEach(ctx context.Context, yield func(Sourc
 			return err
 		}
 		s.subagents.scan(root)
-		s.summaries.scan(root)
+		s.summaries.scan(ctx, root)
 		dir := filepath.Join(root, "conversations")
 		err := streamDirectoryEntries(ctx, dir, func(entry os.DirEntry) error {
 			name := entry.Name()
@@ -328,7 +362,7 @@ func (s antigravitySourceSet) DiscoverEach(ctx context.Context, yield func(Sourc
 				!IsValidSessionID(strings.TrimSuffix(name, ".db")) {
 				return nil
 			}
-			if source, ok := s.sourceRef(root, filepath.Join(dir, name), false); ok {
+			if source, ok := s.sourceRef(ctx, root, filepath.Join(dir, name), false); ok {
 				if err := yield(source); err != nil {
 					return err
 				}
@@ -344,7 +378,7 @@ func (s antigravitySourceSet) DiscoverEach(ctx context.Context, yield func(Sourc
 				IsRegularFile(filepath.Join(root, "conversations", id+".db")) {
 				return nil
 			}
-			if source, ok := s.sourceRef(root, antigravityBrainTranscriptPath(root, id), false); ok {
+			if source, ok := s.sourceRef(ctx, root, antigravityBrainTranscriptPath(root, id), false); ok {
 				return yield(source)
 			}
 			return nil
@@ -417,24 +451,34 @@ func (s antigravitySourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 				IncludeGlobs: []string{"*.pbtxt"},
 				DebounceKey:  string(AgentAntigravity) + ":annotations:" + root,
 			},
-			// brain/<id>/*.md and the plaintext transcript at
-			// brain/<id>/.system_generated/logs/transcript.jsonl are parsed.
-			// The other generated trees (.git, scratch, and the rest of
-			// .system_generated) stay unwatched so they cannot exhaust the
-			// recursive-watch budget.
+			// brain/<id>/*.md, the subagent descriptors under
+			// brain/<id>/.system_generated/subagents, and the plaintext
+			// transcript at
+			// brain/<id>/.system_generated/logs/transcript.jsonl are
+			// parsed. The other generated trees (.git, scratch, and the
+			// rest of .system_generated) stay unwatched so they cannot
+			// exhaust the recursive-watch budget. Both generated
+			// directories must be ExtraDirectories, not just include
+			// globs: at MaxDepth 1 fsnotify installs no watch below
+			// .system_generated without them, so a glob alone reports
+			// nothing and the descriptor events would never reach
+			// SourcesForChangedPath.
 			WatchRoot{
 				Path:      filepath.Join(root, "brain"),
 				Recursive: true,
 				MaxDepth:  1,
 				ExtraDirectories: []string{
 					"*/" + antigravityBrainGeneratedDir + "/" + antigravityBrainLogsDir,
+					"*/" + antigravityBrainGeneratedDir + "/" + antigravitySubagentsDir,
 				},
 				IncludeGlobs: []string{
 					"*.md",
 					"*.md.metadata.json",
 					antigravityBrainTranscriptName,
-					"*/.system_generated/subagents/*.json",
-					"*/.system_generated/logs/transcript.jsonl",
+					"*/" + antigravityBrainGeneratedDir + "/" +
+						antigravitySubagentsDir + "/*.json",
+					"*/" + antigravityBrainGeneratedDir + "/" +
+						antigravityBrainLogsDir + "/" + antigravityBrainTranscriptName,
 				},
 				DebounceKey: string(AgentAntigravity) + ":brain:" + root,
 			},
@@ -467,16 +511,16 @@ func (s antigravitySourceSet) SourcesForChangedPath(
 			continue
 		}
 		if isAntigravitySummaryDB(root, req.Path) {
-			s.summaries.scan(root)
+			s.summaries.scan(ctx, root)
 			var sources []SourceRef
 			for _, p := range s.discoverSessionPaths(root) {
-				if src, ok := s.sourceRef(root, p, false); ok {
+				if src, ok := s.sourceRef(ctx, root, p, false); ok {
 					sources = append(sources, src)
 				}
 			}
 			return sources, nil
 		}
-		source, ok := s.sourceForChangedPath(root, req.Path)
+		source, ok := s.sourceForChangedPath(ctx, root, req.Path)
 		if ok {
 			return []SourceRef{source}, nil
 		}
@@ -490,10 +534,14 @@ func isAntigravitySummaryDB(root, path string) bool {
 	if filepath.Dir(cleanPath) != cleanRoot {
 		return false
 	}
-	base := filepath.Base(cleanPath)
-	return base == "conversation_summaries.db" ||
-		base == "conversation_summaries.db-wal" ||
-		base == "conversation_summaries.db-shm"
+	// Same journal rule as conversations/*.db (see
+	// antigravityConversationDBForPath): a bare "-shm" event never
+	// resolves, because every summaries scan opens the database
+	// read-only and rewrites that index, so honoring it would make each
+	// scan schedule the next one in a self-exciting loop. The "-wal"
+	// sidecar folds onto the base name: committed writes land there.
+	base := strings.TrimSuffix(filepath.Base(cleanPath), "-wal")
+	return base == "conversation_summaries.db"
 }
 
 func (s antigravitySourceSet) FindSource(
@@ -510,7 +558,7 @@ func (s antigravitySourceSet) FindSource(
 			continue
 		}
 		for _, root := range s.roots {
-			if source, ok := s.sourceRef(root, path, true); ok {
+			if source, ok := s.sourceRef(ctx, root, path, true); ok {
 				src := source.Opaque.(antigravitySource)
 				if req.RawSessionID != "" && src.ID != req.RawSessionID {
 					continue
@@ -533,7 +581,7 @@ func (s antigravitySourceSet) FindSource(
 		if path == "" {
 			continue
 		}
-		if source, ok := s.sourceRef(root, path, false); ok {
+		if source, ok := s.sourceRef(ctx, root, path, false); ok {
 			return source, true, nil
 		}
 	}
@@ -547,7 +595,7 @@ func (s antigravitySourceSet) Fingerprint(
 	if err := ctx.Err(); err != nil {
 		return SourceFingerprint{}, err
 	}
-	src, ok := s.sourceFromRef(source)
+	src, ok := s.sourceFromRef(ctx, source)
 	if !ok {
 		return SourceFingerprint{}, errors.New("antigravity source path unavailable")
 	}
@@ -579,7 +627,9 @@ func (s antigravitySourceSet) Fingerprint(
 	}, nil
 }
 
-func (s antigravitySourceSet) sourceFromRef(source SourceRef) (antigravitySource, bool) {
+func (s antigravitySourceSet) sourceFromRef(
+	ctx context.Context, source SourceRef,
+) (antigravitySource, bool) {
 	switch src := source.Opaque.(type) {
 	case antigravitySource:
 		return src, src.Path != ""
@@ -590,7 +640,7 @@ func (s antigravitySourceSet) sourceFromRef(source SourceRef) (antigravitySource
 	}
 	for _, candidate := range []string{source.DisplayPath, source.FingerprintKey, source.Key} {
 		for _, root := range s.roots {
-			if ref, ok := s.sourceRef(root, candidate, true); ok {
+			if ref, ok := s.sourceRef(ctx, root, candidate, true); ok {
 				src := ref.Opaque.(antigravitySource)
 				return src, true
 			}
@@ -599,11 +649,13 @@ func (s antigravitySourceSet) sourceFromRef(source SourceRef) (antigravitySource
 	return antigravitySource{}, false
 }
 
-func (s antigravitySourceSet) sourceForChangedPath(root, path string) (SourceRef, bool) {
+func (s antigravitySourceSet) sourceForChangedPath(
+	ctx context.Context, root, path string,
+) (SourceRef, bool) {
 	root = filepath.Clean(root)
 	path = filepath.Clean(path)
 	if dbPath, _, ok := antigravityConversationDBForPath(root, path); ok {
-		return s.sourceRef(root, dbPath, true)
+		return s.sourceRef(ctx, root, dbPath, true)
 	}
 	if childID, ok := antigravitySubagentDescriptorID(root, path); ok {
 		// A descriptor create/write/remove can change the child's
@@ -612,36 +664,37 @@ func (s antigravitySourceSet) sourceForChangedPath(root, path string) (SourceRef
 		s.subagents.refresh(root, childID)
 		dbPath := filepath.Join(root, "conversations", childID+".db")
 		if IsRegularFile(dbPath) {
-			return s.newSourceRef(root, dbPath, childID), true
+			return s.newSourceRef(ctx, root, dbPath, childID), true
 		}
 		return SourceRef{}, false
 	}
 	if id, ok := antigravityIDETrajectoryID(root, path); ok {
 		dbPath := filepath.Join(root, "conversations", id+".db")
 		if IsRegularFile(dbPath) {
-			return s.newSourceRef(root, dbPath, id), true
+			return s.newSourceRef(ctx, root, dbPath, id), true
 		}
 	}
 	if id, ok := antigravityAnnotationID(root, path); ok {
 		dbPath := filepath.Join(root, "conversations", id+".db")
 		if IsRegularFile(dbPath) {
-			return s.newSourceRef(root, dbPath, id), true
+			return s.newSourceRef(ctx, root, dbPath, id), true
 		}
 	}
 	if transcriptRoot, _, ok := antigravityBrainTranscriptConversation(path); ok &&
 		samePath(transcriptRoot, root) {
-		return s.sourceRef(root, path, true)
+		return s.sourceRef(ctx, root, path, true)
 	}
 	if id, ok := antigravityBrainID(root, path); ok {
 		dbPath := filepath.Join(root, "conversations", id+".db")
 		if IsRegularFile(dbPath) {
-			return s.newSourceRef(root, dbPath, id), true
+			return s.newSourceRef(ctx, root, dbPath, id), true
 		}
 	}
 	return SourceRef{}, false
 }
 
 func (s antigravitySourceSet) sourceRef(
+	ctx context.Context,
 	root, path string,
 	allowMissing bool,
 ) (SourceRef, bool) {
@@ -653,12 +706,12 @@ func (s antigravitySourceSet) sourceRef(
 		// the transcript joins it as a companion instead of standing alone.
 		dbPath := filepath.Join(root, "conversations", id+".db")
 		if IsRegularFile(dbPath) {
-			return s.newSourceRef(root, dbPath, id), true
+			return s.newSourceRef(ctx, root, dbPath, id), true
 		}
 		if !allowMissing && !IsRegularFile(path) {
 			return SourceRef{}, false
 		}
-		return s.newSourceRef(root, path, id), true
+		return s.newSourceRef(ctx, root, path, id), true
 	}
 	dbPath, id, ok := antigravityConversationDBForPath(root, path)
 	if !ok || dbPath != path {
@@ -668,16 +721,18 @@ func (s antigravitySourceSet) sourceRef(
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		transcript := antigravityBrainTranscriptPath(root, id)
 		if IsRegularFile(transcript) {
-			return s.newSourceRef(root, transcript, id), true
+			return s.newSourceRef(ctx, root, transcript, id), true
 		}
 	}
 	if !allowMissing && !IsRegularFile(path) {
 		return SourceRef{}, false
 	}
-	return s.newSourceRef(root, path, id), true
+	return s.newSourceRef(ctx, root, path, id), true
 }
 
-func (s antigravitySourceSet) newSourceRef(root, path, id string) SourceRef {
+func (s antigravitySourceSet) newSourceRef(
+	ctx context.Context, root, path, id string,
+) SourceRef {
 	src := antigravitySource{Root: root, Path: path, ID: id}
 	if d, ok := s.subagents.lookup(root, id); ok {
 		src.SubagentParentID = d.parentID
@@ -685,7 +740,7 @@ func (s antigravitySourceSet) newSourceRef(root, path, id string) SourceRef {
 	}
 	var projectHint string
 	var resolution SourceCwdResolution
-	if sum, ok := s.summaries.lookup(root, id); ok {
+	if sum, ok := s.summaries.lookup(ctx, root, id); ok {
 		projectHint = sum.project
 		if sum.cwd != "" {
 			resolution = SourceCwdResolution{State: SourceCwdResolved, Path: sum.cwd}

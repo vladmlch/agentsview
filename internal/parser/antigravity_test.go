@@ -4825,6 +4825,22 @@ func TestCleanAntigravityPrompt(t *testing.T) {
 			input: "<USER_REQUEST>\nincomplete tag prompt\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-30T21:02:41+02:00.\n</ADDITIONAL_METADATA>",
 			want:  "incomplete tag prompt",
 		},
+		{
+			name:  "unclosed user request envelope with settings change",
+			input: "<USER_REQUEST>\nincomplete tag prompt\n<USER_SETTINGS_CHANGE>\nThe user changed setting Model Selection.\n</USER_SETTINGS_CHANGE>",
+			want:  "incomplete tag prompt",
+		},
+		{
+			name:  "unclosed user request envelope with system information",
+			input: "<USER_REQUEST>\nincomplete tag prompt\n<SYSTEM_INFORMATION>\nThe user has opened file main.go.\n</SYSTEM_INFORMATION>",
+			want:  "incomplete tag prompt",
+		},
+		{
+			name: "unclosed user request envelope cuts at earliest envelope",
+			input: "<USER_REQUEST>\nincomplete tag prompt\n<SYSTEM_INFORMATION>\nsys\n</SYSTEM_INFORMATION>\n" +
+				"<ADDITIONAL_METADATA>\ntime\n</ADDITIONAL_METADATA>",
+			want: "incomplete tag prompt",
+		},
 	}
 
 	for _, tt := range tests {

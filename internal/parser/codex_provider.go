@@ -1019,10 +1019,22 @@ func isMatchingCodexContinuationFile(filename, threadID string) bool {
 }
 
 // findContinuationParentFile locates the predecessor rollout segment for a given
-// continuation thread ID (history_base.thread_id).
+// continuation thread ID (history_base.thread_id). One thread may leave several
+// rollout files behind — retries and later truncations — and each rollout name
+// embeds its creation timestamp, so the newest segment sorts last. Returning the
+// first directory match would pick the oldest and replay a stale ancestor.
 func (s codexSourceSet) findContinuationParentFile(currentPath, threadID string) string {
 	if !IsValidSessionID(threadID) {
 		return ""
+	}
+
+	latest := ""
+	consider := func(path string) {
+		name := filepath.Base(path)
+		if latest == "" || name > filepath.Base(latest) ||
+			(name == filepath.Base(latest) && path > latest) {
+			latest = path
+		}
 	}
 
 	// 1. Check directory of current file first (fast path for same-day continuation).
@@ -1030,7 +1042,7 @@ func (s codexSourceSet) findContinuationParentFile(currentPath, threadID string)
 	if entries, err := os.ReadDir(dir); err == nil {
 		for _, f := range entries {
 			if !f.IsDir() && isMatchingCodexContinuationFile(f.Name(), threadID) {
-				return filepath.Join(dir, f.Name())
+				consider(filepath.Join(dir, f.Name()))
 			}
 		}
 	}
@@ -1040,11 +1052,7 @@ func (s codexSourceSet) findContinuationParentFile(currentPath, threadID string)
 		if strings.HasPrefix(root, "s3://") {
 			continue
 		}
-		var found string
 		walkCodexDayDirs(root, func(dayPath string) bool {
-			if found != "" {
-				return false
-			}
 			if dayPath == dir {
 				return true
 			}
@@ -1054,25 +1062,21 @@ func (s codexSourceSet) findContinuationParentFile(currentPath, threadID string)
 			}
 			for _, f := range dayEntries {
 				if !f.IsDir() && isMatchingCodexContinuationFile(f.Name(), threadID) {
-					found = filepath.Join(dayPath, f.Name())
-					return false
+					consider(filepath.Join(dayPath, f.Name()))
 				}
 			}
 			return true
 		})
-		if found != "" {
-			return found
-		}
 		entries, err := os.ReadDir(root)
 		if err == nil {
 			for _, f := range entries {
 				if !f.IsDir() && isMatchingCodexContinuationFile(f.Name(), threadID) {
-					return filepath.Join(root, f.Name())
+					consider(filepath.Join(root, f.Name()))
 				}
 			}
 		}
 	}
-	return ""
+	return latest
 }
 
 func (s codexSourceSet) WatchPlan(context.Context) (WatchPlan, error) {

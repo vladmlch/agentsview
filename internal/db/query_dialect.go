@@ -539,7 +539,9 @@ func BuildSessionBaseFilterSQL(
 	preds := []string{
 		"message_count > 0",
 		"deleted_at IS NULL",
-		"source_missing_at IS NULL",
+	}
+	if !f.IncludeSourceMissing {
+		preds = append(preds, "source_missing_at IS NULL")
 	}
 	if f.IncludeEmpty {
 		preds = preds[1:]
@@ -627,7 +629,9 @@ func buildSessionFilterWithBuilder(
 	basePreds := []string{
 		q("message_count") + " > 0",
 		q("deleted_at") + " IS NULL",
-		q("source_missing_at") + " IS NULL",
+	}
+	if !f.IncludeSourceMissing {
+		basePreds = append(basePreds, q("source_missing_at")+" IS NULL")
 	}
 	if f.IncludeEmpty {
 		basePreds = basePreds[1:]
@@ -674,6 +678,10 @@ func buildSessionFilterWithBuilder(
 	if childAutomationPred != "" {
 		childAutomationWhere = " AND " + childAutomationPred
 	}
+	childSourceMissingWhere := ""
+	if !f.IncludeSourceMissing {
+		childSourceMissingWhere = " AND s.source_missing_at IS NULL"
+	}
 
 	cte := "WITH RECURSIVE tree(id) AS (" +
 		"SELECT root_session.id FROM sessions root_session" +
@@ -684,7 +692,7 @@ func buildSessionFilterWithBuilder(
 		"SELECT s.id FROM sessions s" +
 		" JOIN tree t ON " + b.dialect.ParentRelation("s", "t") +
 		" WHERE s.message_count > 0 AND s.deleted_at IS NULL" +
-		" AND s.source_missing_at IS NULL" +
+		childSourceMissingWhere +
 		childAutomationWhere +
 		") SELECT id FROM tree"
 

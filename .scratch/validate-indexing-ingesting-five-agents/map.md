@@ -14,7 +14,7 @@ Produce an evidence-based audit report and discrepancy matrix comparing raw on-d
   - Antigravity (`~/.gemini/antigravity`, `internal/parser/antigravity*.go`, 607 sessions in DB)
 - Primary data sources:
   - Raw session artifacts in developer home directories
-  - Live production database at `/Users/vladislav.molchanov/.agentsview/sessions.db` (read-only queries)
+  - Live production database at `~/.agentsview/sessions.db` (read-only queries)
   - Ingestion and sync code in `internal/parser/` and `internal/sync/`
 - Database reads must be strictly read-only (`sqlite3 -readonly`); never modify or truncate production data.
 - Consult `mattpocock-skills:wayfinder` and `mattpocock-skills:dispatching-parallel-agents`.
@@ -32,7 +32,7 @@ Produce an evidence-based audit report and discrepancy matrix comparing raw on-d
 - [Fix Antigravity IDE project extraction and native transcript ingestion](issues/07-fix-antigravity-project-and-transcript-ingestion.md): Added `conversation_summaries.db` reading for `workspace_uris` to populate `ProjectHint` and `cwd`/`project`; ingested native `brain/.../transcript.jsonl` to recover `thinking_text` and attach tool results.
 - [Fix Codex git_branch omission and state_5.sqlite title discovery](issues/08-fix-codex-git-branch-and-sqlite-titles.md): Preserved `git_branch` in session builders and checkpoint cursors; read thread titles from `state_*.sqlite`; added streaming multiline JSON decoder for indented rollouts.
 - [Fix Junie cancellation event handling and subagent link collision](issues/09-fix-junie-cancellation-and-subagent-linking.md): Handled `CancelAgentEvent` and `AgentTaskFailedEvent` to mark sessions with `TerminationTruncated`; preserved question text in `UserAsyncResponseEvent`; implemented 3-tier subagent linking by stepId.
-- [Add model pricing rules for Devin and Antigravity models](issues/10-add-model-pricing-for-devin-and-antigravity.md): Added pricing rules and fixed aliases for Devin CLI models (`swe-2-*`) and Antigravity models (`gemini-3.8-flash-*`, `gemini-3.7-flash-*`, `claude-opus-4-6-thinking`) in supplemental catalog v6.
+- [Add model pricing rules for Devin and Antigravity models](issues/10-add-model-pricing-for-devin-and-antigravity.md): Added pricing rules and fixed aliases for Devin CLI models (`swe-2-*`) and Antigravity models (`gemini-3.8-flash-*`, `gemini-3.7-flash-*`, `claude-opus-4-6-thinking`) in supplemental catalog v7.
 
 ## Not yet specified
 

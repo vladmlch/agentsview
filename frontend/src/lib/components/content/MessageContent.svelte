@@ -323,9 +323,10 @@
     {/if}
     <!-- Tool segments and structured calls render through the trailing tool
       block in standalone mode; event rows render their own tool events, so
-      a segment subset must not re-emit them here. A collapsed prompt folds
-      them behind the disclosure too. -->
-    {#if !promptCollapsed && eventSegments === undefined && inSessionSearch.isBlockEffectivelyVisible("tool")}
+      a segment subset must not re-emit them here. Structured calls are
+      message data, not prompt text, so they stay visible while a collapsed
+      prompt folds only its body behind the disclosure. -->
+    {#if eventSegments === undefined && inSessionSearch.isBlockEffectivelyVisible("tool")}
       {@const turn = turnByMessage.get(message.id)}
       {@const structuredCalls = message.tool_calls ?? []}
       {#if structuredCalls.length === 1}

@@ -101,7 +101,8 @@ func newSessionSearchCommand() *cobra.Command {
 	}
 	flags := cmd.Flags()
 	flags.BoolVar(&useRegex, "regex", false, "Treat pattern as an RE2 regex")
-	flags.BoolVar(&useFTS, "fts", false, "Fast tokenized FTS over messages only")
+	flags.BoolVar(&useFTS, "fts", false,
+		"Fast tokenized FTS over message and tool content")
 	flags.BoolVar(&useSemantic, "semantic", false,
 		"Semantic (vector) search over user/assistant messages")
 	flags.BoolVar(&useHybrid, "hybrid", false,
@@ -153,8 +154,10 @@ func validateScopeFlag(scope string, useSemantic, useHybrid bool) error {
 
 // resolveContentSearchMode picks the search mode from the mutually exclusive
 // --regex/--fts/--semantic/--hybrid flags and, for the modes that only search
-// message content ("fts", "semantic", "hybrid"), rejects an explicit --in
-// naming other sources.
+// message content ("semantic", "hybrid"), rejects an explicit --in naming
+// other sources. --fts sources pass through unvalidated: SQLite's fts covers
+// tool_input/tool_result via tool_content_fts, and read stores that index
+// only messages report the limit with a backend-named error.
 func resolveContentSearchMode(
 	useRegex, useFTS, useSemantic, useHybrid bool, sources []string,
 ) (string, error) {
@@ -177,13 +180,6 @@ func resolveContentSearchMode(
 		mode = "semantic"
 	case useHybrid:
 		mode = "hybrid"
-	}
-	if useFTS {
-		for _, s := range sources {
-			if s != "messages" {
-				return "", errors.New("--fts searches messages only; drop --in or --fts")
-			}
-		}
 	}
 	if useSemantic || useHybrid {
 		for _, s := range sources {

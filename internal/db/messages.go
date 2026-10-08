@@ -2136,10 +2136,6 @@ func replaceSessionMessagesFromTx(ctx context.Context,
 			WHERE session_id = ? AND message_ordinal >= ?`,
 			"tool call agent state",
 		},
-		{
-			`DELETE FROM messages WHERE session_id = ? AND ordinal >= ?`,
-			"messages",
-		},
 	} {
 		if _, err := tx.ExecContext(
 			ctx, stmt.query, sessionID, fromOrdinal,
@@ -2149,6 +2145,17 @@ func replaceSessionMessagesFromTx(ctx context.Context,
 			)
 		}
 	}
+	// The message delete must also retire the FTS entries for the rows it
+	// removes: without 'delete' commands the index keeps their tokens, and
+	// the reinserted rows reuse the same rowids (nextMessageIDTx assigns
+	// MAX(id)+1), gluing the stale tokens to the new content.
+	if err := deleteSessionMessageRowsFromTx(
+		tx, sessionID, fromOrdinal,
+	); err != nil {
+		return fmt.Errorf(
+			"deleting messages from ordinal %d: %w", fromOrdinal, err,
+		)
+	}
 	if err := writeMessagesTx(tx, msgs); err != nil {
 		return err
 	}
@@ -2157,7 +2164,7 @@ func replaceSessionMessagesFromTx(ctx context.Context,
 
 // replaceSessionMessagesTx performs the full message-replace sequence within
 // an existing transaction: saves pins, deletes old tool_calls /
-// tool_result_events / messages (with FTS optimisation), inserts new messages
+// tool_result_events / messages (with bulk FTS delete), inserts new messages
 // + tool_calls + tool_result_events, then restores pins. Caller owns the lock
 // and transaction lifecycle.
 func replaceSessionMessagesTx(
@@ -2308,6 +2315,16 @@ func activeFTSTablesTx(tx transactionQueries) ([]string, error) {
 func deleteSessionMessageRowsTx(
 	tx transactionQueries, sessionID string,
 ) error {
+	return deleteSessionMessageRowsFromTx(tx, sessionID, math.MinInt)
+}
+
+// deleteSessionMessageRowsFromTx removes the session's message rows at or
+// after fromOrdinal, first writing a 'delete' command per removed row into
+// each active FTS table so the index stays synchronized without per-row
+// delete triggers.
+func deleteSessionMessageRowsFromTx(
+	tx transactionQueries, sessionID string, fromOrdinal int,
+) error {
 	active, err := activeFTSTablesTx(tx)
 	if err != nil {
 		return err
@@ -2318,14 +2335,16 @@ func deleteSessionMessageRowsTx(
 		// synchronized without per-row delete triggers.
 		if _, err := tx.Exec(
 			`INSERT INTO `+table+`(`+table+`, rowid, content)
-			 SELECT 'delete', id, content FROM messages WHERE session_id = ?`,
-			sessionID,
+			 SELECT 'delete', id, content FROM messages
+			 WHERE session_id = ? AND ordinal >= ?`,
+			sessionID, fromOrdinal,
 		); err != nil {
 			return fmt.Errorf("bulk-deleting %s entries: %w", table, err)
 		}
 	}
 	if _, err := tx.Exec(
-		"DELETE FROM messages WHERE session_id = ?", sessionID,
+		"DELETE FROM messages WHERE session_id = ? AND ordinal >= ?",
+		sessionID, fromOrdinal,
 	); err != nil {
 		return fmt.Errorf("deleting old messages: %w", err)
 	}
@@ -3601,11 +3620,15 @@ func (db *DB) SetToolCallSubagentSession(ctx context.Context,
 
 // soleToolResultEventTx returns a one-element slice when the call
 // identified by (session, owning message ordinal, call index) has exactly
-// one content-bearing result event, and nil for every other count, which never
-// dedups. The key is the same triple attachToolResultEvents and
-// ToolCallResultContentSQL use, so every site agrees on which event a
-// summary is compared against. Inspect at most two payload rows before
-// loading content so repeated appends do not load the event history.
+// one stored result event row, and nil for every other count, which never
+// dedups. Counting every stored row — not only content-bearing ones —
+// keeps a lone 'started' or otherwise empty-content sibling in the count:
+// collapsing to the summary would otherwise delete that sibling and lose
+// the execution start its status and timestamp carry. The key is the same
+// triple attachToolResultEvents and ToolCallResultContentSQL use, so every
+// site agrees on which event a summary is compared against. Inspect at
+// most two rows before loading content so repeated appends do not load
+// the event history.
 func soleToolResultEventTx(ctx context.Context,
 	tx *sql.Tx, sessionID string, messageOrdinal, callIndex int,
 	imagePolicy config.ToolResultImages,
@@ -3619,7 +3642,6 @@ func soleToolResultEventTx(ctx context.Context,
 			SELECT 1 FROM tool_result_events
 			WHERE session_id = ? AND tool_call_message_ordinal = ?
 			  AND call_index = ?
-			  AND COALESCE(content, '') <> ''
 			LIMIT 2
 		)`,
 		sessionID, messageOrdinal, callIndex,
@@ -3641,7 +3663,7 @@ func soleToolResultEventTx(ctx context.Context,
 		        content
 		 FROM tool_result_events
 		 WHERE session_id = ? AND tool_call_message_ordinal = ?
-		   AND call_index = ? AND COALESCE(content, '') <> ''`,
+		   AND call_index = ?`,
 		sessionID, messageOrdinal, callIndex,
 	).Scan(&subagent, &agentID, &status, &timestamp, &digest, &content); err != nil {
 		return nil, fmt.Errorf(
@@ -3885,12 +3907,27 @@ func applyToolCallResultUpdateTx(ctx context.Context,
 		incoming = toolCall.ResultEvents
 	}
 
+	// inserted collects the events this transaction actually stores so the
+	// incremental signal maintainer can scan exactly those rows — and only
+	// those — for secret findings. metadataChanged reports subagent-link
+	// writes to already-stored events.
+	var inserted []ToolResultEvent
+	var metadataChanged bool
+
 	if eventCount == 0 && (currentResultContent != "" || currentResultContentLen > 0) {
 		if !blocked && len(incoming) == 1 {
 			candidate := incoming[0]
+			// A collapsed call implies a completed result, so an
+			// identical-content replay is a no-op only while its status
+			// stays on that default. A late update replaying the same bytes
+			// with a meaningful status (errored, cancelled, denied, ...) is
+			// NOT a no-op: it must fall through and materialize an event row
+			// so the terminal status, its timestamp, and the failure signal
+			// survive instead of being swallowed by content equality.
 			if candidate.ContentLength == currentResultContentLen &&
 				candidate.Content == currentResultContent &&
-				candidate.AgentID == "" && candidate.SubagentSessionID == "" {
+				candidate.AgentID == "" && candidate.SubagentSessionID == "" &&
+				collapsibleToolResultStatus(candidate.Status) {
 				storedDigest := sha256.Sum256([]byte(currentResultContent))
 				if bytes.Equal(candidate.RawContentDigest, storedDigest[:]) ||
 					strings.Contains(currentResultContent, "asset://") {
@@ -3930,6 +3967,11 @@ func applyToolCallResultUpdateTx(ctx context.Context,
 		if err := upsertToolCallAgentStateRows(tx, []toolResultEventRow{ev0Row}); err != nil {
 			return false, nil, err
 		}
+		// The synthesized event is a real stored row: the canonical
+		// findings scan reads tool_result_events once any exist, so the
+		// secret scan below must see it or its finding is lost until the
+		// next full recompute.
+		inserted = append(inserted, ev0Event)
 	}
 
 	var nextEventIndex int
@@ -3947,8 +3989,6 @@ func applyToolCallResultUpdateTx(ctx context.Context,
 	}
 
 	insertRows := make([]toolResultEventRow, 0, len(incoming))
-	var inserted []ToolResultEvent
-	var metadataChanged bool
 	for _, candidate := range incoming {
 		stored := candidate
 		if blocked {

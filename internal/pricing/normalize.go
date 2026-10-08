@@ -98,7 +98,7 @@ func ResolveMatch[T any](model string, m map[string]T) Match[T] {
 // effortTierSuffixes are reasoning-effort tiers that do not change a model's
 // per-token price: the same base model is billed identically whether the
 // provider ran it at minimal or maximal effort. They are only ever stripped
-// as a last resort (see ResolveMatch step 5), so a catalogued model that
+// as a last resort (see ResolveMatch step 6), so a catalogued model that
 // genuinely ends in one of these words is matched by an earlier exact or
 // canonical step and never reaches the stripping path.
 var effortTierSuffixes = map[string]struct{}{

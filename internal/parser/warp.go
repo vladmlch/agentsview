@@ -7,6 +7,7 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,23 +45,31 @@ func ListWarpSessionMeta(
 func ForEachWarpSessionMeta(
 	ctx context.Context, dbPath string, stableSnapshot bool, yield func(WarpSessionMeta) error,
 ) error {
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) || errors.Is(err, os.ErrPermission) {
-		return nil
+	// A missing database is a clean empty listing. A present but unreadable
+	// one is tolerated the same way — a permission error must not fail the
+	// provider's whole pass — but it is logged, because otherwise it is
+	// indistinguishable from Warp genuinely having no sessions.
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if errors.Is(err, os.ErrPermission) {
+			log.Printf("warp: cannot stat session db %s: %v", dbPath, err)
+			return nil
+		}
 	}
 	f, err := os.Open(dbPath)
 	if err != nil {
-		if errors.Is(err, os.ErrPermission) {
-			return nil
+		if !errors.Is(err, os.ErrPermission) {
+			return err
 		}
-		return err
+		log.Printf("warp: session db %s is not readable: %v", dbPath, err)
+		return nil
 	}
 	_ = f.Close()
 
 	db, err := openWarpDB(dbPath, stableSnapshot)
 	if err != nil {
-		if errors.Is(err, os.ErrPermission) {
-			return nil
-		}
 		return err
 	}
 	defer db.Close()
@@ -544,11 +553,16 @@ func parseWarpTimestamp(s string) time.Time {
 }
 
 // warpDBPath returns the path to warp.sqlite inside the
-// given directory, or "" if it doesn't exist or is not readable.
+// given directory, or "" if it doesn't exist or is not readable. A
+// present-but-unreadable database is logged so it does not silently look
+// like an absent one.
 func warpDBPath(dir string) string {
 	candidate := filepath.Join(dir, WarpDBFilename)
 	f, err := os.Open(candidate)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("warp: session db %s is not readable: %v", candidate, err)
+		}
 		return ""
 	}
 	_ = f.Close()

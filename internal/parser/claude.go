@@ -404,9 +404,6 @@ func claudeParseFile(
 		}
 	}
 
-	if err := lr.Err(); err != nil {
-		return nil, nil, fmt.Errorf("reading claude %s: %w", path, err)
-	}
 	if tee.total < info.Size() {
 		if _, err := io.Copy(io.Discard, tee); err != nil {
 			return nil, nil, fmt.Errorf("reading remainder of %s: %w", path, err)

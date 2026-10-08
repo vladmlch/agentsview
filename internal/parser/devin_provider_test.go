@@ -767,3 +767,114 @@ func TestDevinProviderFindSourceSubagentValidation(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, found, "non-existent subagent stored path should not be found")
 }
+
+// The :agent-<n> suffix is AgentsView's derived key, not a producer-supplied
+// id. A real session row whose id carries that shape stays reachable: when
+// the subagent interpretation finds nothing, the literal id is tried.
+func TestDevinProviderFindSourceFallsBackToLiteralAgentSuffixedID(t *testing.T) {
+	t.Parallel()
+
+	const literalID = "literal:agent-7"
+	fixture := newDevinTestFixture(t,
+		devinSessionRow{
+			ID:             literalID,
+			Title:          "Literal agent-suffixed session",
+			Model:          "db-model",
+			CreatedAt:      new(int64(1704103200)),
+			LastActivityAt: new(int64(1704103210)),
+		},
+	)
+	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{fixture.Root}})
+	require.True(t, ok)
+	literalPath := fixture.sessionVirtualPath(literalID)
+
+	// No "literal" parent session exists at all.
+	source, found, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: literalID})
+	require.NoError(t, err)
+	require.True(t, found, "literal :agent-N session id must resolve")
+	assert.Equal(t, literalPath, source.DisplayPath)
+
+	source, found, err = provider.FindSource(t.Context(), FindSourceRequest{StoredFilePath: literalPath})
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, literalPath, source.DisplayPath)
+
+	// The parent exists but hosts no tree rooted at node 7.
+	insertDevinSessionRow(t, fixture.DBPath, devinSessionRow{
+		ID:             "literal",
+		Title:          "Parent without tree",
+		Model:          "db-model",
+		CreatedAt:      new(int64(1704103200)),
+		LastActivityAt: new(int64(1704103205)),
+	})
+	source, found, err = provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: literalID})
+	require.NoError(t, err)
+	require.True(t, found, "literal id wins when the parent has no matching tree")
+	assert.Equal(t, literalPath, source.DisplayPath)
+
+	// Once the parent really hosts a subagent tree rooted at node 7, the
+	// derived key keeps its meaning and wins over the literal collision.
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: "literal", NodeID: 1, ChatMessage: `{"role":"user","content":"parent prompt"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: "literal", NodeID: 7, ChatMessage: `{"role":"system","content":"You are a subagent of Devin\nWork."}`, CreatedAt: 1704103202},
+		devinSyntheticMessageNodeRow{SessionID: "literal", NodeID: 8, ParentNodeID: new(int64(7)), ChatMessage: `{"role":"user","content":"subtask"}`, CreatedAt: 1704103203},
+	)
+	source, found, err = provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: literalID})
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t,
+		devinSubagentVirtualSourcePath(fixture.sessionVirtualPath("literal"), 7),
+		source.DisplayPath,
+		"a real subagent tree keeps priority over a colliding literal id",
+	)
+}
+
+// With a live export file the fingerprint hashes metadata plus transcript
+// bytes, but message_nodes remains the authoritative representation at parse
+// time. A node-only change must still move the fingerprint, or the stale
+// session never reparses.
+func TestDevinProviderFingerprintChangesWhenNodesChangeWithLiveTranscript(t *testing.T) {
+	const sessionID = "session-node-digest"
+	fixture := newDevinTestFixture(t,
+		devinSessionRow{
+			ID:               sessionID,
+			Title:            "Node digest",
+			WorkingDirectory: "/tmp/node-digest",
+			Model:            "db-model",
+			CreatedAt:        new(int64(1704103200)),
+			LastActivityAt:   new(int64(1704103209)),
+		},
+	)
+	fixture.writeTranscript(t, sessionID, `{"steps":[{"step_id":"s1","source":"user","message":"hi"}]}`)
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"alpha"}`, CreatedAt: 1704103201},
+	)
+
+	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{fixture.Root}})
+	require.True(t, ok)
+
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: sessionID})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	before, err := provider.Fingerprint(t.Context(), source)
+	require.NoError(t, err)
+
+	// An in-place content edit changes neither row count nor timestamps; only
+	// the payload length digest moves the hash.
+	execDevinTestSQL(t, fixture.DBPath,
+		`UPDATE message_nodes SET chat_message = '{"role":"user","content":"a much longer alpha"}' WHERE session_id = 'session-node-digest'`)
+
+	after, err := provider.Fingerprint(t.Context(), source)
+	require.NoError(t, err)
+	assert.Equal(t, before.Key, after.Key)
+	assert.NotEqual(t, before.Hash, after.Hash)
+
+	// A brand-new node moves the digest too.
+	execDevinTestSQL(t, fixture.DBPath,
+		`INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message, created_at) VALUES ('session-node-digest', 2, 1, '{"role":"assistant","content":"reply"}', 1704103205)`)
+
+	later, err := provider.Fingerprint(t.Context(), source)
+	require.NoError(t, err)
+	assert.NotEqual(t, after.Hash, later.Hash)
+}

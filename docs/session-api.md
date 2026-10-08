@@ -651,7 +651,7 @@ with `--include-one-shot`, `--include-automated`, or `--include-children`.
 | Flag                  | HTTP param          | Notes                                                                                                                                                                             |
 | --------------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--regex`             | `mode=regex`        | Treat pattern as an RE2 regex                                                                                                                                                     |
-| `--fts`               | `mode=fts`          | Tokenized FTS5 search; messages-only                                                                                                                                              |
+| `--fts`               | `mode=fts`          | Tokenized FTS5 over message and tool content; messages-only on the PG/DuckDB/ClickHouse read stores                                                                               |
 | `--semantic`          | `mode=semantic`     | Vector search over user/assistant messages; messages-only — see [Semantic Search](/docs/semantic-search/)                                                                         |
 | `--hybrid`            | `mode=hybrid`       | Semantic + FTS reciprocal rank fusion; messages-only — see [Semantic Search](/docs/semantic-search/)                                                                              |
 | `--scope`             | `scope`             | `top`, `all` (default), or `subordinate` — semantic/hybrid only; supersedes `include_children` in those modes                                                                     |
@@ -676,9 +676,13 @@ with `--include-one-shot`, `--include-automated`, or `--include-children`.
 | `--limit`             | `limit`             | int; default 50, max 500                                                                                                                                                          |
 | `--cursor`            | `cursor`            | int — pagination cursor from a previous response                                                                                                                                  |
 
-`--regex`, `--fts`, `--semantic`, and `--hybrid` are mutually exclusive. `--fts`
-is the fastest mode on large archives but only searches message bodies;
-substring (the default) and regex modes also walk `tool_calls.input_json`,
+`--regex`, `--fts`, `--semantic`, and `--hybrid` are mutually exclusive. On the
+SQLite archive `--fts` is the fastest mode on large archives and searches
+message bodies plus tool inputs and results through the `messages_fts` and
+`tool_content_fts` indexes, honoring `--in`; the PostgreSQL, DuckDB, and
+ClickHouse read stores index message content only, so `mode=fts` there is
+messages-only and `--in` naming a tool source is rejected. Substring (the
+default) and regex modes also walk `tool_calls.input_json`,
 `tool_calls.result_content`, and the `tool_result_events` rows. `--semantic` and
 `--hybrid` require an embedding index and return a single ranked page
 (`--cursor` is rejected) — see [Semantic Search](/docs/semantic-search/) for

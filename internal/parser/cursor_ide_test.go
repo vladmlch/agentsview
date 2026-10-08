@@ -1337,6 +1337,59 @@ func TestCursorIDE_FallbackOnBusy(t *testing.T) {
 	assert.Equal(t, cursorIDEIDPrefix+composerID, outcome.Results[0].Result.Session.ID)
 }
 
+// A container that stays locked AND cannot be scratch-copied must report
+// every stored member present: answering "absent" for an unreadable database
+// would tombstone archived sessions.
+func TestCursorIDEBatchMemberPresentFallbackFailureKeepsMembers(t *testing.T) {
+	composerID := "busy-composer-0001"
+	dbPath := createCursorIDEDB(t, []cursorIDETestComposer{{
+		id:        composerID,
+		name:      "locked session",
+		createdAt: 1718954851522,
+		bubbles: []cursorIDETestBubble{
+			{id: "b1", bubbleType: cursorIDEBubbleTypeUser, text: "hello", createdAt: "2026-06-21T07:27:31.522Z"},
+		},
+	}})
+
+	writer, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer writer.Close()
+	writer.SetMaxOpenConns(1)
+	_, err = writer.ExecContext(t.Context(), "PRAGMA journal_mode=WAL")
+	require.NoError(t, err)
+	_, err = writer.ExecContext(t.Context(), "PRAGMA locking_mode=EXCLUSIVE")
+	require.NoError(t, err)
+
+	tx, err := writer.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.ExecContext(t.Context(), "INSERT INTO cursorDiskKV VALUES ('dummy', 'x')")
+	require.NoError(t, err)
+
+	// A directory where the journal sibling would sit cannot be copied as a
+	// file, so the busy fallback's scratch copy fails while the lock holds.
+	require.NoError(t, os.Mkdir(dbPath+"-journal", 0o755))
+
+	container := multiSessionSource{Container: dbPath}
+	members := []multiSessionSource{
+		{
+			Path:      VirtualSourcePath(dbPath, composerID),
+			Container: dbPath,
+			MemberID:  composerID,
+		},
+		{
+			Path:      VirtualSourcePath(dbPath, "ghost-42"),
+			Container: dbPath,
+			MemberID:  "ghost-42",
+		},
+	}
+	present := cursorIDEBatchMemberPresent(t.Context(), container, members)
+	for _, member := range members {
+		assert.True(t, present[member.Path],
+			"member %s must report present while the container is unreadable", member.MemberID)
+	}
+}
+
 func TestDistributeCursorIDETokens(t *testing.T) {
 	tests := []struct {
 		name     string

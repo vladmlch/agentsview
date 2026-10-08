@@ -16,8 +16,9 @@ const (
 
 // simpleFTSJiebaMu serializes the two upstream entry points that share
 // cppjieba's module-global dictionary state: jieba_dict and jieba_query.
-// The simple FTS tokenizer used by MATCH, trigger maintenance, and rebuilds
-// does not read that state; it tokenizes documents directly by code point.
+// The simple FTS tokenizer used by MATCH, batched index maintenance, and
+// rebuilds does not read that state; it tokenizes documents directly by
+// code point.
 var simpleFTSJiebaMu sync.Mutex
 
 func init() {

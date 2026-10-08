@@ -45,7 +45,11 @@ func TestClaudeLateToolResultPreservesFailureMetadata(t *testing.T) {
 	require.Len(t, stored[1].ToolCalls, 1)
 	call := stored[1].ToolCalls[0]
 	assert.Equal(t, "File does not exist.", call.ResultContent)
-	require.Empty(t, call.ResultEvents, "single result event is collapsed into result_content")
+	require.Len(t, call.ResultEvents, 1,
+		"an errored result event must not collapse into result_content")
+	assert.Equal(t, "errored", call.ResultEvents[0].Status)
+	assert.Equal(t, "File does not exist.", call.ResultEvents[0].Content)
+	assert.Equal(t, "2024-01-01T10:00:02Z", call.ResultEvents[0].Timestamp)
 	assert.Equal(t, 1, signals.ComputeToolHealth(ingest.ExtractToolCallRows(stored)).FailureSignalCount)
 
 	provider, ok := parser.NewProvider(parser.AgentClaude, parser.ProviderConfig{Roots: []string{root}, Machine: "local"})
@@ -57,8 +61,8 @@ func TestClaudeLateToolResultPreservesFailureMetadata(t *testing.T) {
 	require.Len(t, parsed, 1)
 	candidate, err := ingest.PrepareCandidate(t.Context(), parsed[0], ingest.ContentOptions{})
 	require.NoError(t, err)
-	assert.Equal(t, candidate.Messages[1].ToolCalls[0].ResultContent, call.ResultContent,
-		"full parsing and late-result storage must retain the same summary")
+	assert.Equal(t, candidate.Messages[1].ToolCalls[0].ResultEvents, call.ResultEvents,
+		"full parsing and late-result storage must retain the same metadata")
 
 	require.NoError(t, database.SetSessionDataVersionsContext(t.Context(), []string{"session"}, db.CurrentDataVersion()-1))
 	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced,
@@ -70,5 +74,5 @@ func TestClaudeLateToolResultPreservesFailureMetadata(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, stored, 2)
 	require.Len(t, stored[1].ToolCalls, 1)
-	assert.Equal(t, call.ResultContent, stored[1].ToolCalls[0].ResultContent)
+	assert.Equal(t, call.ResultEvents, stored[1].ToolCalls[0].ResultEvents)
 }

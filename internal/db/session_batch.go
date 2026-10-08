@@ -823,13 +823,22 @@ func fillEmptyToolResultsTx(
 
 // extendTruncatedTextTx writes candidate text into stored messages at
 // ordinals up to maxOrd whose stored text the candidate extends. It updates
-// only content and content_length by row id.
+// only content and content_length by row id, and keeps the FTS index in
+// step so the completed tail becomes searchable (the rowid is unchanged,
+// so the old entry is deleted and the new content re-indexed, the same
+// pattern applySessionMessageDiffTx uses for updated rows).
 func extendTruncatedTextTx(
 	tx transactionQueries, sessionID string, msgs []Message, maxOrd int,
 ) (int, error) {
-	extended := 0
+	type textExtension struct {
+		id            int64
+		content       string
+		contentLength int
+	}
+	var pending []textExtension
+	seen := make(map[int]bool)
 	for _, m := range msgs {
-		if m.Ordinal > maxOrd {
+		if m.Ordinal > maxOrd || seen[m.Ordinal] {
 			continue
 		}
 		var id int64
@@ -851,19 +860,62 @@ func extendTruncatedTextTx(
 		if !IsTextExtension(stored, m.Content) {
 			continue
 		}
+		seen[m.Ordinal] = true
+		pending = append(pending, textExtension{
+			id:            id,
+			content:       m.Content,
+			contentLength: m.ContentLength,
+		})
+	}
+	if len(pending) == 0 {
+		return 0, nil
+	}
+
+	active, err := activeFTSTablesTx(tx)
+	if err != nil {
+		return 0, err
+	}
+	for _, p := range pending {
+		for _, table := range active {
+			if _, err := tx.Exec(
+				`INSERT INTO `+table+`(`+table+`, rowid, content)
+				 SELECT 'delete', id, content FROM messages WHERE id = ?`,
+				p.id,
+			); err != nil {
+				return 0, fmt.Errorf(
+					"deleting %s entry for extended message %d: %w",
+					table, p.id, err,
+				)
+			}
+		}
+	}
+	for _, p := range pending {
 		if _, err := tx.Exec(
 			`UPDATE messages SET content = ?, content_length = ?
 			 WHERE id = ?`,
-			m.Content, m.ContentLength, id,
+			p.content, p.contentLength, p.id,
 		); err != nil {
 			return 0, fmt.Errorf(
-				"extending text for %s ordinal %d: %w",
-				sessionID, m.Ordinal, err,
+				"extending text for %s message id %d: %w",
+				sessionID, p.id, err,
 			)
 		}
-		extended++
 	}
-	return extended, nil
+	for _, p := range pending {
+		for _, table := range active {
+			if _, err := tx.Exec(
+				`INSERT INTO `+table+`(rowid, content)
+				 SELECT id, content FROM messages WHERE id = ?`,
+				p.id,
+			); err != nil {
+				return 0, fmt.Errorf(
+					"indexing %s entry for extended message %d: %w",
+					table, p.id, err,
+				)
+			}
+		}
+	}
+	return len(pending), nil
 }
 
 func messagesAfterOrdinal(msgs []Message, maxOrd int) []Message {
