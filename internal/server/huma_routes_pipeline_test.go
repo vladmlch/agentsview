@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json/v2"
 	"fmt"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -34,6 +35,9 @@ type pipelineTestEnv struct {
 	*testEnv
 	hub     *pipeline.Hub
 	sandbox *pipeline.Sandbox
+	// pg exposes the playground wiring so tests can tune knobs such
+	// as the observe idle timeout before a session opens.
+	pg *server.PipelinePlayground
 	// tap records the observer observe mode installs, standing in for
 	// the daemon's embed schedulers, which the test env does not build.
 	tap *pipelineObserverTarget
@@ -114,6 +118,7 @@ func buildPipelineTestEnv(t *testing.T, withEngine bool) *pipelineTestEnv {
 		},
 		hub:     hub,
 		sandbox: sandbox,
+		pg:      pg,
 		tap:     tap,
 	}
 }
@@ -452,6 +457,43 @@ func TestPipelineObserveDetachedOnShutdown(t *testing.T) {
 		"shutdown must close the forgotten observe run")
 	_, active := te.hub.ActiveRun()
 	assert.False(t, active)
+}
+
+// TestPipelineObserveAutoDetachesWhenUnwatched covers the dead-client
+// path: a browser killed mid-observe never sends DELETE /observe, so
+// the watchdog must end the session itself once no subscribers remain
+// — otherwise the taps keep recording the production pipeline into
+// the hub forever. A live subscription must hold the session open.
+func TestPipelineObserveAutoDetachesWhenUnwatched(t *testing.T) {
+	te := setupPipelineTestEnv(t)
+	te.pg.ObserveIdleTimeout = 50 * time.Millisecond
+
+	rec := pipelineRequest(t, te, http.MethodPost,
+		"/api/v1/pipeline/observe", map[string]string{
+			"run_id": "observe-idle",
+		})
+	require.Equal(t, http.StatusOK, rec.Code,
+		"body: %s", rec.Body.String())
+
+	// A subscriber on the run's stream keeps the session attached
+	// well past the idle timeout.
+	_, unsub := te.hub.Subscribe(math.MaxUint64)
+	assert.Never(t, func() bool { return te.tap.observer() == nil },
+		150*time.Millisecond, 10*time.Millisecond,
+		"a watched observe session must stay attached")
+	unsub()
+
+	require.Eventually(t, func() bool {
+		return te.tap.observer() == nil
+	}, 5*time.Second, 10*time.Millisecond,
+		"an unwatched observe session must detach itself")
+	_, active := te.hub.ActiveRun()
+	assert.False(t, active)
+	events := te.hub.RunEvents("observe-idle")
+	require.NotEmpty(t, events)
+	assert.Equal(t, pipevents.KindRunFinished,
+		events[len(events)-1].Kind,
+		"auto-detach must close the run with its bookend")
 }
 
 func TestPipelineRecordingsListDownloadImport(t *testing.T) {

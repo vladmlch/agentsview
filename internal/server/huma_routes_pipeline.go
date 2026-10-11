@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"os"
@@ -32,6 +33,12 @@ const pipelineRunStartTimeout = 10 * time.Second
 var errPipelineRunStartTimeout = errors.New(
 	"pipeline: run did not start in time")
 
+// observeIdleTimeoutDefault is how long an observe session may have
+// no event subscribers before the server detaches it. EventSource
+// reconnects land in seconds, so a live stream never trips it — the
+// timeout only catches clients that died without sending the DELETE.
+const observeIdleTimeoutDefault = 60 * time.Second
+
 // PipelineObserverTarget accepts a pipeline event observer, matching
 // the SetPipelineObserver signatures of *sync.Engine and the embed
 // schedulers. Observe mode attaches the hub to every configured target
@@ -55,6 +62,10 @@ type PipelinePlayground struct {
 	// events land in observe recordings alongside the real engine's
 	// events — and can never leak into a sandbox run's recording.
 	EmbedTaps []PipelineObserverTarget
+	// ObserveIdleTimeout detaches an observe session whose event
+	// stream keeps no subscribers for this long. Zero uses
+	// observeIdleTimeoutDefault.
+	ObserveIdleTimeout time.Duration
 
 	// sessionMu serializes run and observe window opens. The hub itself
 	// enforces a single active run; holding sessionMu across the
@@ -374,9 +385,52 @@ func (s *Server) humaPipelineObserveStart(
 		t.SetPipelineObserver(pg.Hub)
 	}
 	pg.observeRunID = runID
+	go pg.watchObserve(runID)
 	return &jsonOutput[pipelineRunStarted]{
 		Body: pipelineRunStarted{RunID: runID},
 	}, nil
+}
+
+// watchObserve detaches an observe session whose event stream keeps
+// no subscribers for the whole idle timeout: the client died without
+// sending DELETE /observe, and leaving the taps attached would keep
+// recording the production pipeline into the hub's log indefinitely.
+// Subscriber presence is polled at a fraction of the timeout; an
+// EventSource reconnect is seconds, so a live stream never trips it.
+// The goroutine exits as soon as observeRunID no longer names its
+// session, so at most one watchdog runs per session and none
+// outlives it.
+func (pg *PipelinePlayground) watchObserve(runID string) {
+	timeout := pg.ObserveIdleTimeout
+	if timeout <= 0 {
+		timeout = observeIdleTimeoutDefault
+	}
+	interval := max(timeout/4, time.Millisecond)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	idleTicks := 0
+	for range ticker.C {
+		pg.sessionMu.Lock()
+		if pg.observeRunID != runID {
+			pg.sessionMu.Unlock()
+			return
+		}
+		if pg.Hub.SubscriberCount() == 0 {
+			idleTicks++
+		} else {
+			idleTicks = 0
+		}
+		if time.Duration(idleTicks)*interval < timeout {
+			pg.sessionMu.Unlock()
+			continue
+		}
+		log.Printf(
+			"pipeline: observe run %s auto-detached after %s "+
+				"without subscribers", runID, timeout)
+		pg.detachObserveLocked()
+		pg.sessionMu.Unlock()
+		return
+	}
 }
 
 // humaPipelineObserveStop detaches the hub from the real engine and the
