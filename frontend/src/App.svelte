@@ -68,6 +68,7 @@
   import TrashPage from "./lib/components/trash/TrashPage.svelte";
   import RecentEditsPage from "./lib/components/recentedits/RecentEditsPage.svelte";
   import DataPage from "./lib/components/data/DataPage.svelte";
+  import PipelinePage from "./lib/components/pipeline/PipelinePage.svelte";
   import SettingsPage from "./lib/components/settings/SettingsPage.svelte";
   import { sessions, filtersToParams } from "./lib/stores/sessions.svelte.js";
   import { messages } from "./lib/stores/messages.svelte.js";
@@ -907,6 +908,10 @@
   <div class="page-scroll data-page-host">
     <DataPage />
   </div>
+{:else if router.route === "pipeline"}
+  <div class="page-scroll pipeline-page-host">
+    <PipelinePage />
+  </div>
 {:else if router.route === "settings"}
   <div class="page-scroll settings-page-host">
     <SettingsPage />
@@ -1025,6 +1030,11 @@
   }
 
   .data-page-host {
+    display: flex;
+    overflow: hidden;
+  }
+
+  .pipeline-page-host {
     display: flex;
     overflow: hidden;
   }
