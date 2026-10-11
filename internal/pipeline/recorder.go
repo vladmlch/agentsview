@@ -119,6 +119,24 @@ func (r *Recorder) ReadRecording(
 	return h, evs, nil
 }
 
+// ReadRecordingFile returns the raw bytes of a stored recording.
+// Download endpoints use it instead of ReadRecording so the served
+// bytes are the file on disk, not a re-encode of parsed events.
+func (r *Recorder) ReadRecordingFile(name string) ([]byte, error) {
+	if err := validRecordingName(name); err != nil {
+		return nil, err
+	}
+	if !r.enabled() {
+		return nil, errors.New("pipeline: recordings disabled")
+	}
+	data, err := os.ReadFile(r.path(name))
+	if err != nil {
+		return nil, fmt.Errorf(
+			"pipeline: read recording: %w", err)
+	}
+	return data, nil
+}
+
 // ImportRecording stores an uploaded recording stream under name. The
 // stream must parse as a valid recording under pipevents.ReadRecording
 // rules; invalid input leaves no file behind. An existing file with

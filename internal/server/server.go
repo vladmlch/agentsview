@@ -198,6 +198,11 @@ type Server struct {
 	// telemetryCapture receives UI telemetry events; nil leaves the route unregistered.
 	telemetryCapture http.Handler
 
+	// pipeline, when set, backs the /api/v1/pipeline playground routes.
+	// Nil leaves the group unregistered — e.g. when sandbox init failed
+	// or the server runs without the playground (pg-serve, plain tests).
+	pipeline *PipelinePlayground
+
 	artifactExchangeRunner ArtifactExchangeRunner
 	rawSyncTenant          string
 	rawSyncDeviceAuth      RawSyncDeviceAuth
