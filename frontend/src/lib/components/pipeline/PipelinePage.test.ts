@@ -212,31 +212,24 @@ describe("PipelinePage", () => {
     unmount();
   });
 
-  it("does not reset the wall-clock playhead when the speed control is used in time mode", async () => {
-    // The timeline's events-per-tick group is inert in time mode —
-    // letting its click reach play() would restart the interval and
-    // reset playheadMs to the cursor event's at_ms, rewinding up to
-    // a tick of progress.
-    vi.useFakeTimers();
+  it("hides the timeline's events-per-tick speed group in time mode", async () => {
+    // In time mode pace comes from rtSpeed, so the events-per-tick
+    // control is removed rather than left inert — a click reaching
+    // play() would restart the interval and reset playheadMs to the
+    // cursor event's at_ms, rewinding up to a tick of progress.
     const store = testStore();
     store.events = EVENTS;
-    store.cursor = 0;
     store.playMode = "time";
     const { unmount } = render(PipelinePage, { props: { store } });
-    const play = vi.spyOn(store, "play");
-    store.play(); // starts the wall-clock interval
-    play.mockClear();
+    await tick();
+    expect(screen.queryByRole("radiogroup", { name: /events per tick/i })).toBeNull();
 
+    // Back in events mode the control returns and sets store.speed.
+    store.playMode = "events";
+    await tick();
     const speed = screen.getByRole("radiogroup", {
       name: /events per tick/i,
     });
-    await fireEvent.click(within(speed).getByRole("radio", { name: "20x" }));
-    expect(play).not.toHaveBeenCalled();
-    expect(store.speed).toBe(1);
-
-    // The same control keeps working once events mode is back.
-    store.pause();
-    store.playMode = "events";
     await fireEvent.click(within(speed).getByRole("radio", { name: "20x" }));
     expect(store.speed).toBe(20);
 

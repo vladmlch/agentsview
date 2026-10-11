@@ -32,6 +32,10 @@
     playing?: boolean;
     /** Events per playback tick. */
     speed?: number;
+    /** Replay pacing the parent transport is in. "time" replays by
+     * wall-clock spacing, where an events-per-tick speed group is
+     * meaningless — it is hidden instead of left inert. */
+    pacing?: "events" | "time";
     /** When set, only events of this stage are listed (seek indexes stay real). */
     filter?: PipelineStage | null;
     /** Inspector selection: an index into `events`, not a seq. */
@@ -67,6 +71,7 @@
     live = true,
     playing = false,
     speed = 1,
+    pacing = "events",
     filter = null,
     selected = null,
     kindFilter = new Set<string>(),
@@ -304,12 +309,14 @@
     >
       <StepForwardIcon size={14} />
     </IconButton>
-    <SegmentedControl
-      options={SPEED_OPTIONS}
-      value={String(speed)}
-      ariaLabel="Replay speed, events per tick"
-      onchange={(v) => onspeed(Number(v))}
-    />
+    {#if pacing === "events"}
+      <SegmentedControl
+        options={SPEED_OPTIONS}
+        value={String(speed)}
+        ariaLabel="Replay speed, events per tick"
+        onchange={(v) => onspeed(Number(v))}
+      />
+    {/if}
     <span class="timeline-pos">{cursor} / {events.length}</span>
     <span class="timeline-live" class:on={live}>
       {#if playing}replaying{:else if live}live{:else}paused{/if}
