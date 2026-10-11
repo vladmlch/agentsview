@@ -132,6 +132,20 @@ describe("PipelineTimeline", () => {
     expect(onspeed).toHaveBeenCalledWith(5);
   });
 
+  it("hides the events-per-tick speed group under wall-clock pacing", () => {
+    const { unmount } = render(PipelineTimeline, {
+      props: { events: EVENTS, cursor: 1, live: false, pacing: "time" },
+    });
+    expect(screen.queryByRole("radiogroup", { name: /events per tick/i })).toBeNull();
+    unmount();
+
+    // Explicit events pacing — and the default above — keep it visible.
+    render(PipelineTimeline, {
+      props: { events: EVENTS, cursor: 1, live: false, pacing: "events" },
+    });
+    expect(screen.getByRole("radiogroup", { name: /events per tick/i })).toBeTruthy();
+  });
+
   it("disables stepping past the buffer ends", () => {
     render(PipelineTimeline, {
       props: { events: EVENTS, cursor: 0, live: false },

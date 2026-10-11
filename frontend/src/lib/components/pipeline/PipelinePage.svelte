@@ -141,11 +141,11 @@
     return id.length > 10 ? `${id.slice(0, 10)}…` : id;
   }
 
-  /** Events-per-tick pace from the timeline's speed group. Inert in
-   * time mode — worse, routing the click through play() would restart
-   * the interval and reset playheadMs to the cursor event's at_ms,
-   * rewinding up to a tick of wall-clock progress per click. The
-   * control itself stays visible; hiding it is deferred. */
+  /** Events-per-tick pace from the timeline's speed group. The group
+   * is hidden in time mode (the timeline's `pacing` prop), so this
+   * guard only covers a stray call — routing a click through play()
+   * would restart the interval and reset playheadMs to the cursor
+   * event's at_ms, rewinding up to a tick of wall-clock progress. */
   function setSpeed(s: number): void {
     if (store.playMode !== "events") return;
     if (store.playing) {
@@ -299,6 +299,7 @@
         live={store.live}
         playing={store.playing}
         speed={store.speed}
+        pacing={store.playMode}
         filter={stageFilter}
         selected={store.selected}
         kindFilter={kindFilter}
