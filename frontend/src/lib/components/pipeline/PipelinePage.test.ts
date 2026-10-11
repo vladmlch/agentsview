@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { tick } from "svelte";
 import { fireEvent, render, screen, within } from "@testing-library/svelte";
 import PipelinePage from "./PipelinePage.svelte";
@@ -29,6 +29,10 @@ const EVENTS: PipelineEvent[] = [
 ];
 
 describe("PipelinePage", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("renders the header, diagram and panes without a server", async () => {
     const store = testStore();
     const { container, unmount } = render(PipelinePage, {
@@ -205,6 +209,37 @@ describe("PipelinePage", () => {
     expect(store.playMode).toBe("events");
     await tick();
     expect(screen.queryByRole("radiogroup", { name: /speed multiplier/i })).toBeNull();
+    unmount();
+  });
+
+  it("does not reset the wall-clock playhead when the speed control is used in time mode", async () => {
+    // The timeline's events-per-tick group is inert in time mode —
+    // letting its click reach play() would restart the interval and
+    // reset playheadMs to the cursor event's at_ms, rewinding up to
+    // a tick of progress.
+    vi.useFakeTimers();
+    const store = testStore();
+    store.events = EVENTS;
+    store.cursor = 0;
+    store.playMode = "time";
+    const { unmount } = render(PipelinePage, { props: { store } });
+    const play = vi.spyOn(store, "play");
+    store.play(); // starts the wall-clock interval
+    play.mockClear();
+
+    const speed = screen.getByRole("radiogroup", {
+      name: /events per tick/i,
+    });
+    await fireEvent.click(within(speed).getByRole("radio", { name: "20x" }));
+    expect(play).not.toHaveBeenCalled();
+    expect(store.speed).toBe(1);
+
+    // The same control keeps working once events mode is back.
+    store.pause();
+    store.playMode = "events";
+    await fireEvent.click(within(speed).getByRole("radio", { name: "20x" }));
+    expect(store.speed).toBe(20);
+
     unmount();
   });
 });
