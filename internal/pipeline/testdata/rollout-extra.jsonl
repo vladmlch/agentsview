@@ -1,0 +1,5 @@
+{"type":"session_meta","timestamp":"2024-01-04T14:45:00Z","payload":{"id":"d3d3d3d3-4444-4555-8666-777777777777","cwd":"/workspace/project-d","originator":"codex_cli_rs"}}
+{"type":"turn_context","timestamp":"2024-01-04T14:45:01Z","payload":{"model":"gpt-5.4","cwd":"/tmp"}}
+{"type":"response_item","timestamp":"2024-01-04T14:45:02Z","payload":{"role":"user","content":[{"type":"input_text","text":"archive me"}]}}
+{"type":"response_item","timestamp":"2024-01-04T14:45:03Z","payload":{"role":"assistant","content":[{"type":"output_text","text":"done"}]}}
+{"type":"event_msg","timestamp":"2024-01-04T14:45:04Z","payload":{"type":"token_count","info":{"last_token_usage":{"cached_input_tokens":0,"total_tokens":230,"input_tokens":200,"output_tokens":30}}}}

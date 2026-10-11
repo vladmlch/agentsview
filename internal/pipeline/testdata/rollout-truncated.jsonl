@@ -1,0 +1,2 @@
+{"type":"session_meta","timestamp":"2024-01-02T09:30:00Z","payload":{"cwd":"/workspace/project-b","originator":"codex_cli_rs","id":"b1b1b1b1-2222-4333-8444-555555555555"}}
+{"type":"turn_context","timestamp":"2024-01-02T09:30:01Z","payload":{"model":"gpt-5.4","cwd":"/tmp"}}
