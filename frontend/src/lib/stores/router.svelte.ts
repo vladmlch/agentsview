@@ -16,6 +16,7 @@ export type Route =
   | "trash"
   | "recent-edits"
   | "data"
+  | "pipeline"
   | "settings";
 
 const VALID_ROUTES: ReadonlySet<string> = new Set<Route>([
@@ -30,6 +31,7 @@ const VALID_ROUTES: ReadonlySet<string> = new Set<Route>([
   "trash",
   "recent-edits",
   "data",
+  "pipeline",
   "settings",
 ]);
 
