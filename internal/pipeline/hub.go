@@ -199,8 +199,14 @@ func (h *Hub) EndRun(stats map[string]any) {
 // the buffered log replays first, then live events follow. The channel
 // holds up to 1024 events; a subscriber that falls further behind
 // loses events (drop-on-full) rather than slowing producers — seq gaps
-// reveal the loss. The returned function unsubscribes and closes the
-// channel; it is safe to call more than once.
+// reveal the loss. The cap applies to replay too, and the backlog is
+// the global log, not one run's: replaying an old run through
+// Subscribe can deliver nothing but heartbeats once the log grows past
+// the buffer. Handlers that owe a complete replay must serve the
+// lossless RunEvents snapshot instead and reserve Subscribe for the
+// live tail (subscribing before snapshotting closes the seam — overlap
+// is deduped by seq). The returned function unsubscribes and closes
+// the channel; it is safe to call more than once.
 func (h *Hub) Subscribe(
 	afterSeq uint64,
 ) (<-chan pipevents.Event, func()) {

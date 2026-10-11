@@ -244,10 +244,15 @@ type pipelineRunEventsInput struct {
 	AfterSeq uint64 `query:"after_seq" doc:"Only events with seq greater than this"`
 }
 
-// humaPipelineRunEvents streams one run's events as SSE: the hub's
-// buffered log replays first (Subscribe semantics), then live events
-// tail until the run's run_finished bookend — the last event stamped
-// with that run id — closes the stream. Events outside the run window
+// humaPipelineRunEvents streams one run's events as SSE. Replay comes
+// from the run's own event list (Hub.RunEvents), which is lossless —
+// the subscriber channel is capped at 1024 events of the global log,
+// so replaying through Subscribe would silently truncate any run whose
+// post-after_seq backlog crosses that cap. The live tail is a
+// subscription registered before the snapshot is taken, so an event
+// observed between the two lands in both and is deduped by seq, never
+// dropped. The run's run_finished bookend — the last event stamped
+// with that run id — closes the stream; events outside the run window
 // carry no run id and are filtered out.
 func (s *Server) humaPipelineRunEvents(
 	_ context.Context, in *pipelineRunEventsInput,
@@ -264,16 +269,40 @@ func (s *Server) humaPipelineRunEvents(
 				apiResponseError{Message: "streaming not supported"})
 			return
 		}
-		// A finished run whose last event sits at or before after_seq
-		// has nothing left to deliver — the client already consumed the
-		// whole stream. Close immediately instead of heartbeating
-		// forever: replay would produce no events for this run, and no
-		// live event can ever carry this (single-use) run id again.
-		if pipelineRunFullyConsumed(pg.Hub, in.ID, in.AfterSeq) {
+		// Subscribe first: from this point every observed event queues
+		// on the channel under h.mu. MaxUint64 skips the capped log
+		// replay — the snapshot below is the replay source, so backlog
+		// events would only consume buffer and be deduped away anyway.
+		live, unsub := pg.Hub.Subscribe(math.MaxUint64)
+		defer unsub()
+		snapshot := pg.Hub.RunEvents(in.ID)
+		if len(snapshot) == 0 {
+			return // run vanished; runs are never removed
+		}
+		// The run_finished bookend is always the run's last event. Read
+		// it off the snapshot's tail rather than the sent set: a resume
+		// cursor at or past the run's end skips the bookend entirely,
+		// yet the stream must still close instead of tailing forever.
+		finished := snapshot[len(snapshot)-1].Kind ==
+			pipevents.KindRunFinished
+		lastSeq := in.AfterSeq
+		for _, ev := range snapshot {
+			if ev.Seq <= lastSeq {
+				continue
+			}
+			if !stream.SendJSON("event", ev) {
+				return
+			}
+			lastSeq = ev.Seq
+		}
+		// A finished run closes here — including a fully consumed one
+		// (after_seq at or past its last event), which streams nothing
+		// instead of heartbeating forever. A run still open at snapshot
+		// time is tailed live; the seq watermark dedupes events that
+		// arrived between Subscribe and the snapshot.
+		if finished {
 			return
 		}
-		events, unsub := pg.Hub.Subscribe(in.AfterSeq)
-		defer unsub()
 		heartbeat := time.NewTicker(
 			sessionwatch.PollInterval * sessionwatch.HeartbeatTicks)
 		defer heartbeat.Stop()
@@ -281,16 +310,17 @@ func (s *Server) humaPipelineRunEvents(
 			select {
 			case <-hctx.Context().Done():
 				return
-			case ev, ok := <-events:
+			case ev, ok := <-live:
 				if !ok {
 					return
 				}
-				if ev.RunID != in.ID {
+				if ev.RunID != in.ID || ev.Seq <= lastSeq {
 					continue
 				}
 				if !stream.SendJSON("event", ev) {
 					return
 				}
+				lastSeq = ev.Seq
 				if ev.Kind == pipevents.KindRunFinished {
 					return
 				}
@@ -302,22 +332,6 @@ func (s *Server) humaPipelineRunEvents(
 			}
 		}
 	}}, nil
-}
-
-// pipelineRunFullyConsumed reports whether runID is finished and its
-// final event's seq is at or before afterSeq — the resume cursor is
-// already past the run's end. A still-open run answers false even when
-// its current events are all replayed, because its run_finished is yet
-// to arrive.
-func pipelineRunFullyConsumed(
-	h *pipeline.Hub, runID string, afterSeq uint64,
-) bool {
-	evs := h.RunEvents(runID)
-	if len(evs) == 0 {
-		return false
-	}
-	last := evs[len(evs)-1]
-	return last.Kind == pipevents.KindRunFinished && last.Seq <= afterSeq
 }
 
 type pipelineObserveInput struct {
@@ -470,6 +484,12 @@ type pipelineRecordingImported struct {
 // humaPipelineRecordingImport stores an uploaded JSONL recording after
 // validating it against the pipevents.ReadRecording contract, so a
 // corrupt file can never shadow a good recording under the same name.
+// The one forbidden target is the file an in-flight run is writing:
+// os.Rename over it would swap the path under the recorder's open
+// descriptor, silently detaching the rest of the run's events onto an
+// unlinked inode. The hub knows the active run id, so the collision
+// check runs under sessionMu — beside the run/observe window opens —
+// keeping check-then-rename race-free against run starts.
 func (s *Server) humaPipelineRecordingImport(
 	_ context.Context, in *pipelineRecordingImportInput,
 ) (*createdOutput[pipelineRecordingImported], error) {
@@ -493,7 +513,16 @@ func (s *Server) humaPipelineRecordingImport(
 		return nil, apiError(http.StatusBadRequest,
 			"invalid recording: "+err.Error())
 	}
-	if err := s.pipeline.Hub.Recorder().ImportRecording(
+	pg := s.pipeline
+	pg.sessionMu.Lock()
+	defer pg.sessionMu.Unlock()
+	if active, ok := pg.Hub.ActiveRun(); ok &&
+		name == active.RunID+".jsonl" {
+		return nil, apiError(http.StatusConflict,
+			fmt.Sprintf("pipeline recording %q is the live file of "+
+				"active run %q", name, active.RunID))
+	}
+	if err := pg.Hub.Recorder().ImportRecording(
 		name, bytes.NewReader(data)); err != nil {
 		return nil, internalError("import pipeline recording", err)
 	}
