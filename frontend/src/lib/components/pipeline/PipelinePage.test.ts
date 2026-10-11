@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from "vite-plus/test";
-import { fireEvent, render, screen } from "@testing-library/svelte";
+import { tick } from "svelte";
+import { fireEvent, render, screen, within } from "@testing-library/svelte";
 import PipelinePage from "./PipelinePage.svelte";
-import { PipelineStore } from "../../stores/pipeline.svelte.js";
+import { PipelineStore, type PipelineEvent } from "../../stores/pipeline.svelte.js";
 
 function testStore() {
   return new PipelineStore({
@@ -14,6 +15,18 @@ function testStore() {
     watch: vi.fn(() => ({ close: vi.fn() })) as never,
   });
 }
+
+const EVENTS: PipelineEvent[] = [
+  { seq: 1, at_ms: 1000, stage: "watch", kind: "batch_formed" },
+  {
+    seq: 2,
+    at_ms: 1050,
+    stage: "parse",
+    kind: "parse_started",
+    path: "/tmp/sandbox/src/f.jsonl",
+    payload: { mode: "full" },
+  },
+];
 
 describe("PipelinePage", () => {
   it("renders the header, diagram and panes without a server", async () => {
@@ -123,5 +136,75 @@ describe("PipelinePage", () => {
     await screen.findByRole("alert");
     expect(store.error).toMatch(/boom/);
     expect(screen.getByRole("button", { name: "Stop observe" })).toBeTruthy();
+  });
+
+  it("renders the inspector panel below the timeline", () => {
+    const store = testStore();
+    const { container, unmount } = render(PipelinePage, {
+      props: { store },
+    });
+
+    const inspector = container.querySelector(".inspector");
+    expect(inspector).not.toBeNull();
+    expect(inspector?.textContent).toContain("Click an event to inspect it.");
+    unmount();
+  });
+
+  it("selects an event through the store when a timeline row is clicked", async () => {
+    const store = testStore();
+    store.events = EVENTS;
+    store.cursor = EVENTS.length;
+    const { container, unmount } = render(PipelinePage, {
+      props: { store },
+    });
+
+    const row = container.querySelector('.timeline-row[data-idx="1"]');
+    expect(row).not.toBeNull();
+    await fireEvent.click(row!);
+    expect(store.selected).toBe(1);
+
+    const head = container.querySelector(".inspector-head");
+    expect(head?.textContent).toContain("#2");
+    expect(head?.textContent).toContain("parse_started");
+    unmount();
+  });
+
+  it("shows the dropped counter only when the store reports losses", async () => {
+    const store = testStore();
+    const { container, unmount } = render(PipelinePage, {
+      props: { store },
+    });
+
+    expect(container.textContent).not.toContain("events lost in transport");
+
+    store.dropped = 3;
+    await tick();
+    expect(container.textContent).toContain("3 events lost in transport");
+    unmount();
+  });
+
+  it("drives replay mode, tempo and pause-on-anomaly from the transport bar", async () => {
+    const store = testStore();
+    const { unmount } = render(PipelinePage, { props: { store } });
+
+    const modes = screen.getByRole("radiogroup", { name: /replay mode/i });
+    await fireEvent.click(within(modes).getByRole("radio", { name: "Time" }));
+    expect(store.playMode).toBe("time");
+
+    // The tempo control only exists in time mode.
+    const tempo = await screen.findByRole("radiogroup", {
+      name: /speed multiplier/i,
+    });
+    await fireEvent.click(within(tempo).getByRole("radio", { name: "100x" }));
+    expect(store.rtSpeed).toBe(100);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Pause on anomaly" }));
+    expect(store.pauseOnAnomaly).toBe(true);
+
+    await fireEvent.click(within(modes).getByRole("radio", { name: "Events" }));
+    expect(store.playMode).toBe("events");
+    await tick();
+    expect(screen.queryByRole("radiogroup", { name: /speed multiplier/i })).toBeNull();
+    unmount();
   });
 });
