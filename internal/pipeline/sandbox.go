@@ -4,10 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
-	"strings"
 	gosync "sync"
 	"time"
 
@@ -38,208 +36,7 @@ const (
 	// batching and 5 s dispatch floor would dominate a test run.
 	sandboxWatchBatchDelay  = 50 * time.Millisecond
 	sandboxWatchMinInterval = 50 * time.Millisecond
-
-	// defaultIdleQuiet is the quiet window a WaitIdle step applies
-	// when the scenario passes a non-positive duration.
-	defaultIdleQuiet = 500 * time.Millisecond
-
-	// idleDeliveryFloor is the minimum time a WaitIdle step waits
-	// before it may report idle. On macOS the FSEvents stream
-	// coalesces delivery at darwinFSEventsLatency (500 ms) before
-	// the watcher's batch delay and dispatch floor add more, so the
-	// step's own filesystem effects legitimately surface ~600 ms+
-	// after the write. A quiet window that only counts hub silence
-	// would expire while that work is still in flight; the floor
-	// holds the window open until delivery had a fair chance.
-	// 1.5 s covers the stream latency, the batch delay, dispatch,
-	// and the sync pass with slack.
-	idleDeliveryFloor = 1500 * time.Millisecond
 )
-
-// Scenario is the minimal scripted-run shape the sandbox executes.
-// Task 6 owns the full DSL (titles, summaries, fixture helpers); the
-// Step func shape is fixed here so its scenarios plug into Run
-// unchanged.
-type Scenario struct {
-	ID string
-	// Fixture names the scenario's source artifact; it is recorded as
-	// the run's source_file in the recording header.
-	Fixture string
-	Steps   []Step
-}
-
-// Step is one scripted action in a scenario. It runs against the
-// sandbox's RunContext and returns an error to abort the run.
-type Step func(ctx context.Context, rc *RunContext) error
-
-// RunContext exposes the sandbox surface a step may touch: the codex
-// source tree (SrcDir), the metadata dir beside it (MetaDir, which
-// holds session_index.jsonl), and the event hub. The runner stamps
-// each helper call as a scenario_step event.
-type RunContext struct {
-	SrcDir  string
-	MetaDir string
-	Hub     *Hub
-
-	ctx context.Context
-	n   int // index of the Step func currently running
-}
-
-// emitStep records the step's action in the active run. It fires
-// before the filesystem effect so the recording orders the scripted
-// cause ahead of the watch events it produces.
-func (rc *RunContext) emitStep(action, path, detail string) {
-	payload := map[string]any{"n": rc.n, "action": action}
-	if detail != "" {
-		payload["detail"] = detail
-	}
-	rc.Hub.ObserveEvent(pipevents.Event{
-		Stage:   pipevents.StageFinalize,
-		Kind:    pipevents.KindScenarioStep,
-		Path:    path,
-		Payload: payload,
-	})
-}
-
-// WriteFile writes content to rel under SrcDir, creating parent
-// directories — a rollout file drop or a rewrite.
-func (rc *RunContext) WriteFile(rel, content string) error {
-	rc.emitStep("write-file", rel, "")
-	path, err := sandboxPath(rc.SrcDir, rel)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("pipeline: step mkdir %s: %w", rel, err)
-	}
-	return os.WriteFile(path, []byte(content), 0o644)
-}
-
-// AppendFile appends content to rel under SrcDir — the live-append
-// ingest path.
-func (rc *RunContext) AppendFile(rel, content string) error {
-	rc.emitStep("append", rel, "")
-	path, err := sandboxPath(rc.SrcDir, rel)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("pipeline: step mkdir %s: %w", rel, err)
-	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	if _, err := f.WriteString(content); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
-}
-
-// RemoveFile deletes rel under SrcDir — the tombstone ingest path.
-func (rc *RunContext) RemoveFile(rel string) error {
-	rc.emitStep("delete", rel, "")
-	path, err := sandboxPath(rc.SrcDir, rel)
-	if err != nil {
-		return err
-	}
-	return os.Remove(path)
-}
-
-// WriteMeta writes content to name under MetaDir — sidecar files such
-// as session_index.jsonl that live beside sessions/, not inside it.
-func (rc *RunContext) WriteMeta(name, content string) error {
-	rc.emitStep("write-meta", name, "")
-	path, err := sandboxPath(rc.MetaDir, name)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("pipeline: step mkdir %s: %w", name, err)
-	}
-	return os.WriteFile(path, []byte(content), 0o644)
-}
-
-// WaitIdle blocks until the hub observes no new events for quiet, or
-// the run context ends — but never sooner than idleDeliveryFloor,
-// which gives the filesystem watcher a fair window to deliver the
-// step's own effects. A non-positive quiet uses defaultIdleQuiet.
-// The subscription opens before the window starts, so work queued in
-// the watcher but not yet dispatched still resets the timer.
-func (rc *RunContext) WaitIdle(quiet time.Duration) error {
-	if quiet <= 0 {
-		quiet = defaultIdleQuiet
-	}
-	rc.emitStep("wait-idle", "", quiet.String())
-	ctx := rc.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	// Subscribing at the max seq skips the buffered backlog: only
-	// events that arrive after this call count against the window.
-	ch, unsub := rc.Hub.Subscribe(math.MaxUint64)
-	defer unsub()
-	notBefore := time.Now().Add(max(quiet, idleDeliveryFloor))
-	timer := time.NewTimer(quiet)
-	defer timer.Stop()
-	reset := func() {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timer.Reset(quiet)
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case _, ok := <-ch:
-			if !ok {
-				return nil
-			}
-			reset()
-		case <-timer.C:
-			// A pending event counts as activity even when the
-			// timer branch won the select draw.
-			select {
-			case _, ok := <-ch:
-				if !ok {
-					return nil
-				}
-				reset()
-				continue
-			default:
-			}
-			if wait := time.Until(notBefore); wait > 0 {
-				timer.Reset(wait)
-				continue
-			}
-			return nil
-		}
-	}
-}
-
-// sandboxPath resolves rel under base, rejecting absolute paths and
-// parent traversal outside the sandbox.
-func sandboxPath(base, rel string) (string, error) {
-	if rel == "" {
-		return "", errors.New("pipeline: empty scenario path")
-	}
-	if filepath.IsAbs(rel) {
-		return "", fmt.Errorf(
-			"pipeline: absolute scenario path %q not allowed", rel)
-	}
-	p := filepath.Join(base, rel)
-	if p != base && !strings.HasPrefix(
-		p, base+string(filepath.Separator)) {
-		return "", fmt.Errorf(
-			"pipeline: scenario path %q escapes the sandbox", rel)
-	}
-	return p, nil
-}
 
 // Sandbox owns an isolated ingest pipeline: its own SQLite archive,
 // its own sync.Engine pointed at a private codex root, and a real
@@ -345,20 +142,40 @@ func (s *Sandbox) startPipeline(ctx context.Context) error {
 	// RegisterRoots — not a bare WatchRecursive — because it is the
 	// daemon's path on macOS: it also records the root's owning agent
 	// scopes, which rename classification and lifecycle coverage use.
-	results := w.RegisterRoots([]sync.WatchRoot{{
-		Path:      s.SrcDir,
-		Recursive: true,
-		Exists:    true,
-		Scopes: []sync.WatchScope{{
-			Agent:   string(parser.AgentCodex),
-			SyncDir: s.SrcDir,
-		}},
-	}}, sandboxWatchBudget)
-	if len(results) > 0 && results[0].Err != nil {
+	// The plan mirrors the codex provider's WatchPlan: the sessions
+	// tree recursively, plus the metadata dir shallowly so a
+	// session_index.jsonl title rename surfaces without waiting for a
+	// periodic sync. The shallow root also sees sandbox.db churn; the
+	// engine classifies those events to no source and drops them,
+	// matching how production ignores unrelated files under ~/.codex.
+	results := w.RegisterRoots([]sync.WatchRoot{
+		{
+			Path:      s.SrcDir,
+			Recursive: true,
+			Exists:    true,
+			Scopes: []sync.WatchScope{{
+				Agent:   string(parser.AgentCodex),
+				SyncDir: s.SrcDir,
+			}},
+		},
+		{
+			Path:      s.MetaDir,
+			Recursive: false,
+			Exists:    true,
+			Scopes: []sync.WatchScope{{
+				Agent:   string(parser.AgentCodex),
+				SyncDir: s.SrcDir,
+			}},
+		},
+	}, sandboxWatchBudget)
+	for i, res := range results {
+		if res.Err == nil {
+			continue
+		}
 		w.Stop()
 		engine.Close()
-		return fmt.Errorf(
-			"pipeline: watch %s: %w", s.SrcDir, results[0].Err)
+		return fmt.Errorf("pipeline: watch %s: %w",
+			[]string{s.SrcDir, s.MetaDir}[i], res.Err)
 	}
 	if err := w.Start(); err != nil {
 		w.Stop()
@@ -430,6 +247,14 @@ func (s *Sandbox) Reset(ctx context.Context) error {
 	if err := os.RemoveAll(
 		filepath.Join(s.Root, "scratch")); err != nil {
 		return fmt.Errorf("pipeline: wipe scratch: %w", err)
+	}
+	// A session_index.jsonl left beside sessions/ would leak its
+	// titles and its folded mtime into the next run's freshness
+	// decisions.
+	if err := os.Remove(filepath.Join(
+		s.MetaDir, parser.CodexSessionIndexFilename)); err != nil &&
+		!errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("pipeline: wipe session index: %w", err)
 	}
 	if err := os.RemoveAll(s.SrcDir); err != nil {
 		return fmt.Errorf("pipeline: wipe source dir: %w", err)

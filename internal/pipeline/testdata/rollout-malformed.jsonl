@@ -1,0 +1,6 @@
+{"type":"session_meta","timestamp":"2024-01-03T11:15:00Z","payload":{"id":"c2c2c2c2-3333-4444-8555-666666666666","cwd":"/workspace/project-c","originator":"codex_cli_rs"}}
+{"type":"turn_context","timestamp":"2024-01-03T11:15:01Z","payload":{"cwd":"/tmp","model":"gpt-5.4"}}
+{"type":"response_item","timestamp":"2024-01-03T11:15:02Z","payload":{"role":"user","content":[{"type":"input_text","text":"inspect the crash"}]}}
+{"type":"response_item","timestamp":"2024-01-03T11:15:03Z","payload":{"role":"assistant","content":[
+{"type":"response_item","timestamp":"2024-01-03T11:15:04Z","payload":{"role":"assistant","content":[{"type":"output_text","text":"the traceback points at config"}]}}
+{"type":"event_msg","timestamp":"2024-01-03T11:15:05Z","payload":{"type":"token_count","info":{"last_token_usage":{"cached_input_tokens":0,"total_tokens":736,"input_tokens":640,"output_tokens":96}}}}
