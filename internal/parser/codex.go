@@ -2244,6 +2244,10 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 			continuationLoaded = false
 
 			dec := json.NewDecoder(tee)
+			// The recovery pass re-classifies the same bytes the line pass
+			// just reported as malformed, so it restarts numbering: decoded
+			// records are numbered from 1 like physical lines would be.
+			lineNo = 0
 			for {
 				if err := ctx.Err(); err != nil {
 					return nil, nil, codexCursorState{}, false, nil, "", "", err
@@ -2256,6 +2260,10 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 					malformedLines++
 					break
 				}
+				// InputOffset sits just past the decoded value and raw holds
+				// its verbatim bytes, so the value's start offset is exact.
+				valueEnd := dec.InputOffset()
+				valueStart := valueEnd - int64(len(raw))
 				trimmed := bytes.TrimSpace(raw)
 				var records []json.RawMessage
 				if bytes.HasPrefix(trimmed, []byte("[")) {
@@ -2267,10 +2275,19 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 				if records == nil {
 					records = []json.RawMessage{raw}
 				}
+				// Locate each record inside raw so array-split records report
+				// their own end offset instead of sharing the parent's.
+				searchFrom := 0
 				for _, record := range records {
 					line := string(record)
 					lineNo++
-					obs.emitLineClassified(lineNo, dec.InputOffset(), line)
+					endOffset := valueEnd
+					if idx := bytes.Index(raw[searchFrom:], record); idx >= 0 {
+						recordEnd := searchFrom + idx + len(record)
+						endOffset = valueStart + int64(recordEnd)
+						searchFrom = recordEnd
+					}
+					obs.emitLineClassified(lineNo, endOffset, line)
 					if !continuationLoaded && gjson.Get(line, "type").Str == codexTypeSessionMeta {
 						continuationLoaded = true
 						if err := p.loadCodexContinuationSegments(
@@ -3140,6 +3157,13 @@ func (p *codexProvider) parseSessionFromWithSources(ctx context.Context,
 		},
 	)
 	if err != nil {
+		if IsIncrementalFullParseFallback(err) {
+			// The tail ends in a valid but unterminated line; the full
+			// parse replays it from the start. lineNo counts only the
+			// complete lines delivered to the callback, so the offending
+			// record is the next one.
+			obs.emitIncrementalFallback("unterminated_tail", lineNo+1)
+		}
 		return codexIncrementalParseResult{}, fmt.Errorf(
 			"reading codex %s from offset %d: %w",
 			path, offset, err,

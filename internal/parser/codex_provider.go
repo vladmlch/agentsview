@@ -560,6 +560,7 @@ func (p *codexProvider) Parse(
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 	sess, msgs, cursor, safe, hashState, anchorDigest, retryReason, err := p.parseSessionWithCursor(ctx, path, machine, false)
 	if err != nil {
+		obs.emitParseFailed(err)
 		return ParseOutcome{}, err
 	}
 	if sess == nil {
@@ -579,9 +580,9 @@ func (p *codexProvider) Parse(
 	if safe {
 		checkpoint, err = cursor.MarshalBinary()
 		if err != nil {
-			return ParseOutcome{}, fmt.Errorf(
-				"encoding codex checkpoint %s: %w", path, err,
-			)
+			err = fmt.Errorf("encoding codex checkpoint %s: %w", path, err)
+			obs.emitParseFailed(err)
+			return ParseOutcome{}, err
 		}
 		obs.emitCursorUpdated(sess.File.Size, &cursor, len(msgs))
 	}
@@ -659,6 +660,7 @@ func ParseCodexSessionStreaming(
 		false, f, info, sink,
 	)
 	if err != nil {
+		obs.emitParseFailed(err)
 		return nil, nil, nil, nil, "", "", err
 	}
 	if sess == nil {
@@ -671,9 +673,9 @@ func ParseCodexSessionStreaming(
 	if safe {
 		cursorBlob, err = cursor.MarshalBinary()
 		if err != nil {
-			return nil, nil, nil, nil, "", "", fmt.Errorf(
-				"encoding codex checkpoint %s: %w", path, err,
-			)
+			err = fmt.Errorf("encoding codex checkpoint %s: %w", path, err)
+			obs.emitParseFailed(err)
+			return nil, nil, nil, nil, "", "", err
 		}
 		obs.emitCursorUpdated(info.Size(), &cursor, len(msgs))
 	}
@@ -705,11 +707,13 @@ func (p *codexProvider) ParseIncremental(
 	}
 	f, err := os.Open(path)
 	if err != nil {
+		obs.emitParseFailed(err)
 		return IncrementalOutcome{}, IncrementalNeedsFullParse, err
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
+		obs.emitParseFailed(err)
 		return IncrementalOutcome{}, IncrementalNeedsFullParse, err
 	}
 	inode, device := sourceFileIdentityForFile(f, info)
@@ -722,6 +726,7 @@ func (p *codexProvider) ParseIncremental(
 	}
 	safe, err := codexSafeResumeOffsetFile(f, req.Offset)
 	if err != nil {
+		obs.emitParseFailed(err)
 		return IncrementalOutcome{}, IncrementalNeedsFullParse, err
 	}
 	if !safe {
@@ -769,12 +774,11 @@ func (p *codexProvider) ParseIncremental(
 	}
 	if err != nil {
 		if IsIncrementalFullParseFallback(err) {
-			// The tail loop reports the precise cause itself; this entry
-			// marks the fallback surfacing at the provider boundary.
-			p.emitIncrementalFallback(path, "tail_parse_fallback", 0)
+			// The tail loop already reported the precise decline cause.
 			return IncrementalOutcome{ForceReplace: true},
 				IncrementalNeedsFullParse, nil
 		}
+		obs.emitParseFailed(err)
 		return IncrementalOutcome{}, IncrementalNeedsFullParse, err
 	}
 	if !result.initialCursor.firstUserSeen && result.cursor.firstUserSeen {
@@ -814,9 +818,9 @@ func (p *codexProvider) ParseIncremental(
 	if !result.cursor.pendingCallsOverflow {
 		nextCursor, err = result.cursor.MarshalBinary()
 		if err != nil {
-			return IncrementalOutcome{}, IncrementalNeedsFullParse, fmt.Errorf(
-				"encoding codex cursor %s: %w", path, err,
-			)
+			err = fmt.Errorf("encoding codex cursor %s: %w", path, err)
+			obs.emitParseFailed(err)
+			return IncrementalOutcome{}, IncrementalNeedsFullParse, err
 		}
 		obs.emitCursorUpdated(
 			req.Offset+result.consumedBytes,
