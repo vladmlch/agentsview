@@ -603,7 +603,12 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // (138: the Antigravity parser unwraps <USER_REQUEST> envelopes and strips
 // runtime prompt-injection metadata (<ADDITIONAL_METADATA>,
 // <USER_SETTINGS_CHANGE>) from user messages.)
-const dataVersion = 138
+// (139: the Antigravity .db decode now reads structured ToolCallMetadata
+// from steps.metadata, deduplicates planner/tool-step calls by call id,
+// decodes ModelUsageStats thinking_output_tokens/response_id, and resolves
+// model_enum MODEL_PLACEHOLDER_* names — stored tool calls, usage events,
+// and model attributions all need a reparse.)
+const dataVersion = 139
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 

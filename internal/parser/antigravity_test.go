@@ -4098,7 +4098,7 @@ func TestAntigravityAdjacentToolCalls(t *testing.T) {
 		{Number: 1, Wire: pbWireBytes, Bytes: []byte(`{"command": "pwd"}`)},
 	}
 
-	calls := extractAntigravityToolCalls(0, fields)
+	calls := extractAntigravityToolCalls(0, fields, nil)
 
 	require.Len(t, calls, 2)
 	assert.Equal(t, "run_command", calls[0].ToolName)
@@ -4120,7 +4120,7 @@ func TestAntigravityAdjacentToolCallsNoUUIDs(t *testing.T) {
 		{Number: 1, Wire: pbWireBytes, Bytes: []byte("run_command")},
 	}
 
-	calls := extractAntigravityToolCalls(0, fields)
+	calls := extractAntigravityToolCalls(0, fields, nil)
 
 	require.Len(t, calls, 2)
 	assert.Equal(t, "run_command", calls[0].ToolName)
@@ -4139,7 +4139,7 @@ func TestAntigravityToolCallUUIDBackwardFallback(t *testing.T) {
 		{Number: 1, Wire: pbWireBytes, Bytes: []byte("view_file")},
 	}
 
-	calls := extractAntigravityToolCalls(0, fields)
+	calls := extractAntigravityToolCalls(0, fields, nil)
 
 	require.Len(t, calls, 1)
 	assert.Equal(t, "view_file", calls[0].ToolName)
@@ -4228,7 +4228,7 @@ func TestAntigravityToolCallsRejectsGenericStrings(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			calls := extractAntigravityToolCalls(0, tc.fields)
+			calls := extractAntigravityToolCalls(0, tc.fields, nil)
 			assert.Len(t, calls, tc.wantLen)
 		})
 	}
@@ -4244,7 +4244,7 @@ func TestAntigravityAdjacentToolCallsIntervening(t *testing.T) {
 		{Number: 4, Wire: pbWireBytes, Bytes: []byte(`{"command": "pwd"}`)},
 	}
 
-	calls := extractAntigravityToolCalls(0, fields)
+	calls := extractAntigravityToolCalls(0, fields, nil)
 	require.Len(t, calls, 2)
 
 	// First call should have synthetic ID and NO JSON input (it is blocked by the second tool name)
@@ -4847,6 +4847,353 @@ func TestCleanAntigravityPrompt(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := cleanAntigravityPrompt(tt.input)
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// antigravityTestToolCallMeta encodes one steps.metadata blob whose
+// field-4 ToolCallMetadata entries mirror what current Antigravity
+// builds write (call_id=1, tool_name=2, argumentsJson=3).
+func antigravityTestToolCallMeta(calls ...[3]string) []byte {
+	var fields []pbField
+	for _, c := range calls {
+		entry := encodePB([]pbField{
+			{num: 1, wire: pbWireBytes, bytes: []byte(c[0])},
+			{num: 2, wire: pbWireBytes, bytes: []byte(c[1])},
+			{num: 3, wire: pbWireBytes, bytes: []byte(c[2])},
+		})
+		fields = append(fields, pbField{
+			num: 4, wire: pbWireBytes, bytes: entry,
+		})
+	}
+	return encodePB(fields)
+}
+
+// TestAntigravityStepsMetadataToolCall verifies that the structured
+// ToolCallMetadata in steps.metadata decodes into a tool call carrying
+// the producer call id and the full arguments object — including for a
+// tool name absent from the known-names list the payload heuristic
+// requires.
+func TestAntigravityStepsMetadataToolCall(t *testing.T) {
+	metadata := antigravityTestToolCallMeta(
+		[3]string{"call_4242", "find_by_name", `{"Pattern":"*provider*"}`},
+		[3]string{"call_4243", "novel_future_tool", `{"Query":"x"}`},
+	)
+	payload := encodePB([]pbField{
+		{num: 1, wire: pbWireVarint, varint: 132},
+		{num: 3, wire: pbWireBytes, bytes: []byte("call_4242")},
+		{num: 3, wire: pbWireBytes, bytes: []byte("find_by_name")},
+		{num: 3, wire: pbWireBytes, bytes: []byte(`{"Pattern":"*provider*"}`)},
+		{num: 5, wire: pbWireBytes, bytes: []byte("found 3 matching files in the tree")},
+	})
+	step, ok := newAntigravityStep(2, 132, payload, metadata)
+	require.True(t, ok)
+	msg, ok := decodeAntigravityParsedStep(step)
+	require.True(t, ok)
+
+	require.Len(t, msg.ToolCalls, 2, "metadata emits both calls; payload echo must not double-emit find_by_name")
+	assert.Equal(t, "call_4242", msg.ToolCalls[0].ToolUseID)
+	assert.Equal(t, "find_by_name", msg.ToolCalls[0].ToolName)
+	assert.Equal(t, "Glob", msg.ToolCalls[0].Category)
+	assert.Equal(t, `{"Pattern":"*provider*"}`, msg.ToolCalls[0].InputJSON)
+	assert.Equal(t, "novel_future_tool", msg.ToolCalls[1].ToolName,
+		"metadata calls are not restricted to the known tool name list")
+
+	assert.NotContains(t, msg.Content, "call_4242",
+		"call ids are bookkeeping and must not leak into content")
+	assert.Contains(t, msg.Content, "found 3 matching files")
+}
+
+// TestAntigravityToolCallDedupAcrossSteps verifies that one invocation
+// recorded twice — once on the planner step's payload and once on the
+// tool step's metadata — yields a single tool call, kept on the planner
+// (request) message.
+func TestAntigravityToolCallDedupAcrossSteps(t *testing.T) {
+	root := t.TempDir()
+	id := "aaaabbbb-cccc-dddd-eeee-ffffffffffff"
+	mustMkdir(t, filepath.Join(root, "conversations"))
+
+	dbPath := filepath.Join(root, "conversations", id+".db")
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	createAntigravityStepTables(t, db)
+
+	ts := encodePB([]pbField{{num: 1, wire: pbWireVarint, varint: 1779000000}})
+	userPayload := encodePB([]pbField{
+		{num: 5, wire: pbWireBytes, bytes: ts},
+		{num: 17, wire: pbWireBytes, bytes: []byte("look at the file for me please")},
+	})
+	argsJSON := `{"AbsolutePath":"/w/a.txt","toolAction":"viewing"}`
+	// Planner step (15): the requested call is echoed in the payload.
+	plannerPayload := encodePB([]pbField{
+		{num: 5, wire: pbWireBytes, bytes: ts},
+		{num: 9, wire: pbWireBytes, bytes: []byte("call_777")},
+		{num: 9, wire: pbWireBytes, bytes: []byte("view_file")},
+		{num: 9, wire: pbWireBytes, bytes: []byte(argsJSON)},
+		{num: 17, wire: pbWireBytes, bytes: []byte("I will view that file now")},
+	})
+	// Tool step (132): metadata carries the same call id.
+	toolMeta := antigravityTestToolCallMeta(
+		[3]string{"call_777", "view_file", argsJSON},
+	)
+	toolPayload := encodePB([]pbField{
+		{num: 5, wire: pbWireBytes, bytes: ts},
+		{num: 9, wire: pbWireBytes, bytes: []byte("call_777")},
+		{num: 9, wire: pbWireBytes, bytes: []byte("view_file")},
+		{num: 9, wire: pbWireBytes, bytes: []byte(argsJSON)},
+		{num: 17, wire: pbWireBytes, bytes: []byte("File Path: file:///w/a.txt\nTotal Lines: 12")},
+	})
+	mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 14, ?)`, userPayload)
+	mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 15, ?)`, plannerPayload)
+	mustExec(t, db, `INSERT INTO steps (idx, step_type, metadata, step_payload) VALUES (2, 132, ?, ?)`, toolMeta, toolPayload)
+	require.NoError(t, db.Close())
+
+	_, msgs, _, err := parseAntigravityTestSession(t, dbPath, "/tmp/proj", "m")
+	require.NoError(t, err)
+
+	var totalCalls int
+	var call ParsedToolCall
+	for _, m := range msgs {
+		for _, c := range m.ToolCalls {
+			totalCalls++
+			call = c
+		}
+	}
+	assert.Equal(t, 1, totalCalls,
+		"planner request and tool-step metadata describe one invocation")
+	assert.Equal(t, "call_777", call.ToolUseID)
+	assert.Equal(t, "view_file", call.ToolName)
+	assert.Equal(t, argsJSON, call.InputJSON)
+}
+
+// TestAntigravityStepsWithoutMetadataColumn verifies the payload-only
+// fallback when the steps table predates the metadata column.
+func TestAntigravityStepsWithoutMetadataColumn(t *testing.T) {
+	root := t.TempDir()
+	id := "bbbbcccc-dddd-eeee-ffff-000000000000"
+	mustMkdir(t, filepath.Join(root, "conversations"))
+
+	dbPath := filepath.Join(root, "conversations", id+".db")
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	mustExec(t, db, `CREATE TABLE steps (
+		idx integer, step_type integer NOT NULL DEFAULT 0,
+		step_payload blob, PRIMARY KEY (idx))`)
+
+	ts := encodePB([]pbField{{num: 1, wire: pbWireVarint, varint: 1779000000}})
+	userPayload := encodePB([]pbField{
+		{num: 5, wire: pbWireBytes, bytes: ts},
+		{num: 17, wire: pbWireBytes, bytes: []byte("please check the file for me")},
+	})
+	asstPayload := encodePB([]pbField{
+		{num: 5, wire: pbWireBytes, bytes: ts},
+		{num: 17, wire: pbWireBytes, bytes: []byte("assistant response body goes here and is long")},
+	})
+	mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 14, ?)`, userPayload)
+	mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 17, ?)`, asstPayload)
+	require.NoError(t, db.Close())
+
+	sess, msgs, _, err := parseAntigravityTestSession(t, dbPath, "/tmp/proj", "m")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	assert.Len(t, msgs, 2, "legacy schema still decodes via the payload heuristic")
+}
+
+// TestAntigravityCallIDToolUseID verifies that call_NNN-style ids in the
+// payload are picked up as the tool-use id, not just UUIDs.
+func TestAntigravityCallIDToolUseID(t *testing.T) {
+	fields := []agProtoField{
+		{Number: 1, Wire: pbWireBytes, Bytes: []byte("call_1590435")},
+		{Number: 1, Wire: pbWireBytes, Bytes: []byte("find_by_name")},
+		{Number: 1, Wire: pbWireBytes, Bytes: []byte(`{"Pattern":"*provider*"}`)},
+	}
+	calls := extractAntigravityToolCalls(0, fields, nil)
+	require.Len(t, calls, 1)
+	assert.Equal(t, "call_1590435", calls[0].ToolUseID)
+	assert.Equal(t, "find_by_name", calls[0].ToolName)
+	assert.Equal(t, "Glob", calls[0].Category)
+	assert.Equal(t, `{"Pattern":"*provider*"}`, calls[0].InputJSON)
+}
+
+// TestAntigravityCallMCPToolRename verifies that call_mcp_tool calls
+// surface under the real mcp__<server>__<tool> name in both the
+// metadata decode and the payload heuristic.
+func TestAntigravityCallMCPToolRename(t *testing.T) {
+	args := `{"ServerName":"github","ToolName":"create_issue","Arguments":{"repo":"o/r"},"toolAction":"creating issue"}`
+
+	metadata := antigravityTestToolCallMeta(
+		[3]string{"call_31", "call_mcp_tool", args},
+	)
+	payload := encodePB([]pbField{
+		{num: 1, wire: pbWireVarint, varint: 132},
+		{num: 5, wire: pbWireBytes, bytes: []byte("mcp call finished with output")},
+	})
+	step, ok := newAntigravityStep(3, 132, payload, metadata)
+	require.True(t, ok)
+	msg, ok := decodeAntigravityParsedStep(step)
+	require.True(t, ok)
+	require.Len(t, msg.ToolCalls, 1)
+	assert.Equal(t, "mcp__github__create_issue", msg.ToolCalls[0].ToolName)
+	assert.Equal(t, "Tool", msg.ToolCalls[0].Category)
+	assert.Equal(t, "call_31", msg.ToolCalls[0].ToolUseID)
+
+	// Payload heuristic path (no metadata): the args JSON sits adjacent
+	// to the wrapper name.
+	fields := []agProtoField{
+		{Number: 1, Wire: pbWireBytes, Bytes: []byte("call_31")},
+		{Number: 1, Wire: pbWireBytes, Bytes: []byte("call_mcp_tool")},
+		{Number: 1, Wire: pbWireBytes, Bytes: []byte(args)},
+	}
+	calls := extractAntigravityToolCalls(0, fields, nil)
+	require.Len(t, calls, 1)
+	assert.Equal(t, "mcp__github__create_issue", calls[0].ToolName)
+	assert.Equal(t, "call_31", calls[0].ToolUseID)
+
+	// Unparseable or incomplete args keep the wrapper name.
+	assert.Equal(t, "call_mcp_tool", antigravityToolCallName("call_mcp_tool", `{}`))
+	assert.Equal(t, "call_mcp_tool", antigravityToolCallName("call_mcp_tool", `{"ServerName":"github"}`))
+	assert.Equal(t, "view_file", antigravityToolCallName("view_file", args))
+}
+
+// TestAntigravityUsageThinkingAndResponseID verifies that the optional
+// ModelUsageStats fields 9 (thinking_output_tokens) and 11
+// (response_id) decode into ReasoningTokens and DedupKey.
+func TestAntigravityUsageThinkingAndResponseID(t *testing.T) {
+	usageFields := []pbField{
+		{num: agModelUsageStatsModelField, wire: pbWireVarint, varint: 1318},
+		{num: agModelUsageStatsInputTokensField, wire: pbWireVarint, varint: 31821},
+		{num: agModelUsageStatsOutputTokensField, wire: pbWireVarint, varint: 196},
+		{num: agModelUsageStatsCacheReadTokensField, wire: pbWireVarint, varint: 400},
+		{num: agModelUsageStatsThinkingTokensField, wire: pbWireVarint, varint: 128},
+		{num: agModelUsageStatsResponseIDField, wire: pbWireBytes, bytes: []byte("ET6xapLwA_umnsEPg_6-UA")},
+	}
+	chatModel := encodePB([]pbField{
+		{num: agChatModelMetadataUsageField, wire: pbWireBytes, bytes: encodePB(usageFields)},
+		{num: agChatModelMetadataResponseModelField, wire: pbWireBytes, bytes: []byte("gemini-3.8-flash")},
+	})
+	genData := encodePB([]pbField{
+		{num: agCortexStepGeneratorMetadataChatModelField, wire: pbWireBytes, bytes: chatModel},
+	})
+
+	block, ok := extractTokenUsage(genData)
+	require.True(t, ok)
+	assert.Equal(t, 31821, block.UncachedInput)
+	assert.Equal(t, 196, block.TotalOutput)
+	assert.Equal(t, 400, block.CacheRead)
+	assert.Equal(t, 128, block.Reasoning)
+	assert.Equal(t, "ET6xapLwA_umnsEPg_6-UA", block.ResponseID)
+
+	var result antigravityStepLoadResult
+	result.usageDedupPrefix = antigravityIDPrefix + "conv-uuid:"
+	result.appendGenMetadataUsage(genData, ParsedMessage{}, false, "")
+	require.Len(t, result.usageEvents, 1)
+	ev := result.usageEvents[0]
+	assert.Equal(t, 128, ev.ReasoningTokens,
+		"thinking split lands on the reasoning breakdown")
+	assert.Equal(t, 196, ev.OutputTokens,
+		"output keeps the total including thinking")
+	assert.Equal(t,
+		"antigravity:conv-uuid:ET6xapLwA_umnsEPg_6-UA", ev.DedupKey,
+		"response_id deduplicates retry rows within the session")
+	assert.Equal(t, "gemini-3.8-flash", ev.Model)
+}
+
+// TestAntigravityModelEnumResolution covers the model_enum attribute
+// (field 20) and the usage stats' model varint as fallbacks when
+// response_model carries an internal config id or nothing.
+func TestAntigravityModelEnumResolution(t *testing.T) {
+	attr := func(k, v string) []byte {
+		return encodePB([]pbField{
+			{num: 1, wire: pbWireBytes, bytes: []byte(k)},
+			{num: 2, wire: pbWireBytes, bytes: []byte(v)},
+		})
+	}
+	genData := func(chatModelFields []pbField) []byte {
+		return encodePB([]pbField{{
+			num:   agCortexStepGeneratorMetadataChatModelField,
+			wire:  pbWireBytes,
+			bytes: encodePB(chatModelFields),
+		}})
+	}
+	usage := func(modelVarint uint64) []byte {
+		return encodePB([]pbField{
+			{num: agModelUsageStatsModelField, wire: pbWireVarint, varint: modelVarint},
+			{num: agModelUsageStatsInputTokensField, wire: pbWireVarint, varint: 10},
+			{num: agModelUsageStatsOutputTokensField, wire: pbWireVarint, varint: 5},
+		})
+	}
+	cm := func(fields ...pbField) pbField {
+		return pbField{
+			num: agChatModelMetadataUsageField, wire: pbWireBytes,
+			bytes: usage(1020),
+		}
+	}
+	_ = cm
+
+	tests := []struct {
+		name   string
+		fields []pbField
+		want   string
+	}{
+		{
+			name: "display name wins over config id and enum",
+			fields: []pbField{
+				{num: 19, wire: pbWireBytes, bytes: []byte("gemini-pro-default")},
+				{num: 20, wire: pbWireBytes, bytes: attr("model_enum", "MODEL_PLACEHOLDER_M16")},
+				{num: 21, wire: pbWireBytes, bytes: []byte("Gemini 3.1 Pro (High)")},
+			},
+			want: "Gemini 3.1 Pro (High)",
+		},
+		{
+			name: "real response_model beats enum table",
+			fields: []pbField{
+				{num: 19, wire: pbWireBytes, bytes: []byte("gemini-3.7-flash")},
+				{num: 20, wire: pbWireBytes, bytes: attr("model_enum", "MODEL_PLACEHOLDER_M298")},
+			},
+			want: "gemini-3.7-flash",
+		},
+		{
+			name: "config id resolves through model_enum table",
+			fields: []pbField{
+				{num: 19, wire: pbWireBytes, bytes: []byte("gemini-pro-default")},
+				{num: 20, wire: pbWireBytes, bytes: attr("model_enum", "MODEL_PLACEHOLDER_M16")},
+			},
+			want: "gemini-3.1-pro-high",
+		},
+		{
+			name: "empty response_model resolves through model_enum table",
+			fields: []pbField{
+				{num: 20, wire: pbWireBytes, bytes: attr("model_enum", "MODEL_PLACEHOLDER_M318")},
+			},
+			want: "gemini-3.8-flash",
+		},
+		{
+			name: "unknown enum name is kept verbatim",
+			fields: []pbField{
+				{num: 20, wire: pbWireBytes, bytes: attr("model_enum", "MODEL_PLACEHOLDER_M999")},
+			},
+			want: "MODEL_PLACEHOLDER_M999",
+		},
+		{
+			name: "usage varint synthesizes placeholder name",
+			fields: []pbField{
+				{num: agChatModelMetadataUsageField, wire: pbWireBytes, bytes: usage(1016)},
+				{num: 19, wire: pbWireBytes, bytes: []byte("gemini-pro-default")},
+			},
+			want: "gemini-3.1-pro-high",
+		},
+		{
+			name: "config id alone falls back to itself",
+			fields: []pbField{
+				{num: 19, wire: pbWireBytes, bytes: []byte("gemini-pro-default")},
+			},
+			want: "gemini-pro-default",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			model, _ := extractAntigravityGenerationModel(genData(tt.fields))
+			assert.Equal(t, tt.want, model)
 		})
 	}
 }

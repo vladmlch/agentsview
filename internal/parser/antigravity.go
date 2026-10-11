@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,6 +32,16 @@ const antigravityIDPrefix = "antigravity:"
 var antigravityUUIDLikeRE = regexp.MustCompile(
 	`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`,
 )
+
+// Tool-call ids recorded in steps.metadata and echoed in step payloads
+// look like "call_2121026" (and occasionally other short word_num
+// prefixes), not UUIDs.
+var antigravityCallIDLikeRE = regexp.MustCompile(`^[a-z]{2,8}_[0-9]{2,}$`)
+
+func isAntigravityToolUseID(s string) bool {
+	return antigravityUUIDLikeRE.MatchString(s) ||
+		antigravityCallIDLikeRE.MatchString(s)
+}
 
 // AntigravityFileInfo returns the effective file info for an IDE
 // session .db, combining the main file with its -wal sidecar,
@@ -160,7 +171,7 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 	sourceVersion := antigravitySourceVersion(ctx, db)
 
 	dbResult, err := loadAntigravityStepsWithRawCount(
-		ctx, db, antigravityIDPrefix,
+		ctx, db, antigravityIDPrefix, id,
 	)
 	if err != nil {
 		// Fail closed on an unreadable steps table, deliberately: a
@@ -381,6 +392,9 @@ type antigravityStepLoadResult struct {
 	// from its own handle via antigravitySourceVersion, so both classify
 	// identically.
 	sourceVersion string
+	// usageDedupPrefix namespaces ModelUsageStats.response_id (unique
+	// only within a conversation) into the usage DedupKey.
+	usageDedupPrefix string
 }
 
 type antigravityStepKind int
@@ -414,16 +428,51 @@ const (
 	agCascadePlannerConfigModelNameField = 28
 )
 
+// These field numbers are not in the descriptor records recovered from the
+// CLI binary; they were established by decoding local gen_metadata/steps rows
+// and cross-checking against the transcript sidecar.
+const (
+	// ModelUsageStats splits output_tokens (field 3) into
+	// thinking_output_tokens (9) + response_output_tokens (10) on current
+	// builds, and carries the RPC response id at field 11.
+	agModelUsageStatsThinkingTokensField = 9
+	agModelUsageStatsResponseIDField     = 11
+
+	// ChatModelMetadata field 20 is a repeated key/value attribute entry
+	// ({1: key, 2: value}); the "model_enum" key carries the internal
+	// MODEL_PLACEHOLDER_M<N> enum name for the selected model.
+	agChatModelMetadataAttributesField = 20
+
+	// The steps.metadata blob carries ToolCallMetadata at field 4:
+	// call_id (1), tool_name (2), argumentsJson (3).
+	agStepMetadataToolCallField = 4
+	agToolCallMetaIDField       = 1
+	agToolCallMetaNameField     = 2
+	agToolCallMetaArgsField     = 3
+)
+
 type antigravityStep struct {
 	idx       int
 	kind      antigravityStepKind
 	fields    []agProtoField
+	metaCalls []antigravityMetaToolCall
 	timestamp time.Time
 	role      RoleType
 }
 
+// antigravityMetaToolCall is one structured tool invocation decoded from
+// the steps.metadata blob (field 4, ToolCallMetadata). Unlike the
+// name-string heuristic over step_payload it carries the real call id and
+// the complete argument object, and it is not restricted to the known tool
+// name list.
+type antigravityMetaToolCall struct {
+	callID string
+	name   string
+	args   string
+}
+
 func newAntigravityStep(
-	idx, stepType int, payload []byte,
+	idx, stepType int, payload, metadata []byte,
 ) (antigravityStep, bool) {
 	if len(payload) == 0 {
 		return antigravityStep{}, false
@@ -440,9 +489,47 @@ func newAntigravityStep(
 		idx:       idx,
 		kind:      kind,
 		fields:    fields,
+		metaCalls: extractAntigravityMetaToolCalls(metadata),
 		timestamp: earliestAntigravityTimestamp(fields),
 		role:      role,
 	}, true
+}
+
+// extractAntigravityMetaToolCalls decodes every ToolCallMetadata entry
+// (steps.metadata field 4) into a structured call. Entries without a tool
+// name are skipped; a malformed metadata blob degrades to no calls and the
+// payload heuristic still applies.
+func extractAntigravityMetaToolCalls(
+	metadata []byte,
+) []antigravityMetaToolCall {
+	if len(metadata) == 0 {
+		return nil
+	}
+	fields, err := agProtoParse(metadata)
+	if err != nil {
+		return nil
+	}
+	var calls []antigravityMetaToolCall
+	for _, f := range fields {
+		if f.Number != agStepMetadataToolCallField || f.Nested == nil {
+			continue
+		}
+		var call antigravityMetaToolCall
+		if idf, ok := agProtoFind(f.Nested, agToolCallMetaIDField); ok {
+			call.callID, _ = agProtoString(idf)
+		}
+		if nf, ok := agProtoFind(f.Nested, agToolCallMetaNameField); ok {
+			call.name, _ = agProtoString(nf)
+		}
+		if af, ok := agProtoFind(f.Nested, agToolCallMetaArgsField); ok {
+			call.args, _ = agProtoString(af)
+		}
+		if call.name == "" {
+			continue
+		}
+		calls = append(calls, call)
+	}
+	return calls
 }
 
 func antigravityStepKindFromProto(
@@ -465,21 +552,48 @@ func roleForAntigravityStepKind(kind antigravityStepKind) RoleType {
 	}
 }
 
+// queryAntigravitySteps selects the steps rows including the metadata
+// blob, which carries structured ToolCallMetadata on current builds.
+// Older steps tables predate that column, so a missing-column failure
+// falls back to the payload-only projection and those sessions still
+// decode through the name-string heuristic.
+func queryAntigravitySteps(
+	ctx context.Context, db *sql.DB,
+) (*sql.Rows, bool, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT idx, step_type, metadata, step_payload FROM steps `+
+			`ORDER BY idx`,
+	)
+	if err == nil {
+		return rows, true, nil
+	}
+	rows, err = db.QueryContext(ctx,
+		`SELECT idx, step_type, step_payload FROM steps `+
+			`ORDER BY idx`,
+	)
+	if err != nil {
+		return nil, false, fmt.Errorf("query steps: %w", err)
+	}
+	return rows, false, nil
+}
+
 func loadAntigravityStepsWithRawCount(ctx context.Context,
-	db *sql.DB, sessionIDPrefix string,
+	db *sql.DB, sessionIDPrefix, conversationID string,
 ) (antigravityStepLoadResult, error) {
 	generations := loadAntigravityGenerationMetadata(ctx, db)
 	executors := loadAntigravityExecutorMetadata(ctx, db)
 	result := antigravityStepLoadResult{
 		executors:      executors,
 		hasGenMetadata: len(generations) > 0,
+		// response_id is only unique within a conversation, so usage
+		// events scope it under the full session id; the provider prefix
+		// is included because the same conversation UUID can exist
+		// under both IDE and CLI roots.
+		usageDedupPrefix: sessionIDPrefix + conversationID + ":",
 	}
-	rows, err := db.QueryContext(ctx,
-		`SELECT idx, step_type, step_payload FROM steps `+
-			`ORDER BY idx`,
-	)
+	rows, hasMeta, err := queryAntigravitySteps(ctx, db)
 	if err != nil {
-		return result, fmt.Errorf("query steps: %w", err)
+		return result, err
 	}
 	defer rows.Close()
 	steps := make([]antigravityLoadedStep, 0)
@@ -488,12 +602,20 @@ func loadAntigravityStepsWithRawCount(ctx context.Context,
 		var (
 			idx      int
 			stepType int
+			metadata []byte
 			payload  []byte
 		)
-		if err := rows.Scan(&idx, &stepType, &payload); err != nil {
+		if hasMeta {
+			err = rows.Scan(&idx, &stepType, &metadata, &payload)
+		} else {
+			err = rows.Scan(&idx, &stepType, &payload)
+		}
+		if err != nil {
 			return result, fmt.Errorf("scan step: %w", err)
 		}
-		parsedStep, parsed := newAntigravityStep(idx, stepType, payload)
+		parsedStep, parsed := newAntigravityStep(
+			idx, stepType, payload, metadata,
+		)
 		var msg ParsedMessage
 		var decoded bool
 		var fields []agProtoField
@@ -532,6 +654,13 @@ func loadAntigravityStepsWithRawCount(ctx context.Context,
 			generation.data, step.msg, step.decoded, executorModel,
 		)
 	}
+	// One tool invocation is recorded twice in the steps table: the
+	// planner step (kind 15) carries the requested call in its payload,
+	// and the tool-execution step carries the same call id in
+	// steps.metadata. Collapse repeats of the same real call id so every
+	// invocation counts once; the first occurrence (the planner's
+	// request) wins.
+	dedupeAntigravityToolCalls(steps)
 	// Spawn edges need sequence context (the result steps after an
 	// invoke_subagent call), so they are resolved on the loaded step
 	// list rather than inside single-step decode. The caller's session
@@ -551,6 +680,37 @@ type antigravityLoadedStep struct {
 	fields  []agProtoField
 	msg     ParsedMessage
 	decoded bool
+}
+
+// dedupeAntigravityToolCalls drops repeated occurrences of the same tool
+// invocation across the ordered steps. Synthetic ids ("ag-step-*",
+// assigned when no call id could be recovered) are unique by
+// construction and never dedup; only real producer ids (UUIDs and
+// call_NNN-style ids) participate.
+func dedupeAntigravityToolCalls(steps []antigravityLoadedStep) {
+	seen := make(map[string]bool)
+	for i := range steps {
+		msg := &steps[i].msg
+		if len(msg.ToolCalls) == 0 {
+			continue
+		}
+		kept := msg.ToolCalls[:0]
+		for _, call := range msg.ToolCalls {
+			if isAntigravityRealCallID(call.ToolUseID) {
+				if seen[call.ToolUseID] {
+					continue
+				}
+				seen[call.ToolUseID] = true
+			}
+			kept = append(kept, call)
+		}
+		msg.ToolCalls = kept
+		msg.HasToolUse = len(kept) > 0
+	}
+}
+
+func isAntigravityRealCallID(id string) bool {
+	return id != "" && !strings.HasPrefix(id, "ag-step-")
 }
 
 type antigravityGenerationMetadata struct {
@@ -769,7 +929,9 @@ func (r *antigravityStepLoadResult) appendGenMetadataUsage(
 		// ModelUsageStats.input_tokens is uncached input,
 		// output_tokens includes thinking in the observed SQLite blocks,
 		// and cache_read_tokens is absent when there are no cache hits.
-		// Those blocks do not provide a separate persisted reasoning count.
+		// thinking_output_tokens, when present, splits the reasoning
+		// share out of output_tokens (it is already counted there, so
+		// it only fills the reasoning breakdown).
 		context := block.UncachedInput + block.CacheRead
 		eventModel := genModel
 		var occurredAt string
@@ -786,15 +948,21 @@ func (r *antigravityStepLoadResult) appendGenMetadataUsage(
 			msg.HasOutputTokens = block.TotalOutput > 0
 
 		}
-		r.usageEvents = append(r.usageEvents, ParsedUsageEvent{
+		event := ParsedUsageEvent{
 			Source:               "generation",
 			Model:                eventModel,
 			InputTokens:          block.UncachedInput,
 			OutputTokens:         block.TotalOutput,
 			CacheReadInputTokens: block.CacheRead,
-			ReasoningTokens:      0, // not available in gen_metadata
+			ReasoningTokens:      block.Reasoning,
 			OccurredAt:           occurredAt,
-		})
+		}
+		// response_id identifies the model RPC response; retry rows
+		// for the same response collapse instead of double-counting.
+		if block.ResponseID != "" {
+			event.DedupKey = r.usageDedupPrefix + block.ResponseID
+		}
+		r.usageEvents = append(r.usageEvents, event)
 	}
 	if decoded && genModel != "" {
 		msg.Model = genModel
@@ -811,13 +979,16 @@ func (r *antigravityStepLoadResult) appendGenMetadataUsage(
 //	TotalOutput   = ModelUsageStats.output_tokens, including thinking in
 //	                observed SQLite blocks
 //	CacheRead     = ModelUsageStats.cache_read_tokens
-//
-// No per-field reasoning breakdown is available in gen_metadata;
-// TotalOutput already includes thinking tokens.
+//	Reasoning     = ModelUsageStats.thinking_output_tokens (field 9,
+//	                optional; absent on older builds)
+//	ResponseID    = ModelUsageStats.response_id (field 11, optional;
+//	                deduplicates retry rows for the same response)
 type agTokenBlock struct {
-	UncachedInput int // ModelUsageStats.input_tokens
-	TotalOutput   int // ModelUsageStats.output_tokens
-	CacheRead     int // ModelUsageStats.cache_read_tokens
+	UncachedInput int    // ModelUsageStats.input_tokens
+	TotalOutput   int    // ModelUsageStats.output_tokens
+	CacheRead     int    // ModelUsageStats.cache_read_tokens
+	Reasoning     int    // ModelUsageStats.thinking_output_tokens
+	ResponseID    string // ModelUsageStats.response_id
 }
 
 // maxPlausibleTokens caps the token values accepted by the heuristic.
@@ -834,13 +1005,14 @@ func extractTokenUsage(data []byte) (agTokenBlock, bool) {
 		return agTokenBlock{}, false
 	}
 	if chatModel, ok := extractAntigravityChatModel(fields); ok {
-		usage, ok := agProtoFind(
+		if usage, ok := agProtoFind(
 			chatModel, agChatModelMetadataUsageField,
-		)
-		if !ok || usage.Nested == nil {
-			return agTokenBlock{}, false
+		); ok && usage.Nested != nil {
+			return tokenBlockFrom(usage.Nested)
 		}
-		return tokenBlockFrom(usage.Nested)
+		// A chat model recognized only by its attribute map
+		// (no usage child) must not suppress the legacy walk
+		// for older record shapes.
 	}
 	return extractLegacyAntigravityTokenUsage(fields)
 }
@@ -948,6 +1120,29 @@ func tokenBlockFrom(fs []agProtoField) (agTokenBlock, bool) {
 	if hasCacheRead {
 		block.CacheRead = int(cacheReadTokens.Varint)
 	}
+	// thinking_output_tokens is optional: older builds do not split it
+	// out of output_tokens. A malformed value (wrong wire type or an
+	// implausible count) means the walked message is not a usage block,
+	// so it fails the gate like any other decoy.
+	if thinking, ok := agProtoFind(
+		fs, agModelUsageStatsThinkingTokensField,
+	); ok {
+		if thinking.Wire != pbWireVarint ||
+			thinking.Varint > maxPlausibleTokens {
+			return agTokenBlock{}, false
+		}
+		block.Reasoning = int(thinking.Varint)
+	}
+	// response_id is optional and string-shaped; a non-bytes field 11 is
+	// something else entirely and is ignored rather than gated on.
+	if rid, ok := agProtoFind(
+		fs, agModelUsageStatsResponseIDField,
+	); ok && rid.Wire == pbWireBytes {
+		if s, ok := agProtoString(rid); ok && s != "" && len(s) <= 128 &&
+			!strings.ContainsAny(s, " \t\n") {
+			block.ResponseID = s
+		}
+	}
 	return block, true
 }
 
@@ -993,9 +1188,25 @@ func extractAntigravityChatModel(
 	) != "" {
 		return chatModel.Nested, true
 	}
+	// A chat model carrying only the attribute map (model_enum at
+	// field 20) is still a chat model.
+	for _, f := range chatModel.Nested {
+		if f.Number == agChatModelMetadataAttributesField &&
+			f.Nested != nil {
+			return chatModel.Nested, true
+		}
+	}
 	return nil, false
 }
 
+// extractAntigravityChatModelName resolves the model a generation ran on.
+// model_display_name (21) is the most human-readable label and wins.
+// response_model (19) is next, except that Antigravity sometimes writes an
+// internal model-config id ("gemini-pro-default") or a bare placeholder
+// there — neither names a real model, so the model_enum attribute
+// (field 20) and, failing that, the usage stats' model enum varint are
+// consulted through the placeholder table before the raw field 19 value
+// is accepted as a last resort.
 func extractAntigravityChatModelName(
 	fields []agProtoField,
 ) (string, bool) {
@@ -1004,9 +1215,104 @@ func extractAntigravityChatModelName(
 	); model != "" {
 		return model, true
 	}
-	return extractModelNameField(
+	responseModel := extractModelNameField(
 		fields, agChatModelMetadataResponseModelField,
-	), false
+	)
+	if responseModel != "" &&
+		!isAntigravityModelConfigID(responseModel) &&
+		!strings.HasPrefix(responseModel, "MODEL_PLACEHOLDER_") {
+		return responseModel, false
+	}
+	enum := antigravityChatModelEnum(fields)
+	if resolved, ok := antigravityPlaceholderModels[enum]; ok {
+		return resolved, true
+	}
+	if responseModel != "" {
+		if resolved, ok := antigravityPlaceholderModels[responseModel]; ok {
+			return resolved, true
+		}
+		return responseModel, false
+	}
+	if enum != "" {
+		// An unmapped enum still records which placeholder served the
+		// generation; preferable to an empty model on new builds.
+		return enum, true
+	}
+	return "", false
+}
+
+// isAntigravityModelConfigID reports whether model is an internal
+// model-config id rather than a model name. Antigravity writes
+// "gemini-pro-default" (and similar *-default routes) into response_model
+// when the request is served by a default config; the concrete model then
+// only lives in the model_enum attribute.
+func isAntigravityModelConfigID(model string) bool {
+	return strings.HasSuffix(model, "-default")
+}
+
+// antigravityChatModelEnum reads the model_enum attribute from the
+// ChatModelMetadata key/value entries (field 20), falling back to the
+// MODEL_PLACEHOLDER_M<N> name synthesized from the usage stats' model
+// enum varint (1000+N) when the attribute map is absent.
+func antigravityChatModelEnum(fields []agProtoField) string {
+	for _, f := range fields {
+		if f.Number != agChatModelMetadataAttributesField ||
+			f.Nested == nil {
+			continue
+		}
+		key, ok := agProtoFind(f.Nested, 1)
+		if !ok {
+			continue
+		}
+		keyStr, ok := agProtoString(key)
+		if !ok || keyStr != "model_enum" {
+			continue
+		}
+		value, ok := agProtoFind(f.Nested, 2)
+		if !ok {
+			continue
+		}
+		if valueStr, ok := agProtoString(value); ok &&
+			isPlausibleModelName(valueStr) {
+			return valueStr
+		}
+	}
+	usage, ok := agProtoFind(fields, agChatModelMetadataUsageField)
+	if !ok || usage.Nested == nil {
+		return ""
+	}
+	modelField, ok := agProtoFind(
+		usage.Nested, agModelUsageStatsModelField,
+	)
+	if !ok || modelField.Wire != pbWireVarint {
+		return ""
+	}
+	if modelField.Varint < 1000 || modelField.Varint >= 100_000 {
+		return ""
+	}
+	return fmt.Sprintf("MODEL_PLACEHOLDER_M%d", modelField.Varint-1000)
+}
+
+// antigravityPlaceholderModels maps MODEL_PLACEHOLDER_M<N> enum names to
+// the model slug they served. Mappings marked "paired" are confirmed by
+// (response_model, display_name) rows in local gen_metadata; the rest
+// follow the upstream format notes and the producer's naming convention.
+var antigravityPlaceholderModels = map[string]string{
+	"MODEL_PLACEHOLDER_M16":  "gemini-3.1-pro-high", // paired: Gemini 3.1 Pro (High)
+	"MODEL_PLACEHOLDER_M18":  "gemini-3-flash",      // upstream notes
+	"MODEL_PLACEHOLDER_M26":  "claude-opus-4-6-thinking",
+	"MODEL_PLACEHOLDER_M35":  "claude-sonnet-4-6",
+	"MODEL_PLACEHOLDER_M36":  "gemini-3.1-pro-low",
+	"MODEL_PLACEHOLDER_M37":  "gemini-3.1-pro-high",   // upstream notes
+	"MODEL_PLACEHOLDER_M71":  "gemini-3.6-flash-high", // paired: Gemini 3.6 Flash (High)
+	"MODEL_PLACEHOLDER_M84":  "gemini-3.5-flash-high", // upstream notes
+	"MODEL_PLACEHOLDER_M298": "gemini-3.7-flash-high",
+	"MODEL_PLACEHOLDER_M299": "gemini-3.7-flash-medium",
+	"MODEL_PLACEHOLDER_M300": "gemini-3.7-flash-low",
+	"MODEL_PLACEHOLDER_M318": "gemini-3.8-flash",
+	"MODEL_PLACEHOLDER_M319": "gemini-3.8-flash",
+	"MODEL_PLACEHOLDER_M320": "gemini-3.8-flash",
+	"MODEL_PLACEHOLDER_M322": "gemini-3.8-flash-tiered",
 }
 
 func extractModelNameField(fields []agProtoField, fieldNumber int) string {
@@ -1165,7 +1471,7 @@ func isPlausibleModelName(s string) bool {
 func decodeAntigravityStep(
 	idx, stepType int, payload []byte,
 ) (ParsedMessage, bool) {
-	step, ok := newAntigravityStep(idx, stepType, payload)
+	step, ok := newAntigravityStep(idx, stepType, payload, nil)
 	if !ok {
 		return ParsedMessage{}, false
 	}
@@ -1180,7 +1486,9 @@ func decodeAntigravityParsedStep(
 	// dropped.
 	var calls []ParsedToolCall
 	if step.role == RoleAssistant {
-		calls = extractAntigravityToolCalls(step.idx, step.fields)
+		calls = extractAntigravityToolCalls(
+			step.idx, step.fields, step.metaCalls,
+		)
 	}
 
 	strs, urlOnly := cleanAntigravityStepStrings(step)
@@ -1236,6 +1544,9 @@ var knownAntigravityToolNames = map[string]bool{
 	"schedule":                   true,
 	"search_web":                 true,
 	"generate_image":             true,
+	"receive_message":            true,
+	"call_mcp_tool":              true,
+	"list_resources":             true,
 	// Gemini/Antigravity shared tools (also appear in CLI variant)
 	"run_command":       true,
 	"execute_command":   true,
@@ -1243,6 +1554,8 @@ var knownAntigravityToolNames = map[string]bool{
 	"grep_search":       true,
 	"search_files":      true,
 	"list_directory":    true,
+	"list_dir":          true,
+	"find_by_name":      true,
 	// Known CLI JSON structure tool names
 	"edit_file":  true,
 	"read_file":  true,
@@ -1256,29 +1569,46 @@ func isAntigravityToolName(s string) bool {
 	return knownAntigravityToolNames[s]
 }
 
-// extractAntigravityToolCalls walks the decoded protobuf field tree
-// and returns one ParsedToolCall per tool invocation found. Uses the
-// same heuristic-walker approach as extractTokenUsage / extractModelName:
-// we identify strings that exactly match known tool names, collect any
-// adjacent UUID-like string as the ToolUseID, and any adjacent JSON
-// object string as the InputJSON.
+// extractAntigravityToolCalls returns one ParsedToolCall per tool
+// invocation found on a step. Structured ToolCallMetadata entries from
+// steps.metadata are authoritative: they carry the real call id and the
+// complete argument object and are not restricted to the known tool name
+// list. The payload heuristic then runs as before — matching known tool
+// name strings and collecting adjacent call ids and JSON argument
+// objects — except that names already emitted from metadata are skipped
+// (the payload echoes the same call and would double-emit it).
 //
-// When no UUID-like ID is found, a synthetic deterministic ID is
-// generated so the timing pipeline still has a stable key per call.
-//
-// Only strings matching Antigravity-known tool names are accepted.
+// When no call id is found, a synthetic deterministic ID is generated so
+// the timing pipeline still has a stable key per call.
 func extractAntigravityToolCalls(
 	stepIdx int, fields []agProtoField,
+	metaCalls []antigravityMetaToolCall,
 ) []ParsedToolCall {
+	var calls []ParsedToolCall
+	metaNames := make(map[string]bool, len(metaCalls))
+	for i, mc := range metaCalls {
+		metaNames[mc.name] = true
+		toolUseID := mc.callID
+		if !isAntigravityToolUseID(toolUseID) {
+			toolUseID = fmt.Sprintf("ag-step-%d-meta-%d", stepIdx, i)
+		}
+		calls = append(calls, ParsedToolCall{
+			ToolUseID: toolUseID,
+			ToolName:  antigravityToolCallName(mc.name, mc.args),
+			Category:  NormalizeToolCategory(mc.name),
+			InputJSON: mc.args,
+		})
+	}
+
 	// Collect all string values reachable from this step's field tree.
 	// minLen=1 so we catch even short tool names like "Bash" or "Read".
 	all := agProtoCollectStrings(fields, 1)
 
-	var calls []ParsedToolCall
 	seen := map[string]bool{}
 	for i, s := range all {
-		// Reject generic taxonomy matches that are not known Antigravity tools.
-		if !isAntigravityToolName(s) {
+		// Reject generic taxonomy matches that are not known Antigravity tools,
+		// and names the metadata decode already emitted for this step.
+		if !isAntigravityToolName(s) || metaNames[s] {
 			continue
 		}
 		cat := NormalizeToolCategory(s)
@@ -1315,7 +1645,7 @@ func extractAntigravityToolCalls(
 				continue
 			}
 
-			if antigravityUUIDLikeRE.MatchString(all[j]) {
+			if isAntigravityToolUseID(all[j]) {
 				toolUseID = all[j]
 				break
 			}
@@ -1375,12 +1705,34 @@ func extractAntigravityToolCalls(
 
 		calls = append(calls, ParsedToolCall{
 			ToolUseID: toolUseID,
-			ToolName:  s,
+			ToolName:  antigravityToolCallName(s, inputJSON),
 			Category:  cat,
 			InputJSON: inputJSON,
 		})
 	}
 	return calls
+}
+
+// antigravityToolCallName resolves the recorded tool name to the name the
+// call should be displayed and counted under. call_mcp_tool wraps an MCP
+// server invocation; its arguments carry the real server and tool names,
+// surfaced as mcp__<server>__<tool> so per-tool accounting attributes the
+// call to the actual MCP tool rather than the wrapper.
+func antigravityToolCallName(name, argsJSON string) string {
+	if name != "call_mcp_tool" {
+		return name
+	}
+	var args struct {
+		ServerName string `json:"ServerName"`
+		ToolName   string `json:"ToolName"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return name
+	}
+	if args.ServerName == "" || args.ToolName == "" {
+		return name
+	}
+	return "mcp__" + args.ServerName + "__" + args.ToolName
 }
 
 func dedupeStrings(in []string) []string {
@@ -1404,6 +1756,14 @@ func cleanAntigravityStepStrings(step antigravityStep) (cleaned, urlOnly []strin
 	for _, s := range dedupeStrings(agProtoCollectStrings(step.fields, 20)) {
 		s = strings.TrimSpace(s)
 		if isNoisyAntigravityStepString(s) {
+			continue
+		}
+		// Tool-call ids ("call_2121026") echo inside tool-step
+		// payloads; they are bookkeeping tokens, not displayable
+		// content. (Not folded into the URL check below: that
+		// predicate also selects the urlOnly rescue set.)
+		if step.role != RoleUser &&
+			antigravityCallIDLikeRE.MatchString(s) {
 			continue
 		}
 		if step.role != RoleUser && isNoisyAntigravityNonUserStepString(s) {

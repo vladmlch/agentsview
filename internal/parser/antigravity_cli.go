@@ -399,6 +399,7 @@ func loadAntigravityCLIDBSteps(ctx context.Context,
 	sourceVersion := antigravitySourceVersion(ctx, db)
 	result, err := loadAntigravityStepsWithRawCount(
 		ctx, db, antigravityCLIIDPrefix,
+		strings.TrimSuffix(filepath.Base(path), ".db"),
 	)
 	result.sourceVersion = sourceVersion
 	if err != nil {
@@ -1415,6 +1416,13 @@ func agyToolDetail(name, inputJSON string) string {
 		if p := getString("Prompt"); p != "" {
 			return p
 		}
+	case "call_mcp_tool":
+		if s := getString("ServerName"); s != "" {
+			if t := getString("ToolName"); t != "" {
+				return s + "." + t
+			}
+			return s
+		}
 	}
 	return name
 }
@@ -1561,7 +1569,9 @@ func parseAntigravityCLITrajectory(
 
 				toolCalls = append(toolCalls, ParsedToolCall{
 					ToolUseID: tc.ID,
-					ToolName:  tc.Name,
+					ToolName: antigravityToolCallName(
+						tc.Name, tc.ArgumentsJSON,
+					),
 					Category:  cat,
 					InputJSON: tc.ArgumentsJSON,
 				})

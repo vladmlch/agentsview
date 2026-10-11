@@ -21,8 +21,10 @@ import (
 // a StepFun step-5-preview row, which the pinned snapshot lacks. Version 6
 // removes the temporary Bedrock Astra row now supplied by the snapshot.
 // Version 7 adds Devin internal models and Antigravity/Devin tier aliases;
-// the pinned snapshot prices their canonical models.
-const supplementalVersion = "7"
+// the pinned snapshot prices their canonical models. Version 8 adds the
+// remaining Antigravity effort/tier-qualified names that gen_metadata
+// response_model and the MODEL_PLACEHOLDER_M* table resolve to.
+const supplementalVersion = "8"
 
 // Canonical pricing models runtime aliases resolve to.
 // KimiK26Canonical exists in the embedded LiteLLM snapshot;
@@ -102,8 +104,18 @@ var fixedPricingAliases = []FixedPricingAlias{
 	{Name: "gemini-3.8-flash-high", Canonical: "gemini-3.8-flash"},
 	{Name: "gemini-3.8-flash-exp-a", Canonical: "gemini-3.8-flash"},
 	{Name: "gemini-3.8-flash-medium", Canonical: "gemini-3.8-flash"},
+	{Name: "gemini-3.8-flash-low", Canonical: "gemini-3.8-flash"},
+	{Name: "gemini-3.8-flash-tiered", Canonical: "gemini-3.8-flash"},
+	{Name: "gemini-3.8-flash-n", Canonical: "gemini-3.8-flash"},
 	{Name: "gemini-3.7-flash-high", Canonical: "gemini-3.7-flash"},
+	{Name: "gemini-3.7-flash-medium", Canonical: "gemini-3.7-flash"},
+	{Name: "gemini-3.7-flash-low", Canonical: "gemini-3.7-flash"},
 	{Name: "gemini-3.7-flash-exp-b", Canonical: "gemini-3.7-flash"},
+	{Name: "gemini-3.6-flash-high", Canonical: "gemini-3.6-flash"},
+	{Name: "gemini-3.5-flash-high", Canonical: "gemini-3.5-flash"},
+	{Name: "gemini-3.1-pro-high", Canonical: "gemini-3.1-pro-preview"},
+	{Name: "gemini-3.1-pro-low", Canonical: "gemini-3.1-pro-preview"},
+	{Name: "gemini-3-flash", Canonical: "gemini-3-flash-preview"},
 }
 
 // DateAliasedModels returns the sorted unqualified date-ambiguous
