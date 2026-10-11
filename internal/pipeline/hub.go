@@ -17,6 +17,20 @@ import (
 // dropping events for it; producers never wait on subscriber drains.
 const subscriberBufferCap = 1024
 
+// hubLogCap bounds the retained global event log. Once it fills, the
+// oldest half is dropped in place, so Subscribe replay only ever
+// reaches the retained tail. Live delivery and per-run recording are
+// unaffected.
+const hubLogCap = 1 << 15
+
+// runEventsRetainedCap bounds how many of one run's events stay in
+// memory. Past it a recorded run's events exist only in its JSONL
+// recording and RunEvents serves them from disk; an unrecorded run
+// can only offer the head it retained. line_classified events carry
+// raw file text, so an observe run left attached to a busy engine
+// would otherwise grow the heap without bound.
+const runEventsRetainedCap = 1 << 13
+
 // RunInfo.State values.
 const (
 	// RunStateRunning marks a run whose recording window is open.
@@ -43,9 +57,9 @@ type Hub struct {
 	mu   gosync.Mutex
 	subs map[chan pipevents.Event]struct{}
 	seq  uint64
-	// log holds every observed event in seq order. Subscribe replays
-	// it and RunEvents filters per run. It grows for the life of the
-	// process, which is acceptable for the playground's short runs.
+	// log holds the newest observed events in seq order, bounded by
+	// hubLogCap. Subscribe replays it; per-run replay comes from
+	// runRecord.events or the run's recording file.
 	log []pipevents.Event
 
 	runs   *runLog
@@ -63,10 +77,13 @@ type runLog struct {
 
 // runRecord is one run's bookkeeping: its listing entry, its recorded
 // events, and its streaming recorder (nil when recording is disabled).
+// events is capped at runEventsRetainedCap; truncated marks a run
+// whose full event list lives only in its recording file.
 type runRecord struct {
-	info   RunInfo
-	events []pipevents.Event
-	w      *runRecorder
+	info      RunInfo
+	events    []pipevents.Event
+	truncated bool
+	w         *runRecorder
 }
 
 // NewHub creates a hub that stores run recordings under
@@ -103,13 +120,26 @@ func (h *Hub) observeLocked(e pipevents.Event) {
 	}
 	if h.active != nil {
 		e.RunID = h.active.info.RunID
-		h.active.events = append(h.active.events, e)
+		if len(h.active.events) < runEventsRetainedCap {
+			h.active.events = append(h.active.events, e)
+		} else {
+			// The recording file stays lossless — writeEvent
+			// flushes every line — so RunEvents reads it back.
+			// EventCount keeps counting the run's real size.
+			h.active.truncated = true
+		}
 		h.active.info.EventCount++
 		if h.active.w != nil {
 			h.active.w.writeEvent(e)
 		}
 	}
 	h.log = append(h.log, e)
+	if len(h.log) > hubLogCap {
+		// Halving in place amortizes the copy across the next
+		// hubLogCap/2 appends.
+		copy(h.log, h.log[len(h.log)-hubLogCap/2:])
+		h.log = h.log[:hubLogCap/2]
+	}
 	for ch := range h.subs {
 		select {
 		case ch <- e:
@@ -259,17 +289,44 @@ func (h *Hub) Recorder() *Recorder { return h.rec }
 
 // RunEvents returns a snapshot copy of the events recorded under
 // runID, including the run_started/run_finished bookends. Unknown run
-// ids return nil.
+// ids return nil. Runs within runEventsRetainedCap are served from
+// memory; a truncated run is read back from its JSONL recording —
+// every writeEvent line is flushed, so the file is complete — and
+// falls back to the retained head if that read fails. An unrecorded
+// truncated run can only offer the retained head.
 func (h *Hub) RunEvents(runID string) []pipevents.Event {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	rec, ok := h.runs.byID[runID]
 	if !ok {
+		h.mu.Unlock()
 		return nil
 	}
+	if !(rec.truncated && h.rec.enabled()) {
+		out := make([]pipevents.Event, len(rec.events))
+		copy(out, rec.events)
+		h.mu.Unlock()
+		return out
+	}
+	// The disk read happens outside the lock: parsing a large
+	// recording must not stall ObserveEvent.
+	h.mu.Unlock()
+	if _, evs, err := h.rec.ReadRecording(
+		runID + recordingFileExt); err == nil {
+		return evs
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	out := make([]pipevents.Event, len(rec.events))
 	copy(out, rec.events)
 	return out
+}
+
+// SubscriberCount reports the number of live event subscriptions.
+// The observe watchdog treats zero as "no client is streaming".
+func (h *Hub) SubscriberCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.subs)
 }
 
 // Runs returns every run the hub has seen, oldest first.

@@ -353,6 +353,71 @@ func TestRecorderListReadImport(t *testing.T) {
 	assert.Equal(t, "k", gotEvs[0].Kind)
 }
 
+// TestHubLogStaysBounded: once the global log passes hubLogCap the
+// oldest half is dropped — memory stays bounded and Subscribe replay
+// reaches only the retained tail while seq keeps climbing.
+func TestHubLogStaysBounded(t *testing.T) {
+	h := NewHub(t.TempDir())
+	const total = hubLogCap + 100
+	for i := 0; i < total; i++ {
+		h.ObserveEvent(pipevents.Event{
+			Stage: pipevents.StageWatch, Kind: pipevents.KindFSEvent,
+		})
+	}
+	assert.LessOrEqual(t, len(h.log), hubLogCap)
+
+	sub, unsub := h.Subscribe(0)
+	defer unsub()
+	first := recvEvent(t, sub)
+	assert.Greater(t, first.Seq, uint64(1),
+		"replay starts at the retained tail, not seq 1")
+}
+
+// TestHubRunEventsReadsTruncatedRunFromRecording: a run that
+// overflows runEventsRetainedCap keeps only a head in memory, yet
+// RunEvents still serves the complete list by reading the JSONL
+// recording back — payload numbers return as float64 through the
+// codec.
+func TestHubRunEventsReadsTruncatedRunFromRecording(t *testing.T) {
+	dir := t.TempDir()
+	h := NewHub(dir)
+	require.NoError(t, h.BeginRun("big", "s", ""))
+	const extra = runEventsRetainedCap + 17
+	for i := 0; i < extra; i++ {
+		h.ObserveEvent(pipevents.Event{
+			Stage:   pipevents.StageParse,
+			Kind:    pipevents.KindLineClassified,
+			Path:    "/x/f.jsonl",
+			Payload: map[string]any{"line_no": i},
+		})
+	}
+	h.EndRun(nil)
+
+	rec := h.runs.byID["big"]
+	assert.True(t, rec.truncated)
+	assert.Len(t, rec.events, runEventsRetainedCap)
+
+	evs := h.RunEvents("big")
+	require.Len(t, evs, extra+2,
+		"run_started + %d observed + run_finished", extra)
+	assert.Equal(t, pipevents.KindRunStarted, evs[0].Kind)
+	assert.Equal(t, pipevents.KindRunFinished, evs[extra+1].Kind)
+	assert.Equal(t, float64(3), evs[4].Payload["line_no"])
+}
+
+// TestHubRunEventsTruncatedUnrecordedReturnsHead: with recording
+// disabled there is no file to fall back on — a truncated run can
+// only offer the head it retained.
+func TestHubRunEventsTruncatedUnrecordedReturnsHead(t *testing.T) {
+	h := NewHub("")
+	require.NoError(t, h.BeginRun("big", "s", ""))
+	for i := 0; i < runEventsRetainedCap+5; i++ {
+		h.ObserveEvent(pipevents.Event{Kind: "e"})
+	}
+	h.EndRun(nil)
+	assert.Len(t, h.RunEvents("big"), runEventsRetainedCap)
+}
+
 // TestRecorderRejectsBadInput pins the validation: unsafe or
 // non-recording names and unparseable content fail without leaving
 // files behind.
