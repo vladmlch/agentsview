@@ -4,12 +4,15 @@ package server_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json/v2"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
+	gosync "sync"
 	"testing"
 	"time"
 
@@ -30,13 +33,47 @@ type pipelineTestEnv struct {
 	*testEnv
 	hub     *pipeline.Hub
 	sandbox *pipeline.Sandbox
+	// tap records the observer observe mode installs, standing in for
+	// the daemon's embed schedulers, which the test env does not build.
+	tap *pipelineObserverTarget
+}
+
+// pipelineObserverTarget is a test double for the embed schedulers:
+// it records the observer the playground attaches/detaches so tests
+// can assert the observe-window lifecycle without running builds.
+type pipelineObserverTarget struct {
+	mu  gosync.Mutex
+	obs pipevents.Observer
+}
+
+func (t *pipelineObserverTarget) SetPipelineObserver(o pipevents.Observer) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.obs = o
+}
+
+func (t *pipelineObserverTarget) observer() pipevents.Observer {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.obs
+}
+
+func setupPipelineTestEnv(t *testing.T) *pipelineTestEnv {
+	return buildPipelineTestEnv(t, true)
+}
+
+// setupPipelineTestEnvNoEngine builds the same playground without a
+// real engine reference, mirroring serve --no-sync / pg-serve: observe
+// answers 501 while every other route keeps working.
+func setupPipelineTestEnvNoEngine(t *testing.T) *pipelineTestEnv {
+	return buildPipelineTestEnv(t, false)
 }
 
 // setupPipelineTestEnv builds a server with a real pipeline playground:
 // a hub recording under the test data dir, a live sandbox (real watcher,
-// real engine, real SQLite archive), and the daemon's own sync engine for
-// observe mode.
-func setupPipelineTestEnv(t *testing.T) *pipelineTestEnv {
+// real engine, real SQLite archive), and — when withEngine — the
+// daemon's own sync engine for observe mode.
+func buildPipelineTestEnv(t *testing.T, withEngine bool) *pipelineTestEnv {
 	t.Helper()
 	dir := tempDirWithRetryCleanup(t)
 	cfg := config.Config{
@@ -54,12 +91,17 @@ func setupPipelineTestEnv(t *testing.T) *pipelineTestEnv {
 	sandbox, err := pipeline.OpenSandbox(t.Context(), dir, hub)
 	require.NoError(t, err)
 	t.Cleanup(sandbox.Close)
+	tap := &pipelineObserverTarget{}
+	pg := &server.PipelinePlayground{
+		Hub:       hub,
+		Sandbox:   sandbox,
+		EmbedTaps: []server.PipelineObserverTarget{tap},
+	}
+	if withEngine {
+		pg.Engine = engine
+	}
 	srv := server.New(cfg, database, engine,
-		server.WithPipelinePlayground(&server.PipelinePlayground{
-			Hub:     hub,
-			Sandbox: sandbox,
-			Engine:  engine,
-		}),
+		server.WithPipelinePlayground(pg),
 	)
 	return &pipelineTestEnv{
 		testEnv: &testEnv{
@@ -71,6 +113,7 @@ func setupPipelineTestEnv(t *testing.T) *pipelineTestEnv {
 		},
 		hub:     hub,
 		sandbox: sandbox,
+		tap:     tap,
 	}
 }
 
@@ -251,6 +294,15 @@ func TestPipelineRunHappyPathStreamsToRunFinished(t *testing.T) {
 	for _, e := range partial {
 		assert.Greater(t, e.Seq, uint64(1))
 	}
+
+	// A cursor at or past the run's final event means the client already
+	// consumed the whole stream: the answer is an empty stream that
+	// closes immediately rather than heartbeating forever.
+	tail := pipelineEventsRequest(
+		t, te, runID,
+		"?after_seq="+strconv.FormatUint(lastSeq, 10),
+		10*time.Second)
+	assert.Empty(t, tail)
 }
 
 func TestPipelineRunConflictWhileActive(t *testing.T) {
@@ -290,6 +342,10 @@ func TestPipelineObserveAttachesToRealEngine(t *testing.T) {
 		})
 	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
 
+	// Attaching also plugs the embed taps, so production embed_* events
+	// join the same observe recording the engine's events land in.
+	assert.Equal(t, te.hub, te.tap.observer())
+
 	// A second observe session cannot attach while one is live.
 	rec = pipelineRequest(t, te, http.MethodPost,
 		"/api/v1/pipeline/observe", map[string]string{
@@ -303,11 +359,14 @@ func TestPipelineObserveAttachesToRealEngine(t *testing.T) {
 		t.Context(), false, nil, func(bool) error { return nil })
 	require.NoError(t, err)
 
-	// Detaching ends the run window; a second delete reports 404.
+	// Detaching ends the run window, unplugs the taps again, and a
+	// second delete reports 404.
 	rec = pipelineRequest(t, te, http.MethodDelete,
 		"/api/v1/pipeline/observe", nil)
 	require.Equal(t, http.StatusNoContent, rec.Code,
 		"body: %s", rec.Body.String())
+	assert.Nil(t, te.tap.observer(),
+		"observe detach must unplug the embed taps")
 	rec = pipelineRequest(t, te, http.MethodDelete,
 		"/api/v1/pipeline/observe", nil)
 	assert.Equal(t, http.StatusNotFound, rec.Code)
@@ -319,6 +378,79 @@ func TestPipelineObserveAttachesToRealEngine(t *testing.T) {
 	assert.Equal(t, pipevents.KindRunFinished, kinds[len(kinds)-1])
 	assert.Contains(t, kinds, pipevents.KindSyncPassStarted,
 		"observe mode must capture the real engine's sync pass events")
+}
+
+// TestPipelineSandboxRunLeavesEmbedTapsDetached is the regression guard
+// for the review's Important finding: the hub stamps every observed
+// event with the active run id, so an embed tap left attached outside
+// observe windows would leak production embed_* events into sandbox
+// recordings and SSE streams. The taps must stay detached for the
+// entire sandbox-run lifecycle.
+func TestPipelineSandboxRunLeavesEmbedTapsDetached(t *testing.T) {
+	te := setupPipelineTestEnv(t)
+	runID := pipelineStartRun(t, te, "happy-path")
+	assert.Nil(t, te.tap.observer(),
+		"sandbox run must not attach the embed taps")
+	pipelineWaitRunFinished(t, te, runID)
+	assert.Nil(t, te.tap.observer(),
+		"embed taps must stay detached after the sandbox run")
+
+	for _, e := range te.hub.RunEvents(runID) {
+		assert.NotEqual(t, pipevents.StageEmbed, e.Stage,
+			"sandbox recordings must not contain embed-stage events")
+	}
+}
+
+// TestPipelineObserveRequiresEngineAndValidRunID covers the observe
+// precondition errors: no real engine → 501 (serve --no-sync /
+// pg-serve), malformed run_id → 400 before the hub is touched.
+func TestPipelineObserveRequiresEngineAndValidRunID(t *testing.T) {
+	teNoEngine := setupPipelineTestEnvNoEngine(t)
+	rec := pipelineRequest(t, teNoEngine, http.MethodPost,
+		"/api/v1/pipeline/observe", map[string]string{
+			"run_id": "observe-nope",
+		})
+	assert.Equal(t, http.StatusNotImplemented, rec.Code,
+		"body: %s", rec.Body.String())
+	assert.Nil(t, teNoEngine.tap.observer())
+
+	te := setupPipelineTestEnv(t)
+	for _, runID := range []string{"bad id", ".hidden", "a/b"} {
+		rec = pipelineRequest(t, te, http.MethodPost,
+			"/api/v1/pipeline/observe", map[string]string{
+				"run_id": runID,
+			})
+		assert.Equal(t, http.StatusBadRequest, rec.Code,
+			"run_id %q must be rejected", runID)
+	}
+	assert.Nil(t, te.tap.observer())
+	_, active := te.hub.ActiveRun()
+	assert.False(t, active, "rejected observe must not open a window")
+}
+
+// TestPipelineObserveDetachedOnShutdown covers the forgotten-session
+// path: a live observe window is detached by Server.Shutdown, closing
+// its recording with run_finished and unplugging the taps instead of
+// leaving a half-open run blocking everything.
+func TestPipelineObserveDetachedOnShutdown(t *testing.T) {
+	te := setupPipelineTestEnv(t)
+	rec := pipelineRequest(t, te, http.MethodPost,
+		"/api/v1/pipeline/observe", map[string]string{
+			"run_id": "observe-shutdown",
+		})
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+
+	require.NoError(t, te.srv.Shutdown(
+		context.WithoutCancel(t.Context())))
+	assert.Nil(t, te.tap.observer())
+
+	events := te.hub.RunEvents("observe-shutdown")
+	require.NotEmpty(t, events)
+	kinds := pipelineRunKinds(events)
+	assert.Equal(t, pipevents.KindRunFinished, kinds[len(kinds)-1],
+		"shutdown must close the forgotten observe run")
+	_, active := te.hub.ActiveRun()
+	assert.False(t, active)
 }
 
 func TestPipelineRecordingsListDownloadImport(t *testing.T) {
@@ -380,6 +512,50 @@ func TestPipelineRecordingsListDownloadImport(t *testing.T) {
 	rec = httptest.NewRecorder()
 	te.handler.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// TestPipelineRecordingDownloadRejectsUnsafeNames covers the recording
+// name validator behind GET /recordings/{name}: anything that is not a
+// plain "*.jsonl" base name answers 400 before touching the filesystem,
+// while a well-formed but absent name answers 404.
+func TestPipelineRecordingDownloadRejectsUnsafeNames(t *testing.T) {
+	te := setupPipelineTestEnv(t)
+	for _, name := range []string{
+		"x.txt",         // not a recording extension
+		".hidden.jsonl", // dotfile
+		".jsonl",        // extension only, no base name
+		"..x.jsonl",     // dot-prefixed traversal look-alike
+	} {
+		rec := pipelineRequest(t, te, http.MethodGet,
+			"/api/v1/pipeline/recordings/"+name, nil)
+		assert.Equal(t, http.StatusBadRequest, rec.Code,
+			"name %q must be rejected, body: %s", name, rec.Body.String())
+	}
+
+	rec := pipelineRequest(t, te, http.MethodGet,
+		"/api/v1/pipeline/recordings/missing.jsonl", nil)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// TestPipelineSandboxResetConflictsWhileRunActive covers the 409 path:
+// resetting the sandbox under a live run must refuse rather than wait
+// on the sandbox mutex or corrupt the run's archive.
+func TestPipelineSandboxResetConflictsWhileRunActive(t *testing.T) {
+	te := setupPipelineTestEnv(t)
+	runID := pipelineStartRun(t, te, "happy-path")
+
+	rec := pipelineRequest(t, te, http.MethodPost,
+		"/api/v1/pipeline/sandbox/reset", nil)
+	assert.Equal(t, http.StatusConflict, rec.Code,
+		"reset while a run is active must be 409, body: %s",
+		rec.Body.String())
+
+	pipelineWaitRunFinished(t, te, runID)
+	rec = pipelineRequest(t, te, http.MethodPost,
+		"/api/v1/pipeline/sandbox/reset", nil)
+	assert.Equal(t, http.StatusNoContent, rec.Code,
+		"reset after the run finishes must succeed, body: %s",
+		rec.Body.String())
 }
 
 func TestPipelineSandboxResetAllowsNewRun(t *testing.T) {

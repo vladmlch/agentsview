@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v7"
@@ -106,8 +107,11 @@ type embedScheduler struct {
 
 	// pipelineObs, when non-nil, receives embed_* pipevents for the
 	// pipeline playground's hub. store labels which index this scheduler
-	// builds so the two schedulers' events stay distinguishable.
-	pipelineObs pipevents.Observer
+	// builds so the two schedulers' events stay distinguishable. The slot
+	// is an atomic pointer because observe-mode attach/detach calls
+	// SetPipelineObserver while the scheduler goroutine is running —
+	// same pattern as sync.Engine.pipelineObs.
+	pipelineObs atomic.Pointer[pipevents.Observer]
 	store       string
 
 	dirty chan func()
@@ -137,10 +141,24 @@ func newEmbedScheduler(
 
 // SetPipelineObserver installs an optional observer for the
 // embed_scheduled/embed_started/embed_done/embed_skipped lifecycle —
-// the pipeline playground's hub. Nil disables reporting. The observer
-// is only consulted from the scheduler's own goroutine.
+// the pipeline playground's hub during observe windows. Nil disables
+// reporting. It may be called while the scheduler is running; the
+// atomic slot makes the swap race-free.
 func (s *embedScheduler) SetPipelineObserver(o pipevents.Observer) {
-	s.pipelineObs = o
+	if o == nil {
+		s.pipelineObs.Store(nil)
+		return
+	}
+	s.pipelineObs.Store(&o)
+}
+
+// pipelineObserver returns the installed observer or nil. The atomic
+// load keeps the common no-observer path allocation-free.
+func (s *embedScheduler) pipelineObserver() pipevents.Observer {
+	if p := s.pipelineObs.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // observeEmbed reports one embed-stage event to the pipeline observer.
@@ -148,14 +166,15 @@ func (s *embedScheduler) SetPipelineObserver(o pipevents.Observer) {
 func (s *embedScheduler) observeEmbed(
 	kind string, payload map[string]any,
 ) {
-	if s.pipelineObs == nil {
+	ob := s.pipelineObserver()
+	if ob == nil {
 		return
 	}
 	p := map[string]any{"store": s.store}
 	for k, v := range payload {
 		p[k] = v
 	}
-	s.pipelineObs.ObserveEvent(pipevents.Event{
+	ob.ObserveEvent(pipevents.Event{
 		Stage:   pipevents.StageEmbed,
 		Kind:    kind,
 		Payload: p,

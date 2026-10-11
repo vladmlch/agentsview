@@ -561,17 +561,23 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 		log.Printf("pipeline playground disabled: %v", pipeErr)
 	} else {
 		defer pipeSandbox.Close()
+		// The embed schedulers become observe-scoped taps: the server
+		// attaches the hub to them only while POST /observe is open, so
+		// production embed_* events land in observe recordings but can
+		// never leak into a sandbox run's recording.
+		var embedTaps []server.PipelineObserverTarget
 		if vectorServe.Scheduler != nil {
-			vectorServe.Scheduler.SetPipelineObserver(pipeHub)
+			embedTaps = append(embedTaps, vectorServe.Scheduler)
 		}
 		if vectorServe.RecallScheduler != nil {
-			vectorServe.RecallScheduler.SetPipelineObserver(pipeHub)
+			embedTaps = append(embedTaps, vectorServe.RecallScheduler)
 		}
 		srvOpts = append(srvOpts, server.WithPipelinePlayground(
 			&server.PipelinePlayground{
-				Hub:     pipeHub,
-				Sandbox: pipeSandbox,
-				Engine:  engine,
+				Hub:       pipeHub,
+				Sandbox:   pipeSandbox,
+				Engine:    engine,
+				EmbedTaps: embedTaps,
 			}))
 	}
 
