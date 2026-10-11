@@ -31,6 +31,7 @@ import (
 	"go.kenn.io/agentsview/internal/ingest"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/pathutil"
+	"go.kenn.io/agentsview/internal/pipevents"
 	"go.kenn.io/agentsview/internal/secrets"
 	"go.kenn.io/agentsview/internal/sync/failurecache"
 	"go.kenn.io/agentsview/internal/timeutil"
@@ -524,6 +525,12 @@ type EngineConfig struct {
 	// that wrote data. Safe to leave nil (e.g., in PG serve mode
 	// where the engine is not run).
 	Emitter Emitter
+	// PipelineObserver, when non-nil, receives fine-grained ingest
+	// events (watch dispatch, gate verdicts, parse modes, batching,
+	// writes, linking, pass lifecycle). Nil disables instrumentation
+	// entirely; emit sites take a nil fast path before building any
+	// payload. Replaceable at runtime via Engine.SetPipelineObserver.
+	PipelineObserver pipevents.Observer
 	// DeferStartupMaintenance keeps startup backfills blocked until the
 	// foreground sync that launched the daemon has completed. Maintenance
 	// still takes syncMu after it is released so later syncs and resyncs
@@ -638,6 +645,7 @@ type Engine struct {
 	storedPathResolver      func(string) (string, bool)
 	completeSourceMirror    bool
 	emitter                 Emitter
+	pipelineObs             atomic.Pointer[pipevents.Observer]
 	providerMigrationModes  map[parser.AgentType]parser.ProviderMigrationMode
 
 	providerWatchRootsMu    gosync.Mutex
@@ -1005,12 +1013,21 @@ func NewEngine(ctx context.Context,
 			return newReconciliationSpool(ctx, path)
 		},
 	}
+	// Wrap every provider factory so each materialized provider receives
+	// the engine's lazily resolved observer source. Storing the wrapped
+	// slice in baseProviderFactories keeps the injection through
+	// ReconfigureSources rebuilds as well.
+	providerFactories = injectPipelineObserverSource(
+		providerFactories, e.pipelineObserverSource,
+	)
+	e.baseProviderFactories = providerFactories
 	e.sourceSet.Store(newEngineSources(providerFactories, SourceConfig{
 		AgentDirs:        cfg.AgentDirs,
 		SourceMachines:   cfg.SourceMachines,
 		ProviderMetadata: cfg.ProviderMetadata,
 		DisabledAgents:   cfg.DisabledAgents,
 	}))
+	e.SetPipelineObserver(cfg.PipelineObserver)
 	if !cfg.Ephemeral {
 		if err := e.failures.Load(ctx, database); err != nil {
 			log.Printf("%v", err)
@@ -1581,8 +1598,17 @@ func (e *Engine) reportProgress(
 	}
 	tracked.UpdatedAt = now
 	tracked.Stalled = false
+	prevPhase := Phase("")
+	if e.currentProgress != nil {
+		prevPhase = e.currentProgress.Phase
+	}
 	e.currentProgress = &tracked
 	e.mu.Unlock()
+	if p.Phase != "" && p.Phase != prevPhase &&
+		e.pipelineObserver() != nil {
+		e.emitPipeline(pipevents.StageFinalize, pipevents.KindPhaseChanged,
+			"", map[string]any{"phase": string(p.Phase)})
+	}
 	if onProgress != nil {
 		onProgress(p)
 	}
@@ -1726,8 +1752,27 @@ func (e *Engine) prepareChangedPathSync(
 		missingPaths: make([]string, 0, len(paths)),
 	}
 	for _, path := range paths {
-		if _, err := e.lstatSource(path); os.IsNotExist(err) {
+		info, err := e.lstatSource(path)
+		classification := "file"
+		switch {
+		case os.IsNotExist(err):
 			prepared.missingPaths = append(prepared.missingPaths, path)
+			classification = "missing"
+		case err == nil && info.IsDir():
+			classification = "dir"
+		}
+		// An index sidecar reports its identity even when missing, so
+		// event consumers can tell an index delete from a transcript
+		// delete without a second stat.
+		if filepath.Base(path) == parser.CodexSessionIndexFilename {
+			classification = "index-sidecar"
+		}
+		if e.pipelineObserver() != nil {
+			e.emitPipeline(pipevents.StageResolve,
+				pipevents.KindPathClassified, path, map[string]any{
+					"path":           path,
+					"classification": classification,
+				})
 		}
 	}
 	// Capture container states before classifyPaths lists any session rows,
@@ -1772,6 +1817,13 @@ func (e *Engine) prepareChangedPathSync(
 func (e *Engine) syncChangedPathsLocked(
 	ctx context.Context, paths []string,
 ) (SyncStats, int, error) {
+	if e.pipelineObserver() != nil {
+		e.emitPipeline(pipevents.StageWatch, pipevents.KindBatchDispatched,
+			"", map[string]any{
+				"origin": "changed_paths",
+				"paths":  len(paths),
+			})
+	}
 	e.reportProgress(nil, Progress{
 		Phase:  PhaseDiscovering,
 		Detail: "Preparing changed session paths",
@@ -1784,9 +1836,25 @@ func (e *Engine) syncChangedPathsLocked(
 
 func (e *Engine) applyChangedPathSyncLocked(
 	ctx context.Context, prepared preparedChangedPathSync,
-) (SyncStats, int, error) {
+) (stats SyncStats, tombstoned int, err error) {
 	if prepared.empty() {
 		return SyncStats{}, 0, prepared.classificationErr
+	}
+	if e.pipelineObserver() != nil {
+		e.emitPipeline(pipevents.StageFinalize,
+			pipevents.KindSyncPassStarted, "", map[string]any{
+				"scope": "changed_paths",
+				"paths": len(prepared.files),
+			})
+		defer func() {
+			e.emitPipeline(pipevents.StageFinalize,
+				pipevents.KindSyncPassDone, "", map[string]any{
+					"scope":   "changed_paths",
+					"synced":  stats.Synced,
+					"skipped": stats.Skipped,
+					"failed":  stats.Failed,
+				})
+		}()
 	}
 	e.resetS3CodexIndexCache()
 	e.resetSourceClaims()
@@ -1802,7 +1870,7 @@ func (e *Engine) applyChangedPathSyncLocked(
 	processingCtx := context.WithValue(ctx, deferGlobalLinkContextKey{}, true)
 	results := e.startWorkers(processingCtx, prepared.files)
 	affectedSessionIDs := make(changedSessionLinks)
-	stats := e.collectAndBatchWithOptions(
+	stats = e.collectAndBatchWithOptions(
 		processingCtx, results, len(prepared.files), len(prepared.files), nil,
 		syncWriteDefault, collectAndBatchOptions{
 			observeResult: func(job syncJob) {
@@ -1817,7 +1885,6 @@ func (e *Engine) applyChangedPathSyncLocked(
 	e.anomalies.applyTo(&stats)
 	complete := prepared.classificationErr == nil && ctx.Err() == nil &&
 		stats.ProcessingComplete()
-	tombstoned := 0
 	var tombstoneErr error
 	if complete && len(prepared.missingPaths) > 0 {
 		tombstoned, tombstoneErr = e.tombstoneMissingWatchSourcesLocked(
@@ -1995,7 +2062,7 @@ func (e *Engine) classifyPaths(
 	if err != nil {
 		classificationErr = errors.Join(classificationErr, err)
 	}
-	files = dedupeDiscoveredFiles(files)
+	files = e.dedupeDiscoveredFiles(files)
 	return e.dedupeClaudeDiscoveredFiles(ctx, files), classificationErr
 }
 
@@ -2569,15 +2636,71 @@ func dedupeDiscoveredFiles(
 	return dedupeDiscoveredFilesByPreference(files, preferDiscoveredFile)
 }
 
-func dedupeDiscoveredFilesPreferNewestCodex(
+// dedupeDiscoveredFiles runs the path dedup with winner/loser observation
+// wired to the pipeline observer.
+func (e *Engine) dedupeDiscoveredFiles(
 	files []parser.DiscoveredFile,
 ) []parser.DiscoveredFile {
-	return dedupeDiscoveredFilesByPreference(files, preferNewestCodexDiscoveredFile)
+	if e.pipelineObserver() == nil {
+		return dedupeDiscoveredFiles(files)
+	}
+	return dedupeDiscoveredFilesByPreferenceObserved(
+		files, preferDiscoveredFile,
+		func(winner, loser parser.DiscoveredFile) {
+			reason := "duplicate_path"
+			uuid := ""
+			if isCodexFormatAgent(winner.Agent) {
+				if id := parser.CodexSessionUUIDFromFilename(
+					filepath.Base(winner.Path),
+				); id != "" {
+					uuid = id
+					reason = "duplicate_session_uuid"
+				}
+			}
+			e.emitDedupChoice(winner, loser, uuid, reason)
+		},
+	)
+}
+
+// dedupeDiscoveredFilesPreferNewestCodex runs the quick-sync dedup with
+// winner/loser observation wired to the pipeline observer.
+func (e *Engine) dedupeDiscoveredFilesPreferNewestCodex(
+	files []parser.DiscoveredFile,
+) []parser.DiscoveredFile {
+	if e.pipelineObserver() == nil {
+		return dedupeDiscoveredFilesByPreference(
+			files, preferNewestCodexDiscoveredFile,
+		)
+	}
+	return dedupeDiscoveredFilesByPreferenceObserved(
+		files, preferNewestCodexDiscoveredFile,
+		func(winner, loser parser.DiscoveredFile) {
+			reason := "duplicate_path"
+			uuid := ""
+			if isCodexFormatAgent(winner.Agent) {
+				if id := parser.CodexSessionUUIDFromFilename(
+					filepath.Base(winner.Path),
+				); id != "" {
+					uuid = id
+					reason = "duplicate_session_uuid"
+				}
+			}
+			e.emitDedupChoice(winner, loser, uuid, reason)
+		},
+	)
 }
 
 func dedupeDiscoveredFilesByPreference(
 	files []parser.DiscoveredFile,
 	prefer func(candidate, current parser.DiscoveredFile) bool,
+) []parser.DiscoveredFile {
+	return dedupeDiscoveredFilesByPreferenceObserved(files, prefer, nil)
+}
+
+func dedupeDiscoveredFilesByPreferenceObserved(
+	files []parser.DiscoveredFile,
+	prefer func(candidate, current parser.DiscoveredFile) bool,
+	onChoice func(winner, loser parser.DiscoveredFile),
 ) []parser.DiscoveredFile {
 	if len(files) < 2 {
 		return files
@@ -2588,7 +2711,12 @@ func dedupeDiscoveredFilesByPreference(
 		key := discoveredFileKey(file)
 		if current, ok := bestByKey[key]; ok {
 			if prefer(file, current) {
+				if onChoice != nil {
+					onChoice(file, current)
+				}
 				bestByKey[key] = file
+			} else if onChoice != nil {
+				onChoice(current, file)
 			}
 			continue
 		}
@@ -7884,6 +8012,28 @@ func (e *Engine) syncAllLocked(
 	if ctx.Err() != nil {
 		return SyncStats{Aborted: true}
 	}
+	if e.pipelineObserver() != nil {
+		passScope := "all"
+		switch {
+		case scope != nil:
+			passScope = "scoped"
+		case !since.IsZero():
+			passScope = "since"
+		}
+		e.emitPipeline(pipevents.StageFinalize,
+			pipevents.KindSyncPassStarted, "", map[string]any{
+				"scope": passScope,
+			})
+		defer func() {
+			e.emitPipeline(pipevents.StageFinalize,
+				pipevents.KindSyncPassDone, "", map[string]any{
+					"scope":   passScope,
+					"synced":  stats.Synced,
+					"skipped": stats.Skipped,
+					"failed":  stats.Failed,
+				})
+		}()
+	}
 	ctx = e.parsePolicyContext(ctx)
 	ctx = parser.WithProjectRootMemo(ctx)
 
@@ -7968,9 +8118,9 @@ func (e *Engine) syncAllLocked(
 	}
 
 	if quickSyncCutoff {
-		all = dedupeDiscoveredFilesPreferNewestCodex(all)
+		all = e.dedupeDiscoveredFilesPreferNewestCodex(all)
 	} else {
-		all = dedupeDiscoveredFiles(all)
+		all = e.dedupeDiscoveredFiles(all)
 	}
 	all = e.dedupeClaudeDiscoveredFiles(ctx, all)
 	if forceDiscoveredFiles {
@@ -10287,9 +10437,17 @@ func (e *Engine) collectAndBatchWithOptions(
 		}
 		writes[write.key] = write
 	}
-	flushPending := func() {
+	flushPending := func(reason string) {
 		if len(pending) == 0 {
 			return
+		}
+		if e.pipelineObserver() != nil {
+			e.emitPipeline(pipevents.StageBatch,
+				pipevents.KindFlushTriggered, "", map[string]any{
+					"reason":        reason,
+					"pending_count": len(pending),
+					"pending_bytes": pendingBytes,
+				})
 		}
 		func() {
 			defer releaseParseRetentionLeases(pendingLeases)
@@ -10456,7 +10614,7 @@ func (e *Engine) collectAndBatchWithOptions(
 				drainResults(results, total-i)
 				goto flush
 			case <-pressure:
-				flushPending()
+				flushPending("pressure")
 				continue
 			case r = <-results:
 				if runtimeMetrics != nil {
@@ -10797,7 +10955,7 @@ func (e *Engine) collectAndBatchWithOptions(
 			if resultRetentionBytes > 0 && len(pending) > 0 &&
 				(pendingRetentionBytes >= pendingRetentionLimit ||
 					resultRetentionBytes > pendingRetentionLimit-pendingRetentionBytes) {
-				flushPending()
+				flushPending("bytes")
 			}
 			if archiveRetention {
 				r.releaseRetention()
@@ -10846,6 +11004,14 @@ func (e *Engine) collectAndBatchWithOptions(
 				if runtimeMetrics != nil {
 					runtimeMetrics.pendingWrites(len(pending))
 				}
+				if e.pipelineObserver() != nil {
+					e.emitPipeline(pipevents.StageBatch,
+						pipevents.KindPendingAccumulated, r.path,
+						map[string]any{
+							"pending_count": len(pending),
+							"pending_bytes": pendingBytes,
+						})
+				}
 			}
 			if archiveRetention && len(allowed) > 0 {
 				pendingRetentionBytes = min(
@@ -10874,12 +11040,20 @@ func (e *Engine) collectAndBatchWithOptions(
 					sourceFingerprint: r.sourceFingerprint,
 				})
 			}
-			if len(pending) >= batchSize ||
-				(archiveRetention &&
-					pendingRetentionBytes >= pendingRetentionLimit) ||
-				(!archiveRetention && (budget.underPressure() ||
-					pendingBytes >= parseBatchBytesLimit)) {
-				flushPending()
+			flushReason := ""
+			switch {
+			case len(pending) >= batchSize:
+				flushReason = "size"
+			case archiveRetention &&
+				pendingRetentionBytes >= pendingRetentionLimit:
+				flushReason = "bytes"
+			case !archiveRetention && budget.underPressure():
+				flushReason = "pressure"
+			case !archiveRetention && pendingBytes >= parseBatchBytesLimit:
+				flushReason = "bytes"
+			}
+			if flushReason != "" {
+				flushPending(flushReason)
 			}
 			// A Kiro SQLite store is discovered as one container source
 			// but fans out into one session per row, so `total` counted it
@@ -10905,7 +11079,7 @@ flush:
 			onProgress, writeMode, finalizingSessionWritesDetail,
 		)
 	}
-	flushPending()
+	flushPending("drain")
 	if ctx.Err() != nil && e.discardWritesOnCancel {
 		return stats
 	}
@@ -10950,16 +11124,18 @@ flush:
 	// Link subagent child sessions to their parents via
 	// tool_calls.subagent_session_id references. Run once
 	// after all batches to avoid repeated full-table scans.
+	linked := 0
 	if deferred, _ := ctx.Value(deferGlobalLinkContextKey{}).(bool); !deferred {
 		e.reportFinalizingProgress(
 			onProgress, writeMode, finalizingFileLinksDetail,
 		)
-		linked, err := e.linkSubagentSessions(postWriteCtx)
+		linkedCount, err := e.linkSubagentSessions(postWriteCtx)
 		if err != nil {
 			log.Printf("link subagent sessions: %v", err)
 			stats.RecordFailed()
 		} else {
-			stats.RecordLinksUpdated(linked)
+			stats.RecordLinksUpdated(linkedCount)
+			linked = linkedCount
 		}
 	}
 	e.reportFinalizingProgress(
@@ -10977,6 +11153,13 @@ flush:
 		stats.RecordFailed()
 	} else {
 		stats.RecordLinksUpdated(repaired)
+	}
+	if e.pipelineObserver() != nil {
+		e.emitPipeline(pipevents.StageFinalize, pipevents.KindLinksResolved,
+			"", map[string]any{
+				"linked":   linked,
+				"repaired": repaired,
+			})
 	}
 
 	// PhaseDone is emitted by syncAllLocked after the DB-backed
@@ -11803,13 +11986,19 @@ func (e *Engine) processProviderFile(
 				e.setPiebaldRetry(file.Path, piebaldFailureIdentity{})
 			}
 			e.failures.Clear(failureKey)
+			e.gateVerdict(file, "failure_cache", "pass",
+				"forced refresh clears recorded failure", nil)
 		} else if id.Missing {
 			if e.sourcePathMissing(file) {
 				if cached, ok := e.cachedSourceFailure(ctx, file, id); ok {
+					e.gateVerdict(file, "failure_cache", "skip",
+						"unchanged since recorded failure", nil)
 					return cached, true
 				}
 			} else {
 				e.failures.Clear(failureKey)
+				e.gateVerdict(file, "failure_cache", "pass",
+					"recorded failure no longer missing", nil)
 			}
 		}
 	}
@@ -11826,6 +12015,8 @@ func (e *Engine) processProviderFile(
 	// of its sessions can have changed, so skip before paying for the
 	// per-session fingerprint (a DB open per source) and parse.
 	if e.sqliteContainerSourceFresh(ctx, file) {
+		e.gateVerdict(file, "sqlite_container", "skip",
+			"container stat signature fresh", nil)
 		return processResult{skip: true}, true
 	}
 
@@ -11837,6 +12028,8 @@ func (e *Engine) processProviderFile(
 	storageState, storageSnap, storageStateOK := e.openCodeStorageSessionGateState(file)
 	if storageStateOK &&
 		e.openCodeStorageSessionFresh(file.Path, storageState) {
+		e.gateVerdict(file, "opencode_storage", "skip",
+			"storage signature unchanged", nil)
 		return processResult{skip: true}, true
 	}
 
@@ -11877,8 +12070,12 @@ func (e *Engine) processProviderFile(
 		// removed database instead of failing the sync.
 		if (file.ForceParse || file.ForceFullParse) &&
 			providerDeletedPhysicalSQLiteSource(file.Agent, file.Path) {
+			e.gateVerdict(file, "source_lookup", "pass",
+				"deleted container forces replacement", nil)
 			return processResult{forceReplace: true}, true
 		}
+		e.gateVerdict(file, "source_lookup", "skip",
+			"provider source not found", nil)
 		return markSourceFailure(file, processResult{
 			err: fmt.Errorf(
 				"%s provider source not found for %s",
@@ -11910,6 +12107,26 @@ func (e *Engine) processProviderFile(
 		source.ProjectHint = file.Project
 	}
 	file.ProviderSource = &source
+	if e.pipelineObserver() != nil {
+		resolved := map[string]any{
+			"path": file.Path,
+			"key":  source.Key,
+		}
+		if uuid := parser.CodexSessionUUIDFromFilename(
+			filepath.Base(file.Path),
+		); uuid != "" {
+			resolved["uuid"] = uuid
+		}
+		if isCodexFormatAgent(file.Agent) {
+			layout := "flat"
+			if codexLayoutForPath(file.Path) == parser.CodexLayoutDated {
+				layout = "dated"
+			}
+			resolved["layout"] = layout
+		}
+		e.emitPipeline(pipevents.StageResolve, pipevents.KindSourceResolved,
+			file.Path, resolved)
+	}
 	sqliteContainerResultPath = providerDiscoveredPath(source)
 	cwdDecision = e.sourceCwdDecision(ctx, source)
 	cwdPath = e.sourceCwdLookupPath(source)
@@ -11958,6 +12175,8 @@ func (e *Engine) processProviderFile(
 			verifiedCapture.key.agent, source,
 			verifiedCapture.signature.size, verifiedMtime,
 		) {
+			e.gateVerdict(file, "verified_source", "skip",
+				"verified source signature fresh", nil)
 			return processResult{
 				skip:  true,
 				mtime: verifiedMtime,
@@ -11966,6 +12185,8 @@ func (e *Engine) processProviderFile(
 		e.invalidateVerifiedSource(
 			verifiedCapture.key.agent, verifiedCapture.key.path,
 		)
+		e.gateVerdict(file, "verified_source", "pass",
+			"verified snapshot stale in DB", nil)
 		// The stat snapshot was fresh, but the persisted projection was not.
 		// Treat the source as unverified for the remaining gates in this call:
 		// if the row disappeared, the Codex cold-parse path can derive its
@@ -12026,11 +12247,15 @@ func (e *Engine) processProviderFile(
 			if verifiedStateOK {
 				e.promoteVerifiedSource(verifiedCapture)
 			}
+			e.gateVerdict(file, "stat_digest", "skip",
+				"persisted stat digest matches", nil)
 			return processResult{
 				skip:  true,
 				mtime: freshMTime,
 			}, true
 		}
+		e.gateVerdict(file, "stat_digest", "pass",
+			"stat digest stale or missing", nil)
 	}
 
 	// Consult the heavier checkpoint tables only after the free in-memory and
@@ -12057,6 +12282,15 @@ func (e *Engine) processProviderFile(
 			case codexCheckpointInvalid:
 				codexForceFullParse = true
 			}
+			var cpExtra map[string]any
+			if cpResult.checkpoint != nil && e.pipelineObserver() != nil {
+				cpExtra = map[string]any{
+					"offset": cpResult.checkpoint.Offset,
+				}
+			}
+			e.gateVerdict(file, "codex_checkpoint",
+				codexCheckpointGateDecision(cpResult.decision),
+				codexCheckpointDecisionReason(cpResult.decision), cpExtra)
 		}
 	}
 
@@ -12086,6 +12320,8 @@ func (e *Engine) processProviderFile(
 						ctx, preParseStatHash,
 					)
 				}
+				e.gateVerdict(file, "fingerprint", "skip",
+					"single-session source unchanged", nil)
 				return processResult{
 					skip:  true,
 					mtime: mtime,
@@ -12093,8 +12329,15 @@ func (e *Engine) processProviderFile(
 			}
 			// A gate-eligible local source without a comparable stored hash
 			// takes the fingerprint path once to earn verified-source trust.
+			e.gateVerdict(file, "fingerprint", "pass",
+				"freshness unverified, fingerprint read required", nil)
 		} else if forceReplace {
 			sourceForceReplace = true
+			e.gateVerdict(file, "fingerprint", "pass",
+				"stored rows must be replaced", nil)
+		} else {
+			e.gateVerdict(file, "fingerprint", "pass",
+				"fingerprint freshness declined", nil)
 		}
 	}
 
@@ -12109,6 +12352,8 @@ func (e *Engine) processProviderFile(
 		if freshMtime, fresh := e.watermarkOnlySQLiteSourceFresh(ctx,
 			source, file,
 		); fresh {
+			e.gateVerdict(file, "watermark", "skip",
+				"composite watermark unchanged", nil)
 			return processResult{
 				skip:  true,
 				mtime: freshMtime,
@@ -12300,6 +12545,8 @@ func (e *Engine) processProviderFile(
 							ctx, preParseStatHash,
 						)
 					}
+					e.gateVerdict(file, "skip_cache", "skip",
+						"cached skip entry fresh", nil)
 					return processResult{
 						skip:       true,
 						mtime:      fingerprint.MTimeNS,
@@ -12312,16 +12559,24 @@ func (e *Engine) processProviderFile(
 				// Fall through to parse the now-current container.
 			}
 		}
+		e.gateVerdict(file, "skip_cache", "pass",
+			"no usable cached skip", nil)
 	}
-	if cacheSkip && !forceSourceCwdParse && e.shouldSkipProviderSource(ctx,
-		file, source, fingerprint, providerSemantics,
-	) {
-		return processResult{
-			skip:      true,
-			mtime:     fingerprint.MTimeNS,
-			cacheSkip: true,
-			cacheKey:  cacheKey,
-		}, true
+	if cacheSkip && !forceSourceCwdParse {
+		if e.shouldSkipProviderSource(ctx,
+			file, source, fingerprint, providerSemantics,
+		) {
+			e.gateVerdict(file, "db_skip", "skip",
+				"persisted freshness matches", nil)
+			return processResult{
+				skip:      true,
+				mtime:     fingerprint.MTimeNS,
+				cacheSkip: true,
+				cacheKey:  cacheKey,
+			}, true
+		}
+		e.gateVerdict(file, "db_skip", "pass",
+			"persisted freshness declined", nil)
 	}
 
 	// Append-only incremental parse for already-synced JSONL files.
@@ -12331,10 +12586,12 @@ func (e *Engine) processProviderFile(
 	var incRes processResult
 	var incOK bool
 	if codexForceFullParse {
+		e.emitParseMode(file, "full", "checkpoint proof invalid", nil)
 		incRes = processResult{forceReplace: true}
 	} else if codexAuditDeepVerify {
 		// The audit content-hashes the full source below and repairs only
 		// on mismatch; never tail-apply against a prefix it cannot prove.
+		e.emitParseMode(file, "full", "checkpoint audit deep-verify", nil)
 		incRes = processResult{}
 	} else if !forceSourceCwdParse {
 		incRes, incOK = e.tryProviderIncrementalAppend(
@@ -12391,6 +12648,8 @@ func (e *Engine) processProviderFile(
 					ctx, preParseStatHash,
 				)
 			}
+			e.gateVerdict(file, "db_fingerprint", "skip",
+				"stored fingerprint matches", nil)
 			return processResult{
 				skip:        true,
 				mtime:       fingerprint.MTimeNS,
@@ -12399,6 +12658,8 @@ func (e *Engine) processProviderFile(
 				noCacheSkip: true,
 			}, true
 		}
+		e.gateVerdict(file, "db_fingerprint", "pass",
+			"stored fingerprint stale or unverified", nil)
 	}
 
 	// DB-stored-file-info skip: a session whose persisted file_size/file_mtime
@@ -12411,16 +12672,21 @@ func (e *Engine) processProviderFile(
 	// a provider whose fingerprint mtime differs from the stored value simply
 	// reparses, matching the prior behavior. Claude and Cowork have their own
 	// earlier freshness checks; this is the generic fallback for the rest.
-	if !forceSourceCwdParse && !incForceReplace && !e.forceParseRequested(file) &&
-		e.providerSourceUnchangedInDB(
+	if !forceSourceCwdParse && !incForceReplace && !e.forceParseRequested(file) {
+		if e.providerSourceUnchangedInDB(
 			ctx, source, fingerprint, providerSemantics, preParseStatHash,
 		) {
-		return processResult{
-			skip:      true,
-			mtime:     fingerprint.MTimeNS,
-			cacheSkip: cacheSkip,
-			cacheKey:  cacheKey,
-		}, true
+			e.gateVerdict(file, "db_unchanged", "skip",
+				"stored file info matches", nil)
+			return processResult{
+				skip:      true,
+				mtime:     fingerprint.MTimeNS,
+				cacheSkip: cacheSkip,
+				cacheKey:  cacheKey,
+			}, true
+		}
+		e.gateVerdict(file, "db_unchanged", "pass",
+			"stored file info stale or missing", nil)
 	}
 
 	failureIdentity, failureIdentityOK := e.sourceFailureCacheIdentity(file, fingerprint)
@@ -12435,8 +12701,15 @@ func (e *Engine) processProviderFile(
 		}
 		if forceFailureRefresh || codexForceFullParse || codexAuditDeepVerify {
 			e.failures.Clear(failureKey)
+			e.gateVerdict(file, "failure_cache", "pass",
+				"forced refresh clears recorded failure", nil)
 		} else if cached, ok := e.cachedSourceFailure(ctx, cacheFile, failureIdentity); ok {
+			e.gateVerdict(file, "failure_cache", "skip",
+				"unchanged since recorded failure", nil)
 			return cached, true
+		} else {
+			e.gateVerdict(file, "failure_cache", "pass",
+				"no matching recorded failure", nil)
 		}
 	}
 
@@ -12449,10 +12722,14 @@ func (e *Engine) processProviderFile(
 			err: fmt.Errorf("rank %s source %s: %w", file.Agent, providerDiscoveredPath(source), err),
 		}, true
 	} else if lowerRanked {
+		e.gateVerdict(file, "source_priority", "skip",
+			"lower-ranked duplicate source", nil)
 		return processResult{
 			skip: true, suppressPresenceSweep: true,
 		}, true
 	}
+	e.gateVerdict(file, "source_priority", "pass",
+		"source is the preferred copy", nil)
 
 	// Provider parse seam: every gate above returns a lease-free skip. From
 	// here the provider parses the source, so acquire the retention lease that
@@ -12470,6 +12747,11 @@ func (e *Engine) processProviderFile(
 	)
 	if err != nil {
 		return processResult{err: err}, true
+	}
+	if e.pipelineObserver() != nil {
+		e.gateVerdict(file, "retention_budget", "pass",
+			"retention lease acquired",
+			map[string]any{"bytes": sourceBytes})
 	}
 	if runtimeMetrics := reconciliationRuntimeMetricsFor(ctx); runtimeMetrics != nil {
 		if _, _, ok := sqliteContainerSourceForFile(file); ok {
@@ -12504,7 +12786,17 @@ func (e *Engine) processProviderFile(
 		stagedSink.database = e.db
 		stagedSink.idPrefix = e.idPrefix
 		stagedSink.disableSignals = e.disableSignalRecompute
+		stagedSink.obsSource = e.pipelineObserverSource
+		stagedSink.obsPath = file.Path
 		stagedGCRelease = beginStagedColdSync()
+		if e.pipelineObserver() != nil {
+			e.emitParseMode(file, "staged",
+				"source exceeds staged parse threshold",
+				map[string]any{
+					"threshold":    e.stagedCodexMin,
+					"source_bytes": sourceBytes,
+				})
+		}
 	}
 	admission := &providerResultAdmission{
 		engine: e, ctx: ctx, def: provider.Definition(), file: file,
@@ -12513,6 +12805,30 @@ func (e *Engine) processProviderFile(
 		codexIdentities: isCodexFormatAgent(file.Agent) && stagedSink == nil,
 	}
 	var outcome parser.ParseOutcome
+	parseMode := "collect"
+	if stagedSink != nil {
+		parseMode = "staged"
+	}
+	if e.pipelineObserver() != nil {
+		e.emitPipeline(pipevents.StageParse, pipevents.KindParseStarted,
+			file.Path, map[string]any{
+				"mode":         parseMode,
+				"source_bytes": sourceBytes,
+			})
+	}
+	emitParseDone := func() {
+		if e.pipelineObserver() == nil {
+			return
+		}
+		e.emitPipeline(pipevents.StageParse, pipevents.KindParseDone,
+			file.Path, map[string]any{
+				"mode":                parseMode,
+				"results":             len(outcome.Results),
+				"source_errors":       len(outcome.SourceErrors),
+				"result_set_complete": outcome.ResultSetComplete,
+				"force_replace":       outcome.ForceReplace,
+			})
+	}
 	if stagedSink != nil {
 		if e.forceParseRequested(file) {
 			parser.EvictCodexSessionIndexForSession(
@@ -12525,6 +12841,7 @@ func (e *Engine) processProviderFile(
 			ctx, stagedConfig, source, fingerprint, stagedSink,
 		)
 		if err == nil {
+			emitParseDone()
 			outcome, err = admission.admitAll(outcome)
 		}
 	} else {
@@ -12535,6 +12852,9 @@ func (e *Engine) processProviderFile(
 			ForceParse:         e.forceParseRequested(file),
 			StoredPathResolver: e.storedPathResolver,
 		}, admission.admit)
+		if err == nil {
+			emitParseDone()
+		}
 	}
 	if err != nil && admission.validationErr == nil {
 		if stagedSink != nil {
@@ -15826,10 +16146,12 @@ func (e *Engine) tryProviderIncrementalAppend(
 	// explicit exception below because a single-session refresh must rebuild
 	// head-derived metadata.
 	if e.forceParse || e.forceFullParse || file.ForceFullParse {
+		e.emitParseMode(file, "full", "forced full parse", nil)
 		return processResult{}, false
 	}
 	if provider.Capabilities().Source.IncrementalAppend !=
 		parser.CapabilitySupported {
+		e.emitParseMode(file, "full", "incremental append unsupported", nil)
 		return processResult{}, false
 	}
 	// Incremental appends can write before the full-parse rank gate.
@@ -15840,12 +16162,15 @@ func (e *Engine) tryProviderIncrementalAppend(
 			err: fmt.Errorf("rank %s source %s: %w", file.Agent, providerDiscoveredPath(source), err),
 		}, true
 	} else if lowerRanked {
+		e.gateVerdict(file, "source_priority", "skip",
+			"lower-ranked duplicate source", nil)
 		return processResult{
 			skip: true, suppressPresenceSweep: true,
 		}, true
 	}
 	path := providerDiscoveredPath(source)
 	if path == "" {
+		e.emitParseMode(file, "full", "no physical source path", nil)
 		return processResult{}, false
 	}
 	// Codex-format incremental parsing intentionally preserves head-derived
@@ -15860,10 +16185,13 @@ func (e *Engine) tryProviderIncrementalAppend(
 			e.pathNeedsProjectReparse(ctx, providerAgent, path) ||
 			(providerAgent == parser.AgentCodex &&
 				e.codexIndexSessionNameChanged(path))) {
+		e.emitParseMode(file, "full",
+			"metadata refresh requires full parse", nil)
 		return processResult{forceReplace: true}, false
 	}
 	info, err := os.Stat(path)
 	if err != nil {
+		e.emitParseMode(file, "full", "source stat failed", nil)
 		return processResult{}, false
 	}
 
@@ -15943,10 +16271,16 @@ func (e *Engine) tryProviderIncrementalAppend(
 		}
 	}
 
-	return e.tryIncrementalJSONL(
+	res, ok := e.tryIncrementalJSONL(
 		ctx, file, info, file.Agent, parseFn,
 		checkpoint, fullHash, hashState,
 	)
+	if ok && res.incremental != nil && e.pipelineObserver() != nil {
+		e.emitParseMode(file, "incremental",
+			"resumed from stored offset",
+			map[string]any{"offset": res.incremental.fileSize})
+	}
+	return res, ok
 }
 
 // incrementalParseFunc reads new JSONL lines from a file
@@ -15977,6 +16311,7 @@ func (e *Engine) tryIncrementalJSONL(
 ) (processResult, bool) {
 	if e.forceParse || e.forceFullParse || file.ForceFullParse {
 		// Parse-diff and explicit full imports never produce append deltas.
+		e.emitParseMode(file, "full", "forced full parse", nil)
 		return processResult{}, false
 	}
 	lookupPath := file.Path
@@ -15985,6 +16320,7 @@ func (e *Engine) tryIncrementalJSONL(
 	}
 	inc, ok := e.db.GetSessionForIncremental(ctx, lookupPath, string(agent))
 	if !ok || inc.FileSize <= 0 {
+		e.emitParseMode(file, "full", "no stored incremental state", nil)
 		return processResult{}, false
 	}
 
@@ -15994,6 +16330,7 @@ func (e *Engine) tryIncrementalJSONL(
 	// so the same veto applies; it also re-derives the cwd from the
 	// whole file, which covers a stored cwd that predates cwd capture.
 	if !e.cwdFilter.allows(inc.Cwd) {
+		e.emitParseMode(file, "full", "stored cwd outside allow-list", nil)
 		return processResult{}, false
 	}
 
@@ -16002,6 +16339,7 @@ func (e *Engine) tryIncrementalJSONL(
 	// up rather than appending new rows on top of stale ones.
 	if e.db.GetSessionDataVersion(ctx, inc.ID) <
 		db.CurrentDataVersion() {
+		e.emitParseMode(file, "full", "stale session data version", nil)
 		return processResult{}, false
 	}
 
@@ -16012,6 +16350,7 @@ func (e *Engine) tryIncrementalJSONL(
 	// identity, which makes a full-file replacement look like an
 	// append from the old file_size offset.
 	if inc.MsgCount == 0 {
+		e.emitParseMode(file, "full", "no stored append boundary", nil)
 		return processResult{}, false
 	}
 
@@ -16032,6 +16371,7 @@ func (e *Engine) tryIncrementalJSONL(
 				inc.FileInode, curInode,
 				inc.FileDevice, curDevice,
 			)
+			e.emitParseMode(file, "full", "file identity changed", nil)
 			return processResult{forceReplace: true}, false
 		}
 	}
@@ -16047,6 +16387,7 @@ func (e *Engine) tryIncrementalJSONL(
 				agent, file.Path, inc.FileSize, currentSize,
 			)
 		}
+		e.emitParseMode(file, "full", "file truncated", nil)
 		return processResult{forceReplace: true}, false
 	}
 	if currentSize == inc.FileSize {
@@ -16055,12 +16396,15 @@ func (e *Engine) tryIncrementalJSONL(
 			// reach the fingerprint path. Codex's composite mtime may also
 			// change when session_index.jsonl does. Let the later database
 			// freshness checks decide whether to skip or full-parse.
+			e.emitParseMode(file, "full", "no new transcript bytes", nil)
 			return processResult{}, false
 		}
 		log.Printf(
 			"incremental %s %s: file size unchanged at %d but changed since last sync, full parse",
 			agent, file.Path, currentSize,
 		)
+		e.emitParseMode(file, "full",
+			"size unchanged, contents differ", nil)
 		return processResult{forceReplace: true}, false
 	}
 
@@ -16091,9 +16435,24 @@ func (e *Engine) tryIncrementalJSONL(
 		return processResult{err: leaseErr}, true
 	}
 
+	if e.pipelineObserver() != nil {
+		e.emitPipeline(pipevents.StageParse, pipevents.KindParseStarted,
+			file.Path, map[string]any{
+				"mode":   "incremental",
+				"offset": inc.FileSize,
+			})
+	}
 	newMsgs, links, toolCallUpdates, messageUsageUpdates, endedAt, consumed, terminationStatus, cursor, err := parseFn(
 		file.Path, inc,
 	)
+	if err == nil && e.pipelineObserver() != nil {
+		e.emitPipeline(pipevents.StageParse, pipevents.KindParseDone,
+			file.Path, map[string]any{
+				"mode":     "incremental",
+				"messages": len(newMsgs),
+				"consumed": consumed,
+			})
+	}
 	if err != nil {
 		lease.Release()
 		if parser.IsIncrementalFullParseFallback(err) {
@@ -16108,12 +16467,15 @@ func (e *Engine) tryIncrementalJSONL(
 			// otherwise the append-only write path skips
 			// rows whose ordinal ≤ maxOrd and the updates
 			// are silently dropped.
+			e.emitParseMode(file, "full",
+				"parser requested full parse", nil)
 			return processResult{forceReplace: true}, false
 		}
 		log.Printf(
 			"incremental %s %s: %v (full parse)",
 			agent, file.Path, err,
 		)
+		e.emitParseMode(file, "full", "incremental parse error", nil)
 		return processResult{}, false
 	}
 
@@ -16132,6 +16494,8 @@ func (e *Engine) tryIncrementalJSONL(
 		}
 		if missing {
 			lease.Release()
+			e.emitParseMode(file, "full",
+				"tool result metadata missing", nil)
 			return processResult{forceReplace: true}, false
 		}
 	}
@@ -16368,6 +16732,12 @@ func (e *Engine) tryIncrementalJSONL(
 					agent, file.Path,
 				)
 				lease.Release()
+				// Covers an unclassifiable scan verdict and every
+				// nil-update decline inside tryClaudeSplitSuffixUpdate:
+				// the split run could not be resolved into a
+				// trustworthy incremental delta.
+				e.emitParseMode(file, "full",
+					"claude split run unresolved", nil)
 				return processResult{forceReplace: true}, false
 			}
 		}
@@ -16398,6 +16768,8 @@ func (e *Engine) tryIncrementalJSONL(
 			agent, file.Path,
 		)
 		lease.Release()
+		e.emitParseMode(file, "full",
+			"first real user prompt after empty preview", nil)
 		return processResult{}, false
 	}
 
@@ -17995,6 +18367,13 @@ func (e *Engine) writeBatchWithOutcomeContext(
 	if writeMode == syncWriteBulk || e.discardWritesOnCancel {
 		return e.writeBatchBulkWithOutcomeContext(ctx, batch, forceReplace)
 	}
+	if e.pipelineObserver() != nil {
+		e.emitPipeline(pipevents.StageWrite, pipevents.KindTxStarted,
+			"", map[string]any{
+				"sessions": len(batch),
+				"mode":     "batch",
+			})
+	}
 	resolveWorktreeProject := e.loadWorktreeProjectResolverContext(ctx)
 	for i, pw := range batch {
 		if ctx.Err() != nil {
@@ -18037,6 +18416,7 @@ func (e *Engine) writeBatchWithOutcomeContext(
 			continue
 		}
 		s, msgs := prepared.Session, prepared.Messages
+		var writtenCheckpoint *db.ParserCheckpoint
 		// Detect stale parser version BEFORE UpsertSession
 		// overwrites it. Existing message rows from an
 		// older parser lack new metadata columns, and newly
@@ -18111,6 +18491,7 @@ func (e *Engine) writeBatchWithOutcomeContext(
 					)
 					cp, blobs = nil, nil
 				}
+				writtenCheckpoint = cp
 				werr = e.db.ReplaceSessionContentWithCheckpointAndToolResultImages(ctx,
 					s.ID, msgs, update, findings, cp, blobs,
 					e.toolResultImages,
@@ -18219,6 +18600,44 @@ func (e *Engine) writeBatchWithOutcomeContext(
 		outcome.writtenMessages += len(msgs)
 		outcome.written[i] = true
 		outcome.resolved[i] = true
+		if e.pipelineObserver() != nil {
+			path := pw.sess.File.Path
+			e.emitPipeline(pipevents.StageWrite,
+				pipevents.KindSessionWritten, path, map[string]any{
+					"session_id": s.ID,
+				})
+			e.emitPipeline(pipevents.StageWrite,
+				pipevents.KindMessagesWritten, path, map[string]any{
+					"session_id":  s.ID,
+					"inserted":    len(msgs),
+					"max_ordinal": maxMessageOrdinal(msgs),
+				})
+			// fts_rows derives from the inserted message count: the write
+			// path indexes every committed message row in the same
+			// transaction, so one fts row exists per inserted message.
+			e.emitPipeline(pipevents.StageWrite,
+				pipevents.KindFTSUpdated, path, map[string]any{
+					"session_id": s.ID,
+					"fts_rows":   len(msgs),
+				})
+			if writtenCheckpoint != nil {
+				e.emitPipeline(pipevents.StageWrite,
+					pipevents.KindCheckpointWritten, path,
+					map[string]any{
+						"session_id":         s.ID,
+						"checkpoint_version": writtenCheckpoint.Version,
+						"offset":             writtenCheckpoint.Offset,
+					})
+			}
+		}
+	}
+	if e.pipelineObserver() != nil {
+		e.emitPipeline(pipevents.StageWrite, pipevents.KindTxCommitted,
+			"", map[string]any{
+				"sessions": outcome.writtenSessions,
+				"inserted": outcome.writtenMessages,
+				"failed":   outcome.failedSessions,
+			})
 	}
 	return outcome
 }
@@ -18604,6 +19023,13 @@ func (e *Engine) writeStagedFullParse(
 		log.Printf("checkpoint build %s: %v", pw.sess.File.Path, cpErr)
 		cp, blobs = nil, nil
 	}
+	if e.pipelineObserver() != nil {
+		e.emitPipeline(pipevents.StageWrite, pipevents.KindTxStarted,
+			pw.sess.File.Path, map[string]any{
+				"session_id": s.ID,
+				"mode":       "staged",
+			})
+	}
 	if err := e.db.ReplaceSessionContentStagedWithCheckpoint(
 		ctx, s.ID, msgs, pw.staged,
 		e.blockedResultCategories, closure, cp, blobs,
@@ -18611,6 +19037,39 @@ func (e *Engine) writeStagedFullParse(
 		return err
 	}
 	e.anomalies.recordSanitize(pw.staged.ValidationStats())
+	if e.pipelineObserver() != nil {
+		path := pw.sess.File.Path
+		e.emitPipeline(pipevents.StageWrite,
+			pipevents.KindSessionWritten, path, map[string]any{
+				"session_id": s.ID,
+			})
+		e.emitPipeline(pipevents.StageWrite,
+			pipevents.KindMessagesWritten, path, map[string]any{
+				"session_id":  s.ID,
+				"inserted":    len(msgs),
+				"max_ordinal": maxMessageOrdinal(msgs),
+			})
+		// fts_rows derives from the inserted message count (see the
+		// per-session write path for the same derivation).
+		e.emitPipeline(pipevents.StageWrite,
+			pipevents.KindFTSUpdated, path, map[string]any{
+				"session_id": s.ID,
+				"fts_rows":   len(msgs),
+			})
+		if cp != nil {
+			e.emitPipeline(pipevents.StageWrite,
+				pipevents.KindCheckpointWritten, path, map[string]any{
+					"session_id":         s.ID,
+					"checkpoint_version": cp.Version,
+					"offset":             cp.Offset,
+				})
+		}
+		e.emitPipeline(pipevents.StageWrite, pipevents.KindTxCommitted,
+			path, map[string]any{
+				"session_id": s.ID,
+				"inserted":   len(msgs),
+			})
+	}
 
 	return nil
 }
@@ -18799,6 +19258,13 @@ func (e *Engine) writeBatchBulkWithOutcomeContext(
 		return outcome
 	}
 
+	if e.pipelineObserver() != nil {
+		e.emitPipeline(pipevents.StageWrite, pipevents.KindTxStarted,
+			"", map[string]any{
+				"sessions": len(writes),
+				"mode":     "bulk",
+			})
+	}
 	tWrite := time.Now()
 	result, err := e.db.WriteSessionBatchContext(ctx, writes)
 	e.phaseStats.WriteNanos.Add(int64(time.Since(tWrite)))
@@ -18819,6 +19285,41 @@ func (e *Engine) writeBatchBulkWithOutcomeContext(
 			pendingIndex := pendingIndexes[writtenIndex]
 			outcome.written[pendingIndex] = true
 			outcome.resolved[pendingIndex] = true
+		}
+	}
+	if e.pipelineObserver() != nil {
+		for _, writtenIndex := range result.WrittenIndexes {
+			if writtenIndex < 0 || writtenIndex >= len(writes) {
+				continue
+			}
+			w := writes[writtenIndex]
+			path := sources[writtenIndex].path
+			e.emitPipeline(pipevents.StageWrite,
+				pipevents.KindSessionWritten, path, map[string]any{
+					"session_id": w.Session.ID,
+				})
+			e.emitPipeline(pipevents.StageWrite,
+				pipevents.KindMessagesWritten, path, map[string]any{
+					"session_id":  w.Session.ID,
+					"inserted":    len(w.Messages),
+					"max_ordinal": maxMessageOrdinal(w.Messages),
+				})
+			// fts_rows derives from the inserted message count (see the
+			// per-session write path for the same derivation).
+			e.emitPipeline(pipevents.StageWrite,
+				pipevents.KindFTSUpdated, path, map[string]any{
+					"session_id": w.Session.ID,
+					"fts_rows":   len(w.Messages),
+				})
+			if w.Checkpoint != nil {
+				e.emitPipeline(pipevents.StageWrite,
+					pipevents.KindCheckpointWritten, path,
+					map[string]any{
+						"session_id":         w.Session.ID,
+						"checkpoint_version": w.Checkpoint.Version,
+						"offset":             w.Checkpoint.Offset,
+					})
+			}
 		}
 	}
 	for _, id := range result.FailedIDs {
@@ -18847,6 +19348,14 @@ func (e *Engine) writeBatchBulkWithOutcomeContext(
 	outcome.writtenSessions = result.WrittenSessions
 	outcome.writtenMessages = result.WrittenMessages
 	outcome.failedSessions += result.FailedSessions
+	if e.pipelineObserver() != nil {
+		e.emitPipeline(pipevents.StageWrite, pipevents.KindTxCommitted,
+			"", map[string]any{
+				"sessions": result.WrittenSessions,
+				"inserted": result.WrittenMessages,
+				"failed":   result.FailedSessions,
+			})
+	}
 	return outcome
 }
 
@@ -19540,6 +20049,13 @@ func (e *Engine) writeIncremental(ctx context.Context,
 			}
 		}
 	}
+	if e.pipelineObserver() != nil {
+		e.emitPipeline(pipevents.StageWrite, pipevents.KindTxStarted,
+			"", map[string]any{
+				"session_id": inc.sessionID,
+				"mode":       "incremental",
+			})
+	}
 	signalsMaintained, err := e.db.WriteSessionIncrementalWithToolResultImages(ctx,
 		inc.sessionID,
 		dbMsgs,
@@ -19573,6 +20089,39 @@ func (e *Engine) writeIncremental(ctx context.Context,
 			"incremental write %s: %w",
 			inc.sessionID, err,
 		)
+	}
+	if e.pipelineObserver() != nil {
+		e.emitPipeline(pipevents.StageWrite,
+			pipevents.KindSessionWritten, "", map[string]any{
+				"session_id": inc.sessionID,
+			})
+		e.emitPipeline(pipevents.StageWrite,
+			pipevents.KindMessagesWritten, "", map[string]any{
+				"session_id":  inc.sessionID,
+				"inserted":    len(dbMsgs),
+				"updated":     len(toolCallResultUpdates) + len(messageUsageUpdates),
+				"max_ordinal": maxMessageOrdinal(dbMsgs),
+			})
+		// fts_rows derives from the inserted message count (see the
+		// per-session write path for the same derivation).
+		e.emitPipeline(pipevents.StageWrite,
+			pipevents.KindFTSUpdated, "", map[string]any{
+				"session_id": inc.sessionID,
+				"fts_rows":   len(dbMsgs),
+			})
+		if inc.checkpoint != nil {
+			e.emitPipeline(pipevents.StageWrite,
+				pipevents.KindCheckpointWritten, "", map[string]any{
+					"session_id":         inc.sessionID,
+					"checkpoint_version": inc.checkpoint.Version,
+					"offset":             inc.checkpoint.Offset,
+				})
+		}
+		e.emitPipeline(pipevents.StageWrite, pipevents.KindTxCommitted,
+			"", map[string]any{
+				"session_id": inc.sessionID,
+				"inserted":   len(dbMsgs),
+			})
 	}
 
 	finalProject, err := e.applyWorktreeMappingToSingleSession(
@@ -21398,6 +21947,10 @@ func pairToolResultEventSummariesContext(
 func (e *Engine) emit(scope string) {
 	if e.emitter != nil {
 		e.emitter.Emit(scope)
+	}
+	if e.pipelineObserver() != nil {
+		e.emitPipeline(pipevents.StageFinalize, pipevents.KindSSEEmitted,
+			"", map[string]any{"scope": scope})
 	}
 }
 

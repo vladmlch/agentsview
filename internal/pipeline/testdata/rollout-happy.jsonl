@@ -1,0 +1,7 @@
+{"payload":{"id":"a0a0a0a0-1111-4222-8333-444444444444","cwd":"/workspace/project-a","originator":"codex_cli_rs"},"type":"session_meta","timestamp":"2024-01-01T10:00:00Z"}
+{"type":"turn_context","timestamp":"2024-01-01T10:00:01Z","payload":{"model":"gpt-5.4","cwd":"/tmp"}}
+{"timestamp":"2024-01-01T10:00:02Z","payload":{"role":"user","content":[{"type":"input_text","text":"run the test suite"}]},"type":"response_item"}
+{"payload":{"call_id":"call_test","summary":"go test ./...","type":"function_call","name":"exec_command"},"type":"response_item","timestamp":"2024-01-01T10:00:03Z"}
+{"type":"response_item","timestamp":"2024-01-01T10:00:04Z","payload":{"type":"function_call_output","call_id":"call_test","output":"ok all packages"}}
+{"payload":{"role":"assistant","content":[{"type":"output_text","text":"all tests pass"}]},"type":"response_item","timestamp":"2024-01-01T10:00:05Z"}
+{"timestamp":"2024-01-01T10:00:06Z","payload":{"info":{"last_token_usage":{"input_tokens":1200,"output_tokens":340,"cached_input_tokens":128,"total_tokens":1540}},"type":"token_count"},"type":"event_msg"}

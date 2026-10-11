@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+
+	"go.kenn.io/agentsview/internal/pipevents"
 )
 
 // changedSessionLinks collects only sessions reached by a changed-path batch.
@@ -83,5 +85,12 @@ func (ids changedSessionLinks) link(ctx context.Context, e *Engine, stats *SyncS
 		return linkErr
 	}
 	stats.RecordLinksUpdated(linked)
+	if e.pipelineObserver() != nil {
+		e.emitPipeline(pipevents.StageFinalize,
+			pipevents.KindLinksResolved, "", map[string]any{
+				"linked":   linked,
+				"repaired": 0,
+			})
+	}
 	return nil
 }

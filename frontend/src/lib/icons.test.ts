@@ -1,5 +1,5 @@
 import { cleanup, render } from "@testing-library/svelte";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vite-plus/test";
 
 import * as icons from "./icons.ts";
 
@@ -53,14 +53,18 @@ const approvedIconNames = [
   "MousePointer2Icon",
   "PanelLeftCloseIcon",
   "PanelLeftOpenIcon",
+  "PauseIcon",
   "PencilIcon",
   "PinIcon",
+  "PlayIcon",
   "PlusIcon",
   "RefreshCwIcon",
   "SearchIcon",
   "SettingsIcon",
   "SquareTerminalIcon",
   "StarIcon",
+  "StepBackIcon",
+  "StepForwardIcon",
   "SunIcon",
   "TrashIcon",
   "TriangleAlertIcon",

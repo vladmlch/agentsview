@@ -25,6 +25,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/insight"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/pipeline"
 	"go.kenn.io/agentsview/internal/poller"
 	"go.kenn.io/agentsview/internal/rawderive"
 	"go.kenn.io/agentsview/internal/recall/extract"
@@ -548,6 +549,38 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 	srvOpts = append(srvOpts, server.WithArtifactExchangeRunner(
 		newDaemonArtifactExchangeRunner(cfg, database, engine, emitter),
 	))
+
+	// The pipeline playground wires an isolated codex ingest sandbox and
+	// its event hub into /api/v1/pipeline. A failed sandbox leaves the
+	// rest of the API untouched, so init errors are logged and the
+	// playground simply stays unregistered.
+	pipeHub := pipeline.NewHub(
+		filepath.Join(cfg.DataDir, "pipeline-recordings"))
+	pipeSandbox, pipeErr := pipeline.OpenSandbox(ctx, cfg.DataDir, pipeHub)
+	if pipeErr != nil {
+		log.Printf("pipeline playground disabled: %v", pipeErr)
+	} else {
+		defer pipeSandbox.Close()
+		// The embed schedulers become observe-scoped taps: the server
+		// attaches the hub to them only while POST /observe is open, so
+		// production embed_* events land in observe recordings but can
+		// never leak into a sandbox run's recording.
+		var embedTaps []server.PipelineObserverTarget
+		if vectorServe.Scheduler != nil {
+			embedTaps = append(embedTaps, vectorServe.Scheduler)
+		}
+		if vectorServe.RecallScheduler != nil {
+			embedTaps = append(embedTaps, vectorServe.RecallScheduler)
+		}
+		srvOpts = append(srvOpts, server.WithPipelinePlayground(
+			&server.PipelinePlayground{
+				Hub:       pipeHub,
+				Sandbox:   pipeSandbox,
+				Engine:    engine,
+				EmbedTaps: embedTaps,
+			}))
+	}
+
 	srv := server.New(cfg, database, engine, srvOpts...)
 
 	startupProgress.SetPhase("starting HTTP server")

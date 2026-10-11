@@ -1,0 +1,5 @@
+{"type":"session_meta","timestamp":"2024-01-02T09:30:00Z","payload":{"id":"b1b1b1b1-2222-4333-8444-555555555555","cwd":"/workspace/project-b","originator":"codex_cli_rs"}}
+{"type":"turn_context","timestamp":"2024-01-02T09:30:01Z","payload":{"model":"gpt-5.4","cwd":"/tmp"}}
+{"type":"response_item","timestamp":"2024-01-02T09:30:02Z","payload":{"role":"user","content":[{"type":"input_text","text":"start the refactor"}]}}
+{"type":"response_item","timestamp":"2024-01-02T09:30:03Z","payload":{"role":"assistant","content":[{"type":"output_text","text":"phase one complete"}]}}
+{"type":"event_msg","timestamp":"2024-01-02T09:30:04Z","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":120,"cached_input_tokens":0,"total_tokens":920,"input_tokens":800}}}}

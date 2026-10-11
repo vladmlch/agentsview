@@ -12,6 +12,7 @@ export * as InsightsService from "./insights/insights.ts";
 export * as MetadataService from "./metadata/metadata.ts";
 export * as OpenersService from "./openers/openers.ts";
 export * as PinsService from "./pins/pins.ts";
+export * as PipelineService from "./pipeline/pipeline.ts";
 export * as PushService from "./push/push.ts";
 export * as RawSyncService from "./raw-sync/raw-sync.ts";
 export * as RecallService from "./recall/recall.ts";

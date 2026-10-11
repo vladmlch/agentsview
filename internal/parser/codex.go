@@ -88,6 +88,19 @@ type codexSessionBuilder struct {
 	// Calls beyond the persisted cursor's capacity remain parse-local until
 	// enough results arrive to fit the bounded checkpoint again.
 	overflowPendingCalls map[string]codexPendingToolCall
+	// obs reports parse-level events to the pipeline observer. The zero
+	// value resolves to no observer, so builders without instrumentation
+	// allocate nothing.
+	obs codexParseObserver
+}
+
+// appendMessage records a normalized message through the sink and reports
+// it to the parse observer with the ordinal the sink assigned.
+func (b *codexSessionBuilder) appendMessage(msg ParsedMessage) int {
+	ordinal := b.sink.AppendMessage(msg)
+	msg.Ordinal = ordinal
+	b.obs.emitMessageEmitted(msg)
+	return ordinal
 }
 
 // codexForkGate drops replayed parent history at the top of a Codex
@@ -542,7 +555,7 @@ func (b *codexSessionBuilder) handleResponseItem(ctx context.Context,
 	if role == string(RoleAssistant) {
 		msg.ReasoningEffort = b.reasoningEffort
 	}
-	b.sink.AppendMessage(msg)
+	b.appendMessage(msg)
 }
 
 func (b *codexSessionBuilder) handleAgentMessage(
@@ -563,7 +576,7 @@ func (b *codexSessionBuilder) handleAgentMessage(
 	}
 	b.committedUsageTarget = nil
 	b.committedUsageBlockedByUser = true
-	b.sink.AppendMessage(ParsedMessage{
+	b.appendMessage(ParsedMessage{
 		Role:          RoleUser,
 		Content:       content,
 		Timestamp:     ts,
@@ -703,7 +716,7 @@ func (b *codexSessionBuilder) handleFunctionCall(
 		}
 	}
 
-	messageOrdinal := b.sink.AppendMessage(ParsedMessage{
+	messageOrdinal := b.appendMessage(ParsedMessage{
 		Role:            RoleAssistant,
 		Content:         content,
 		Timestamp:       ts,
@@ -929,7 +942,7 @@ func (b *codexSessionBuilder) flushPendingAgentResultsContext(
 					return err
 				}
 				key := agentID + "\x00" + ev.status + "\x00" + ev.text
-				b.sink.InsertOrphanMessage(key, ParsedMessage{
+				orphan := ParsedMessage{
 					Ordinal:       ev.ordinal,
 					Role:          RoleUser,
 					Content:       ev.text,
@@ -937,7 +950,10 @@ func (b *codexSessionBuilder) flushPendingAgentResultsContext(
 					Timestamp:     ev.timestamp,
 					Model:         b.model,
 					ContentLength: len(ev.text),
-				})
+				}
+				if b.sink.InsertOrphanMessage(key, orphan) {
+					b.obs.emitMessageEmitted(orphan)
+				}
 
 			}
 			delete(b.pendingAgentEvents, agentID)
@@ -2153,13 +2169,16 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 	tee := newCodexHashAnchorTee(io.LimitReader(f, info.Size()))
 	lr := newLineReaderContext(ctx, tee, maxLineSize)
 	defer releaseLineReader(lr)
+	obs := p.parseObserver(path, sink)
 	b := newCodexSessionBuilder(
 		ctx, includeExec, p.parentTurnResolver(ctx, path), sink,
 	)
+	b.obs = obs
 	b.resolveCanonicalParent = p.canonicalParentResolver(ctx, path)
 	malformedLines := 0
 	validRecords := 0
 	continuationLoaded := false
+	lineNo := 0
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -2169,6 +2188,8 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 		if !ok {
 			break
 		}
+		lineNo++
+		obs.emitLineClassified(lineNo, lr.bytesRead, line)
 		if !gjson.Valid(line) {
 			var terminator [1]byte
 			if _, err := f.ReadAt(terminator[:], lr.bytesRead-1); err != nil {
@@ -2217,11 +2238,16 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 			b = newCodexSessionBuilder(
 				ctx, includeExec, p.parentTurnResolver(ctx, path), sink,
 			)
+			b.obs = obs
 			b.resolveCanonicalParent = p.canonicalParentResolver(ctx, path)
 			malformedLines = 0
 			continuationLoaded = false
 
 			dec := json.NewDecoder(tee)
+			// The recovery pass re-classifies the same bytes the line pass
+			// just reported as malformed, so it restarts numbering: decoded
+			// records are numbered from 1 like physical lines would be.
+			lineNo = 0
 			for {
 				if err := ctx.Err(); err != nil {
 					return nil, nil, codexCursorState{}, false, nil, "", "", err
@@ -2234,6 +2260,10 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 					malformedLines++
 					break
 				}
+				// InputOffset sits just past the decoded value and raw holds
+				// its verbatim bytes, so the value's start offset is exact.
+				valueEnd := dec.InputOffset()
+				valueStart := valueEnd - int64(len(raw))
 				trimmed := bytes.TrimSpace(raw)
 				var records []json.RawMessage
 				if bytes.HasPrefix(trimmed, []byte("[")) {
@@ -2245,8 +2275,19 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 				if records == nil {
 					records = []json.RawMessage{raw}
 				}
+				// Locate each record inside raw so array-split records report
+				// their own end offset instead of sharing the parent's.
+				searchFrom := 0
 				for _, record := range records {
 					line := string(record)
+					lineNo++
+					endOffset := valueEnd
+					if idx := bytes.Index(raw[searchFrom:], record); idx >= 0 {
+						recordEnd := searchFrom + idx + len(record)
+						endOffset = valueStart + int64(recordEnd)
+						searchFrom = recordEnd
+					}
+					obs.emitLineClassified(lineNo, endOffset, line)
 					if !continuationLoaded && gjson.Get(line, "type").Str == codexTypeSessionMeta {
 						continuationLoaded = true
 						if err := p.loadCodexContinuationSegments(
@@ -2768,17 +2809,21 @@ func readCodexJSONLFromContext(
 	if err != nil {
 		return 0, fmt.Errorf("stat %s: %w", path, err)
 	}
-	return readCodexJSONLSectionContext(ctx, f, offset, info.Size(), fn)
+	return readCodexJSONLSectionContext(
+		ctx, f, offset, info.Size(),
+		func(line string, _ int64) { fn(line) },
+	)
 }
 
 // readCodexJSONLSection applies the conservative Codex JSONL rules to the
 // exact byte range [offset, limit). A SectionReader makes the captured limit a
-// real EOF even if the underlying descriptor has since grown.
+// real EOF even if the underlying descriptor has since grown. fn receives
+// each accepted line with the absolute file offset just past it.
 func readCodexJSONLSection(
 	f *os.File,
 	offset int64,
 	limit int64,
-	fn func(line string),
+	fn func(line string, endOffset int64),
 ) (consumed int64, err error) {
 	return readCodexJSONLSectionContext(
 		context.Background(), f, offset, limit, fn,
@@ -2790,7 +2835,7 @@ func readCodexJSONLSectionContext(
 	f *os.File,
 	offset int64,
 	limit int64,
-	fn func(line string),
+	fn func(line string, endOffset int64),
 ) (consumed int64, err error) {
 	if offset < 0 || limit < offset {
 		return 0, fmt.Errorf(
@@ -2798,7 +2843,12 @@ func readCodexJSONLSectionContext(
 		)
 	}
 	section := io.NewSectionReader(f, offset, limit-offset)
-	return readCodexJSONLReaderContext(ctx, section, section, fn)
+	return readCodexJSONLReaderContext(
+		ctx, section, section,
+		func(line string, endOffset int64) {
+			fn(line, offset+endOffset)
+		},
+	)
 }
 
 func readCodexJSONLReader(
@@ -2807,15 +2857,18 @@ func readCodexJSONLReader(
 	fn func(line string),
 ) (consumed int64, err error) {
 	return readCodexJSONLReaderContext(
-		context.Background(), r, at, fn,
+		context.Background(), r, at,
+		func(line string, _ int64) { fn(line) },
 	)
 }
 
+// readCodexJSONLReaderContext delivers each accepted line with the offset
+// just past it, relative to the start of r.
 func readCodexJSONLReaderContext(
 	ctx context.Context,
 	r io.Reader,
 	at io.ReaderAt,
-	fn func(line string),
+	fn func(line string, endOffset int64),
 ) (consumed int64, err error) {
 	lr := newLineReaderContext(ctx, r, maxLineSize)
 	defer releaseLineReader(lr)
@@ -2838,8 +2891,8 @@ func readCodexJSONLReaderContext(
 			break
 		}
 		if gjson.Valid(line) {
-			fn(line)
 			consumed = lr.bytesRead
+			fn(line, consumed)
 		}
 	}
 	return consumed, lr.Err()
@@ -2931,7 +2984,7 @@ func (p *codexProvider) parseSessionFromSnapshot(ctx context.Context,
 		startOrdinal,
 		includeExec,
 		info,
-		func(fn func(string)) (int64, error) {
+		func(fn func(string, int64)) (int64, error) {
 			return readCodexJSONLSection(f, offset, limit, fn)
 		},
 		func() (codexIncrementalSeed, error) {
@@ -2969,7 +3022,7 @@ func (p *codexProvider) parseSessionFromCheckpoint(ctx context.Context,
 		startOrdinal,
 		includeExec,
 		info,
-		func(fn func(string)) (int64, error) {
+		func(fn func(string, int64)) (int64, error) {
 			return readCodexJSONLSection(f, offset, limit, fn)
 		},
 		func() (codexIncrementalSeed, error) {
@@ -3016,8 +3069,12 @@ func (p *codexProvider) parseSessionFromWithReaders(ctx context.Context,
 		startOrdinal,
 		includeExec,
 		info,
-		func(fn func(string)) (int64, error) {
-			return readLines(path, offset, fn)
+		func(fn func(string, int64)) (int64, error) {
+			// The generic tail reader exposes no per-line offsets; -1
+			// marks the offset as untracked in classified-line events.
+			return readLines(path, offset, func(line string) {
+				fn(line, -1)
+			})
 		},
 		func() (codexIncrementalSeed, error) {
 			return readSeed(ctx, path, offset)
@@ -3032,10 +3089,11 @@ func (p *codexProvider) parseSessionFromWithSources(ctx context.Context,
 	startOrdinal int,
 	includeExec bool,
 	info os.FileInfo,
-	readLines func(func(string)) (int64, error),
+	readLines func(func(line string, endOffset int64)) (int64, error),
 	readSeed func() (codexIncrementalSeed, error),
 	committedUsageTarget *int,
 ) (codexIncrementalParseResult, error) {
+	obs := p.parseObserver(path, nil)
 	inode, device := sourceFileIdentityForPath(path, info)
 	cached, cacheHit := p.cursorCache.Get(path, offset, inode, device)
 	seed := codexIncrementalSeed{codexCursorState: cached}
@@ -3043,6 +3101,9 @@ func (p *codexProvider) parseSessionFromWithSources(ctx context.Context,
 		var err error
 		seed, err = readSeed()
 		if err != nil {
+			if IsIncrementalFullParseFallback(err) {
+				obs.emitIncrementalFallback("seed_requires_full_parse", 0)
+			}
 			return codexIncrementalParseResult{}, fmt.Errorf(
 				"seed codex %s at offset %d: %w",
 				path, offset, err,
@@ -3055,6 +3116,7 @@ func (p *codexProvider) parseSessionFromWithSources(ctx context.Context,
 		p.parentTurnResolver(ctx, path),
 		NewCodexCollectingSink(startOrdinal),
 	)
+	b.obs = obs
 	b.resolveCanonicalParent = p.canonicalParentResolver(ctx, path)
 	b.codexCursorState = seed.codexCursorState
 	b.overflowPendingCalls = seed.overflowPendingCalls
@@ -3063,32 +3125,45 @@ func (p *codexProvider) parseSessionFromWithSources(ctx context.Context,
 		b.committedUsageTarget = &ordinal
 	}
 	var fallbackErr error
+	lineNo := 0
 
 	consumed, err := readLines(
-		func(line string) {
+		func(line string, endOffset int64) {
 			if fallbackErr != nil {
 				return
 			}
+			lineNo++
+			obs.emitLineClassified(lineNo, endOffset, line)
 			lineType := gjson.Get(line, "type").Str
 			// A session_meta after the persisted offset can change fork or
 			// subagent replay classification. Rebuild the current session
 			// authoritatively instead of appending against stale gate state.
 			if lineType == codexTypeSessionMeta {
+				obs.emitIncrementalFallback("session_meta_after_offset", lineNo)
 				fallbackErr = errCodexIncrementalNeedsFullParse
 				return
 			}
 			if b.codexIncrementalNeedsFullParse(line) {
+				obs.emitIncrementalFallback("builder_requires_full_parse", lineNo)
 				fallbackErr = errCodexIncrementalNeedsFullParse
 				return
 			}
 			b.processLine(ctx, line)
 			if b.unattachedTokenUsage {
+				obs.emitIncrementalFallback("unattached_token_usage", lineNo)
 				fallbackErr = errCodexIncrementalNeedsFullParse
 				return
 			}
 		},
 	)
 	if err != nil {
+		if IsIncrementalFullParseFallback(err) {
+			// The tail ends in a valid but unterminated line; the full
+			// parse replays it from the start. lineNo counts only the
+			// complete lines delivered to the callback, so the offending
+			// record is the next one.
+			obs.emitIncrementalFallback("unterminated_tail", lineNo+1)
+		}
 		return codexIncrementalParseResult{}, fmt.Errorf(
 			"reading codex %s from offset %d: %w",
 			path, offset, err,
@@ -3100,10 +3175,12 @@ func (p *codexProvider) parseSessionFromWithSources(ctx context.Context,
 
 	b.flushPendingAgentResults()
 	if b.checkpointUnsafe {
+		obs.emitIncrementalFallback("checkpoint_unsafe", lineNo)
 		return codexIncrementalParseResult{}, errCodexIncrementalNeedsFullParse
 	}
 	for _, update := range b.sink.ToolCallUpdates() {
 		if !update.TargetKnown {
+			obs.emitIncrementalFallback("unknown_tool_call_target", lineNo)
 			return codexIncrementalParseResult{}, errCodexIncrementalNeedsFullParse
 		}
 	}

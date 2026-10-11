@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v7"
@@ -17,6 +18,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/pipevents"
 	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/vector"
@@ -103,6 +105,15 @@ type embedScheduler struct {
 	// override (see EmbeddingsBuildOptions.IncludeAutomatedSet).
 	includeAutomated bool
 
+	// pipelineObs, when non-nil, receives embed_* pipevents for the
+	// pipeline playground's hub. store labels which index this scheduler
+	// builds so the two schedulers' events stay distinguishable. The slot
+	// is an atomic pointer because observe-mode attach/detach calls
+	// SetPipelineObserver while the scheduler goroutine is running —
+	// same pattern as sync.Engine.pipelineObs.
+	pipelineObs atomic.Pointer[pipevents.Observer]
+	store       string
+
 	dirty chan func()
 	stop  chan struct{}
 	done  chan struct{}
@@ -126,6 +137,80 @@ func newEmbedScheduler(
 		stop:             make(chan struct{}),
 		done:             make(chan struct{}),
 	}
+}
+
+// SetPipelineObserver installs an optional observer for the
+// embed_scheduled/embed_started/embed_done/embed_skipped lifecycle —
+// the pipeline playground's hub during observe windows. Nil disables
+// reporting. It may be called while the scheduler is running; the
+// atomic slot makes the swap race-free.
+func (s *embedScheduler) SetPipelineObserver(o pipevents.Observer) {
+	if o == nil {
+		s.pipelineObs.Store(nil)
+		return
+	}
+	s.pipelineObs.Store(&o)
+}
+
+// pipelineObserver returns the installed observer or nil. The atomic
+// load keeps the common no-observer path allocation-free.
+func (s *embedScheduler) pipelineObserver() pipevents.Observer {
+	if p := s.pipelineObs.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// observeEmbed reports one embed-stage event to the pipeline observer.
+// It allocates a payload only when an observer is installed.
+func (s *embedScheduler) observeEmbed(
+	kind string, payload map[string]any,
+) {
+	ob := s.pipelineObserver()
+	if ob == nil {
+		return
+	}
+	p := map[string]any{"store": s.store}
+	for k, v := range payload {
+		p[k] = v
+	}
+	ob.ObserveEvent(pipevents.Event{
+		Stage:   pipevents.StageEmbed,
+		Kind:    kind,
+		Payload: p,
+	})
+}
+
+// tryBuild runs TryBuild and reports the scheduled/started/done/skipped
+// lifecycle to the pipeline observer. TryBuild is synchronous, so
+// embed_started and embed_done arrive back-to-back after the build
+// finishes — the events are an accurate record, not live progress.
+func (s *embedScheduler) tryBuild(
+	ctx context.Context, req vector.BuildRequest, trigger string,
+) (bool, error) {
+	s.observeEmbed(pipevents.KindEmbedScheduled, map[string]any{
+		"trigger":           trigger,
+		"backstop":          req.Backstop,
+		"include_automated": req.IncludeAutomated,
+	})
+	started, err := s.mgr.TryBuild(ctx, req)
+	switch {
+	case err != nil:
+		s.observeEmbed(pipevents.KindEmbedDone, map[string]any{
+			"started": started,
+			"error":   err.Error(),
+		})
+	case !started:
+		s.observeEmbed(pipevents.KindEmbedSkipped, map[string]any{
+			"reason": "build already running",
+		})
+	default:
+		s.observeEmbed(pipevents.KindEmbedStarted, nil)
+		s.observeEmbed(pipevents.KindEmbedDone, map[string]any{
+			"started": true,
+		})
+	}
+	return started, err
 }
 
 // Notify signals that new data may need embedding. It never blocks: dirty
@@ -218,7 +303,7 @@ func (s *embedScheduler) run(
 			resetTimer(debounceTimer, s.debounce)
 		case <-debounceTimer.C:
 			req := vector.BuildRequest{Backstop: pendingBackstop, IncludeAutomated: s.includeAutomated}
-			started, err := s.mgr.TryBuild(ctx, req)
+			started, err := s.tryBuild(ctx, req, "debounce")
 			if err != nil {
 				log.Printf("embed scheduler: build failed: %v", err)
 				if buildErrorRetries >= embedBuildErrorRetryLimit {
@@ -268,8 +353,9 @@ func (s *embedScheduler) run(
 			if !ok {
 				continue
 			}
-			started, err := s.mgr.TryBuild(ctx,
-				vector.BuildRequest{Backstop: true, IncludeAutomated: s.includeAutomated})
+			started, err := s.tryBuild(ctx,
+				vector.BuildRequest{Backstop: true, IncludeAutomated: s.includeAutomated},
+				"backstop")
 			if err != nil {
 				log.Printf("embed scheduler: backstop build failed: %v", err)
 				buildErrorRetries++
@@ -741,9 +827,11 @@ func setupVectorServing(
 	scheduler := newEmbedScheduler(
 		mgr, embedDebounceInterval, backstop, cfg.Vector.IncludeAutomated, idle,
 	)
+	scheduler.store = vector.MessageIndexSpec().Name
 	recallScheduler := newEmbedScheduler(
 		recallMgr, embedDebounceInterval, recallBackstop(cfg, backstop), false, idle,
 	)
+	recallScheduler.store = vector.RecallIndexSpec().Name
 	serverOpts := []server.Option{
 		server.WithEmbeddingsManager(mgr),
 		server.WithEmbeddingsStoreManager(
