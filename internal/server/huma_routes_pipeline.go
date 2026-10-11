@@ -32,6 +32,14 @@ const pipelineRunStartTimeout = 10 * time.Second
 var errPipelineRunStartTimeout = errors.New(
 	"pipeline: run did not start in time")
 
+// PipelineObserverTarget accepts a pipeline event observer, matching
+// the SetPipelineObserver signatures of *sync.Engine and the embed
+// schedulers. Observe mode attaches the hub to every configured target
+// for the duration of the session.
+type PipelineObserverTarget interface {
+	SetPipelineObserver(pipevents.Observer)
+}
+
 // PipelinePlayground bundles the dependencies the /api/v1/pipeline
 // routes serve: the event hub that records runs and fans events out to
 // SSE subscribers, the isolated sandbox ingest engine, and the daemon's
@@ -42,6 +50,11 @@ type PipelinePlayground struct {
 	// Engine is the daemon's real sync engine. POST /observe attaches
 	// the hub to it; nil (serve --no-sync, pg-serve) disables observe.
 	Engine *agentsync.Engine
+	// EmbedTaps are the daemon's embed schedulers. They attach to the
+	// hub only while an observe window is open, so production embed_*
+	// events land in observe recordings alongside the real engine's
+	// events — and can never leak into a sandbox run's recording.
+	EmbedTaps []PipelineObserverTarget
 
 	// sessionMu serializes run and observe window opens. The hub itself
 	// enforces a single active run; holding sessionMu across the
@@ -251,6 +264,14 @@ func (s *Server) humaPipelineRunEvents(
 				apiResponseError{Message: "streaming not supported"})
 			return
 		}
+		// A finished run whose last event sits at or before after_seq
+		// has nothing left to deliver — the client already consumed the
+		// whole stream. Close immediately instead of heartbeating
+		// forever: replay would produce no events for this run, and no
+		// live event can ever carry this (single-use) run id again.
+		if pipelineRunFullyConsumed(pg.Hub, in.ID, in.AfterSeq) {
+			return
+		}
 		events, unsub := pg.Hub.Subscribe(in.AfterSeq)
 		defer unsub()
 		heartbeat := time.NewTicker(
@@ -283,6 +304,22 @@ func (s *Server) humaPipelineRunEvents(
 	}}, nil
 }
 
+// pipelineRunFullyConsumed reports whether runID is finished and its
+// final event's seq is at or before afterSeq — the resume cursor is
+// already past the run's end. A still-open run answers false even when
+// its current events are all replayed, because its run_finished is yet
+// to arrive.
+func pipelineRunFullyConsumed(
+	h *pipeline.Hub, runID string, afterSeq uint64,
+) bool {
+	evs := h.RunEvents(runID)
+	if len(evs) == 0 {
+		return false
+	}
+	last := evs[len(evs)-1]
+	return last.Kind == pipevents.KindRunFinished && last.Seq <= afterSeq
+}
+
 type pipelineObserveInput struct {
 	Body struct {
 		RunID string `json:"run_id" required:"true" doc:"Client-chosen run id for this observe session"`
@@ -290,11 +327,12 @@ type pipelineObserveInput struct {
 }
 
 // humaPipelineObserveStart opens a recording window on the hub and taps
-// the daemon's real sync engine: every pipeline event the live ingest
-// path emits lands in the observe run until DELETE /observe detaches.
-// Only one session may hold the tap; a detached tap is mandatory because
-// leaving it on would keep recording the production pipeline and grow
-// the hub's event log indefinitely.
+// the daemon's real sync engine and embed schedulers: every pipeline
+// event the live ingest path emits lands in the observe run until
+// DELETE /observe detaches. Only one session may hold the tap — while
+// it is open, sandbox runs and resets answer 409 — and a detached tap
+// is mandatory because leaving it on would keep recording the
+// production pipeline and grow the hub's event log indefinitely.
 func (s *Server) humaPipelineObserveStart(
 	_ context.Context, in *pipelineObserveInput,
 ) (*jsonOutput[pipelineRunStarted], error) {
@@ -318,15 +356,18 @@ func (s *Server) humaPipelineObserveStart(
 		return nil, apiError(http.StatusConflict, err.Error())
 	}
 	pg.Engine.SetPipelineObserver(pg.Hub)
+	for _, t := range pg.EmbedTaps {
+		t.SetPipelineObserver(pg.Hub)
+	}
 	pg.observeRunID = runID
 	return &jsonOutput[pipelineRunStarted]{
 		Body: pipelineRunStarted{RunID: runID},
 	}, nil
 }
 
-// humaPipelineObserveStop detaches the hub from the real engine before
-// closing the run window, so the run_finished bookend is the last event
-// the session records.
+// humaPipelineObserveStop detaches the hub from the real engine and the
+// embed schedulers before closing the run window, so the run_finished
+// bookend is the last event the session records.
 func (s *Server) humaPipelineObserveStop(
 	_ context.Context, _ *emptyInput,
 ) (*noContentOutput, error) {
@@ -337,12 +378,26 @@ func (s *Server) humaPipelineObserveStop(
 		return nil, apiError(http.StatusNotFound,
 			"no pipeline observe session is active")
 	}
+	pg.detachObserveLocked()
+	return &noContentOutput{Status: http.StatusNoContent}, nil
+}
+
+// detachObserveLocked removes every observe tap — engine first, then
+// the embed schedulers — and closes the run window. Callers hold
+// sessionMu; the observe window can only ever be the active run because
+// every other run path is 409-blocked while a session is open.
+// Server.Shutdown calls this too, so a forgotten session still ends
+// with its run_finished bookend and cannot keep reporting into a hub
+// the process is abandoning.
+func (pg *PipelinePlayground) detachObserveLocked() {
 	if pg.Engine != nil {
 		pg.Engine.SetPipelineObserver(nil)
 	}
+	for _, t := range pg.EmbedTaps {
+		t.SetPipelineObserver(nil)
+	}
 	pg.Hub.EndRun(map[string]any{"source": "observe"})
 	pg.observeRunID = ""
-	return &noContentOutput{Status: http.StatusNoContent}, nil
 }
 
 // validPipelineRunID mirrors the hub's run-id safety rules so observe
