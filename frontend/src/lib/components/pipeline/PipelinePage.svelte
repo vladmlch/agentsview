@@ -140,6 +140,20 @@
   function shortRunId(id: string): string {
     return id.length > 10 ? `${id.slice(0, 10)}…` : id;
   }
+
+  /** Events-per-tick pace from the timeline's speed group. Inert in
+   * time mode — worse, routing the click through play() would restart
+   * the interval and reset playheadMs to the cursor event's at_ms,
+   * rewinding up to a tick of wall-clock progress per click. The
+   * control itself stays visible; hiding it is deferred. */
+  function setSpeed(s: number): void {
+    if (store.playMode !== "events") return;
+    if (store.playing) {
+      store.play(s);
+    } else {
+      store.speed = s;
+    }
+  }
 </script>
 
 <div class="pipeline-page">
@@ -298,7 +312,7 @@
         onanomalieschange={(on) => (anomaliesOnly = on)}
         onstep={(d) => store.stepBy(d)}
         onplaypause={() => (store.playing ? store.pause() : store.play())}
-        onspeed={(s) => (store.playing ? store.play(s) : (store.speed = s))}
+        onspeed={setSpeed}
         ongolive={() => store.seekToEnd()}
         onclearfilter={() => (stageFilter = null)}
       />
