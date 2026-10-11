@@ -140,7 +140,11 @@ func (r *Recorder) ReadRecordingFile(name string) ([]byte, error) {
 // ImportRecording stores an uploaded recording stream under name. The
 // stream must parse as a valid recording under pipevents.ReadRecording
 // rules; invalid input leaves no file behind. An existing file with
-// the same name is replaced atomically.
+// the same name is replaced atomically. Callers must not target the
+// file an in-flight run is writing: the rename would swap the path
+// under the run recorder's open descriptor and silently detach the
+// rest of the run's events. The recorder cannot see runs — HTTP
+// callers guard with Hub.ActiveRun under the session mutex.
 func (r *Recorder) ImportRecording(name string, rd io.Reader) error {
 	if err := validRecordingName(name); err != nil {
 		return err

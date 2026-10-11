@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json/v2"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -574,6 +575,193 @@ func TestPipelineSandboxResetAllowsNewRun(t *testing.T) {
 	require.NotEmpty(t, events)
 	kinds := pipelineRunKinds(events)
 	assert.Equal(t, pipevents.KindRunFinished, kinds[len(kinds)-1])
+}
+
+// pipelineImportRecording POSTs data as a multipart file field under
+// filename to the recording import route.
+func pipelineImportRecording(
+	t *testing.T, te *pipelineTestEnv,
+	filename string, data []byte,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	var form bytes.Buffer
+	mw := multipart.NewWriter(&form)
+	fw, err := mw.CreateFormFile("file", filename)
+	require.NoError(t, err)
+	_, err = fw.Write(data)
+	require.NoError(t, err)
+	require.NoError(t, mw.Close())
+	req := httptest.NewRequest(
+		http.MethodPost, "/api/v1/pipeline/recordings", &form)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	te.handler.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestPipelineRunEventsReplayBeyondSubscriberCap is the regression test
+// for the review's truncated-replay finding: a run whose events outgrow
+// the 1024-event subscriber buffer must still stream completely. The hub
+// log itself is unbounded, so the overflow is forced honestly — one run
+// window that observes more events than the buffer holds. Replaying
+// through the capped Subscribe path would deliver a torn prefix and
+// then heartbeat forever because run_finished never arrives.
+func TestPipelineRunEventsReplayBeyondSubscriberCap(t *testing.T) {
+	te := setupPipelineTestEnv(t)
+	hub := te.hub
+
+	const fillers = 1500 // comfortably past the 1024-event cap
+	require.NoError(t, hub.BeginRun("big-run", "manual", ""))
+	emit := func(from, to int) {
+		for i := from; i < to; i++ {
+			hub.ObserveEvent(pipevents.Event{
+				Stage: pipevents.StageParse,
+				Kind:  "filler",
+				Path:  fmt.Sprintf("/big/%04d", i),
+			})
+		}
+	}
+	emit(0, fillers-100)
+
+	// Open the stream while the run is still live so the tail path —
+	// not only the finished-run snapshot — is exercised: the remaining
+	// events and run_finished may arrive after the handler snapshots.
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/pipeline/runs/big-run/events", nil)
+	req.Header.Set("Accept", "text/event-stream")
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		te.handler.ServeHTTP(rec, req)
+		close(done)
+	}()
+	// Give the handler a moment to subscribe, so the last batch and the
+	// run_finished bookend really flow through the live subscription.
+	time.Sleep(50 * time.Millisecond)
+	emit(fillers-100, fillers)
+	hub.EndRun(nil)
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("live-tailed stream did not close on run_finished")
+	}
+	require.Equal(t, http.StatusOK, rec.Code,
+		"body: %s", rec.Body.String())
+	live := parsePipelineSSE(t, rec.Body.String())
+
+	// assertBigRun verifies one complete big-run stream: bookends at
+	// the edges, strictly increasing seqs, and every filler present in
+	// emit order. Kind and Path filters keep stray non-run events from
+	// disturbing the count.
+	assertBigRun := func(events []pipevents.Event) {
+		t.Helper()
+		require.NotEmpty(t, events)
+		assert.Equal(t, pipevents.KindRunStarted, events[0].Kind)
+		assert.Equal(t, pipevents.KindRunFinished,
+			events[len(events)-1].Kind)
+		seen := 0
+		var lastSeq uint64
+		for _, e := range events {
+			assert.Equal(t, "big-run", e.RunID)
+			assert.Greater(t, e.Seq, lastSeq)
+			lastSeq = e.Seq
+			if e.Kind == "filler" {
+				assert.Equal(t,
+					fmt.Sprintf("/big/%04d", seen), e.Path,
+					"fillers must arrive in emit order")
+				seen++
+			}
+		}
+		assert.Equal(t, fillers, seen,
+			"every filler event must survive the stream")
+	}
+	assertBigRun(live)
+
+	// Finished-run replay is equally complete and closes promptly.
+	replay := pipelineEventsRequest(
+		t, te, "big-run", "", 10*time.Second)
+	assertBigRun(replay)
+	lastSeq := replay[len(replay)-1].Seq
+
+	// A resume cursor mid-run returns exactly the remaining tail.
+	resume := pipelineEventsRequest(
+		t, te, "big-run", "?after_seq=1401", 10*time.Second)
+	require.NotEmpty(t, resume)
+	assert.Greater(t, resume[0].Seq, uint64(1401))
+	for _, e := range resume {
+		assert.Equal(t, "big-run", e.RunID)
+	}
+	assert.Equal(t, pipevents.KindRunFinished,
+		resume[len(resume)-1].Kind)
+
+	// A cursor at the run's last event closes empty immediately.
+	tail := pipelineEventsRequest(t, te, "big-run",
+		"?after_seq="+strconv.FormatUint(lastSeq, 10), 10*time.Second)
+	assert.Empty(t, tail)
+
+	// Other runs piling onto the global log afterwards do not eat into
+	// this run's replay: the run's own event list is the source.
+	require.NoError(t, hub.BeginRun("noise", "manual", ""))
+	for i := 0; i < 50; i++ {
+		hub.ObserveEvent(pipevents.Event{
+			Stage: pipevents.StageWatch, Kind: "noise",
+		})
+	}
+	hub.EndRun(nil)
+	again := pipelineEventsRequest(
+		t, te, "big-run", "", 10*time.Second)
+	assertBigRun(again)
+}
+
+// TestPipelineRecordingImportRejectsActiveRun covers the guard the T4
+// review forwarded to the import handler: an upload named after the
+// file an in-flight run is writing must be refused, because os.Rename
+// would swap the path under the recorder's open descriptor and send the
+// rest of the run's events to an unlinked inode.
+func TestPipelineRecordingImportRejectsActiveRun(t *testing.T) {
+	te := setupPipelineTestEnv(t)
+
+	var rec bytes.Buffer
+	require.NoError(t, pipevents.WriteRecording(&rec,
+		pipevents.RecordingHeader{RunID: "uploaded", StartedAtMS: 1},
+		[]pipevents.Event{
+			{Seq: 1, Stage: pipevents.StageParse, Kind: "k"},
+		}))
+	upload := rec.Bytes()
+
+	require.NoError(t, te.hub.BeginRun("liverun", "manual", ""))
+	te.hub.ObserveEvent(pipevents.Event{
+		Stage: pipevents.StageParse, Kind: "live-event",
+	})
+
+	// The live file is a forbidden target; any other name imports fine.
+	res := pipelineImportRecording(t, te, "liverun.jsonl", upload)
+	assert.Equal(t, http.StatusConflict, res.Code,
+		"import over a live recording must be 409, body: %s",
+		res.Body.String())
+	res = pipelineImportRecording(t, te, "unrelated.jsonl", upload)
+	assert.Equal(t, http.StatusCreated, res.Code,
+		"unrelated import must succeed, body: %s", res.Body.String())
+
+	// The run's recording on disk is untouched by the rejected import:
+	// it still parses as this run's live file, not the upload.
+	data, err := te.hub.Recorder().ReadRecordingFile("liverun.jsonl")
+	require.NoError(t, err)
+	header, _, err := pipevents.ReadRecording(bytes.NewReader(data))
+	require.NoError(t, err)
+	assert.Equal(t, "liverun", header.RunID,
+		"rejected import must not shadow the live recording")
+
+	// Once the run ends the file is a finished recording again and may
+	// be replaced by an explicit import.
+	te.hub.EndRun(nil)
+	res = pipelineImportRecording(t, te, "liverun.jsonl", upload)
+	assert.Equal(t, http.StatusCreated, res.Code,
+		"import after the run finished must succeed, body: %s",
+		res.Body.String())
+	header, _, err = te.hub.Recorder().ReadRecording("liverun.jsonl")
+	require.NoError(t, err)
+	assert.Equal(t, "uploaded", header.RunID)
 }
 
 func TestPipelineRoutesAbsentWithoutPlayground(t *testing.T) {

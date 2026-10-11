@@ -21,6 +21,10 @@ const (
 
 // Kind values (string constants; exhaustive list).
 const (
+	// KindFSEvent is reserved: raw watcher events are coalesced into
+	// batch_formed inside sync.Watcher before the pipeline sees them,
+	// so no producer emits fs_event today. Kept for vocabulary
+	// stability — recordings and UIs may still reference the kind.
 	KindFSEvent             = "fs_event"
 	KindBatchFormed         = "batch_formed"
 	KindBatchDispatched     = "batch_dispatched"
