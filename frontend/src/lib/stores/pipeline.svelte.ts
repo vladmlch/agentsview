@@ -238,10 +238,13 @@ function off(v: unknown): number {
   return typeof v === "number" && Number.isFinite(v) ? v : -1;
 }
 
-/** Last path segment, for compact labels like the dedup loser reason. */
-function baseName(p: string): string {
-  const i = p.lastIndexOf("/");
-  return i === -1 ? p : p.slice(i + 1);
+/** Last path segment, for compact labels like the dedup loser reason
+ * and the pipeline components' path cells. A missing or empty path
+ * reads as "". */
+export function basename(path: string | undefined): string {
+  if (!path) return "";
+  const i = path.lastIndexOf("/");
+  return i === -1 ? path : path.slice(i + 1);
 }
 
 /** Reason an event is anomalous for the replay UI, or null when it is
@@ -252,13 +255,25 @@ export function eventAnomaly(ev: PipelineEvent): string | null {
   switch (ev.kind) {
     case "gate_verdict": {
       const decision = str(p.decision);
-      if (decision === "reject" || decision === "drop" || decision === "rescan") {
+      // Emitted vocabulary: gateVerdict call sites produce "pass" and
+      // "skip" (internal/sync/engine.go) and the codex_checkpoint gate
+      // produces "unchanged"/"append"/"invalid"/"missing"
+      // (codexCheckpointGateDecision, internal/sync/pipeline_events.go).
+      // "invalid" means the checkpoint proof failed (e.g. a truncate
+      // rewrite); "reject"/"drop"/"rescan" are kept for forward-compat.
+      // Routine "skip" is never anomalous — gates emit it constantly.
+      if (
+        decision === "reject" ||
+        decision === "drop" ||
+        decision === "rescan" ||
+        decision === "invalid"
+      ) {
         return `gate "${str(p.gate)}": ${decision}`;
       }
       return null;
     }
     case "dedup_loser":
-      return `dedup lost to ${baseName(str(p.winner))}`;
+      return `dedup lost to ${basename(str(p.winner))}`;
     case "incremental_fallback":
       return str(p.reason) || "incremental parse fell back";
     case "parse_done":
@@ -816,6 +831,13 @@ export class PipelineStore {
   seek(i: number): void {
     this.cursor = Math.max(0, Math.min(this.events.length, Math.trunc(i)));
     this.live = this.cursor >= this.events.length;
+    // A running time-mode timer recomputes the cursor from playheadMs
+    // on the next tick — rebase the watermark on the event under the
+    // new cursor, like a fresh play() does, or the tick snaps the
+    // cursor back to where the stale playhead left off.
+    if (this.playMode === "time" && this.playTimer !== null) {
+      this.playheadMs = this.events[this.cursor]?.at_ms ?? 0;
+    }
   }
 
   stepBy(d: number): void {

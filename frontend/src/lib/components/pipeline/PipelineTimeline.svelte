@@ -8,6 +8,7 @@
   } from "@kenn-io/kit-ui";
   import {
     PIPELINE_STAGES,
+    basename,
     eventAnomaly,
     type PipelineEvent,
     type PipelineStage,
@@ -95,12 +96,6 @@
     { value: "5", label: "5x" },
     { value: "20", label: "20x" },
   ];
-
-  function basename(path: string | undefined): string {
-    if (!path) return "";
-    const idx = path.lastIndexOf("/");
-    return idx === -1 ? path : path.slice(idx + 1);
-  }
 
   /** Lowercased haystack for the query filter: kind, path, and the
    * serialized payload. Buffer events are immutable, so the string is

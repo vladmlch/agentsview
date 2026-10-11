@@ -485,15 +485,19 @@ describe("reduceEvents", () => {
       ev(
         "gates",
         "gate_verdict",
-        { gate: "fingerprint", decision: "reject", reason: "stale" },
+        {
+          gate: "codex_checkpoint",
+          decision: "invalid",
+          reason: "checkpoint proof invalid",
+        },
         "f.jsonl",
       ),
       ev("parse", "parse_started", { mode: "full" }, "f.jsonl"),
     ]);
     const j = s.journeys[0];
     expect(j?.anomalies).toBe(1);
-    expect(j?.steps[0]?.anomaly).toBe('gate "fingerprint": reject');
-    expect(j?.steps[0]?.summary).toBe("fingerprint → reject (stale)");
+    expect(j?.steps[0]?.anomaly).toBe('gate "codex_checkpoint": invalid');
+    expect(j?.steps[0]?.summary).toBe("codex_checkpoint → invalid (checkpoint proof invalid)");
     expect(j?.steps[1]?.anomaly).toBeUndefined();
   });
 
@@ -506,8 +510,11 @@ describe("reduceEvents", () => {
 });
 
 describe("eventAnomaly", () => {
-  it("flags rejecting gate verdicts", () => {
-    for (const decision of ["reject", "drop", "rescan"]) {
+  it("flags adverse gate verdicts", () => {
+    // "invalid" is really emitted — the codex_checkpoint gate reports
+    // it when the checkpoint proof fails (truncate-rewrite). The rest
+    // are forward-compat vocabulary no producer emits today.
+    for (const decision of ["reject", "drop", "rescan", "invalid"]) {
       expect(eventAnomaly(ev("gates", "gate_verdict", { gate: "g", decision }))).toBe(
         `gate "g": ${decision}`,
       );
@@ -515,8 +522,12 @@ describe("eventAnomaly", () => {
   });
 
   it("passes routine gate verdicts", () => {
-    expect(eventAnomaly(ev("gates", "gate_verdict", { gate: "g", decision: "pass" }))).toBeNull();
-    expect(eventAnomaly(ev("gates", "gate_verdict", { gate: "g", decision: "skip" }))).toBeNull();
+    // The emitted routine vocabulary: "pass"/"skip" from gateVerdict
+    // call sites, "unchanged"/"append"/"missing" from the
+    // codex_checkpoint gate.
+    for (const decision of ["pass", "skip", "unchanged", "append", "missing"]) {
+      expect(eventAnomaly(ev("gates", "gate_verdict", { gate: "g", decision }))).toBeNull();
+    }
   });
 
   it("flags the dedup loser with the winner's basename", () => {
@@ -895,6 +906,37 @@ describe("PipelineStore", () => {
     expect(store.cursor).toBe(3);
     vi.advanceTimersByTime(100); // playhead 2500 → tail reached
     expect(store.cursor).toBe(4);
+    expect(store.playing).toBe(false);
+    expect(store.live).toBe(true);
+  });
+
+  it("re-bases the time playhead on seek so the next tick does not undo it", () => {
+    vi.useFakeTimers();
+    const w = fakeWatch();
+    const store = new PipelineStore({ watch: w.watch });
+    store.playMode = "time";
+    store.rtSpeed = 10; // 1000ms of event time per 100ms tick
+    store.attachLive("run-1");
+    for (const t of [1000, 2000, 3000, 4000, 5000]) {
+      const e = ev("watch", "batch_formed");
+      e.at_ms = t;
+      w.emit(e);
+    }
+    store.seek(0);
+    store.play();
+    vi.advanceTimersByTime(200); // playhead 3000 → cursor 3
+    expect(store.cursor).toBe(3);
+    // Scrub back mid-play. Without a playhead rebase the next tick
+    // recomputes from the stale watermark (3000+1000) and snaps the
+    // cursor right back past the seek target.
+    store.seek(1);
+    vi.advanceTimersByTime(100); // rebased playhead 2000+1000 → cursor 3
+    expect(store.cursor).toBe(3);
+    expect(store.playing).toBe(true);
+    vi.advanceTimersByTime(100); // playhead 4000 → cursor 4
+    expect(store.cursor).toBe(4);
+    vi.advanceTimersByTime(100); // playhead 5000 → tail
+    expect(store.cursor).toBe(5);
     expect(store.playing).toBe(false);
     expect(store.live).toBe(true);
   });
