@@ -7,6 +7,8 @@ import (
 	"os"
 	"slices"
 	"strings"
+
+	"go.kenn.io/agentsview/internal/pipevents"
 )
 
 // WatchBatchSyncer is the engine surface needed to classify and apply one
@@ -406,6 +408,17 @@ func (e *Engine) SyncWatchBatchThenRun(
 			e.emit("sessions")
 		}
 	}()
+	if e.pipelineObserver() != nil {
+		e.emitPipeline(pipevents.StageWatch, pipevents.KindBatchDispatched,
+			"", map[string]any{
+				"origin":          "watcher",
+				"paths":           len(batch.Paths),
+				"renames":         len(batch.Renames),
+				"reconcile_roots": len(batch.ReconcileRoots),
+				"full_sync":       batch.FullSync,
+				"lost_events":     batch.LostEvents,
+			})
+	}
 	e.reportProgress(nil, Progress{
 		Phase:  PhaseDiscovering,
 		Detail: "Planning watcher batch",

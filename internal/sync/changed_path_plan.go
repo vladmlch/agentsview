@@ -58,7 +58,7 @@ func (e *Engine) PlanChangedPathsContext(
 	if err := e.resolveClaudeDuplicateAttribution(ctx, &plan); err != nil {
 		return ChangedPathPlan{}, err
 	}
-	plan.rebuildAggregates()
+	plan.rebuildAggregates(e)
 	return plan, nil
 }
 
@@ -215,7 +215,7 @@ func (e *Engine) planOneChangedPath(
 			attribution.addFallback(agent)
 		}
 	}
-	attribution.files = dedupeDiscoveredFiles(attribution.files)
+	attribution.files = e.dedupeDiscoveredFiles(attribution.files)
 	attribution.normalize()
 	return attribution, claimed, nil
 }
@@ -232,7 +232,7 @@ func (e *Engine) resolveClaudeDuplicateAttribution(
 	if err != nil {
 		return err
 	}
-	expanded = dedupeDiscoveredFiles(expanded)
+	expanded = e.dedupeDiscoveredFiles(expanded)
 	preferredFiles := e.dedupeClaudeDiscoveredFiles(ctx, expanded)
 	preferredBySession := make(map[string]parser.DiscoveredFile)
 	for _, file := range preferredFiles {
@@ -260,7 +260,7 @@ func (e *Engine) resolveClaudeDuplicateAttribution(
 				attribution.files[i] = preferred
 			}
 		}
-		attribution.files = dedupeDiscoveredFiles(attribution.files)
+		attribution.files = e.dedupeDiscoveredFiles(attribution.files)
 		attribution.normalize()
 		plan.attribution[path] = attribution
 	}
@@ -474,14 +474,14 @@ func (a *changedPathAttribution) normalize() {
 	})
 }
 
-func (plan *ChangedPathPlan) rebuildAggregates() {
+func (plan *ChangedPathPlan) rebuildAggregates(e *Engine) {
 	var files []parser.DiscoveredFile
 	var providers []parser.AgentType
 	for _, attribution := range plan.attribution {
 		files = append(files, attribution.files...)
 		providers = append(providers, attribution.fallbackProviders...)
 	}
-	plan.Files = dedupeDiscoveredFiles(sortAndDedupeChangedPathFiles(files))
+	plan.Files = e.dedupeDiscoveredFiles(sortAndDedupeChangedPathFiles(files))
 	slices.SortFunc(providers, func(a, b parser.AgentType) int {
 		return strings.Compare(string(a), string(b))
 	})
