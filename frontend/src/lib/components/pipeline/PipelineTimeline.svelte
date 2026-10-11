@@ -93,13 +93,16 @@
   let listEl: HTMLDivElement | undefined = $state();
 
   // Keep the cursor on screen while replaying or tailing: aim for the
-  // next pending row, fall back to the marker when the row is filtered
-  // out or the cursor sits at the end. jsdom has no scrollIntoView —
-  // the ?.() call degrades to a no-op there.
+  // row the marker actually attaches to — a stage filter can hide the
+  // cursor row entirely, and after a filter change the marker may sit
+  // off-screen until the next cursor tick. Tracking markerBeforeIndex
+  // (not cursor) covers both. jsdom has no scrollIntoView — the ?.()
+  // call degrades to a no-op there.
   $effect(() => {
     if (!listEl) return;
+    const idx = markerBeforeIndex;
     const target =
-      listEl.querySelector(`[data-idx="${cursor}"]`) ??
+      (idx === -1 ? null : listEl.querySelector(`[data-idx="${idx}"]`)) ??
       listEl.querySelector(".cursor-line");
     target?.scrollIntoView?.({ block: "nearest" });
   });
@@ -165,7 +168,7 @@
     {/if}
   </div>
 
-  <div class="timeline-list" bind:this={listEl} aria-label="Event timeline">
+  <div class="timeline-list" bind:this={listEl}>
     {#if rows.length === 0}
       <div class="timeline-empty">
         {events.length === 0 ? "No events yet — start a run or load a recording." : "No events match the stage filter."}

@@ -539,13 +539,20 @@ export class PipelineStore {
 
   /** Open the SSE stream for a run: fresh buffer, live tail-follow.
    * Works for finished runs too — the server replays the recorded
-   * log and closes after run_finished. */
+   * log and closes after run_finished. A stream that never opens
+   * (unknown run id, unregistered playground) would otherwise fail
+   * silently — surface it in `error` so the page can show it. */
   attachLive(runId: string, opts: WatchPipelineEventsOptions = {}): void {
     this.detach();
     this.resetBuffer();
     this.runId = runId;
     this.live = true;
-    this.es = this.deps.watch(runId, (e) => this.pushEvent(e), opts);
+    this.es = this.deps.watch(runId, (e) => this.pushEvent(e), {
+      onPermanentFailure: () => {
+        this.error = `pipeline run ${runId}: event stream never opened`;
+      },
+      ...opts,
+    });
   }
 
   /** Close the stream and stop playback. Call from onDestroy. */

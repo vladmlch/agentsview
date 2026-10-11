@@ -55,18 +55,35 @@
 
   onMount(() => {
     void store.loadScenarios();
-    void store.loadRuns();
     void store.loadRecordings();
+    void store.loadRuns().then(() => {
+      // Reconcile the toggle with reality: an observe window left open
+      // (e.g. after navigating away mid-observe) shows up in the runs
+      // list as a running run whose scenario is "observe". Without
+      // this the UI could only offer "Observe" — which the server
+      // rejects with 409 — and no path to issue the DELETE.
+      observing = store.runs.some(
+        (run) => run.scenario_id === "observe" && run.state === "running",
+      );
+    });
   });
 
   onDestroy(() => {
+    // detach() only closes the local stream; the server-side observe
+    // tap would keep recording the real engine and 409 every later
+    // run until something issues DELETE /observe.
+    if (observing) void store.stopObserve();
     store.detach();
   });
 
   // The observe window closes server-side when its run_finished bookend
-  // arrives — drop the toggle so the button doesn't lie about a live tap.
+  // arrives — drop the toggle so the button doesn't lie about a live
+  // tap. Only the observe run's own bookend counts: a finished
+  // recording loaded mid-observe must not clear the flag.
   $effect(() => {
-    if (observing && view.run.finished) observing = false;
+    if (observing && view.run.finished && view.run.scenarioId === "observe") {
+      observing = false;
+    }
   });
 
   function selectScenario(value: string) {
@@ -81,8 +98,12 @@
   async function toggleObserve() {
     if (observing) {
       await store.stopObserve();
-      observing = false;
+      // capture() swallows the failure into store.error — keep the
+      // toggle on when the DELETE failed so the live tap can still
+      // be stopped from here.
+      observing = store.error !== null;
     } else {
+      recordingName = "";
       const id = await store.startObserve();
       if (id !== undefined) observing = true;
     }
@@ -121,7 +142,10 @@
         label="Run"
         title="Start a sandboxed run of the selected scenario"
         disabled={scenarioId === ""}
-        onclick={() => void store.startRun(scenarioId)}
+        onclick={() => {
+          recordingName = "";
+          void store.startRun(scenarioId);
+        }}
       />
       <Button
         size="sm"
@@ -189,7 +213,10 @@
             interactive
             tone={run.run_id === store.runId ? "info" : "neutral"}
             title={`${run.run_id} · ${run.scenario_id} · ${run.state} · ${run.event_count} events — click to replay`}
-            onclick={() => store.attachLive(run.run_id)}
+            onclick={() => {
+              recordingName = "";
+              store.attachLive(run.run_id);
+            }}
           >
             {shortRunId(run.run_id)} · {run.scenario_id}
           </Chip>

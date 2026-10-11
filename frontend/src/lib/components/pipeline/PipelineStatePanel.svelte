@@ -95,7 +95,9 @@
                 {#if ev.path}<span class="ev-path">{basename(ev.path)}</span>{/if}
               </span>
               {#if ev.payload && Object.keys(ev.payload).length > 0}
-                <code class="ev-payload">{JSON.stringify(ev.payload)}</code>
+                <code class="ev-payload" title={JSON.stringify(ev.payload)}
+                  >{JSON.stringify(ev.payload)}</code
+                >
               {/if}
             </li>
           {/each}
