@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Button, IconButton } from "@kenn-io/kit-ui";
   import {
+    basename,
     eventAnomaly,
     type PipelineEvent,
   } from "../../stores/pipeline.svelte.js";
@@ -32,12 +33,6 @@
     onselect = () => {},
     onseek = () => {},
   }: Props = $props();
-
-  function basename(path: string | undefined): string {
-    if (!path) return "";
-    const idx = path.lastIndexOf("/");
-    return idx === -1 ? path : path.slice(idx + 1);
-  }
 
   /** First buffer index walking from `from` in `step` direction whose
    * event satisfies `pred`, or -1 at the buffer bounds. */

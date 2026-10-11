@@ -1,8 +1,9 @@
 <script lang="ts">
   import { EmptyState, SegmentedControl } from "@kenn-io/kit-ui";
-  import type {
-    PipelineFileJourney,
-    PipelineViewState,
+  import {
+    basename,
+    type PipelineFileJourney,
+    type PipelineViewState,
   } from "../../stores/pipeline.svelte.js";
   import { TriangleAlertIcon } from "../../icons.js";
 
@@ -87,11 +88,6 @@
   /** Seq buttons and gap rows are jump targets only when a callback
    * can receive the index. */
   const canJump = $derived(onseek !== undefined || onselect !== undefined);
-
-  function basename(path: string): string {
-    const idx = path.lastIndexOf("/");
-    return idx === -1 ? path : path.slice(idx + 1);
-  }
 
   function shortPath(path: string): string {
     // Keep the tail of a long absolute path readable.
@@ -804,7 +800,8 @@
 
   .decision[data-decision="reject"],
   .decision[data-decision="drop"],
-  .decision[data-decision="rescan"] {
+  .decision[data-decision="rescan"],
+  .decision[data-decision="invalid"] {
     color: var(--accent-red);
   }
 
