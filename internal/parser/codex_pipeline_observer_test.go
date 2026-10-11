@@ -1,6 +1,8 @@
 package parser
 
 import (
+	"bytes"
+	stdjson "encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -296,6 +298,82 @@ func TestCodexPipelineObserverIncrementalFallbackReportsReason(t *testing.T) {
 	}
 	assert.True(t, found,
 		fmt.Sprintf("expected session_meta_after_offset fallback, got %v", fallbacks))
+}
+
+// TestCodexPipelineObserverDecoderRecoveryRenumbersRecords covers the
+// JSON-decoder recovery pass: when no physical line is valid JSON the
+// snapshot is retried as a JSON stream, and line_classified events must
+// report the decoded records numbered from 1 with each record's own end
+// offset (array-split records included).
+func TestCodexPipelineObserverDecoderRecoveryRenumbersRecords(t *testing.T) {
+	root := t.TempDir()
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229f4"
+	meta := testjsonl.CodexSessionMetaJSON(
+		uuid, "/workspace/project-a", "codex_cli_rs", tsEarly,
+	)
+	user := testjsonl.CodexMsgJSON("user", "first request", tsEarlyS1)
+	assistant := testjsonl.CodexMsgJSON("assistant", "first response", tsEarlyS5)
+
+	// Pretty-printed values span multiple physical lines that are each
+	// malformed for the JSONL pass, forcing the decoder recovery pass.
+	var buf bytes.Buffer
+	require.NoError(t, stdjson.Indent(&buf, []byte(meta), "", "  "))
+	prettyMeta := buf.String()
+	buf.Reset()
+	require.NoError(
+		t,
+		stdjson.Indent(&buf, []byte("["+user+","+assistant+"]"), "", "  "),
+	)
+	prettyArray := buf.String()
+	content := prettyMeta + "\n" + prettyArray + "\n"
+	writeCodexProviderSessionContent(t, root, uuid, content)
+
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	collector := &collectingPipelineObserver{}
+	requirePipelineObserverProvider(t, provider).
+		SetPipelineObserverSource(func() pipevents.Observer { return collector })
+	source := requireCodexProviderSource(t, provider, uuid)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	require.Len(t, outcome.Results[0].Result.Messages, 2)
+
+	classified := collector.ofKind(pipevents.KindLineClassified)
+	physicalLines := strings.Count(content, "\n")
+	require.Len(t, classified, physicalLines+3,
+		"pass 1 classifies every malformed physical line, then the recovery "+
+			"pass classifies the three decoded records")
+	records := classified[physicalLines:]
+	require.Len(t, records, 3)
+	for i, ev := range records {
+		assert.Equal(t, i+1, ev.Payload["line_no"],
+			"decoded records are numbered from 1, not continued past the "+
+				"malformed physical lines")
+	}
+	assert.Equal(t, "session_meta", records[0].Payload["type"])
+	assert.Equal(t, "response_item", records[1].Payload["type"])
+	assert.Equal(t, "response_item", records[2].Payload["type"])
+
+	// Each offset lands just past its record: the meta value, then each
+	// array item inside the pretty-printed array. The first item ends at
+	// its two-space-indented closing "}," line — nested object closers are
+	// indented deeper and must not match.
+	metaEnd := int64(len(prettyMeta))
+	assert.Equal(t, metaEnd, records[0].Payload["offset"])
+	arrayStart := int64(len(prettyMeta)) + 1
+	itemBoundary := strings.Index(prettyArray, "\n  },")
+	require.Greater(t, itemBoundary, 0)
+	firstItemEnd := arrayStart + int64(itemBoundary) + 4
+	secondItemEnd := arrayStart + int64(strings.LastIndex(prettyArray, "}")) + 1
+	assert.Equal(t, firstItemEnd, records[1].Payload["offset"],
+		"the first array item must not share the array's InputOffset")
+	assert.Equal(t, secondItemEnd, records[2].Payload["offset"])
+	firstItemOff, ok := records[1].Payload["offset"].(int64)
+	require.True(t, ok)
+	assert.Equal(t, byte('}'), content[firstItemOff-1],
+		"the reported offset points just past the record's closing brace")
 }
 
 func TestCodexPipelineObserverDisabledSourceAllocatesNoEvents(t *testing.T) {

@@ -182,3 +182,19 @@ func (o codexParseObserver) emitIncrementalFallback(reason string, lineNo int) {
 		"line_no": lineNo,
 	})
 }
+
+// emitParseFailed closes the event stream on a hard-error exit so an
+// observer never sees a parse_started left unterminated. It reports the
+// same shape as emitParseDone plus the failure.
+func (o codexParseObserver) emitParseFailed(err error) {
+	if o.observer() == nil {
+		return
+	}
+	o.emit(pipevents.KindParseDone, map[string]any{
+		"messages":       0,
+		"consumed_bytes": int64(0),
+		"safe":           false,
+		"checkpoint":     false,
+		"error":          err.Error(),
+	})
+}

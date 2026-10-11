@@ -502,6 +502,11 @@ func (e *Engine) parseMaterializedS3Source(
 			"no provider for s3 agent %s", file.Agent,
 		)
 	}
+	// Providers built through the package registry bypass the engine's
+	// wrapped providerFactories, so the observer source is injected here.
+	if op, ok := provider.(parser.PipelineObserverProvider); ok {
+		op.SetPipelineObserverSource(e.pipelineObserverSource)
+	}
 	source := parser.SourceRef{
 		Provider:       file.Agent,
 		Key:            tempPath,
