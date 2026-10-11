@@ -31,13 +31,17 @@ export type PipelineStageStatus = "idle" | "active" | "done";
 /** One transcript line shown on the File tab. `no` is the line's
  * number within its parse pass for `fileLines` entries, and its
  * position in the reconstructed file for `files` entries. `parsed`
- * is false only for `type === "malformed"` (non-JSON lines). */
+ * is false only for `type === "malformed"` (non-JSON lines).
+ * `offset` is the absolute byte offset just past the line, or -1
+ * when the parser's reader did not track offsets (the generic
+ * incremental tail reader reports -1). */
 export interface PipelineFileLine {
   no: number;
   raw: string;
   parsed: boolean;
   type: string;
   truncated: boolean;
+  offset: number;
 }
 
 export interface PipelineGateVerdict {
@@ -78,10 +82,16 @@ export interface PipelineViewState {
   /** Append-only transcript of every classified line (parse ordinal
    * `no` restarts each pass), each tagged with its file `path`. */
   fileLines: (PipelineFileLine & { path: string })[];
-  /** Reconstructed current content per path: reset when a parse
-   * starts with mode "full", appended to by line_classified. Engine-
-   * level parse_started modes ("collect"/"staged") do not reset —
-   * the parser-level "full"/"incremental" event follows them. */
+  /** Reconstructed content per path, from line_classified events:
+   * reset when a parse starts with mode "full", appended to
+   * otherwise. Engine-level parse_started modes ("collect"/"staged")
+   * do not reset — the parser-level "full"/"incremental" event
+   * follows them. Two honest gaps: when the first observed parse of
+   * a path is incremental (observe mode on an already-checkpointed
+   * file), the reconstruction holds only the tail bytes the pipeline
+   * actually read; and a scenario_step delete clears the entry by
+   * path-suffix match because steps carry sandbox-relative paths
+   * while parse events carry absolute ones. */
   files: Record<string, PipelineFileLine[]>;
   /** Every consumed event — the Events tab log. */
   parsedEvents: PipelineEvent[];
@@ -174,6 +184,12 @@ function optStr(v: unknown): string | undefined {
   return s === "" ? undefined : s;
 }
 
+/** line_classified byte offset: -1 marks untracked (the parser's
+ * generic tail reader exposes no per-line offsets). */
+function off(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : -1;
+}
+
 /** Kinds that close their stage for the diagram. Stages without a
  * closing kind (watch, resolve, gates) report done once a different
  * stage emits — see applyStageStatus. run_finished closes all. */
@@ -244,6 +260,12 @@ function applyStageStatus(state: PipelineViewState, ev: PipelineEvent): void {
  * in array order; callers pass events[0..cursor). */
 export function reduceEvents(evs: PipelineEvent[]): PipelineViewState {
   const state = emptyViewState();
+  // Per-path parse-pass bookkeeping for files reconstruction.
+  // lastLineNo is the line_no of the previous line_classified inside
+  // the current pass; passStart is the files[path] index where the
+  // current pass began appending. Both reset on each parse_started.
+  const lastLineNo: Record<string, number> = {};
+  const passStart: Record<string, number> = {};
   for (const ev of evs) {
     state.parsedEvents.push(ev);
     applyStageStatus(state, ev);
@@ -258,10 +280,25 @@ export function reduceEvents(evs: PipelineEvent[]): PipelineViewState {
           parsed: type !== "malformed",
           type,
           truncated: p.truncated === true,
+          offset: off(p.offset),
         };
         state.fileLines.push({ ...line, path: ev.path ?? "" });
         if (ev.path !== undefined) {
           const lines = (state.files[ev.path] ??= []);
+          const no = num(p.line_no);
+          if (no > 0) {
+            // A line_no regression inside one parse pass means the
+            // parser re-read this pass's bytes — the JSON-stream
+            // recovery in codex.go seeks back to 0 and re-classifies
+            // the same range, restarting numbering at 1. The pass's
+            // earlier lines never coexisted with the re-read output,
+            // so the reconstruction drops them. (offset keying would
+            // fail here: the generic tail reader reports offset -1.)
+            if (no <= (lastLineNo[ev.path] ?? 0)) {
+              lines.length = passStart[ev.path] ?? 0;
+            }
+            lastLineNo[ev.path] = no;
+          }
           lines.push({ ...line, no: lines.length + 1 });
         }
         break;
@@ -272,6 +309,14 @@ export function reduceEvents(evs: PipelineEvent[]): PipelineViewState {
         // "incremental" mode appends.
         if (ev.path !== undefined && p.mode === "full") {
           state.files[ev.path] = [];
+        }
+        // Every parse_started opens a new pass for the path — the
+        // line_no regression check only applies within one pass, so
+        // an incremental pass legitimately restarting at line_no 1
+        // appends instead of truncating earlier content.
+        if (ev.path !== undefined) {
+          passStart[ev.path] = state.files[ev.path]?.length ?? 0;
+          lastLineNo[ev.path] = 0;
         }
         break;
       }
@@ -319,14 +364,25 @@ export function reduceEvents(evs: PipelineEvent[]): PipelineViewState {
         };
         state.queue = { pending: 0, bytes: 0 };
         break;
-      case "scenario_step":
+      case "scenario_step": {
+        const action = str(p.action);
         state.steps.push({
           n: num(p.n),
-          action: str(p.action),
+          action,
           path: ev.path,
           detail: optStr(p.detail),
         });
+        if (action === "delete" && ev.path !== undefined) {
+          // Steps carry sandbox-relative paths while files keys are
+          // absolute — match on a path-boundary suffix.
+          for (const key of Object.keys(state.files)) {
+            if (key === ev.path || key.endsWith(`/${ev.path}`)) {
+              delete state.files[key];
+            }
+          }
+        }
         break;
+      }
       case "run_started":
         state.run = {
           runId: ev.run_id ?? null,

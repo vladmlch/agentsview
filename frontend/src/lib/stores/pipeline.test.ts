@@ -110,7 +110,7 @@ describe("reduceEvents", () => {
     ]);
     expect(s.fileLines).toHaveLength(2); // transcript keeps both parses
     expect(s.files["f.jsonl"]).toEqual([
-      { no: 1, raw: "two", parsed: true, type: "a", truncated: false },
+      { no: 1, raw: "two", parsed: true, type: "a", truncated: false, offset: -1 },
     ]);
   });
 
@@ -124,6 +124,88 @@ describe("reduceEvents", () => {
     ]);
     expect(s.files["f.jsonl"]?.map((l) => l.raw)).toEqual(["one", "two"]);
     expect(s.files["f.jsonl"]?.[1]?.no).toBe(2);
+  });
+
+  it("replaces in-pass re-classified lines on the JSON-stream recovery pass", () => {
+    // codex.go: a snapshot with zero valid JSONL records but ≥1
+    // terminated malformed line seeks back to 0 and re-classifies the
+    // same bytes through json.Decoder — physical lines first
+    // (line_no 1..N, type malformed), then decoded records with
+    // line_no restarting at 1. The reconstruction must not show both.
+    const s = reduceEvents([
+      ev("parse", "parse_started", { mode: "full", offset: 0, size: 24 }, "f.json"),
+      ev(
+        "parse",
+        "line_classified",
+        { line_no: 1, offset: 8, type: "malformed", raw: `{"a":1,` },
+        "f.json",
+      ),
+      ev(
+        "parse",
+        "line_classified",
+        { line_no: 2, offset: 17, type: "malformed", raw: `"b":2},` },
+        "f.json",
+      ),
+      ev(
+        "parse",
+        "line_classified",
+        { line_no: 3, offset: 24, type: "malformed", raw: `{"c":3}` },
+        "f.json",
+      ),
+      // Recovery pass: same bytes, record segmentation, line_no back to 1.
+      ev(
+        "parse",
+        "line_classified",
+        { line_no: 1, offset: 15, type: "message", raw: `{"a":1,"b":2}` },
+        "f.json",
+      ),
+      ev(
+        "parse",
+        "line_classified",
+        { line_no: 2, offset: 24, type: "message", raw: `{"c":3}` },
+        "f.json",
+      ),
+    ]);
+    expect(s.files["f.json"]?.map((l) => l.raw)).toEqual([`{"a":1,"b":2}`, `{"c":3}`]);
+    // The transcript still preserves both passes — the parser did
+    // read the bytes twice.
+    expect(s.fileLines).toHaveLength(5);
+  });
+
+  it("does not truncate earlier content when a new pass restarts line_no", () => {
+    // A second full parse is a new pass, not an in-pass re-read.
+    const s = reduceEvents([
+      ev("parse", "parse_started", { mode: "full" }, "f.jsonl"),
+      ev("parse", "line_classified", { line_no: 1, type: "a", raw: "one" }, "f.jsonl"),
+      ev("parse", "line_classified", { line_no: 2, type: "a", raw: "two" }, "f.jsonl"),
+      ev("parse", "parse_started", { mode: "incremental", offset: 40 }, "f.jsonl"),
+      ev("parse", "line_classified", { line_no: 1, type: "b", raw: "three" }, "f.jsonl"),
+    ]);
+    expect(s.files["f.jsonl"]?.map((l) => l.raw)).toEqual(["one", "two", "three"]);
+  });
+
+  it("clears reconstructed content when the scenario deletes the file", () => {
+    // scenario_step paths are sandbox-relative while files keys are
+    // absolute — the clear matches on a path-boundary suffix.
+    const s = reduceEvents([
+      ev("parse", "parse_started", { mode: "full" }, "/tmp/sandbox/src/f.jsonl"),
+      ev(
+        "parse",
+        "line_classified",
+        { line_no: 1, type: "a", raw: "x" },
+        "/tmp/sandbox/src/f.jsonl",
+      ),
+      ev("parse", "parse_started", { mode: "full" }, "/tmp/sandbox/src/other.jsonl"),
+      ev(
+        "parse",
+        "line_classified",
+        { line_no: 1, type: "a", raw: "y" },
+        "/tmp/sandbox/src/other.jsonl",
+      ),
+      ev("finalize", "scenario_step", { n: 1, action: "delete" }, "f.jsonl"),
+    ]);
+    expect(s.files["/tmp/sandbox/src/f.jsonl"]).toBeUndefined();
+    expect(s.files["/tmp/sandbox/src/other.jsonl"]).toHaveLength(1);
   });
 
   it("appends gate verdicts with their path", () => {
