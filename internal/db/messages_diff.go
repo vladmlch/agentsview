@@ -342,28 +342,12 @@ func messageDiffNeedsPinRemapTx(ctx context.Context,
 
 // applySessionMessageDiffTx persists a planned diff: changed rows
 // are updated in place (keeping rowids, so pins survive and the FTS
-// sync reindexes only those rows), their tool rows are rebuilt,
+// triggers reindex only those rows), their tool rows are rebuilt,
 // and new ordinals are inserted through the normal insert path.
 func applySessionMessageDiffTx(ctx context.Context,
 	tx *sql.Tx, sessionID string, plan messageDiffPlan,
 ) error {
 	if len(plan.updates) > 0 {
-		active, err := activeFTSTablesTx(tx)
-		if err != nil {
-			return err
-		}
-		for _, u := range plan.updates {
-			for _, table := range active {
-				if _, err := tx.ExecContext(ctx,
-					`INSERT INTO `+table+`(`+table+`, rowid, content)
-					 SELECT 'delete', id, content FROM messages WHERE id = ?`,
-					u.id,
-				); err != nil {
-					return fmt.Errorf("deleting %s entry for updated message %d: %w", table, u.id, err)
-				}
-			}
-		}
-
 		updateSQL := "UPDATE messages SET " +
 			messageUpdateSetClause + " WHERE id = ?"
 		ids := make([]int64, 0, len(plan.updates))
@@ -380,17 +364,6 @@ func applySessionMessageDiffTx(ctx context.Context,
 			ids = append(ids, u.id)
 			ordinals = append(ordinals, u.msg.Ordinal)
 			msgs = append(msgs, u.msg)
-		}
-		for _, u := range plan.updates {
-			for _, table := range active {
-				if _, err := tx.ExecContext(ctx,
-					`INSERT INTO `+table+`(rowid, content)
-					 SELECT id, content FROM messages WHERE id = ?`,
-					u.id,
-				); err != nil {
-					return fmt.Errorf("indexing %s entry for updated message %d: %w", table, u.id, err)
-				}
-			}
 		}
 		if err := deleteToolRowsForMessagesTx(ctx,
 			tx, sessionID, ids, ordinals,

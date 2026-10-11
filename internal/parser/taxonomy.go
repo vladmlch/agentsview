@@ -90,17 +90,21 @@ func NormalizeToolCategory(rawName string) string {
 		return "Task"
 
 	// Antigravity tools
-	case "view_file", "read_url_content":
+	// Note: "call_mcp_tool" (MCP wrapper→Tool) is handled in the Warp
+	// section below.
+	case "view_file", "read_url_content", "list_dir":
 		return "Read"
+	case "find_by_name":
+		return "Glob"
 	case "replace_file_content", "multi_replace_file_content":
 		return "Edit"
 	case "write_to_file":
 		return "Write"
 	case "define_subagent", "invoke_subagent", "manage_subagents",
-		"send_message", "manage_task":
+		"send_message", "receive_message", "manage_task":
 		return "Task"
 	case "ask_permission", "ask_question", "schedule", "search_web",
-		"generate_image":
+		"generate_image", "list_resources":
 		return "Tool"
 
 	// OpenCode tools (lowercase variants)

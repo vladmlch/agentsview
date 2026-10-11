@@ -49,6 +49,7 @@ func (e *devinSubagentParseError) Unwrap() error {
 func partitionDevinSubagentMessageNodes(
 	ctx context.Context,
 	rows []devinMessageNodeRow,
+	mainChainRootID int64,
 ) (devinSubagentNodePartition, error) {
 	partition := devinSubagentNodePartition{
 		ExcludedNodeIDs: make(map[int64]struct{}),
@@ -60,12 +61,15 @@ func partitionDevinSubagentMessageNodes(
 	indexByNodeID := make(map[int64]int, len(rows))
 	childrenByParent := make(map[int64][]int64, len(rows))
 	treeIndexByPromptMessageID := make(map[string]int)
+	earliestRootID := int64(-1)
 	for i, row := range rows {
 		indexByNodeID[row.NodeID] = i
 		if row.ParentNodeID.Valid {
 			childrenByParent[row.ParentNodeID.Int64] = append(
 				childrenByParent[row.ParentNodeID.Int64], row.NodeID,
 			)
+		} else if earliestRootID < 0 {
+			earliestRootID = row.NodeID
 		}
 	}
 
@@ -74,6 +78,9 @@ func partitionDevinSubagentMessageNodes(
 			return devinSubagentNodePartition{}, err
 		}
 		if row.ParentNodeID.Valid {
+			continue
+		}
+		if row.NodeID == mainChainRootID || row.NodeID == earliestRootID {
 			continue
 		}
 		kind := devinMessageNodeRootKind(ctx, row.ChatMessage)
@@ -180,10 +187,22 @@ func devinMessageNodeRootKind(
 		return devinMessageNodeRootNone
 	}
 	content, _, _, _, _, _, _ := ExtractTextContent(ctx, message.Get("content"))
+	return devinRootMarkerKind(content)
+}
+
+// devinRootMarkerKind anchors the subagent/summarizer markers at the start of
+// the node's text. Devin writes these prompts as the first line of the tree
+// root; an unanchored match would also fire on the main session's own system
+// prompt whenever it quotes the marker (for example inside an embedded
+// subagent profile list).
+func devinRootMarkerKind(text string) devinMessageNodeRoot {
+	text = strings.TrimSpace(text)
+	text = strings.Trim(text, "'\"")
+	text = strings.TrimSpace(text)
 	switch {
-	case strings.Contains(content, devinSubagentRootMarker):
+	case strings.HasPrefix(text, devinSubagentRootMarker):
 		return devinMessageNodeRootSubagent
-	case strings.Contains(content, devinSummarizerRootMarker):
+	case strings.HasPrefix(text, devinSummarizerRootMarker):
 		return devinMessageNodeRootSummarizer
 	default:
 		return devinMessageNodeRootNone
@@ -378,7 +397,7 @@ func devinSubagentExists(
 	if len(rows) == 0 {
 		return false, nil
 	}
-	partition, err := partitionDevinSubagentMessageNodes(ctx, rows)
+	partition, err := partitionDevinSubagentMessageNodes(ctx, rows, rootNodeID)
 	if err != nil {
 		return false, err
 	}

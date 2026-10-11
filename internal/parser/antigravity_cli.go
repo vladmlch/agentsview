@@ -142,7 +142,7 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 	var dbErr error
 	if ext == ".db" {
 		var dbResult antigravityStepLoadResult
-		dbResult, dbErr = loadAntigravityCLIDBSteps(ctx, path, antigravityCLIIDPrefix)
+		dbResult, dbErr = loadAntigravityCLIDBSteps(ctx, path, antigravityCLIIDPrefix, id)
 		sourceVersion = dbResult.sourceVersion
 		hasGenMetadata = dbResult.hasGenMetadata
 		// gen_metadata token usage describes the session's actual
@@ -440,10 +440,11 @@ func normalizeAntigravityCLIWorkspace(workspace string) string {
 }
 
 func loadAntigravityCLIDBSteps(ctx context.Context,
-	path string, sessionIDPrefix string,
+	path string, sessionIDPrefix, conversationID string,
 ) (antigravityStepLoadResult, error) {
 	result, err := loadAntigravityCLIDBStepsWithOptions(
 		ctx, path, sqliteReadOptions{busyTimeoutMS: 3000}, sessionIDPrefix,
+		conversationID,
 	)
 	if err != nil && !sqliteWALHasFrames(path+"-wal") {
 		// When a WAL database has been cleanly checkpointed and closed by
@@ -453,7 +454,7 @@ func loadAntigravityCLIDBSteps(ctx context.Context,
 		// retry once with immutable=1 (stableSnapshot).
 		if retry, retryErr := loadAntigravityCLIDBStepsWithOptions(
 			ctx, path, sqliteReadOptions{stableSnapshot: true},
-			sessionIDPrefix,
+			sessionIDPrefix, conversationID,
 		); retryErr == nil {
 			return retry, nil
 		}
@@ -465,7 +466,7 @@ func loadAntigravityCLIDBStepsWithOptions(
 	ctx context.Context,
 	path string,
 	opts sqliteReadOptions,
-	sessionIDPrefix string,
+	sessionIDPrefix, conversationID string,
 ) (antigravityStepLoadResult, error) {
 	db, err := openSQLiteReadOnly(path, opts)
 	if err != nil {
@@ -483,6 +484,7 @@ func loadAntigravityCLIDBStepsWithOptions(
 	sourceVersion := antigravitySourceVersion(ctx, db)
 	result, err := loadAntigravityStepsWithRawCount(
 		ctx, db, sessionIDPrefix,
+		strings.TrimSuffix(filepath.Base(path), ".db"),
 	)
 	result.sourceVersion = sourceVersion
 	if err != nil {
@@ -1618,6 +1620,13 @@ func agyToolDetail(name, inputJSON string) string {
 		if p := getString("Prompt"); p != "" {
 			return p
 		}
+	case "call_mcp_tool":
+		if s := getString("ServerName"); s != "" {
+			if t := getString("ToolName"); t != "" {
+				return s + "." + t
+			}
+			return s
+		}
 	}
 	return name
 }
@@ -1764,7 +1773,9 @@ func parseAntigravityCLITrajectory(
 
 				toolCalls = append(toolCalls, ParsedToolCall{
 					ToolUseID: tc.ID,
-					ToolName:  tc.Name,
+					ToolName: antigravityToolCallName(
+						tc.Name, tc.ArgumentsJSON,
+					),
 					Category:  cat,
 					InputJSON: tc.ArgumentsJSON,
 				})

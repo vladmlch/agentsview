@@ -359,7 +359,8 @@ func TestAntigravityCLIDBStepsCarriesSourceVersionOnStepError(t *testing.T) {
 			"PRIMARY KEY (`trajectory_id`))")
 	require.NoError(t, db.Close())
 
-	result, err := loadAntigravityCLIDBSteps(t.Context(), path, antigravityCLIIDPrefix)
+	result, err := loadAntigravityCLIDBSteps(t.Context(), path, antigravityCLIIDPrefix,
+		strings.TrimSuffix(filepath.Base(path), ".db"))
 	require.Error(t, err, "missing steps table must fail the step query")
 	assert.True(t,
 		strings.HasPrefix(result.sourceVersion, antigravitySchemaUnknownPrefix),

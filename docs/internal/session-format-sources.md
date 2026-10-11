@@ -4033,9 +4033,20 @@ schemas keep their existing ordering behavior.
   parent.
 - **Usage and cost:** Heuristically decoded generation metadata or sidecars
   provide uncached input, output (including thinking), cache-read, and model
-  data. There is no separate reliable reasoning counter or reported USD cost;
+  data. Current builds additionally split `thinking_output_tokens`
+  (`ModelUsageStats` field 9) out of output and carry a per-response
+  `response_id` (field 11) that deduplicates retry rows. The selected model
+  resolves through `model_display_name` (21), then `response_model` (19),
+  then the `model_enum` attribute (field 20, `MODEL_PLACEHOLDER_M<N>` —
+  `usage.model` varint encodes the same enum as 1000+N) mapped through a
+  curated placeholder table; `*-default` values in `response_model` are
+  internal config ids, not model names. There is no reported USD cost;
   Agentsview catalog-prices tokens. Decode failures are surfaced explicitly.
-
+  Tool calls come from `steps.metadata` field 4 (`ToolCallMetadata`:
+  call_id, tool_name, argumentsJson) with the payload name-string scan as
+  fallback; the same call id echoed on the planner step and the tool step
+  counts once, and `call_mcp_tool` arguments reattribute the call to
+  `mcp__<server>__<tool>`.
 - **Agentsview:** `internal/parser/antigravity.go`,
   `internal/parser/antigravity_proto.go`,
   `internal/parser/antigravity_brain_transcript.go`,
