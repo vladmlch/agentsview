@@ -11,6 +11,7 @@ import {
   SessionsService,
   InsightsService,
   ImportService,
+  PipelineService,
   type DbSessionTiming as SessionTiming,
   type ImporterImportStats as ImportStats,
 } from "./generated/index.js";
@@ -220,6 +221,111 @@ export function watchEvents(
   es.onerror = () => {
     consecutiveErrors += 1;
     if (consecutiveErrors >= WATCH_EVENTS_MAX_CONSECUTIVE_ERRORS) {
+      es.close();
+      if (!hasOpened && opts.onPermanentFailure) {
+        opts.onPermanentFailure();
+      }
+    }
+  };
+
+  return es;
+}
+
+/* Pipeline playground */
+
+/** Pipeline stage identifiers, mirroring pipevents.Stage
+ * (internal/pipevents/pipevents.go). */
+export type PipelineStage =
+  | "watch"
+  | "resolve"
+  | "gates"
+  | "parse"
+  | "batch"
+  | "write"
+  | "finalize"
+  | "embed";
+
+/** One pipeline event as streamed by
+ * GET /api/v1/pipeline/runs/{id}/events — the JSON shape of
+ * pipevents.Event. `kind` stays a plain string so recordings with
+ * kinds newer than this client still parse; the reducer treats
+ * unknown kinds as event-log entries only. */
+export interface PipelineEvent {
+  seq: number;
+  at_ms: number;
+  run_id?: string;
+  stage: PipelineStage;
+  kind: string;
+  path?: string;
+  payload?: Record<string, unknown>;
+}
+
+/** Same circuit-breaker budget as watchEvents. */
+export const WATCH_PIPELINE_EVENTS_MAX_CONSECUTIVE_ERRORS = 5;
+
+export interface WatchPipelineEventsOptions {
+  /** Resume cursor: only events with seq greater than this are sent. */
+  afterSeq?: number;
+  /** Called when the stream never reached OPEN before the breaker
+   * tripped — the run id is likely unknown or the playground is not
+   * registered on this server. */
+  onPermanentFailure?: () => void;
+}
+
+/** Stream one pipeline run's events over SSE. The server replays the
+ * run's buffered log, tails live events, and closes the stream after
+ * the run's `run_finished` bookend (heartbeat frames are ignored
+ * except as proof of liveness).
+ *
+ * The eventsource client reconnects on transient drops, and the
+ * server replays the run log from `afterSeq` on each connect — so
+ * the consumer must dedup by `seq` (PipelineStore.pushEvent does). */
+export function watchPipelineEvents(
+  runId: string,
+  onEvent: (e: PipelineEvent) => void,
+  opts: WatchPipelineEventsOptions = {},
+): EventSource {
+  const params = opts.afterSeq !== undefined ? { after_seq: opts.afterSeq } : undefined;
+  const url = new URL(
+    `${getGeneratedBase()}${PipelineService.getGetApiV1PipelineRunsByIdEventsUrl({ id: runId }, params)}`,
+    window.location.origin,
+  );
+  const es = new EventSource(url, {
+    fetch: (_url, options) =>
+      PipelineService.getApiV1PipelineRunsByIdEvents({ id: runId }, params, options),
+  });
+
+  let consecutiveErrors = 0;
+  let hasOpened = false;
+
+  es.addEventListener("open", () => {
+    hasOpened = true;
+    consecutiveErrors = 0;
+  });
+
+  // The server sends the event object under the "event" frame name.
+  es.addEventListener("event", (msg) => {
+    consecutiveErrors = 0;
+    hasOpened = true;
+    let parsed: PipelineEvent;
+    try {
+      parsed = JSON.parse((msg as MessageEvent).data) as PipelineEvent;
+    } catch {
+      return; // malformed frame — skip, never crash the stream
+    }
+    onEvent(parsed);
+    // The server ends the stream after run_finished; closing here
+    // avoids a pointless reconnect that would replay the whole run.
+    if (parsed.kind === "run_finished") es.close();
+  });
+
+  es.addEventListener("heartbeat", () => {
+    consecutiveErrors = 0;
+  });
+
+  es.onerror = () => {
+    consecutiveErrors += 1;
+    if (consecutiveErrors >= WATCH_PIPELINE_EVENTS_MAX_CONSECUTIVE_ERRORS) {
       es.close();
       if (!hasOpened && opts.onPermanentFailure) {
         opts.onPermanentFailure();
