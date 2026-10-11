@@ -33,6 +33,7 @@ func WriteRecording(
 	w io.Writer, h RecordingHeader, events []Event,
 ) error {
 	h.Kind = "header"
+	h.FormatVersion = RecordingFormatVersion
 	if err := writeLine(w, h); err != nil {
 		return err
 	}
