@@ -16722,6 +16722,12 @@ func (e *Engine) tryIncrementalJSONL(
 					agent, file.Path,
 				)
 				lease.Release()
+				// Covers an unclassifiable scan verdict and every
+				// nil-update decline inside tryClaudeSplitSuffixUpdate:
+				// the split run could not be resolved into a
+				// trustworthy incremental delta.
+				e.emitParseMode(file, "full",
+					"claude split run unresolved", nil)
 				return processResult{forceReplace: true}, false
 			}
 		}
@@ -16752,6 +16758,8 @@ func (e *Engine) tryIncrementalJSONL(
 			agent, file.Path,
 		)
 		lease.Release()
+		e.emitParseMode(file, "full",
+			"first real user prompt after empty preview", nil)
 		return processResult{}, false
 	}
 
