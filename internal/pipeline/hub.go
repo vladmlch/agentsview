@@ -236,6 +236,21 @@ func (h *Hub) Subscribe(
 	return ch, unsub
 }
 
+// ActiveRun reports the currently open run, if any. Callers use it to
+// reject a second run or observe session while one is live.
+func (h *Hub) ActiveRun() (RunInfo, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.active == nil {
+		return RunInfo{}, false
+	}
+	return h.active.info, true
+}
+
+// Recorder exposes the hub's recordings store so HTTP surfaces can
+// list, download, and import the same files run recording writes.
+func (h *Hub) Recorder() *Recorder { return h.rec }
+
 // RunEvents returns a snapshot copy of the events recorded under
 // runID, including the run_started/run_finished bookends. Unknown run
 // ids return nil.

@@ -28,6 +28,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/insight"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/pipeline"
 	"go.kenn.io/agentsview/internal/poller"
 	"go.kenn.io/agentsview/internal/rawderive"
 	"go.kenn.io/agentsview/internal/recall/extract"
@@ -618,6 +619,32 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 	srvOpts = append(srvOpts, server.WithArtifactExchangeRunner(
 		newDaemonArtifactExchangeRunner(cfg, database, engine, emitter),
 	))
+
+	// The pipeline playground wires an isolated codex ingest sandbox and
+	// its event hub into /api/v1/pipeline. A failed sandbox leaves the
+	// rest of the API untouched, so init errors are logged and the
+	// playground simply stays unregistered.
+	pipeHub := pipeline.NewHub(
+		filepath.Join(cfg.DataDir, "pipeline-recordings"))
+	pipeSandbox, pipeErr := pipeline.OpenSandbox(ctx, cfg.DataDir, pipeHub)
+	if pipeErr != nil {
+		log.Printf("pipeline playground disabled: %v", pipeErr)
+	} else {
+		defer pipeSandbox.Close()
+		if vectorServe.Scheduler != nil {
+			vectorServe.Scheduler.SetPipelineObserver(pipeHub)
+		}
+		if vectorServe.RecallScheduler != nil {
+			vectorServe.RecallScheduler.SetPipelineObserver(pipeHub)
+		}
+		srvOpts = append(srvOpts, server.WithPipelinePlayground(
+			&server.PipelinePlayground{
+				Hub:     pipeHub,
+				Sandbox: pipeSandbox,
+				Engine:  engine,
+			}))
+	}
+
 	srv := server.New(cfg, database, engine, srvOpts...)
 	waitFriction := startLocalFrictionReview(ctx, cfg, database, srv, idleTracker)
 	defer func() {

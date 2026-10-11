@@ -334,11 +334,17 @@ func newOpenAPICommand() *cobra.Command {
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// The playground stub registers the pipeline route group for
+			// schema generation only — a running daemon still leaves it
+			// unregistered when no sandbox is wired, but generated clients
+			// get the full surface either way.
 			spec := server.OpenAPISpec(server.VersionInfo{
 				Version:   version,
 				Commit:    commit,
 				BuildDate: buildDate,
-			}, pushBackendOptions()...)
+			}, append(pushBackendOptions(),
+				server.WithPipelinePlayground(
+					&server.PipelinePlayground{}))...)
 			var data []byte
 			var err error
 			if yamlOutput {
