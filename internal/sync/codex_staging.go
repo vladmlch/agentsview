@@ -18,6 +18,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/pipevents"
 	"go.kenn.io/agentsview/internal/secrets"
 	"go.kenn.io/agentsview/internal/signals"
 	"go.kenn.io/agentsview/internal/timeutil"
@@ -83,6 +84,61 @@ type codexStagingSink struct {
 	// "successful" archive missing tool outputs.
 	stageErr        error
 	validationStats db.ValidationStats
+
+	// obsSource resolves the engine's pipeline observer lazily, matching
+	// the provider contract; obsPath attributes staging events to the
+	// transcript being parsed. stagedBytes accumulates the content bytes
+	// written to scratch, and stagingOpened latches the lazily emitted
+	// "open" lifecycle event.
+	obsSource     parser.ObserverSource
+	obsPath       string
+	stagedBytes   int64
+	stagingOpened bool
+}
+
+// PipelineObserverSource implements parser.PipelineObserverSourceProvider:
+// the Codex parser adopts the sink's source when the provider carries
+// none, so a staged parse reports the same event stream as a collecting
+// one.
+func (s *codexStagingSink) PipelineObserverSource() parser.ObserverSource {
+	return s.obsSource
+}
+
+// emitStaging reports one staging lifecycle event. The first call emits
+// the "open" event lazily, so the scratch file's creation is reported even
+// though the observer source is installed after the constructor returns.
+// The uninstrumented path resolves the source and allocates nothing.
+func (s *codexStagingSink) emitStaging(op string, extra map[string]any) {
+	source := s.obsSource
+	if source == nil {
+		return
+	}
+	ob := source()
+	if ob == nil {
+		return
+	}
+	deliver := func(op string, extra map[string]any) {
+		payload := map[string]any{
+			"op":     op,
+			"bytes":  s.stagedBytes,
+			"events": s.eventSeq,
+		}
+		for k, v := range extra {
+			payload[k] = v
+		}
+		ob.ObserveEvent(pipevents.Event{
+			AtMS:    time.Now().UnixMilli(),
+			Stage:   pipevents.StageParse,
+			Kind:    pipevents.KindStaging,
+			Path:    s.obsPath,
+			Payload: payload,
+		})
+	}
+	if !s.stagingOpened {
+		s.stagingOpened = true
+		deliver("open", map[string]any{"bytes": 0, "events": 0})
+	}
+	deliver(op, extra)
 }
 
 // fail records the sticky staging failure. Later events and the publish
@@ -90,6 +146,9 @@ type codexStagingSink struct {
 func (s *codexStagingSink) fail(err error) {
 	if s.stageErr == nil {
 		s.stageErr = fmt.Errorf("codex staging: %w", err)
+		s.emitStaging("error", map[string]any{
+			"error": s.stageErr.Error(),
+		})
 	}
 }
 
@@ -329,7 +388,14 @@ func newCodexStagingSink(ctx context.Context,
 func (s *codexStagingSink) Close() error {
 	err := s.scratch.Close()
 	if err == nil {
+		var scratchBytes int64
+		if info, statErr := os.Stat(s.path); statErr == nil {
+			scratchBytes = info.Size()
+		}
 		err = os.Remove(s.path)
+		s.emitStaging("close", map[string]any{"bytes": scratchBytes})
+	} else {
+		s.emitStaging("close", map[string]any{"error": err.Error()})
 	}
 	return err
 }
@@ -355,6 +421,7 @@ func (s *codexStagingSink) Reset() {
 	s.singleSummaries = nil
 	s.contentFailures = nil
 	s.stageErr = nil
+	s.stagedBytes = 0
 	s.validationStats = db.ValidationStats{}
 	if s.scratch != nil {
 		// The interface carries no context; the scratch pool is a single
@@ -615,6 +682,8 @@ func (s *codexStagingSink) AppendToolResultEvent(ctx context.Context,
 		s.fail(err)
 		return
 	}
+	s.stagedBytes += int64(contentLength)
+	s.emitStaging("append", nil)
 
 	// Definite findings from the stored (blanked) content — the same
 	// text the legacy scan reads back from the database.

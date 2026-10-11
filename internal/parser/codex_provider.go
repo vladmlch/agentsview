@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"go.kenn.io/agentsview/internal/pathutil"
+	"go.kenn.io/agentsview/internal/pipevents"
 )
 
 var (
@@ -21,6 +22,7 @@ var (
 	_ RawCaptureProvider                = (*codexProvider)(nil)
 	_ RawCaptureSourceProvider          = (*codexProvider)(nil)
 	_ StreamingRawCaptureSourceProvider = (*codexProvider)(nil)
+	_ PipelineObserverProvider          = (*codexProvider)(nil)
 )
 
 // codexProviderSpec parameterizes the one shared Codex-format provider
@@ -131,6 +133,55 @@ type codexProvider struct {
 	sources         codexSourceSet
 	cursorCache     *codexCursorCache
 	parentTurnCache *codexParentTurnCache
+	// obsSource resolves the pipeline observer lazily. The sync engine
+	// installs it once at provider construction; emit sites resolve it per
+	// event so a runtime toggle never requires rebuilding the provider.
+	obsSource ObserverSource
+}
+
+// SetPipelineObserverSource implements PipelineObserverProvider.
+func (p *codexProvider) SetPipelineObserverSource(source ObserverSource) {
+	p.obsSource = source
+}
+
+// parseObserver builds the emit helper for one transcript path. When the
+// provider itself carries no source, a sink implementing
+// PipelineObserverSourceProvider supplies it, which lets the engine's
+// staged parse path reuse the same instrumentation without widening the
+// streaming entry point's signature.
+func (p *codexProvider) parseObserver(
+	path string, sink CodexSessionSink,
+) codexParseObserver {
+	source := p.obsSource
+	if source == nil && sink != nil {
+		if carrier, ok := sink.(PipelineObserverSourceProvider); ok {
+			source = carrier.PipelineObserverSource()
+		}
+	}
+	return codexParseObserver{source: source, path: path}
+}
+
+// emit delivers a parse-level event for path when an observer is active.
+// Emit sites that construct payload maps must resolve the observer first
+// (the codexParseObserver helpers already do); emit re-checks to stay
+// nil-safe for direct callers.
+func (p *codexProvider) emit(kind, path string, payload map[string]any) {
+	codexParseObserver{source: p.obsSource, path: path}.emit(kind, payload)
+}
+
+// emitIncrementalFallback reports a provider-boundary decline of the
+// incremental append path, gated on an active observer so the disabled
+// path allocates no payload.
+func (p *codexProvider) emitIncrementalFallback(
+	path, reason string, lineNo int,
+) {
+	if p.obsSource == nil || p.obsSource() == nil {
+		return
+	}
+	p.emit(pipevents.KindIncrementalFallback, path, map[string]any{
+		"reason":  reason,
+		"line_no": lineNo,
+	})
 }
 
 func (p *codexProvider) Discover(ctx context.Context) ([]SourceRef, error) {
@@ -499,6 +550,8 @@ func (p *codexProvider) Parse(
 	if !ok {
 		return ParseOutcome{}, errors.New("codex source path unavailable")
 	}
+	obs := p.parseObserver(path, nil)
+	obs.emitParseStarted("full", 0, req.Fingerprint.Size, false)
 	if req.ForceParse && p.spec.agent == AgentCodex {
 		for _, index := range p.sources.metadata.IndexPaths(path) {
 			EvictCodexSessionIndex(index)
@@ -510,6 +563,7 @@ func (p *codexProvider) Parse(
 		return ParseOutcome{}, err
 	}
 	if sess == nil {
+		obs.emitParseDone(0, 0, false, false)
 		return ParseOutcome{
 			ResultSetComplete: true,
 			SkipReason:        SkipNoSession,
@@ -529,7 +583,9 @@ func (p *codexProvider) Parse(
 				"encoding codex checkpoint %s: %w", path, err,
 			)
 		}
+		obs.emitCursorUpdated(sess.File.Size, &cursor, len(msgs))
 	}
+	obs.emitParseDone(len(msgs), sess.File.Size, safe, checkpoint != nil)
 	result := ParseResultOutcome{
 		Result: ParseResult{
 			Session:                *sess,
@@ -595,6 +651,8 @@ func ParseCodexSessionStreaming(
 	if err != nil {
 		return nil, nil, nil, nil, "", "", fmt.Errorf("stat %s: %w", path, err)
 	}
+	obs := cp.parseObserver(path, sink)
+	obs.emitParseStarted("full", 0, info.Size(), false)
 	sess, msgs, cursor, safe, hashState, anchorDigest, retryReason, err := cp.parseCodexSessionSnapshotStreaming(
 		ctx, path,
 		firstNonEmptyJSONLString("", cfg.Machine),
@@ -604,6 +662,7 @@ func ParseCodexSessionStreaming(
 		return nil, nil, nil, nil, "", "", err
 	}
 	if sess == nil {
+		obs.emitParseDone(0, 0, false, false)
 		return nil, nil, nil, nil, "", "", fmt.Errorf(
 			"codex session unavailable in %s", path,
 		)
@@ -616,7 +675,9 @@ func ParseCodexSessionStreaming(
 				"encoding codex checkpoint %s: %w", path, err,
 			)
 		}
+		obs.emitCursorUpdated(info.Size(), &cursor, len(msgs))
 	}
+	obs.emitParseDone(len(msgs), info.Size(), safe, cursorBlob != nil)
 	return sess, msgs, cursorBlob, hashState, anchorDigest,
 		retryReason, nil
 }
@@ -633,7 +694,12 @@ func (p *codexProvider) ParseIncremental(
 		return IncrementalOutcome{}, IncrementalUnsupported,
 			errors.New("codex source path unavailable")
 	}
+	obs := p.parseObserver(path, nil)
+	obs.emitParseStarted(
+		"incremental", req.Offset, req.Fingerprint.Size, len(req.Seed) > 0,
+	)
 	if req.Offset < 0 || req.Fingerprint.Size < req.Offset {
+		p.emitIncrementalFallback(path, "invalid_resume_range", 0)
 		return IncrementalOutcome{ForceReplace: true},
 			IncrementalNeedsFullParse, nil
 	}
@@ -650,6 +716,7 @@ func (p *codexProvider) ParseIncremental(
 	if (req.Fingerprint.Inode != 0 && req.Fingerprint.Inode != inode) ||
 		(req.Fingerprint.Device != 0 && req.Fingerprint.Device != device) ||
 		info.Size() < req.Fingerprint.Size {
+		p.emitIncrementalFallback(path, "fingerprint_mismatch", 0)
 		return IncrementalOutcome{ForceReplace: true},
 			IncrementalNeedsFullParse, nil
 	}
@@ -658,10 +725,12 @@ func (p *codexProvider) ParseIncremental(
 		return IncrementalOutcome{}, IncrementalNeedsFullParse, err
 	}
 	if !safe {
+		p.emitIncrementalFallback(path, "unsafe_resume_offset", 0)
 		return IncrementalOutcome{ForceReplace: true},
 			IncrementalNeedsFullParse, nil
 	}
 	if req.Fingerprint.Size == req.Offset {
+		obs.emitParseDone(0, 0, false, false)
 		return IncrementalOutcome{}, IncrementalNoNewData, nil
 	}
 
@@ -671,6 +740,7 @@ func (p *codexProvider) ParseIncremental(
 		if err := seed.UnmarshalBinary(req.Seed); err != nil {
 			// A persisted cursor the current binary cannot decode must not
 			// resume; rebuild the transcript authoritatively.
+			p.emitIncrementalFallback(path, "undecodable_seed", 0)
 			return IncrementalOutcome{ForceReplace: true},
 				IncrementalNeedsFullParse, nil
 		}
@@ -699,6 +769,9 @@ func (p *codexProvider) ParseIncremental(
 	}
 	if err != nil {
 		if IsIncrementalFullParseFallback(err) {
+			// The tail loop reports the precise cause itself; this entry
+			// marks the fallback surfacing at the provider boundary.
+			p.emitIncrementalFallback(path, "tail_parse_fallback", 0)
 			return IncrementalOutcome{ForceReplace: true},
 				IncrementalNeedsFullParse, nil
 		}
@@ -708,6 +781,7 @@ func (p *codexProvider) ParseIncremental(
 		// The stored session has no genuine first prompt yet, so appending this
 		// tail would leave its persisted FirstMessage preview stale. A full parse
 		// can rebuild both the messages and the session summary atomically.
+		p.emitIncrementalFallback(path, "first_user_after_offset", 0)
 		return IncrementalOutcome{ForceReplace: true},
 			IncrementalNeedsFullParse, nil
 	}
@@ -719,6 +793,7 @@ func (p *codexProvider) ParseIncremental(
 		result.initialCursor,
 	)
 	if result.consumedBytes == 0 {
+		obs.emitParseDone(0, 0, false, false)
 		return IncrementalOutcome{}, IncrementalNoNewData, nil
 	}
 	p.cursorCache.Put(
@@ -743,7 +818,15 @@ func (p *codexProvider) ParseIncremental(
 				"encoding codex cursor %s: %w", path, err,
 			)
 		}
+		obs.emitCursorUpdated(
+			req.Offset+result.consumedBytes,
+			&result.cursor,
+			req.StartOrdinal+len(result.messages),
+		)
 	}
+	obs.emitParseDone(
+		len(result.messages), result.consumedBytes, true, nextCursor != nil,
+	)
 	return IncrementalOutcome{
 		SessionID:                req.SessionID,
 		Messages:                 result.messages,
