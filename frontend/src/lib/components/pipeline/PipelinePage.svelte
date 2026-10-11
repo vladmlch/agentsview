@@ -3,6 +3,7 @@
     Button,
     Chip,
     IconButton,
+    SegmentedControl,
     Typeahead,
     type TypeaheadOption,
   } from "@kenn-io/kit-ui";
@@ -14,6 +15,7 @@
   } from "../../stores/pipeline.svelte.js";
   import { RefreshCwIcon } from "../../icons.js";
   import PipelineDiagram from "./PipelineDiagram.svelte";
+  import PipelineInspector from "./PipelineInspector.svelte";
   import PipelineTimeline from "./PipelineTimeline.svelte";
   import PipelineStatePanel from "./PipelineStatePanel.svelte";
 
@@ -29,6 +31,24 @@
   let stageFilter = $state<PipelineStage | null>(null);
   let observing = $state(false);
   let fileInput: HTMLInputElement | undefined = $state();
+
+  // Second-row list filters live on the page so a deliberate kind /
+  // text / anomaly filter survives run and recording switches —
+  // resetBuffer clears the inspector selection but not these.
+  let kindFilter = $state(new Set<string>());
+  let query = $state("");
+  let anomaliesOnly = $state(false);
+
+  const PLAY_MODE_OPTIONS = [
+    { value: "events", label: "Events" },
+    { value: "time", label: "Time" },
+  ];
+
+  const RT_SPEED_OPTIONS = [
+    { value: "10", label: "10x" },
+    { value: "100", label: "100x" },
+    { value: "1000", label: "1000x" },
+  ];
 
   const view = $derived(store.viewState);
 
@@ -119,6 +139,20 @@
 
   function shortRunId(id: string): string {
     return id.length > 10 ? `${id.slice(0, 10)}…` : id;
+  }
+
+  /** Events-per-tick pace from the timeline's speed group. The group
+   * is hidden in time mode (the timeline's `pacing` prop), so this
+   * guard only covers a stray call — routing a click through play()
+   * would restart the interval and reset playheadMs to the cursor
+   * event's at_ms, rewinding up to a tick of wall-clock progress. */
+  function setSpeed(s: number): void {
+    if (store.playMode !== "events") return;
+    if (store.playing) {
+      store.play(s);
+    } else {
+      store.speed = s;
+    }
   }
 </script>
 
@@ -232,21 +266,69 @@
   />
 
   <div class="pipeline-split">
-    <PipelineTimeline
-      events={store.events}
-      cursor={store.cursor}
-      live={store.live}
-      playing={store.playing}
-      speed={store.speed}
-      filter={stageFilter}
+    <div class="timeline-col">
+      <div class="transport-bar">
+        <span class="row-label">Replay</span>
+        <SegmentedControl
+          options={PLAY_MODE_OPTIONS}
+          value={store.playMode}
+          ariaLabel="Replay mode: fixed event count or wall-clock pacing"
+          onchange={(v) => (store.playMode = v as "events" | "time")}
+        />
+        {#if store.playMode === "time"}
+          <SegmentedControl
+            options={RT_SPEED_OPTIONS}
+            value={String(store.rtSpeed)}
+            ariaLabel="Wall-clock replay speed multiplier"
+            onchange={(v) => (store.rtSpeed = Number(v))}
+          />
+        {/if}
+        <span class="transport-spacer"></span>
+        <Button
+          size="sm"
+          surface={store.pauseOnAnomaly ? "solid" : "outline"}
+          tone={store.pauseOnAnomaly ? "info" : "neutral"}
+          label="Pause on anomaly"
+          title="Stop playback when a consumed event is flagged anomalous"
+          onclick={() => (store.pauseOnAnomaly = !store.pauseOnAnomaly)}
+        />
+      </div>
+      <PipelineTimeline
+        events={store.events}
+        cursor={store.cursor}
+        live={store.live}
+        playing={store.playing}
+        speed={store.speed}
+        pacing={store.playMode}
+        filter={stageFilter}
+        selected={store.selected}
+        kindFilter={kindFilter}
+        query={query}
+        anomaliesOnly={anomaliesOnly}
+        dropped={store.dropped}
+        onseek={(i) => store.seek(i)}
+        onselect={(i) => store.select(i)}
+        onkindchange={(k) => (kindFilter = k)}
+        onquerychange={(q) => (query = q)}
+        onanomalieschange={(on) => (anomaliesOnly = on)}
+        onstep={(d) => store.stepBy(d)}
+        onplaypause={() => (store.playing ? store.pause() : store.play())}
+        onspeed={setSpeed}
+        ongolive={() => store.seekToEnd()}
+        onclearfilter={() => (stageFilter = null)}
+      />
+      <PipelineInspector
+        events={store.events}
+        selected={store.selected}
+        onselect={(i) => store.select(i)}
+        onseek={(i) => store.seek(i)}
+      />
+    </div>
+    <PipelineStatePanel
+      {view}
+      onselect={(i) => store.select(i)}
       onseek={(i) => store.seek(i)}
-      onstep={(d) => store.stepBy(d)}
-      onplaypause={() => (store.playing ? store.pause() : store.play())}
-      onspeed={(s) => (store.playing ? store.play(s) : (store.speed = s))}
-      ongolive={() => store.seekToEnd()}
-      onclearfilter={() => (stageFilter = null)}
     />
-    <PipelineStatePanel {view} />
   </div>
 </div>
 
@@ -329,5 +411,38 @@
     grid-template-columns: minmax(0, 3fr) minmax(280px, 2fr);
     min-height: 0;
     border-top: 1px solid var(--border-default);
+  }
+
+  .timeline-col {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    min-width: 0;
+  }
+
+  .transport-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--border-muted);
+    flex-wrap: wrap;
+  }
+
+  .transport-spacer {
+    flex: 1;
+  }
+
+  /* The timeline fills the column's spare height so its inner list
+   * scrolls; the inspector keeps its own capped height and never
+   * stretches. Both are child component roots — the rules reach them
+   * through :global. */
+  .timeline-col :global(.pipeline-timeline) {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .timeline-col :global(.inspector) {
+    flex: none;
   }
 </style>

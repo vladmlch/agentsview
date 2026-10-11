@@ -67,6 +67,51 @@ export interface PipelineScenarioStep {
   detail?: string;
 }
 
+/** One step in a file's journey through the pipeline. `idx` is the
+ * event's index in the buffer (events[i]) so a step can seek or
+ * select straight back to it. Runs of line_classified,
+ * message_emitted, and cursor_updated events for the same path
+ * collapse into a single step — `folded` then counts the events the
+ * step stands for and `idx` points at the run's first event. */
+export interface PipelineJourneyStep {
+  idx: number;
+  kind: string;
+  summary: string;
+  /** First eventAnomaly reason inside the step's event run. */
+  anomaly?: string;
+  folded?: number;
+}
+
+/** Everything the replay observed about one file: the ordered steps
+ * it went through, a byte map of how far the parser read, and the
+ * write outcome once the session committed. Journeys are listed in
+ * first-seen path order. */
+export interface PipelineFileJourney {
+  path: string;
+  steps: PipelineJourneyStep[];
+  byteMap: {
+    /** Declared parse size or the furthest tracked line offset —
+     * whichever reached further. */
+    size: number;
+    /** Furthest byte read: max line offset, else parse_done's
+     * consumed count when offsets were untracked. */
+    readEnd: number;
+    /** Offset of the last checkpoint_written for this path. */
+    checkpoint: number | null;
+    /** Offset the last incremental parse_started resumed from. */
+    incStart: number | null;
+  };
+  /** Set once a session_written or messages_written lands for the
+   * path; inserted sums every messages_written. */
+  outcome: {
+    sessionId?: string;
+    inserted: number;
+    checkpointVersion?: number;
+  } | null;
+  /** Events in this journey eventAnomaly flags. */
+  anomalies: number;
+}
+
 export interface PipelineRunState {
   runId: string | null;
   scenarioId: string | null;
@@ -109,6 +154,9 @@ export interface PipelineViewState {
   /** Last flush_triggered: what was drained and why. */
   lastFlush: { reason: string; pending: number; bytes: number } | null;
   steps: PipelineScenarioStep[];
+  /** Per-file journeys, in first-seen path order — the Journey tab's
+   * model. */
+  journeys: PipelineFileJourney[];
   /** Stage of the last consumed event — the diagram's highlight. */
   activeStage: PipelineStage | null;
   /** Per-stage lifecycle for the diagram. A stage is "active" while
@@ -190,6 +238,243 @@ function off(v: unknown): number {
   return typeof v === "number" && Number.isFinite(v) ? v : -1;
 }
 
+/** Last path segment, for compact labels like the dedup loser reason
+ * and the pipeline components' path cells. A missing or empty path
+ * reads as "". */
+export function basename(path: string | undefined): string {
+  if (!path) return "";
+  const i = path.lastIndexOf("/");
+  return i === -1 ? path : path.slice(i + 1);
+}
+
+/** Reason an event is anomalous for the replay UI, or null when it is
+ * routine. Pure in the event — cheap enough to call per rendered row
+ * and per consumed event during playback. */
+export function eventAnomaly(ev: PipelineEvent): string | null {
+  const p = ev.payload ?? {};
+  switch (ev.kind) {
+    case "gate_verdict": {
+      const decision = str(p.decision);
+      // Emitted vocabulary: gateVerdict call sites produce "pass" and
+      // "skip" (internal/sync/engine.go) and the codex_checkpoint gate
+      // produces "unchanged"/"append"/"invalid"/"missing"
+      // (codexCheckpointGateDecision, internal/sync/pipeline_events.go).
+      // "invalid" means the checkpoint proof failed (e.g. a truncate
+      // rewrite); "reject"/"drop"/"rescan" are kept for forward-compat.
+      // Routine "skip" is never anomalous — gates emit it constantly.
+      if (
+        decision === "reject" ||
+        decision === "drop" ||
+        decision === "rescan" ||
+        decision === "invalid"
+      ) {
+        return `gate "${str(p.gate)}": ${decision}`;
+      }
+      return null;
+    }
+    case "dedup_loser":
+      return `dedup lost to ${basename(str(p.winner))}`;
+    case "incremental_fallback":
+      return str(p.reason) || "incremental parse fell back";
+    case "parse_done":
+    case "embed_done": {
+      const err = str(p.error);
+      return err === "" ? null : err;
+    }
+    case "tx_committed": {
+      const failed = num(p.failed);
+      return failed > 0 ? `${failed} session(s) failed` : null;
+    }
+    case "line_classified":
+      return str(p.type) === "malformed" ? "malformed line" : null;
+    case "batch_formed":
+      return p.lost_events === true ? "watcher lost events" : null;
+    default:
+      return null;
+  }
+}
+
+/** Kinds whose consecutive same-path events collapse into one journey
+ * step. A new parse_started (or any other kind) naturally closes the
+ * open run — the kinds no longer match. */
+const JOURNEY_FOLD_KINDS: ReadonlySet<string> = new Set([
+  "line_classified",
+  "message_emitted",
+  "cursor_updated",
+]);
+
+/** Step summary for a folded run of one kind. `malformed` counts the
+ * run's malformed lines and only applies to line_classified. */
+function foldSummary(kind: string, folded: number, malformed: number): string {
+  switch (kind) {
+    case "line_classified": {
+      const lines = `${folded} ${folded === 1 ? "line" : "lines"} classified`;
+      return malformed > 0 ? `${lines}, ${malformed} malformed` : lines;
+    }
+    case "message_emitted":
+      return `${folded} ${folded === 1 ? "message" : "messages"} emitted`;
+    case "cursor_updated":
+      return `${folded} cursor updates`;
+    default:
+      return kind;
+  }
+}
+
+/** One-line step summary for kinds that do not fold. Extraction
+ * tolerates both producer shapes: parser-level payloads
+ * (consumed_bytes, messages, checkpoint_version) and engine-level
+ * ones (source_bytes, consumed, results) — missing fields read as
+ * absent, not as errors. */
+function journeySummary(ev: PipelineEvent): string {
+  const p = ev.payload ?? {};
+  switch (ev.kind) {
+    case "path_classified":
+      return `classified: ${str(p.classification)}`;
+    case "source_resolved":
+      return `source resolved: ${optStr(p.agent) ?? optStr(p.key) ?? JSON.stringify(p)}`;
+    case "gate_verdict":
+      return `${str(p.gate)} → ${str(p.decision)} (${str(p.reason)})`;
+    case "dedup_winner":
+      return `dedup win: ${str(p.reason)}`;
+    case "dedup_loser":
+      return `dedup lost: ${str(p.reason)}`;
+    case "parse_mode_selected":
+      return `mode ${str(p.mode)}: ${str(p.reason)}`;
+    case "parse_started":
+      return `parse ${str(p.mode)} offset=${num(p.offset)} size=${num(p.size ?? p.source_bytes)}`;
+    case "parse_done": {
+      const mode = str(p.mode);
+      const err = str(p.error);
+      const done = `done${mode === "" ? "" : ` ${mode}`}: ${num(p.messages ?? p.results)} msgs, ${num(p.consumed_bytes ?? p.consumed)} B`;
+      return err === "" ? done : `${done}, error: ${err}`;
+    }
+    case "incremental_fallback":
+      return `fallback: ${str(p.reason)} @line ${num(p.line_no)}`;
+    case "staging":
+      return `staging ${str(p.op)}: ${num(p.bytes)} B`;
+    case "result_admitted":
+      return `admitted ${str(p.session_hint)}: ${num(p.messages)} msgs`;
+    case "pending_accumulated":
+      return `queued: ${num(p.pending_count)} / ${num(p.pending_bytes)} B`;
+    case "session_written":
+      return `session ${str(p.session_id)}`;
+    case "messages_written":
+      return `${num(p.inserted)} msgs (max ord ${num(p.max_ordinal)})`;
+    case "fts_updated":
+      return `fts +${num(p.fts_rows)}`;
+    case "checkpoint_written":
+      return `checkpoint v${num(p.checkpoint_version)} @${num(p.offset)}`;
+    case "tx_started":
+      return `tx ${str(p.mode)}`;
+    case "tx_committed":
+      return `committed ${num(p.inserted)} msgs`;
+    case "cursor_updated":
+      return `cursor @${num(p.offset)} ord=${num(p.next_ordinal)}`;
+    default:
+      // line_classified and message_emitted always arrive via a
+      // folded run; every other kind with a path gets a bare label.
+      return ev.kind;
+  }
+}
+
+/** Per-path journey scratch that does not belong in the exported
+ * shape: the furthest tracked line offset (-1 = no tracked offsets
+ * seen, so readEnd falls back to parse_done's consumed count), the
+ * furthest consumed byte count, and the last checkpoint version —
+ * kept so an outcome created after checkpoint_written still learns
+ * it. */
+interface JourneyAcc {
+  lineMax: number;
+  consumedMax: number;
+  checkpointVersion?: number;
+}
+
+/** Fold one event into its path's journey: append or extend a step,
+ * count anomalies, and update the byte map and write outcome. */
+function recordJourneyEvent(
+  j: PipelineFileJourney,
+  acc: JourneyAcc,
+  foldMalformed: Map<PipelineJourneyStep, number>,
+  ev: PipelineEvent,
+  idx: number,
+): void {
+  const p = ev.payload ?? {};
+  const anomaly = eventAnomaly(ev);
+  if (anomaly !== null) j.anomalies += 1;
+
+  const last = j.steps[j.steps.length - 1];
+  if (last !== undefined && last.kind === ev.kind && JOURNEY_FOLD_KINDS.has(ev.kind)) {
+    // Extend the open run — idx stays on the run's first event.
+    last.folded = (last.folded ?? 1) + 1;
+    const malformed =
+      (foldMalformed.get(last) ?? 0) +
+      (ev.kind === "line_classified" && str(p.type) === "malformed" ? 1 : 0);
+    foldMalformed.set(last, malformed);
+    last.summary = foldSummary(ev.kind, last.folded, malformed);
+    if (anomaly !== null && last.anomaly === undefined) last.anomaly = anomaly;
+  } else {
+    const step: PipelineJourneyStep = { idx, kind: ev.kind, summary: "" };
+    if (anomaly !== null) step.anomaly = anomaly;
+    if (JOURNEY_FOLD_KINDS.has(ev.kind)) {
+      step.folded = 1;
+      const malformed = ev.kind === "line_classified" && str(p.type) === "malformed" ? 1 : 0;
+      foldMalformed.set(step, malformed);
+      // A lone cursor_updated keeps its detailed summary; the other
+      // foldable kinds summarize even a one-element run.
+      step.summary =
+        ev.kind === "cursor_updated" ? journeySummary(ev) : foldSummary(ev.kind, 1, malformed);
+    } else {
+      step.summary = journeySummary(ev);
+    }
+    j.steps.push(step);
+  }
+
+  switch (ev.kind) {
+    case "parse_started": {
+      const size = num(p.size ?? p.source_bytes);
+      if (size > j.byteMap.size) j.byteMap.size = size;
+      if (p.mode === "incremental") j.byteMap.incStart = num(p.offset);
+      break;
+    }
+    case "line_classified": {
+      const o = off(p.offset);
+      if (o > acc.lineMax) {
+        acc.lineMax = o;
+        j.byteMap.readEnd = o;
+        if (o > j.byteMap.size) j.byteMap.size = o;
+      }
+      break;
+    }
+    case "parse_done": {
+      const consumed = num(p.consumed_bytes ?? p.consumed);
+      if (consumed > acc.consumedMax) acc.consumedMax = consumed;
+      if (acc.lineMax < 0) j.byteMap.readEnd = acc.consumedMax;
+      break;
+    }
+    case "checkpoint_written": {
+      j.byteMap.checkpoint = num(p.offset);
+      acc.checkpointVersion = num(p.checkpoint_version);
+      if (j.outcome !== null) j.outcome.checkpointVersion = acc.checkpointVersion;
+      break;
+    }
+    case "session_written":
+    case "messages_written": {
+      if (j.outcome === null) {
+        j.outcome = { inserted: 0 };
+        if (acc.checkpointVersion !== undefined) {
+          j.outcome.checkpointVersion = acc.checkpointVersion;
+        }
+      }
+      if (ev.kind === "session_written") {
+        j.outcome.sessionId = optStr(p.session_id) ?? j.outcome.sessionId;
+      } else {
+        j.outcome.inserted += num(p.inserted);
+      }
+      break;
+    }
+  }
+}
+
 /** Kinds that close their stage for the diagram. Stages without a
  * closing kind (watch, resolve, gates) report done once a different
  * stage emits — see applyStageStatus. run_finished closes all. */
@@ -215,6 +500,7 @@ function emptyViewState(): PipelineViewState {
     queue: { pending: 0, bytes: 0 },
     lastFlush: null,
     steps: [],
+    journeys: [],
     activeStage: null,
     stageStatus: {
       watch: "idle",
@@ -266,10 +552,34 @@ export function reduceEvents(evs: PipelineEvent[]): PipelineViewState {
   // current pass began appending. Both reset on each parse_started.
   const lastLineNo: Record<string, number> = {};
   const passStart: Record<string, number> = {};
-  for (const ev of evs) {
+  // Per-path journey accumulation. journeys keeps insertion order —
+  // the order each path first appears in the stream. foldMalformed
+  // remembers the malformed-line count of each open folded step so a
+  // run's summary can report "N lines classified, M malformed".
+  const journeys = new Map<string, { j: PipelineFileJourney; acc: JourneyAcc }>();
+  const foldMalformed = new Map<PipelineJourneyStep, number>();
+  for (const [idx, ev] of evs.entries()) {
     state.parsedEvents.push(ev);
     applyStageStatus(state, ev);
     const p = ev.payload ?? {};
+    if (ev.path !== undefined && ev.path !== "") {
+      let entry = journeys.get(ev.path);
+      if (entry === undefined) {
+        entry = {
+          j: {
+            path: ev.path,
+            steps: [],
+            byteMap: { size: 0, readEnd: 0, checkpoint: null, incStart: null },
+            outcome: null,
+            anomalies: 0,
+          },
+          acc: { lineMax: -1, consumedMax: 0 },
+        };
+        journeys.set(ev.path, entry);
+        state.journeys.push(entry.j);
+      }
+      recordJourneyEvent(entry.j, entry.acc, foldMalformed, ev, idx);
+    }
     switch (ev.kind) {
       case "line_classified": {
         const type = str(p.type);
@@ -440,14 +750,30 @@ export class PipelineStore {
   /** Header of the loaded recording, when the buffer came from a file. */
   header = $state<PipelineRecordingHeader | null>(null);
   playing = $state(false);
-  /** Events advanced per playback tick. */
+  /** Events advanced per playback tick (events mode). */
   speed = $state(1);
+  /** Inspector selection: an index into `events`, or null. Selection
+   * is a view concern — it never moves `cursor`. */
+  selected = $state<number | null>(null);
+  /** Stop playback when a newly consumed event is an anomaly. */
+  pauseOnAnomaly = $state(false);
+  /** Events the live transport skipped: seq gaps mean the server's
+   * buffer evicted them between broadcasts. */
+  dropped = $state(0);
+  /** Playback basis: "events" advances a fixed count per tick, "time"
+   * follows the events' at_ms wall-clock spacing at rtSpeed×. */
+  playMode = $state<"events" | "time">("events");
+  /** Wall-clock speed multiplier for "time" playback. */
+  rtSpeed = $state(10);
   error = $state<string | null>(null);
 
   viewState = $derived.by(() => reduceEvents(this.events.slice(0, this.cursor)));
 
   private es: EventSource | null = null;
   private playTimer: ReturnType<typeof setInterval> | null = null;
+  /** Time-mode playhead: the at_ms watermark the cursor has caught
+   * up to. */
+  private playheadMs = 0;
   /** Highest seq appended — SSE reconnect replays the run log, so
    * already-seen seqs are dropped instead of duplicated. */
   private lastSeq = 0;
@@ -480,6 +806,12 @@ export class PipelineStore {
    * reconnect (which replays the run log) cannot duplicate rows. */
   private pushEvent(e: PipelineEvent): void {
     if (e.seq <= this.lastSeq) return;
+    // A seq gap means the server evicted events between broadcasts —
+    // count the loss so the UI can flag it. lastSeq 0 is the fresh
+    // stream's first frame, where no baseline exists to gap from.
+    if (this.lastSeq !== 0 && e.seq > this.lastSeq + 1) {
+      this.dropped += e.seq - this.lastSeq - 1;
+    }
     this.lastSeq = e.seq;
     this.events.push(e);
     if (this.live) this.cursor = this.events.length;
@@ -490,6 +822,8 @@ export class PipelineStore {
     this.cursor = 0;
     this.lastSeq = 0;
     this.header = null;
+    this.selected = null;
+    this.dropped = 0;
   }
 
   /** Scrub to a position. Seeking away from the tail freezes live
@@ -497,6 +831,13 @@ export class PipelineStore {
   seek(i: number): void {
     this.cursor = Math.max(0, Math.min(this.events.length, Math.trunc(i)));
     this.live = this.cursor >= this.events.length;
+    // A running time-mode timer recomputes the cursor from playheadMs
+    // on the next tick — rebase the watermark on the event under the
+    // new cursor, like a fresh play() does, or the tick snaps the
+    // cursor back to where the stale playhead left off.
+    if (this.playMode === "time" && this.playTimer !== null) {
+      this.playheadMs = this.events[this.cursor]?.at_ms ?? 0;
+    }
   }
 
   stepBy(d: number): void {
@@ -508,21 +849,73 @@ export class PipelineStore {
     this.seek(this.events.length);
   }
 
+  /** Select an event index for the inspector, or clear with null.
+   * Selection never moves `cursor` — inspecting is not seeking. */
+  select(i: number | null): void {
+    this.selected = i;
+  }
+
   /** Advance `speed` events per PIPELINE_PLAY_TICK_MS until the tail
-   * is reached, then resume live following. */
+   * is reached, then resume live following. In "time" playMode the
+   * playhead instead advances rtSpeed× real time each tick and the
+   * cursor follows the events' at_ms ordering — a recording replays
+   * with its original pacing. With pauseOnAnomaly set, consuming an
+   * anomalous event stops playback where it stands. */
   play(speed = this.speed): void {
     this.speed = Math.max(1, Math.round(speed));
     this.pauseTimer();
     this.playing = true;
     this.live = false;
-    this.playTimer = setInterval(() => {
-      const next = Math.min(this.events.length, this.cursor + this.speed);
-      this.cursor = next;
-      if (next >= this.events.length) {
+    if (this.playMode === "time") {
+      // The playhead starts on the event under the cursor; at the
+      // tail there is nothing to replay — settle into live, matching
+      // what events mode does after its first tick.
+      if (this.cursor >= this.events.length) {
         this.pauseTimer();
         this.live = true;
+        return;
       }
+      this.playheadMs = this.events[this.cursor]?.at_ms ?? 0;
+      this.playTimer = setInterval(() => {
+        this.playheadMs += this.rtSpeed * PIPELINE_PLAY_TICK_MS;
+        const prev = this.cursor;
+        let next = prev;
+        while (
+          next < this.events.length &&
+          (this.events[next]?.at_ms ?? Number.POSITIVE_INFINITY) <= this.playheadMs
+        ) {
+          next += 1;
+        }
+        this.cursor = next;
+        this.afterPlayAdvance(prev, next);
+      }, PIPELINE_PLAY_TICK_MS);
+      return;
+    }
+    this.playTimer = setInterval(() => {
+      const prev = this.cursor;
+      const next = Math.min(this.events.length, this.cursor + this.speed);
+      this.cursor = next;
+      this.afterPlayAdvance(prev, next);
     }, PIPELINE_PLAY_TICK_MS);
+  }
+
+  /** Shared post-tick logic for play(): pause where playback stands
+   * when a newly consumed event is anomalous (pauseOnAnomaly), else
+   * hand the cursor back to live tail-following at the buffer's end. */
+  private afterPlayAdvance(prev: number, next: number): void {
+    if (this.pauseOnAnomaly) {
+      for (let i = prev; i < next; i++) {
+        const e = this.events[i];
+        if (e !== undefined && eventAnomaly(e) !== null) {
+          this.pauseTimer();
+          return;
+        }
+      }
+    }
+    if (next >= this.events.length) {
+      this.pauseTimer();
+      this.live = true;
+    }
   }
 
   pause(): void {
