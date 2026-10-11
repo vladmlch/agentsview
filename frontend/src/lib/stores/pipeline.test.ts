@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import type { EventSource } from "eventsource";
+import type { WatchPipelineEventsOptions } from "../api/client.js";
 import {
   parsePipelineRecording,
   PipelineStore,
@@ -466,6 +467,34 @@ describe("PipelineStore", () => {
     store.pause();
     vi.advanceTimersByTime(500);
     expect(store.cursor).toBe(1);
+  });
+
+  it("surfaces a stream that never opens as store.error", () => {
+    let captured: WatchPipelineEventsOptions | undefined;
+    const store = new PipelineStore({
+      watch: (_runId, _onEvent, opts) => {
+        captured = opts;
+        return { close: vi.fn() } as unknown as EventSource;
+      },
+    });
+    store.attachLive("run-x");
+    captured?.onPermanentFailure?.();
+    expect(store.error).toMatch(/run-x/);
+  });
+
+  it("lets a caller-supplied onPermanentFailure win over the default", () => {
+    let captured: WatchPipelineEventsOptions | undefined;
+    const custom = vi.fn();
+    const store = new PipelineStore({
+      watch: (_runId, _onEvent, opts) => {
+        captured = opts;
+        return { close: vi.fn() } as unknown as EventSource;
+      },
+    });
+    store.attachLive("run-x", { onPermanentFailure: custom });
+    captured?.onPermanentFailure?.();
+    expect(custom).toHaveBeenCalledTimes(1);
+    expect(store.error).toBeNull();
   });
 
   it("playRecording loads events frozen at the end, not live", async () => {
