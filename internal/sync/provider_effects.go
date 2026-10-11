@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/pipevents"
 )
 
 // validateProviderOutcome rejects a provider parse outcome whose sessions,
@@ -118,6 +119,13 @@ func (a *providerResultAdmission) admit(r parser.ParseResultOutcome) error {
 	kept, verifyFailed := a.engine.dropShrinkingTruncatedCursorIDEResults(a.ctx, a.file, kept)
 	a.truncationVerifyFailed = a.truncationVerifyFailed || verifyFailed
 	a.kept = append(a.kept, kept...)
+	if a.engine.pipelineObserver() != nil {
+		a.engine.emitPipeline(pipevents.StageParse,
+			pipevents.KindResultAdmitted, a.file.Path, map[string]any{
+				"session_hint": r.Result.Session.ID,
+				"messages":     len(r.Result.Messages),
+			})
+	}
 	if a.engine.parseAdmissionObserver != nil {
 		a.engine.parseAdmissionObserver(len(a.emitted), len(a.kept))
 	}
