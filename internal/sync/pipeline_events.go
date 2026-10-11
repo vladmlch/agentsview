@@ -49,6 +49,50 @@ func (e *Engine) emitPipeline(
 	})
 }
 
+// pipelineObserverSource adapts the engine's observer slot to the lazy
+// source contract parser providers accept: providers keep the function
+// and resolve the current observer per event, so installing or swapping
+// observers at runtime never requires rebuilding providers.
+func (e *Engine) pipelineObserverSource() pipevents.Observer {
+	return e.pipelineObserver()
+}
+
+// pipelineObserverFactory injects the engine's observer source into every
+// provider it materializes. Wrapping the factories — rather than each
+// NewProvider call site — covers every construction path uniformly,
+// including ReconfigureSources rebuilds from baseProviderFactories and
+// ad-hoc providers built for fingerprints or watch plans.
+type pipelineObserverFactory struct {
+	parser.ProviderFactory
+	source parser.ObserverSource
+}
+
+func (f pipelineObserverFactory) NewProvider(
+	cfg parser.ProviderConfig,
+) parser.Provider {
+	provider := f.ProviderFactory.NewProvider(cfg)
+	if observed, ok := provider.(parser.PipelineObserverProvider); ok {
+		observed.SetPipelineObserverSource(f.source)
+	}
+	return provider
+}
+
+// injectPipelineObserverSource wraps every factory so each materialized
+// provider receives the engine's lazy observer source.
+func injectPipelineObserverSource(
+	factories []parser.ProviderFactory,
+	source parser.ObserverSource,
+) []parser.ProviderFactory {
+	injected := make([]parser.ProviderFactory, len(factories))
+	for i, factory := range factories {
+		injected[i] = pipelineObserverFactory{
+			ProviderFactory: factory,
+			source:          source,
+		}
+	}
+	return injected
+}
+
 // gateVerdict records one gate outcome for file. Every decision point in
 // processProviderFile — cache lookups, freshness checks, checkpoint and
 // fingerprint probes, rank and retention probes — emits exactly one

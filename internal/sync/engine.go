@@ -1066,6 +1066,14 @@ func NewEngine(ctx context.Context,
 		},
 	}
 	e.sourceSyncErr = sourceSyncErr
+	// Wrap every provider factory so each materialized provider receives
+	// the engine's lazily resolved observer source. Storing the wrapped
+	// slice in baseProviderFactories keeps the injection through
+	// ReconfigureSources rebuilds as well.
+	providerFactories = injectPipelineObserverSource(
+		providerFactories, e.pipelineObserverSource,
+	)
+	e.baseProviderFactories = providerFactories
 	e.sourceSet.Store(newEngineSources(providerFactories, SourceConfig{
 		AgentDirs:        cfg.AgentDirs,
 		SourceMachines:   cfg.SourceMachines,
@@ -13244,6 +13252,8 @@ func (e *Engine) processProviderFile(
 		stagedSink.database = e.db
 		stagedSink.idPrefix = e.idPrefix
 		stagedSink.disableSignals = e.disableSignalRecompute
+		stagedSink.obsSource = e.pipelineObserverSource
+		stagedSink.obsPath = file.Path
 		stagedGCRelease = beginStagedColdSync()
 		if e.pipelineObserver() != nil {
 			e.emitParseMode(file, "staged",
