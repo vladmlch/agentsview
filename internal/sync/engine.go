@@ -714,8 +714,13 @@ type Engine struct {
 		context.Context, []db.SessionSourcePath,
 	) ([]db.SessionSourceAttribution, error)
 	// workerCountOverride is a test seam for exercising the production worker
-	// floor and cap independently of the host CPU count.
+	// floor and cap independently of the host CPU count. An explicit override
+	// also bypasses the load governor so seam-backed tests stay deterministic
+	// under host load.
 	workerCountOverride int
+	// loadAvgSampler is the load-governor injection seam; nil samples the
+	// system load average via gopsutil. See governor.go.
+	loadAvgSampler loadAvgSampler
 	// parseAdmissionObserver is a cardinality-test seam; result admission
 	// reports results seen and still held for the current source.
 	parseAdmissionObserver func(yielded, retained int)
@@ -10742,12 +10747,21 @@ func (e *Engine) beginBulkRetentionPass() func() {
 	return func() { e.activeRetention.Store(nil) }
 }
 
+// workerCount computes the parse worker pool size for one sync pass. Every
+// pass builds a fresh pool through startWorkers, so this is the load
+// governor's re-sample point: the CPU baseline is shrunk under sampled
+// system-load pressure (see governor.go). An explicit workerCountOverride
+// skips the governor to keep the test seam deterministic.
 func (e *Engine) workerCount() int {
 	workers := runtime.NumCPU()
 	if e.workerCountOverride > 0 {
 		workers = e.workerCountOverride
 	}
-	return min(max(workers, 2), maxWorkers)
+	base := min(max(workers, 2), maxWorkers)
+	if e.workerCountOverride > 0 {
+		return base
+	}
+	return e.applyLoadGovernor(context.Background(), base)
 }
 
 // collectAndBatch drains the results channel, batches
