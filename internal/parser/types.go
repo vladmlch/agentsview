@@ -1464,6 +1464,45 @@ const SessionKindNonInteractive = "non-interactive"
 // is the roborev feature tag (`codex exec --thread-source roborev`).
 const SessionKindRoborev = "roborev"
 
+// Reason classes for source lines a parser skips as malformed. The strings
+// are stable identifiers surfaced in sync diagnostics next to the
+// malformed-line counters.
+const (
+	// MalformedLineInvalidJSON marks a line that is not valid JSON at all,
+	// typically a torn tail left by a crash mid-write.
+	MalformedLineInvalidJSON = "malformed_json"
+	// MalformedLineNotObject marks a line that is valid JSON but not an
+	// object.
+	MalformedLineNotObject = "non_object_line"
+	// MalformedLineNoStepFields marks a JSON object carrying none of the
+	// fields the lane needs to build an entry.
+	MalformedLineNoStepFields = "missing_step_fields"
+)
+
+// MaxMalformedLineSamplesPerClass bounds how many line numbers each
+// ParsedMalformedLineClass samples; the Count stays complete past the cap.
+const MaxMalformedLineSamplesPerClass = 8
+
+// ParsedMalformedLineClass breaks one session's MalformedLines down by
+// reason class. It is a payload-free quarantine record: a class, the total
+// number of lines the class dropped, and the first few 1-based line
+// numbers. Dropped lines may hold secrets, so no part of their payload is
+// ever captured.
+type ParsedMalformedLineClass struct {
+	Class string
+	Count int
+	// Lines holds the first MaxMalformedLineSamplesPerClass line numbers
+	// this class dropped, in file order.
+	Lines []int
+	// SourcePath names the file the line numbers refer to. A lane that
+	// folds several sources into one session (an Antigravity brain
+	// transcript folded into its conversation's database session) sets it
+	// so the record identifies its own file, not the session's primary
+	// source; every reader stamps it with the path it read. A path is
+	// metadata, not payload: the dropped lines' bytes stay unrecorded.
+	SourcePath string
+}
+
 // FileInfo holds file system metadata for a session source file.
 type FileInfo struct {
 	Path   string
@@ -1514,9 +1553,17 @@ type ParsedSession struct {
 	// parsers; false for every other agent.
 	GenMetadataWithoutUsage bool
 	MalformedLines          int
-	IsTruncated             bool
-	FirstMessage            string
-	SessionName             string
+	// MalformedLineClasses breaks MalformedLines down by reason class and
+	// samples the dropped lines' 1-based line numbers, so diagnostics can
+	// point at the malformed lines without carrying their bytes. The
+	// records are payload-free by construction: a class, a count, and at
+	// most MaxMalformedLineSamplesPerClass line numbers per class. Set by
+	// lanes that skip individual lines (Antigravity brain transcripts);
+	// nil when MalformedLines is zero.
+	MalformedLineClasses []ParsedMalformedLineClass
+	IsTruncated          bool
+	FirstMessage         string
+	SessionName          string
 	// SessionNamePresent distinguishes an explicitly present provider title
 	// (including a blank title) from no title signal. Codex, Antigravity,
 	// and Qoder keep titles outside the transcript, so a missing or

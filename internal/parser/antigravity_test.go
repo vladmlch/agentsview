@@ -5085,7 +5085,7 @@ func TestAntigravityUsageThinkingAndResponseID(t *testing.T) {
 
 	var result antigravityStepLoadResult
 	result.usageDedupPrefix = antigravityIDPrefix + "conv-uuid:"
-	result.appendGenMetadataUsage(genData, ParsedMessage{}, false, "")
+	result.appendGenMetadataUsage(0, genData, ParsedMessage{}, false, "")
 	require.Len(t, result.usageEvents, 1)
 	ev := result.usageEvents[0]
 	assert.Equal(t, 128, ev.ReasoningTokens,

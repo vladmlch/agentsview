@@ -30,6 +30,15 @@ const antigravityBrainTranscriptShort = `{"step_index":0,"source":"USER_EXPLICIT
 {"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-20T22:10:01Z","content":"answered"}
 `
 
+func writeAntigravityBrainTranscript(t *testing.T, root, id, body string) string {
+	t.Helper()
+	dir := filepath.Join(root, "brain", id, ".system_generated", "logs")
+	mustMkdir(t, dir)
+	path := filepath.Join(dir, "transcript.jsonl")
+	mustWrite(t, path, []byte(body))
+	return path
+}
+
 func newAntigravityProviderForRoots(t *testing.T, roots ...string) Provider {
 	t.Helper()
 	provider, ok := NewProvider(AgentAntigravity, ProviderConfig{
@@ -407,6 +416,125 @@ func TestAntigravityDefaultRootsCoverTheIDETree(t *testing.T) {
 		assert.NotContains(t, cli.DefaultDirs, dir,
 			"the CLI reader must not be pointed at %s", dir)
 	}
+}
+
+// TestAntigravityBrainTranscriptRecordsMalformedLineDrops pins that a
+// transcript line skipped as malformed is no longer dropped silently: the
+// session counts it and carries a payload-free record -- reason class, the
+// file's path, and 1-based line numbers only -- for each of the three skip
+// classes. The expected records are exact struct comparisons, so any field
+// carrying payload bytes would fail them.
+func TestAntigravityBrainTranscriptRecordsMalformedLineDrops(t *testing.T) {
+	root := t.TempDir()
+	id := "76a0c2f1-3d5e-4f6a-9b1c-2e8d7a4b5c6d"
+	// Line 4 is blank on purpose: blank separators are normal JSONL
+	// spacing and must not be counted as drops.
+	body := `{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-05-20T21:41:49Z","content":"hello"}
+{"step_index":1,"source":"MODEL","sourc
+[1,2,3]
+
+{"unrelated":true}
+{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-20T21:41:52Z","content":"done"}
+`
+	path := writeAntigravityBrainTranscript(t, root, id, body)
+	provider := newAntigravityProviderForRoots(t, root)
+
+	sources := mustDiscoverAntigravity(t, provider)
+	require.Len(t, sources, 1, "one source for the transcript")
+	results := parseAntigravitySources(t, provider, sources)
+	require.Len(t, results, 1, "one session")
+
+	sess := results[0].Session
+	assert.Equal(t, 2, sess.MessageCount, "only the well-formed steps parse")
+	assert.Equal(t, 3, sess.MalformedLines, "every malformed line is counted")
+	assert.Equal(t, []ParsedMalformedLineClass{
+		{Class: MalformedLineInvalidJSON, Count: 1, Lines: []int{2}, SourcePath: path},
+		{Class: MalformedLineNotObject, Count: 1, Lines: []int{3}, SourcePath: path},
+		{Class: MalformedLineNoStepFields, Count: 1, Lines: []int{5}, SourcePath: path},
+	}, sess.MalformedLineClasses, "payload-free class, count, and line records")
+}
+
+// TestAntigravityBrainTranscriptCapsLineSamples pins the sample cap: a class
+// that drops many lines keeps a complete count but samples only the first
+// MaxMalformedLineSamplesPerClass line numbers.
+func TestAntigravityBrainTranscriptCapsLineSamples(t *testing.T) {
+	root := t.TempDir()
+	id := "87b1d3e2-4c6f-4a7b-8c2d-3f9e8b5c6d7e"
+	var b strings.Builder
+	for range MaxMalformedLineSamplesPerClass + 2 {
+		b.WriteString("this is not json\n")
+	}
+	path := writeAntigravityBrainTranscript(t, root, id, b.String())
+	provider := newAntigravityProviderForRoots(t, root)
+
+	sources := mustDiscoverAntigravity(t, provider)
+	require.Len(t, sources, 1, "one source")
+	results := parseAntigravitySources(t, provider, sources)
+	require.Len(t, results, 1, "one session")
+
+	want := make([]int, 0, MaxMalformedLineSamplesPerClass)
+	for line := 1; line <= MaxMalformedLineSamplesPerClass; line++ {
+		want = append(want, line)
+	}
+	sess := results[0].Session
+	assert.Equal(t, MaxMalformedLineSamplesPerClass+2, sess.MalformedLines,
+		"the count stays complete past the cap")
+	require.Len(t, sess.MalformedLineClasses, 1, "one class")
+	assert.Equal(t, ParsedMalformedLineClass{
+		Class:      MalformedLineInvalidJSON,
+		Count:      MaxMalformedLineSamplesPerClass + 2,
+		Lines:      want,
+		SourcePath: path,
+	}, sess.MalformedLineClasses[0], "only the first lines are sampled")
+}
+
+// TestAntigravityBrainTranscriptCleanInputRecordsNoDrops pins the zero
+// case: a well-formed transcript counts no malformed lines and carries no
+// drop records.
+func TestAntigravityBrainTranscriptCleanInputRecordsNoDrops(t *testing.T) {
+	root := t.TempDir()
+	id := "98c2e4f3-5d7a-4b8c-9d3e-4a0f9c6d7e8f"
+	writeAntigravityBrainTranscript(
+		t, root, id, antigravityBrainTranscriptFixture,
+	)
+	provider := newAntigravityProviderForRoots(t, root)
+
+	results := parseAntigravitySources(t, provider,
+		mustDiscoverAntigravity(t, provider))
+	require.Len(t, results, 1, "one session")
+	assert.Zero(t, results[0].Session.MalformedLines, "no drops")
+	assert.Empty(t, results[0].Session.MalformedLineClasses, "no records")
+}
+
+// TestAntigravityBrainTranscriptDropsFoldIntoDBSession pins the companion
+// path: when the transcript folds into its conversation's database session,
+// the transcript's malformed-line records are attributed to that session
+// rather than vanishing, and each record names the transcript -- not the
+// session's database file -- as the file its line numbers refer to.
+func TestAntigravityBrainTranscriptDropsFoldIntoDBSession(t *testing.T) {
+	id := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	root := t.TempDir()
+	writeAntigravityIDEProviderFixture(t, root, id)
+	transcript := writeAntigravityBrainTranscript(t, root, id,
+		`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-05-20T21:41:49Z","content":"hello"}
+{"step_index":1,"source":"MODEL","sourc
+`)
+	provider := newAntigravityProviderForRoots(t, root)
+
+	results := parseAntigravitySources(t, provider,
+		mustDiscoverAntigravity(t, provider))
+	require.Len(t, results, 1, "the database is the only source")
+	sess := results[0].Session
+	assert.Equal(t, 1, sess.MalformedLines,
+		"the transcript's torn tail counts against the session")
+	require.Len(t, sess.MalformedLineClasses, 1, "one class")
+	assert.Equal(t, MalformedLineInvalidJSON, sess.MalformedLineClasses[0].Class)
+	assert.Equal(t, []int{2}, sess.MalformedLineClasses[0].Lines,
+		"the record points at the dropped line")
+	assert.Equal(t, transcript, sess.MalformedLineClasses[0].SourcePath,
+		"line numbers identify the transcript, not the database")
+	assert.NotEqual(t, sess.File.Path, sess.MalformedLineClasses[0].SourcePath,
+		"the folded session's own source is the database")
 }
 
 func TestAntigravityBrainTranscriptCleansUserPromptEnvelopes(t *testing.T) {

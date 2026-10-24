@@ -4,6 +4,8 @@ import (
 	"slices"
 	gosync "sync"
 	"time"
+
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 // Phase describes the current sync phase.
@@ -170,6 +172,14 @@ type AnomalyStats struct {
 	MalformedLinesByAgent map[string]int `json:"malformed_lines_by_agent,omitempty"`
 	// MalformedLinesTotal is the grand total across all agents.
 	MalformedLinesTotal int `json:"malformed_lines_total,omitempty"`
+	// MalformedLineSamples holds bounded, payload-free per-class
+	// breakdowns behind MalformedLinesTotal: which source file dropped
+	// which class of malformed lines, how many, and the first few
+	// 1-based line numbers. A malformed line may hold secrets, so a
+	// sample points at the spot without ever quoting it. Capped at
+	// maxMalformedLineSamplesPerRun entries; the totals above stay
+	// complete past the cap.
+	MalformedLineSamples []MalformedLineSample `json:"malformed_line_samples,omitempty"`
 
 	// UnknownSchemaSessionsByAgent maps an agent type to the number of
 	// sessions written this run that were decoded from an unrecognized
@@ -208,6 +218,24 @@ type SanitizeStats struct {
 	TimestampsBlanked    int `json:"timestamps_blanked,omitempty"`
 }
 
+// maxMalformedLineSamplesPerRun bounds how many MalformedLineSample entries
+// one run's report carries, so a corpus-wide resync over many malformed
+// files cannot bloat the summary. Totals are unaffected by the cap.
+const maxMalformedLineSamplesPerRun = 64
+
+// MalformedLineSample is one source file's malformed-line breakdown for one
+// reason class. It is a payload-free quarantine record: the file's agent
+// and path, the class, the total count in that file, and the first few
+// 1-based line numbers. Nothing from the dropped lines themselves is ever
+// recorded.
+type MalformedLineSample struct {
+	Agent string `json:"agent"`
+	Path  string `json:"path,omitempty"`
+	Class string `json:"class"`
+	Count int    `json:"count"`
+	Lines []int  `json:"lines"`
+}
+
 // Total returns the sum of all sanitize fix counts.
 func (s SanitizeStats) Total() int {
 	return s.ControlCharsStripped + s.ModelClamped + s.TokensClamped +
@@ -224,6 +252,7 @@ func (s SanitizeStats) IsZero() bool {
 func (a *AnomalyStats) IsZero() bool {
 	return a.UnsupportedSourceLayoutsTotal == 0 &&
 		a.MalformedLinesTotal == 0 &&
+		len(a.MalformedLineSamples) == 0 &&
 		a.UnknownSchemaSessionsTotal == 0 &&
 		a.GenMetadataWithoutUsageTotal == 0 &&
 		a.Sanitize.IsZero()
@@ -300,6 +329,12 @@ func (a *AnomalyStats) merge(o AnomalyStats) {
 	for agent, n := range o.MalformedLinesByAgent {
 		a.RecordMalformedLines(agent, n)
 	}
+	for _, sample := range o.MalformedLineSamples {
+		if len(a.MalformedLineSamples) >= maxMalformedLineSamplesPerRun {
+			break
+		}
+		a.MalformedLineSamples = append(a.MalformedLineSamples, sample)
+	}
 	for agent, n := range o.UnknownSchemaSessionsByAgent {
 		a.RecordUnknownSchemaSessions(agent, n)
 	}
@@ -353,13 +388,14 @@ func (a *anomalyAccumulator) recordUnsupportedSourceLayout(agent, source string)
 }
 
 // recordMalformedLines accumulates an agent's parser malformed-line count for
-// one source file. A single source file can fork into several sessions (e.g.
-// Claude subagents) that each carry the same source-level count, so the count
-// is recorded once per non-empty source path to avoid multiplying a single
-// malformed line across the fork. Sessions with no source path (DB-backed
-// agents) are recorded as-is.
+// one source file, along with the file's payload-free per-class drop records
+// when the parser produced them. A single source file can fork into several
+// sessions (e.g. Claude subagents) that each carry the same source-level
+// count, so the count is recorded once per non-empty source path to avoid
+// multiplying a single malformed line across the fork. Sessions with no
+// source path (DB-backed agents) are recorded as-is.
 func (a *anomalyAccumulator) recordMalformedLines(
-	agent, sourcePath string, n int,
+	agent, sourcePath string, n int, classes []parser.ParsedMalformedLineClass,
 ) {
 	if n <= 0 {
 		return
@@ -376,6 +412,27 @@ func (a *anomalyAccumulator) recordMalformedLines(
 		a.malformedFiles[sourcePath] = true
 	}
 	a.stats.RecordMalformedLines(agent, n)
+	for _, class := range classes {
+		if len(a.stats.MalformedLineSamples) >= maxMalformedLineSamplesPerRun {
+			return
+		}
+		// A record whose lane folds sources into one session (a brain
+		// transcript folded into its conversation's database session)
+		// names its own file; its line numbers refer to that file, not
+		// the session's primary source.
+		path := sourcePath
+		if class.SourcePath != "" {
+			path = class.SourcePath
+		}
+		a.stats.MalformedLineSamples = append(a.stats.MalformedLineSamples,
+			MalformedLineSample{
+				Agent: agent,
+				Path:  path,
+				Class: class.Class,
+				Count: class.Count,
+				Lines: class.Lines,
+			})
+	}
 }
 
 // recordUnknownSchemaSession attributes one unrecognized-schema session to the

@@ -39,7 +39,8 @@ import (
 // Trust posture (SECURITY.md, "Imports and new readers"): the transcript is
 // untrusted structured input. The read is size-capped, unknown sources and
 // malformed lines are skipped, and nothing read here is executed or echoed to
-// any outbound channel.
+// any outbound channel. Skipped lines are counted and sampled payload-free
+// (reason class and line number only) for diagnostics.
 
 const (
 	// antigravityBrainTranscriptName is the transcript's file name; the two
@@ -140,38 +141,99 @@ type antigravityBrainTranscriptEntry struct {
 	toolCalls []ParsedToolCall
 }
 
+// malformedLineTracker accumulates per-class drop counts and bounded
+// line-number samples for one transcript read. It records why and where a
+// line was dropped, never the line itself: dropped lines may hold secrets,
+// so the records stay payload-free.
+type malformedLineTracker struct {
+	classes map[string]*ParsedMalformedLineClass
+	order   []string
+}
+
+// record counts one dropped line of the given class at the 1-based line
+// number. Only the first MaxMalformedLineSamplesPerClass line numbers per
+// class are sampled; the count stays complete.
+func (m *malformedLineTracker) record(class string, line int) {
+	if m.classes == nil {
+		m.classes = make(map[string]*ParsedMalformedLineClass)
+	}
+	c, ok := m.classes[class]
+	if !ok {
+		c = &ParsedMalformedLineClass{Class: class}
+		m.classes[class] = c
+		m.order = append(m.order, class)
+	}
+	c.Count++
+	if len(c.Lines) < MaxMalformedLineSamplesPerClass {
+		c.Lines = append(c.Lines, line)
+	}
+}
+
+// records returns the accumulated classes in first-encounter order, or nil
+// when nothing was dropped.
+func (m *malformedLineTracker) records() []ParsedMalformedLineClass {
+	if len(m.order) == 0 {
+		return nil
+	}
+	out := make([]ParsedMalformedLineClass, 0, len(m.order))
+	for _, class := range m.order {
+		out = append(out, *m.classes[class])
+	}
+	return out
+}
+
+// malformedLineClassTotal returns the summed Count across classes.
+func malformedLineClassTotal(classes []ParsedMalformedLineClass) int {
+	var n int
+	for i := range classes {
+		n += classes[i].Count
+	}
+	return n
+}
+
 // readAntigravityBrainTranscript parses the transcript at path into entries
 // ordered by step_index. A line that is not an object, or that carries no
-// step fields at all, is skipped; the rest of the file still reads.
+// step fields at all, is skipped; the rest of the file still reads. Every
+// skipped line is counted and sampled, payload-free, in the returned
+// classes so the drop is no longer silent.
 func readAntigravityBrainTranscript(
 	path string,
-) ([]antigravityBrainTranscriptEntry, error) {
+) ([]antigravityBrainTranscriptEntry, []ParsedMalformedLineClass, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer f.Close()
 	data, err := io.ReadAll(
 		io.LimitReader(f, maxAntigravityBrainTranscriptBytes+1),
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if int64(len(data)) > maxAntigravityBrainTranscriptBytes {
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"antigravity brain transcript %s exceeds %d-byte cap",
 			path, int64(maxAntigravityBrainTranscriptBytes),
 		)
 	}
 
 	var entries []antigravityBrainTranscriptEntry
+	var drops malformedLineTracker
+	lineNumber := 0
 	for line := range strings.SplitSeq(string(data), "\n") {
+		lineNumber++
 		line = strings.TrimSpace(line)
-		if line == "" || !gjson.Valid(line) {
+		if line == "" {
+			// Blank separators are normal JSONL spacing, not drops.
+			continue
+		}
+		if !gjson.Valid(line) {
+			drops.record(MalformedLineInvalidJSON, lineNumber)
 			continue
 		}
 		parsed := gjson.Parse(line)
 		if !parsed.IsObject() {
+			drops.record(MalformedLineNotObject, lineNumber)
 			continue
 		}
 		entry := antigravityBrainTranscriptEntry{
@@ -184,6 +246,7 @@ func readAntigravityBrainTranscript(
 			toolCalls: antigravityBrainToolCalls(parsed.Get("tool_calls")),
 		}
 		if entry.source == "" && entry.stepType == "" {
+			drops.record(MalformedLineNoStepFields, lineNumber)
 			continue
 		}
 		if stamp := parsed.Get("created_at").Str; stamp != "" {
@@ -196,7 +259,14 @@ func readAntigravityBrainTranscript(
 	sort.SliceStable(entries, func(i, j int) bool {
 		return entries[i].stepIndex < entries[j].stepIndex
 	})
-	return entries, nil
+	// Stamp every record with the file it was dropped from, so a record
+	// folded into a session backed by a different source still points at
+	// the right lines.
+	classes := drops.records()
+	for i := range classes {
+		classes[i].SourcePath = path
+	}
+	return entries, classes, nil
 }
 
 // antigravityBrainToolCalls reads the tool_calls array of one step. Arguments
@@ -247,13 +317,14 @@ type antigravityBrainTranscriptStep struct {
 }
 
 // collectAntigravityBrainTranscriptSteps renders one step-indexed message per
-// logged step, in step order.
+// logged step, in step order, and returns the payload-free drop records for
+// the lines the read skipped.
 func collectAntigravityBrainTranscriptSteps(
 	path string,
-) ([]antigravityBrainTranscriptStep, error) {
-	entries, err := readAntigravityBrainTranscript(path)
+) ([]antigravityBrainTranscriptStep, []ParsedMalformedLineClass, error) {
+	entries, drops, err := readAntigravityBrainTranscript(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	steps := make([]antigravityBrainTranscriptStep, 0, len(entries))
 	for _, entry := range entries {
@@ -297,22 +368,25 @@ func collectAntigravityBrainTranscriptSteps(
 			},
 		})
 	}
-	return steps, nil
+	return steps, drops, nil
 }
 
 // collectAntigravityBrainTranscriptMessages renders one message per logged
-// step, in step order. Ordinals are assigned by the caller's own ordering
+// step, in step order, and returns the payload-free drop records for the
+// lines the read skipped. Ordinals are assigned by the caller's own ordering
 // pass when the messages join a database session.
-func collectAntigravityBrainTranscriptMessages(path string) ([]ParsedMessage, error) {
-	steps, err := collectAntigravityBrainTranscriptSteps(path)
+func collectAntigravityBrainTranscriptMessages(
+	path string,
+) ([]ParsedMessage, []ParsedMalformedLineClass, error) {
+	steps, drops, err := collectAntigravityBrainTranscriptSteps(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	messages := make([]ParsedMessage, len(steps))
 	for i, s := range steps {
 		messages[i] = s.msg
 	}
-	return messages, nil
+	return messages, drops, nil
 }
 
 // parseAntigravityBrainTranscriptSession parses a brain transcript that is a
@@ -325,7 +399,7 @@ func parseAntigravityBrainTranscriptSession(
 	if err != nil {
 		return nil, nil, fmt.Errorf("stat %s: %w", path, err)
 	}
-	messages, err := collectAntigravityBrainTranscriptMessages(path)
+	messages, drops, err := collectAntigravityBrainTranscriptMessages(path)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -363,15 +437,17 @@ func parseAntigravityBrainTranscriptSession(
 	}
 
 	sess := &ParsedSession{
-		ID:               antigravityIDPrefix + id,
-		Project:          project,
-		Machine:          machine,
-		Agent:            AgentAntigravity,
-		FirstMessage:     firstMessage,
-		StartedAt:        startedAt,
-		EndedAt:          endedAt,
-		MessageCount:     len(messages),
-		UserMessageCount: userCount,
+		ID:                   antigravityIDPrefix + id,
+		Project:              project,
+		Machine:              machine,
+		Agent:                AgentAntigravity,
+		FirstMessage:         firstMessage,
+		StartedAt:            startedAt,
+		EndedAt:              endedAt,
+		MessageCount:         len(messages),
+		UserMessageCount:     userCount,
+		MalformedLines:       malformedLineClassTotal(drops),
+		MalformedLineClasses: drops,
 		File: FileInfo{
 			Path:  path,
 			Size:  info.Size(),

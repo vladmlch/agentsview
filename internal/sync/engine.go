@@ -19299,6 +19299,7 @@ func (e *Engine) prepareSessionNormalizedContext(
 	e.anomalies.recordSanitize(prepared.Validation)
 	e.anomalies.recordMalformedLines(
 		s.Agent, pw.sess.File.Path, s.ParserMalformedLines,
+		pw.sess.MalformedLineClasses,
 	)
 	// An Antigravity session decoded from an unrecognized (newer) schema
 	// carries an "agy-schema:" source_version; count it as an early warning

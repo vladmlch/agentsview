@@ -15,6 +15,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	stdsync "sync"
 	"syscall"
@@ -2164,6 +2165,19 @@ func formatAnomalySummary(a sync.AnomalyStats) string {
 		) {
 			fmt.Fprintf(&b,
 				"    %s: %d\n", agent, a.MalformedLinesByAgent[agent],
+			)
+		}
+		// Payload-free quarantine records: where the malformed lines sit,
+		// never what they say.
+		for _, sample := range a.MalformedLineSamples {
+			lines := make([]string, 0, len(sample.Lines))
+			for _, line := range sample.Lines {
+				lines = append(lines, strconv.Itoa(line))
+			}
+			fmt.Fprintf(&b,
+				"    %s: %s: %s: %d line(s), first at %s\n",
+				sample.Agent, sample.Path, sample.Class, sample.Count,
+				strings.Join(lines, ", "),
 			)
 		}
 	}

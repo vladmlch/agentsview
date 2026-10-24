@@ -122,7 +122,7 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 	// stays empty for legacy .pb and sidecar-only sessions where no schema
 	// is available, so SourceVersion is never fabricated.
 	var sourceVersion string
-	brainTranscriptSteps, brainTranscriptErr := collectAntigravityBrainTranscriptSteps(
+	brainTranscriptSteps, _, brainTranscriptErr := collectAntigravityBrainTranscriptSteps(
 		antigravityBrainTranscriptPath(root, id),
 	)
 	if brainTranscriptErr != nil && !os.IsNotExist(brainTranscriptErr) {

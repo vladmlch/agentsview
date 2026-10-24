@@ -226,8 +226,9 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 	)
 	// The brain's own transcript of this conversation, when it wrote one. It is
 	// folded in here rather than stored as a second session so one conversation
-	// stays one session.
-	brainMessages, err := collectAntigravityBrainTranscriptMessages(
+	// stays one session. Its malformed-line drop records fold in with the
+	// messages, so a skipped transcript line is attributed to this session.
+	brainMessages, brainDrops, err := collectAntigravityBrainTranscriptMessages(
 		antigravityBrainTranscriptPath(root, id),
 	)
 	if err != nil && !os.IsNotExist(err) {
@@ -319,6 +320,12 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 			Size:  size,
 			Mtime: mtime,
 		},
+	}
+	if brainDrops != nil {
+		sess.MalformedLines += malformedLineClassTotal(brainDrops)
+		sess.MalformedLineClasses = append(
+			sess.MalformedLineClasses, brainDrops...,
+		)
 	}
 	// Subagent link precedence: the brain descriptor is authoritative,
 	// then the agy-reader sidecar's parentCascadeId (mirroring the CLI

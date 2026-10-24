@@ -3909,7 +3909,6 @@ func TestSeedCodexIncrementalStatePropagatesReaderError(t *testing.T) {
 	_, err := seedCodexIncrementalStateFromReader(t.Context(), AgentCodex,
 		iotest.ErrReader(wantErr),
 		nil,
-		nil,
 	)
 
 	require.ErrorIs(t, err, wantErr)

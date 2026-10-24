@@ -2542,6 +2542,25 @@ func TestFormatAnomalySummary(t *testing.T) {
 			},
 		},
 		{
+			name: "malformed line samples render class and lines, no payload",
+			anomalies: agentsync.AnomalyStats{
+				MalformedLinesByAgent: map[string]int{"antigravity": 4},
+				MalformedLinesTotal:   4,
+				MalformedLineSamples: []agentsync.MalformedLineSample{{
+					Agent: "antigravity",
+					Path:  "/home/u/.gemini/antigravity/brain/id/.system_generated/logs/transcript.jsonl",
+					Class: "malformed_json",
+					Count: 3,
+					Lines: []int{2, 7, 9},
+				}},
+			},
+			wantContain: []string{
+				"malformed lines: 4 total",
+				"antigravity: 4",
+				"antigravity: /home/u/.gemini/antigravity/brain/id/.system_generated/logs/transcript.jsonl: malformed_json: 3 line(s), first at 2, 7, 9",
+			},
+		},
+		{
 			name: "unknown schema sessions only",
 			anomalies: agentsync.AnomalyStats{
 				UnknownSchemaSessionsByAgent: map[string]int{
