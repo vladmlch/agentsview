@@ -257,10 +257,7 @@ func (s *Server) humaDataCompact(
 	}
 	if errors.Is(err, syncpkg.ErrSyncInProgress) ||
 		errors.Is(err, db.ErrCompactInProgress) {
-		return nil, apiError(
-			http.StatusConflict,
-			"another archive maintenance operation is already running",
-		)
+		return nil, maintenanceBusyError()
 	}
 	if handled := handleHumaContextError(err); handled != nil {
 		return nil, handled
@@ -355,10 +352,7 @@ func (s *Server) humaDataStripImages(
 	})
 	if errors.Is(err, syncpkg.ErrSyncInProgress) ||
 		errors.Is(err, db.ErrCompactInProgress) {
-		return nil, apiError(
-			http.StatusConflict,
-			"another archive maintenance operation is already running",
-		)
+		return nil, maintenanceBusyError()
 	}
 	if handled := handleHumaContextError(err); handled != nil {
 		return nil, handled

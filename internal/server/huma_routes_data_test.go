@@ -686,6 +686,9 @@ func TestDataStripImagesReturnsBusyWhileEngineHeld(t *testing.T) {
 
 	w := te.post(t, "/api/v1/data/strip-images", `{"confirmed":true}`)
 	assertStatus(t, w, http.StatusConflict)
+	assert.Equal(t, "2", w.Header().Get("Retry-After"),
+		"the busy 409 must tell clients how long to back off "+
+			"(maintenanceBusyRetryAfterSeconds)")
 	assert.Zero(t, notified, "cleanup rejected before writing must not notify")
 }
 
@@ -774,6 +777,9 @@ func TestDataCompactEndpointMapsBusyBarrierToConflict(t *testing.T) {
 			})
 			w := te.post(t, "/api/v1/data/compact", `{}`)
 			assertStatus(t, w, http.StatusConflict)
+			assert.Equal(t, "2", w.Header().Get("Retry-After"),
+				"the busy 409 must tell clients how long to back off "+
+					"(maintenanceBusyRetryAfterSeconds)")
 		})
 	}
 }

@@ -509,6 +509,27 @@ func writerClosedError() error {
 	)
 }
 
+// maintenanceBusyRetryAfterSeconds is the Retry-After hint returned when an
+// archive maintenance request is refused because a sync or compaction pass
+// already holds the engine's exclusive lock. Such a pass usually drains within
+// seconds, so this floor sits below writerClosedRetryAfterSeconds, which covers
+// the longer read-only maintenance barriers.
+const maintenanceBusyRetryAfterSeconds = "2"
+
+// maintenanceBusyError is the 409 + Retry-After response for an archive
+// maintenance request refused because another sync or compaction is already
+// running, so a well-behaved client backs off instead of retrying in a tight
+// loop.
+func maintenanceBusyError() error {
+	return huma.ErrorWithHeaders(
+		apiError(
+			http.StatusConflict,
+			"another archive maintenance operation is already running",
+		),
+		http.Header{"Retry-After": []string{maintenanceBusyRetryAfterSeconds}},
+	)
+}
+
 // rejectWriterClosedWrite fails a write endpoint before its stream body opens
 // while the archive writer is closed for a maintenance pass, so clients see
 // the 503 + Retry-After instead of an HTTP-200 SSE error event or a generic
