@@ -738,6 +738,11 @@ type Engine struct {
 	// loadAvgSampler is the load-governor injection seam; nil samples the
 	// system load average via gopsutil. See governor.go.
 	loadAvgSampler loadAvgSampler
+	// activeDeferNow and activeDeferSleep are the active-writer defer
+	// gate's clock and inter-sample wait seams; nil uses time.Now and
+	// time.Sleep. See active_defer.go.
+	activeDeferNow   func() time.Time
+	activeDeferSleep func(time.Duration)
 	// parseAdmissionObserver is a cardinality-test seam; result admission
 	// reports results seen and still held for the current source.
 	parseAdmissionObserver func(yielded, retained int)
@@ -12776,6 +12781,12 @@ func (e *Engine) processProviderFile(
 	// admission, after the source resolves, so every lane that reaches a
 	// parse decision sees the same budget. See applySourceByteBudget.
 	if res, budgeted := e.applySourceByteBudget(file, source); budgeted {
+		return res, true
+	}
+	// Active-writer defer (cass-style, freshness-only): a freshest-growing
+	// source skips this admission and re-enters on its next event or pass.
+	// See applyActiveWriteDefer.
+	if res, deferred := e.applyActiveWriteDefer(file, source); deferred {
 		return res, true
 	}
 	providerSemantics := provider.Capabilities().Sync
