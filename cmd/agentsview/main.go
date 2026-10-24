@@ -1883,13 +1883,14 @@ func fatal(format string, args ...any) {
 	os.Exit(1)
 }
 
-// cleanResyncTemp removes leftover temp database files from
-// a prior crashed resync.
+// cleanResyncTemp removes leftover temp database files from a prior crashed
+// resync. It shares the engine's orphan-sweep discipline: only the exact
+// <db>-resync{,-wal,-shm} family, regular non-symlink files, and older than
+// the engine's conservative orphan age. A younger family may be the live,
+// in-flight build of a worker resync pass (which holds no write-owner
+// flock), so it is left in place and logged instead of reaped.
 func cleanResyncTemp(dbPath string) {
-	tempPath := dbPath + "-resync"
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		os.Remove(tempPath + suffix)
-	}
+	sync.SweepResyncTemp(dbPath)
 }
 
 func runInitialSync(
