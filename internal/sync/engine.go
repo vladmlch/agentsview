@@ -2885,6 +2885,16 @@ const shelleyDBFile = "shelley.db"
 // form the temp database path during resync.
 const resyncTempSuffix = "-resync"
 
+// resyncTempOrphanAge is how old every member of a leftover resync temp
+// database family must be before a sweep may remove it. A live build keeps
+// its temp files' mtimes fresh (SQLite writes continuously during the bulk
+// load), so a younger leftover may belong to a concurrent pass — most
+// importantly the worker resync-build arm, which holds no write-owner flock
+// while the daemon has released it for the pass. flock(2) cannot detect
+// another process's SQLite fcntl locks, so age is the only portable
+// liveness signal available; until it passes, the family is treated as live.
+const resyncTempOrphanAge = time.Hour
+
 // closeWriterForResyncBarrier indirects db.CloseWriter so tests can inject a
 // barrier-establishment failure.
 var closeWriterForResyncBarrier = func(d *db.DB) error { return d.CloseWriter() }
@@ -3288,8 +3298,26 @@ func (e *Engine) resyncBuildLocked(
 		}
 	}
 
-	// Clean up stale temp DB from a prior crash.
-	removeTempDB(tempPath)
+	// Clean up stale temp DB from a prior crash. Orphanhood is proven
+	// conservatively: exact family names, regular files only, and at least
+	// resyncTempOrphanAge of age. When the family is not provably orphaned,
+	// refuse to build rather than reaping it or opening the leftover as a
+	// fresh replacement — either would corrupt a concurrent live builder's
+	// database. The no-error abort makes callers fall back to incremental
+	// sync, and the next pass sweeps the family once it ages out.
+	if cleared, _ := sweepResyncTempFamily(tempPath, resyncTempOrphanAge); !cleared {
+		warning := fmt.Sprintf(
+			"resync aborted: temp database %s is not provably orphaned "+
+				"(younger than %s or non-regular); a concurrent build may hold it",
+			tempPath, resyncTempOrphanAge,
+		)
+		log.Printf("resync: %s", warning)
+		stats = SyncStats{Aborted: true, Warnings: []string{warning}}
+		e.mu.Lock()
+		e.lastSyncStats = stats
+		e.mu.Unlock()
+		return stats, nil
+	}
 
 	// 1. Snapshot and clear in-memory skip cache. The
 	// snapshot is restored on early failure so behavior
@@ -4306,17 +4334,118 @@ func (e *Engine) setLastSyncStats(stats SyncStats) {
 	e.mu.Unlock()
 }
 
-// removeTempDB removes a temp database and its WAL/SHM files.
+// tempDBFamilyPaths lists the exact files a resync temp database occupies:
+// the main file plus SQLite's WAL and SHM sidecars. A sweep only ever
+// considers these names — the archive database itself is never a member.
+func tempDBFamilyPaths(path string) []string {
+	return []string{path, path + "-wal", path + "-shm"}
+}
+
+// sweepTempFiles removes the named files when every present member is
+// provably disposable: a regular file (never a symlink, never a directory)
+// whose mtime is at least minAge old. minAge <= 0 disables the age gate for
+// families this process itself created and just closed. It returns the bytes
+// reclaimed and whether every present member was removed. The check is
+// all-or-nothing: one non-qualifying member keeps the whole family in place,
+// because reaping half a live family (say its main file but not its WAL)
+// corrupts the build that owns it. Lstat is used deliberately so a symlink
+// is detected and skipped, never followed.
+func sweepTempFiles(paths []string, minAge time.Duration) (reclaimed int64, cleared bool) {
+	type victim struct {
+		path string
+		size int64
+	}
+	var victims []victim
+	for _, path := range paths {
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			log.Printf("resync: inspecting temp file %s: %v", path, err)
+			return 0, false
+		}
+		if !info.Mode().IsRegular() {
+			log.Printf(
+				"resync: keeping non-regular temp file %s (mode %s)",
+				path, info.Mode(),
+			)
+			return 0, false
+		}
+		if minAge > 0 {
+			if age := time.Since(info.ModTime()); age < minAge {
+				log.Printf(
+					"resync: keeping recent temp file %s (age %s < %s); "+
+						"a concurrent build may hold it",
+					path, age.Round(time.Second), minAge,
+				)
+				return 0, false
+			}
+		}
+		victims = append(victims, victim{path: path, size: info.Size()})
+	}
+	for _, v := range victims {
+		if err := os.Remove(v.path); err != nil {
+			log.Printf("resync: removing temp file %s: %v", v.path, err)
+			return reclaimed, false
+		}
+		reclaimed += v.size
+	}
+	return reclaimed, true
+}
+
+// sweepResyncTempFamily sweeps a leftover resync temp database family at
+// tempPath under the orphan age gate, logging the reclaimed byte total. It
+// reports whether the family is fully gone, so callers about to stage a
+// fresh build know the path is clear.
+func sweepResyncTempFamily(tempPath string, minAge time.Duration) (cleared bool, reclaimed int64) {
+	reclaimed, cleared = sweepTempFiles(tempDBFamilyPaths(tempPath), minAge)
+	if reclaimed > 0 {
+		log.Printf(
+			"resync: swept stale temp database %s (reclaimed %d bytes)",
+			tempPath, reclaimed,
+		)
+	}
+	return cleared, reclaimed
+}
+
+// SweepResyncTemp removes a leftover resync temp database family next to
+// dbPath when it is provably orphaned: exact <db>-resync{,-wal,-shm} names,
+// regular non-symlink files, and older than the conservative orphan age. It
+// never touches the archive database itself. It is the shared startup sweep
+// for the CLI and daemon; a family that fails the test is left in place and
+// logged, because the worker resync-build arm holds no write-owner flock and
+// a young family may be its live, in-flight replacement archive.
+func SweepResyncTemp(dbPath string) (cleared bool, reclaimedBytes int64) {
+	return sweepResyncTempFamily(dbPath+resyncTempSuffix, resyncTempOrphanAge)
+}
+
+// removeTempDB removes a temp database and its WAL/SHM files after this
+// process created and closed them: the age gate is off, but the
+// regular-file, no-symlink, and no-directory checks stay armed so cleanup
+// can never follow a symlink or remove a directory, and removals are logged
+// with their byte total.
 func removeTempDB(path string) {
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		os.Remove(path + suffix)
+	reclaimed, _ := sweepTempFiles(tempDBFamilyPaths(path), 0)
+	if reclaimed > 0 {
+		log.Printf(
+			"resync: removed temp database %s (reclaimed %d bytes)",
+			path, reclaimed,
+		)
 	}
 }
 
-// removeWAL removes WAL and SHM files for a database path.
+// removeWAL removes WAL and SHM files for a database path. It only ever
+// touches the exact sidecar names, never the database file itself, and
+// skips symlinks and directories.
 func removeWAL(path string) {
-	os.Remove(path + "-wal")
-	os.Remove(path + "-shm")
+	reclaimed, _ := sweepTempFiles([]string{path + "-wal", path + "-shm"}, 0)
+	if reclaimed > 0 {
+		log.Printf(
+			"resync: removed WAL sidecars for %s (reclaimed %d bytes)",
+			path, reclaimed,
+		)
+	}
 }
 
 func countRootSessionsForAgent(ctx context.Context,
