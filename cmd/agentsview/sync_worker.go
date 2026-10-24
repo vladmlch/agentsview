@@ -118,6 +118,11 @@ func runSyncWorker(cfg config.Config, request syncWorkerRequest, out io.Writer) 
 func runSyncWorkerContext(
 	ctx context.Context, cfg config.Config, request syncWorkerRequest, out io.Writer,
 ) error {
+	// Demote the child's scheduling priority before any heavy work so
+	// background indexing does not compete with interactive use (av-6).
+	// This is the only process doing archive-scale parsing in production;
+	// best-effort, never fails the pass (see sync_demote.go).
+	demoteSyncWorkerPass()
 	mode := request.Mode
 	stopProfile := startSyncWorkerProfile(mode)
 	defer stopProfile()
