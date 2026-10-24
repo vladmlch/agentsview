@@ -211,6 +211,16 @@ type AnomalyStats struct {
 	// QuarantineRetriesTotal is the grand total across all classes.
 	QuarantineRetriesTotal int `json:"quarantine_retries_total,omitempty"`
 
+	// ActiveDefersByAgent maps an agent type to the number of source files
+	// this run whose parse admission was deferred by the active-writer
+	// gate: the source was inside the recency window and still growing
+	// between the two admission stats, so parsing it would mostly reparse
+	// the same append on the writer's next event. Skips are deduped per
+	// source, so a source deferred on several lanes counts once.
+	ActiveDefersByAgent map[string]int `json:"active_defers_by_agent,omitempty"`
+	// ActiveDefersTotal is the grand total across all agents.
+	ActiveDefersTotal int `json:"active_defers_total,omitempty"`
+
 	// Sanitize aggregates the central validation/sanitization fix counts
 	// across every session, message, and usage event written this run.
 	Sanitize SanitizeStats `json:"sanitize,omitzero"`
@@ -267,6 +277,7 @@ func (a *AnomalyStats) IsZero() bool {
 		a.GenMetadataWithoutUsageTotal == 0 &&
 		a.QuarantineSkipsTotal == 0 &&
 		a.QuarantineRetriesTotal == 0 &&
+		a.ActiveDefersTotal == 0 &&
 		a.Sanitize.IsZero()
 }
 
@@ -350,6 +361,19 @@ func (a *AnomalyStats) RecordQuarantineRetries(class string, n int) {
 	a.QuarantineRetriesTotal += n
 }
 
+// RecordActiveDefers attributes n active-writer admission deferrals to the
+// given agent and updates the grand total. A non-positive count is ignored.
+func (a *AnomalyStats) RecordActiveDefers(agent string, n int) {
+	if n <= 0 {
+		return
+	}
+	if a.ActiveDefersByAgent == nil {
+		a.ActiveDefersByAgent = make(map[string]int)
+	}
+	a.ActiveDefersByAgent[agent] += n
+	a.ActiveDefersTotal += n
+}
+
 // addSanitize accumulates the per-category counts from one
 // validateAndSanitize pass into the aggregate.
 func (a *AnomalyStats) addSanitize(v validationStats) {
@@ -386,6 +410,9 @@ func (a *AnomalyStats) merge(o AnomalyStats) {
 	for class, n := range o.QuarantineRetriesByClass {
 		a.RecordQuarantineRetries(class, n)
 	}
+	for agent, n := range o.ActiveDefersByAgent {
+		a.RecordActiveDefers(agent, n)
+	}
 	a.Sanitize.ControlCharsStripped += o.Sanitize.ControlCharsStripped
 	a.Sanitize.ModelClamped += o.Sanitize.ModelClamped
 	a.Sanitize.TokensClamped += o.Sanitize.TokensClamped
@@ -411,6 +438,9 @@ type anomalyAccumulator struct {
 	// quarantineSkips tracks cache keys whose quarantine admission denial
 	// has already been counted this run. Reset each run.
 	quarantineSkips map[string]bool
+	// activeDefers tracks cache keys whose active-writer admission deferral
+	// has already been counted this run. Reset each run.
+	activeDefers map[string]bool
 }
 
 // reset clears the accumulator at the start of a sync run.
@@ -420,6 +450,7 @@ func (a *anomalyAccumulator) reset() {
 	a.malformedFiles = nil
 	a.unsupportedSources = nil
 	a.quarantineSkips = nil
+	a.activeDefers = nil
 	a.mu.Unlock()
 }
 
@@ -528,6 +559,23 @@ func (a *anomalyAccumulator) recordQuarantineSkip(agent, key string) {
 	}
 	a.quarantineSkips[key] = true
 	a.stats.RecordQuarantineSkips(agent, 1)
+}
+
+// recordActiveDefer counts one parse-admission deferral for a source the
+// active-writer gate caught still growing inside its recency window. A
+// source deferred on several lanes in one run counts once, mirroring the
+// quarantine-skip dedup.
+func (a *anomalyAccumulator) recordActiveDefer(agent, key string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.activeDefers == nil {
+		a.activeDefers = make(map[string]bool)
+	}
+	if a.activeDefers[key] {
+		return
+	}
+	a.activeDefers[key] = true
+	a.stats.RecordActiveDefers(agent, 1)
 }
 
 // recordQuarantineRetry counts parse failures recorded against an existing
