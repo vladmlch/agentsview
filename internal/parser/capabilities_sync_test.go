@@ -152,6 +152,18 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 			FingerprintHashInCacheKey:           true,
 			FingerprintHashRequiredForFreshness: true,
 		},
+		// The antigravity lanes' composite stat (sum of sizes, max of mtimes)
+		// cannot distinguish a same-size, same-mtime rewrite of the source or
+		// a companion, so the fingerprint's content hash must gate every
+		// stat-matching skip while the per-component stat digest
+		// (ctime+inode, persisted in provider_freshness) keeps warm passes
+		// stat-only.
+		AgentAntigravity: {
+			FingerprintHashRequiredForFreshness: true,
+		},
+		AgentAntigravityCLI: {
+			FingerprintHashRequiredForFreshness: true,
+		},
 	}
 
 	for _, factory := range ProviderFactories() {

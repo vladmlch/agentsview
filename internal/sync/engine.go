@@ -15850,9 +15850,11 @@ func (e *Engine) providerIncrementalContentChanged(ctx context.Context,
 // delegate to parser.CodebuffCompanionMtime, which is the single
 // source of truth for the max(chat, run-state, chat-meta) derivation;
 // Codex folds session_index.jsonl exactly as its fingerprint stamps
-// file_mtime (parser.CodexEffectiveMtime), so a cold→warm cycle does
-// not drift; other MultiFileStatHasher agents fall through to
-// chat-only since they have no sibling companions to fold in.
+// file_mtime (parser.CodexEffectiveMtime); the antigravity agents stamp the
+// composite max-mtime of AntigravityFileInfo/AntigravityCLIFileInfo, so
+// their digest skip returns that same composite mtime; other
+// MultiFileStatHasher agents fall through to chat-only since they have no
+// sibling companions to fold in.
 func (e *Engine) providerStatFreshnessMtime(
 	agent parser.AgentType,
 	lookupPath string,
@@ -15865,6 +15867,16 @@ func (e *Engine) providerStatFreshnessMtime(
 		return e.codexMetadata().EffectiveMtime(
 			lookupPath, chatInfo.ModTime().UnixNano(),
 		)
+	case parser.AgentAntigravity:
+		if effInfo, err := parser.AntigravityFileInfo(lookupPath); err == nil {
+			return effInfo.ModTime().UnixNano()
+		}
+		return chatInfo.ModTime().UnixNano()
+	case parser.AgentAntigravityCLI:
+		if effInfo, err := parser.AntigravityCLIFileInfo(lookupPath); err == nil {
+			return effInfo.ModTime().UnixNano()
+		}
+		return chatInfo.ModTime().UnixNano()
 	default:
 		return chatInfo.ModTime().UnixNano()
 	}

@@ -1470,6 +1470,8 @@ func TestSyncEngineProviderStatHashersRegistrationIsCapabilityGated(t *testing.T
 		parser.AgentClaude,
 		parser.AgentCodex,
 		parser.AgentTraeX,
+		parser.AgentAntigravity,
+		parser.AgentAntigravityCLI,
 	} {
 		require.NotNil(t, engine.ProviderStatHasher(agent),
 			"%s declares Source.MultiFileStatHash=Supported and "+
