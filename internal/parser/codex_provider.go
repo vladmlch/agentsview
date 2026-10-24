@@ -643,14 +643,13 @@ func ParseCodexSessionStreaming(
 		return nil, nil, nil, nil, "", "",
 			errors.New("codex source path unavailable")
 	}
-	f, err := os.Open(path)
+	f, info, cleanup, err := openCodexTranscript(path)
 	if err != nil {
-		return nil, nil, nil, nil, "", "", fmt.Errorf("open %s: %w", path, err)
+		return nil, nil, nil, nil, "", "", err
 	}
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, nil, nil, nil, "", "", fmt.Errorf("stat %s: %w", path, err)
+	if cleanup != nil {
+		defer cleanup()
 	}
 	obs := cp.parseObserver(path, sink)
 	obs.emitParseStarted("full", 0, info.Size(), false)
@@ -695,6 +694,16 @@ func (p *codexProvider) ParseIncremental(
 	if !ok {
 		return IncrementalOutcome{}, IncrementalUnsupported,
 			errors.New("codex source path unavailable")
+	}
+	if !codexTranscriptSupportsResume(path) {
+		// Compressed .jsonl.zst rollouts parse through a decompressed
+		// temporary copy, so stored byte offsets describe bytes no later
+		// open can re-align with; legacy .json containers carry no
+		// line-aligned boundaries at all. Neither is delta-resumable —
+		// rebuild through a full parse.
+		p.emitIncrementalFallback(path, "non_resumable_transcript", 0)
+		return IncrementalOutcome{ForceReplace: true},
+			IncrementalNeedsFullParse, nil
 	}
 	obs := p.parseObserver(path, nil)
 	obs.emitParseStarted(
@@ -1094,12 +1103,13 @@ func (s codexSourceSet) findSourceFile(sessionsDir, sessionID string) string {
 }
 
 // isMatchingCodexContinuationFile reports whether filename matches threadID,
-// either by a segment suffix "_<threadID>.jsonl" (Pattern A) or by direct UUID match (Pattern B).
+// either by a segment suffix "_<threadID>" before the rollout extension
+// (Pattern A) or by direct UUID match (Pattern B).
 func isMatchingCodexContinuationFile(filename, threadID string) bool {
 	if !isCodexSessionFilename(filename) {
 		return false
 	}
-	if strings.HasSuffix(filename, "_"+threadID+".jsonl") {
+	if strings.HasSuffix(codexRolloutStem(filename), "_"+threadID) {
 		return true
 	}
 	return extractUUIDFromRollout(filename) == threadID
@@ -1174,9 +1184,13 @@ func (s codexSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 			continue
 		}
 		roots = append(roots, WatchRoot{
-			Path:         root,
-			Recursive:    true,
-			IncludeGlobs: []string{"*.jsonl"},
+			Path:      root,
+			Recursive: true,
+			// The three released rollout extensions: live .jsonl
+			// transcripts, legacy whole-JSON .json rollouts, and
+			// compressed .jsonl.zst archives. Non-rollout names under
+			// the root are filtered by shape at classification time.
+			IncludeGlobs: []string{"*.jsonl", "*.json", "*.jsonl.zst"},
 			DebounceKey:  string(s.agent) + ":sessions:" + root,
 		})
 		if !s.ownsCodexSidecars() {
@@ -1401,7 +1415,12 @@ func (s codexSourceSet) directPathSource(
 ) (SourceRef, bool) {
 	root = filepath.Clean(root)
 	path = filepath.Clean(path)
-	if !strings.HasSuffix(path, ".jsonl") || !pathUnderRoot(root, path) {
+	// Direct (layout-less) admission is limited to rollout-shaped names so
+	// non-rollout .jsonl/.json/.zst files that appear under the sessions
+	// root stay ignored; the UUID shape itself is validated by
+	// CodexSessionPathInfo before this fallback is consulted.
+	if !isCodexSessionFilename(filepath.Base(path)) ||
+		!pathUnderRoot(root, path) {
 		return SourceRef{}, false
 	}
 	if requireRegular && !IsRegularFile(path) {

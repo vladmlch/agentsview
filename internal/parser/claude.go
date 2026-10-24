@@ -92,7 +92,7 @@ func claudeParseFile(
 		return nil, nil, fmt.Errorf("stat %s: %w", path, err)
 	}
 
-	sessionID := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	sessionID := claudeSessionStemFromPath(path)
 
 	// Background-fork lineage: when the transcript is a bg-marked fork
 	// that replays a non-bg sibling, drop the replayed prefix and link
@@ -155,8 +155,18 @@ func claudeParseFile(
 		parentSessionID = lineage.parentSessionID
 	}
 
+	// The hash tee wraps the raw file bytes so the session hash covers the
+	// original source — container or not. For whole-JSON <uuid>.json
+	// containers a converter sits above the tee, flattening the array into
+	// JSONL lines as it is consumed; JSONL content in a .json file passes
+	// through the converter unchanged.
 	tee := newCodexHashAnchorTee(io.LimitReader(f, info.Size()))
-	lr := newLineReaderContext(ctx, tee, maxLineSize)
+	lineSource := io.Reader(tee)
+	container := isClaudeWholeJSONSessionFilename(filepath.Base(path))
+	if container {
+		lineSource = newJSONContainerJSONLReader(tee)
+	}
+	lr := newLineReaderContext(ctx, lineSource, maxLineSize)
 	defer releaseLineReader(lr)
 	lastLineFailed := false
 	for {
@@ -556,7 +566,11 @@ func claudeParseFile(
 			break
 		}
 	}
-	if !opts.uploadIdentity && lineage == nil && !lastLineFailed && len(kept) == 1 && lastEntryUUID != "" {
+	// Whole-JSON containers never earn resume cursors: the engine's
+	// byte-offset appends describe JSONL positions that do not map back
+	// onto the container's single JSON document.
+	if !opts.uploadIdentity && lineage == nil && !lastLineFailed &&
+		!container && len(kept) == 1 && lastEntryUUID != "" {
 		hashState, stateErr := tee.HashState()
 		if stateErr == nil {
 			kept[0].Checkpoint = []byte(lastEntryUUID)
