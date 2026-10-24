@@ -2132,40 +2132,72 @@ type codexContinuationSegment struct {
 }
 
 func readCodexSessionMetaHeader(path string) (gjson.Result, error) {
-	f, err := os.Open(path)
+	// newHeaderSource opens a fresh read stream from the transcript's
+	// start. Compressed rollouts wrap the file in the shared zstd decoder;
+	// the first-line probe and the whole-stream fallback each need an
+	// independent stream.
+	newHeaderSource := func() (io.Reader, func(), error) {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !isCodexCompressedTranscript(path) {
+			return f, func() { f.Close() }, nil
+		}
+		decoder, err := newCodexZstdDecoder(f)
+		if err != nil {
+			f.Close()
+			return nil, nil, fmt.Errorf("open zstd stream %s: %w", path, err)
+		}
+		return decoder, func() {
+			decoder.Close()
+			f.Close()
+		}, nil
+	}
+
+	source, closeSource, err := newHeaderSource()
 	if err != nil {
 		return gjson.Result{}, err
 	}
-	defer f.Close()
+	defer closeSource()
 
-	reader := bufio.NewReader(f)
+	reader := bufio.NewReader(source)
 	line, err := reader.ReadBytes('\n')
 	if err != nil && len(line) == 0 {
 		return gjson.Result{}, err
 	}
-	if gjson.Get(string(line), "type").Str == codexTypeSessionMeta {
+	// A compact whole-JSON container can put the entire array before the
+	// first newline; gjson would answer a "type" query from the array's
+	// first element and misreport the array itself as the header. Array
+	// openers always fall through to the stream decoder below, which
+	// splits containers into their items.
+	if !bytes.HasPrefix(bytes.TrimSpace(line), []byte("[")) &&
+		gjson.Get(string(line), "type").Str == codexTypeSessionMeta {
 		return gjson.Get(string(line), "payload"), nil
 	}
-	if _, seekErr := f.Seek(0, io.SeekStart); seekErr == nil {
-		dec := json.NewDecoder(f)
-		for {
-			var raw json.RawMessage
-			if decErr := dec.Decode(&raw); decErr != nil {
-				break
-			}
-			trimmed := bytes.TrimSpace(raw)
-			if bytes.HasPrefix(trimmed, []byte("[")) {
-				var items []json.RawMessage
-				if err := json.Unmarshal(trimmed, &items); err == nil {
-					for _, item := range items {
-						if gjson.Get(string(item), "type").Str == codexTypeSessionMeta {
-							return gjson.Get(string(item), "payload"), nil
-						}
+	source, closeSource, err = newHeaderSource()
+	if err != nil {
+		return gjson.Result{}, nil //nolint:nilerr // An unreadable fallback leaves no header, matching the prior seek-failure behavior.
+	}
+	defer closeSource()
+	dec := json.NewDecoder(source)
+	for {
+		var raw json.RawMessage
+		if decErr := dec.Decode(&raw); decErr != nil {
+			break
+		}
+		trimmed := bytes.TrimSpace(raw)
+		if bytes.HasPrefix(trimmed, []byte("[")) {
+			var items []json.RawMessage
+			if err := json.Unmarshal(trimmed, &items); err == nil {
+				for _, item := range items {
+					if gjson.Get(string(item), "type").Str == codexTypeSessionMeta {
+						return gjson.Get(string(item), "payload"), nil
 					}
 				}
-			} else if gjson.Get(string(raw), "type").Str == codexTypeSessionMeta {
-				return gjson.Get(string(raw), "payload"), nil
 			}
+		} else if gjson.Get(string(raw), "type").Str == codexTypeSessionMeta {
+			return gjson.Get(string(raw), "payload"), nil
 		}
 	}
 	return gjson.Result{}, nil
@@ -2275,15 +2307,13 @@ func (p *codexProvider) feedContinuationSegment(
 	b *codexSessionBuilder,
 	malformedLines *int,
 ) error {
-	f, err := os.Open(seg.path)
+	f, info, cleanup, err := openCodexTranscript(seg.path)
 	if err != nil {
-		return nil
+		return nil //nolint:nilerr // An unreadable optional segment is skipped, matching the prior open-failure behavior.
 	}
 	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return nil
+	if cleanup != nil {
+		defer cleanup()
 	}
 
 	lr := newLineReaderContext(ctx, io.LimitReader(f, info.Size()), maxLineSize)
@@ -2331,7 +2361,14 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 		return nil, nil, codexCursorState{}, false, nil, "", "", err
 	}
 	// The tee hashes decoded bytes; the snapshot separately hashes the source.
+	// Legacy .json rollouts are whole-JSON containers (an array of records
+	// or one multi-line document). Their bytes carry no line-aligned record
+	// boundaries, so the JSONL pass is skipped entirely: a compact
+	// single-line array would otherwise pass the per-line validity check
+	// and be processed as one synthetic record built from the array's
+	// first element.
 	f, info := snapshot.File, snapshot.Source
+	wholeJSONContainer := strings.HasSuffix(filepath.Base(path), ".json")
 	tee := newCodexHashAnchorTee(snapshot.Reader)
 	lr := newLineReaderContext(ctx, tee, maxLineSize)
 	defer releaseLineReader(lr)
@@ -2342,55 +2379,68 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 	b.obs = obs
 	b.resolveCanonicalParent = p.canonicalParentResolver(ctx, path)
 	malformedLines := 0
+	validRecords := 0
 	continuationLoaded := false
 	lineNo := 0
 
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, nil, codexCursorState{}, false, nil, "", "", err
-		}
-		line, ok := lr.next()
-		if !ok {
-			break
-		}
-		lineNo++
-		obs.emitLineClassified(lineNo, lr.bytesRead, line)
-		if !gjson.Valid(line) {
-			// A writer may leave its final JSON record incomplete while the
-			// session is live. Count terminated malformed records, and count an
-			// unterminated tail only when the caller owns a stable snapshot.
-			if lr.terminated || p.Config.StableSourceSnapshots {
-				malformedLines++
-			}
-			continue
-		}
-		if !continuationLoaded && gjson.Get(line, "type").Str == codexTypeSessionMeta {
-			continuationLoaded = true
-			if err := p.loadCodexContinuationSegments(
-				ctx, path, line, b, &malformedLines,
-			); err != nil {
+	if !wholeJSONContainer {
+		for {
+			if err := ctx.Err(); err != nil {
 				return nil, nil, codexCursorState{}, false, nil, "", "", err
 			}
+			line, ok := lr.next()
+			if !ok {
+				break
+			}
+			lineNo++
+			obs.emitLineClassified(lineNo, lr.bytesRead, line)
+			if !gjson.Valid(line) {
+				// A writer may leave its final JSON record incomplete while the
+				// session is live. Count terminated malformed records, and count an
+				// unterminated tail only when the caller owns a stable snapshot.
+				if lr.terminated || p.Config.StableSourceSnapshots {
+					malformedLines++
+				}
+				continue
+			}
+			validRecords++
+			if !continuationLoaded && gjson.Get(line, "type").Str == codexTypeSessionMeta {
+				continuationLoaded = true
+				if err := p.loadCodexContinuationSegments(
+					ctx, path, line, b, &malformedLines,
+				); err != nil {
+					return nil, nil, codexCursorState{}, false, nil, "", "", err
+				}
+			}
+			skip, err := b.processLine(ctx, line)
+			if err != nil {
+				return nil, nil, codexCursorState{}, false, nil, "", "", err
+			}
+			if skip {
+				return nil, nil, codexCursorState{}, false, nil, "", "", nil
+			}
 		}
-		skip, err := b.processLine(ctx, line)
-		if err != nil {
-			return nil, nil, codexCursorState{}, false, nil, "", "", err
-		}
-		if skip {
-			return nil, nil, codexCursorState{}, false, nil, "", "", nil
+
+		if err := lr.Err(); err != nil {
+			return nil, nil,
+				codexCursorState{}, false, nil, "", "",
+				fmt.Errorf("reading codex %s: %w", path, err)
 		}
 	}
 
-	if err := lr.Err(); err != nil {
-		return nil, nil,
-			codexCursorState{}, false, nil, "", "",
-			fmt.Errorf("reading codex %s: %w", path, err)
-	}
-
-	if b.sessionID == "" && malformedLines > 0 {
-		if _, seekErr := f.Seek(0, io.SeekStart); seekErr == nil {
+	// A snapshot that produced no valid single-line record may still be a
+	// multi-line JSON document or an array of records, so retry it as a
+	// JSON stream. The fallback must stay below "any valid record": for
+	// ordinary JSONL with a damaged or missing session_meta the first
+	// pass's salvaged lines are authoritative, while the decoder stops at
+	// the first undecodable record and would republish a truncated
+	// session in their place. Whole-JSON .json containers always take this
+	// pass because their line pass never ran.
+	if validRecords == 0 && (malformedLines > 0 || wholeJSONContainer) {
+		if recovery, recErr := openCodexRolloutLines(path); recErr == nil {
+			defer recovery.Close()
 			sink.Reset()
-			tee = newCodexHashAnchorTee(io.LimitReader(f, info.Size()))
+			tee = newCodexHashAnchorTee(recovery)
 			b = newCodexSessionBuilder(
 				ctx, p.spec.agent, includeExec, p.parentTurnResolver(ctx, path), sink,
 			)
@@ -2480,9 +2530,11 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 	// remaining replayed parent records would be imported as child
 	// content. Refuse the checkpoint until a genuine child turn opens the
 	// gate; the file then reparses authoritatively and earns its cursor.
-	// A compressed rollout never earns one: its stored size is the
-	// compressed file's, which is no offset into the plain bytes.
-	if !snapshot.Compressed && !b.forkGate.active && !b.pendingCallsOverflow && !b.checkpointUnsafe {
+	// Compressed and whole-JSON transcripts never earn cursors at all:
+	// their offsets do not describe line-aligned resume boundaries a
+	// later open could reuse (codexTranscriptSupportsResume).
+	if !b.forkGate.active && !b.pendingCallsOverflow && !b.checkpointUnsafe &&
+		codexTranscriptSupportsResume(path) {
 		if safeCheck, safeErr := codexSafeResumeOffsetFile(
 			f, info.Size(),
 		); safeErr == nil && safeCheck {
@@ -2582,6 +2634,9 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 	if err := accumulateMessageTokenUsageContext(ctx, sess, msgs); err != nil {
 		return nil, nil, codexCursorState{}, false, nil, "", "", err
 	}
+	// A compressed rollout parsed through its decompressed temporary copy
+	// must report the on-disk source's stat identity, not the temp file's.
+	rebindCodexZstSessionFile(p, sess, path)
 	// A complete source hash is useful even when continuation state cannot
 	// fit a checkpoint or the snapshot ends in a partial JSONL record.
 	fullHash, err := tee.HashDigest()

@@ -31,14 +31,17 @@ import (
 // into their compressed bytes.
 const (
 	codexRolloutSuffix           = ".jsonl"
+	codexLegacyJSONRolloutSuffix = ".json"
 	codexCompressedRolloutSuffix = ".jsonl.zst"
 )
 
-// hasCodexRolloutSuffix reports whether path names a rollout in either of
-// the forms Codex writes.
+// hasCodexRolloutSuffix reports whether path names a rollout in any of
+// the forms Codex writes: .jsonl live transcripts, .json legacy whole-JSON
+// rollouts, or .jsonl.zst compressed archives.
 func hasCodexRolloutSuffix(path string) bool {
 	return strings.HasSuffix(path, codexRolloutSuffix) ||
-		strings.HasSuffix(path, codexCompressedRolloutSuffix)
+		strings.HasSuffix(path, codexCompressedRolloutSuffix) ||
+		strings.HasSuffix(path, codexLegacyJSONRolloutSuffix)
 }
 
 // isCompressedCodexRolloutPath reports whether path is the compressed form.
@@ -52,11 +55,13 @@ func codexPlainRolloutPath(path string) string {
 	return codexRolloutStem(path) + codexRolloutSuffix
 }
 
-// codexRolloutStem strips the plain or compressed rollout suffix from a
-// filename, so both forms of one rollout share a stem.
+// codexRolloutStem strips the plain, legacy-JSON, or compressed rollout
+// suffix from a filename, so all forms of one rollout share a stem. The
+// compressed suffix must be trimmed before the plain one it contains.
 func codexRolloutStem(name string) string {
 	name = strings.TrimSuffix(name, codexCompressedRolloutSuffix)
-	return strings.TrimSuffix(name, codexRolloutSuffix)
+	name = strings.TrimSuffix(name, codexRolloutSuffix)
+	return strings.TrimSuffix(name, codexLegacyJSONRolloutSuffix)
 }
 
 // codexRolloutSnapshot owns the source file and yields decoded bytes.

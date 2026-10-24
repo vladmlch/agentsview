@@ -391,6 +391,13 @@ func (p *claudeProvider) ParseIncremental(
 		return IncrementalOutcome{}, IncrementalUnsupported,
 			errors.New("claude source path unavailable")
 	}
+	if isClaudeWholeJSONSessionFilename(filepath.Base(path)) {
+		// Whole-JSON containers are immutable exports whose single JSON
+		// document has no byte-offset resume points; rebuild through a
+		// full parse.
+		return IncrementalOutcome{ForceReplace: true},
+			IncrementalNeedsFullParse, nil
+	}
 	if req.Offset > 0 && req.Fingerprint.Size < req.Offset {
 		return IncrementalOutcome{ForceReplace: true},
 			IncrementalNeedsFullParse, nil
@@ -498,9 +505,10 @@ type claudeSource struct {
 }
 
 // claudeSourceIsProjectLevel reports whether a discovered local source
-// is a top-level project transcript (root/<project>/<session>.jsonl).
-// Only those participate in background-fork sibling lineage: subagent
-// transcripts, materialized s3 objects, and uploads never do.
+// is a top-level project transcript (root/<project>/<session>.jsonl, or
+// a whole-JSON <uuid>.json container). Only those participate in
+// background-fork sibling lineage: subagent transcripts, materialized s3
+// objects, and uploads never do.
 func claudeSourceIsProjectLevel(source SourceRef, path string) bool {
 	var root string
 	switch src := source.Opaque.(type) {
@@ -522,8 +530,12 @@ func claudeSourceIsProjectLevel(source SourceRef, path string) bool {
 		return false
 	}
 	parts := strings.Split(rel, string(filepath.Separator))
-	return len(parts) == 2 && strings.HasSuffix(parts[1], ".jsonl") &&
-		!strings.HasPrefix(parts[1], "agent-")
+	if len(parts) == 2 && (strings.HasSuffix(parts[1], ".jsonl") ||
+		isClaudeWholeJSONSessionFilename(parts[1])) &&
+		!strings.HasPrefix(parts[1], "agent-") {
+		return true
+	}
+	return false
 }
 
 // claudeLayoutSpec parameterizes claudeSourceSet over the agents that store
@@ -554,8 +566,11 @@ func claudeLayoutSpecClaude() claudeLayoutSpec {
 		agent:         AgentClaude,
 		dirLabel:      "Claude project directory",
 		debounceScope: "projects",
-		watchGlobs:    []string{"*.jsonl"},
-		listFiles:     ClaudeProjectSessionFiles,
+		// JSONL transcripts plus whole-JSON <uuid>.json containers;
+		// non-session .json files under a project directory are filtered
+		// by the UUID stem gate at classification time.
+		watchGlobs: []string{"*.jsonl", "*.json"},
+		listFiles:  ClaudeProjectSessionFiles,
 	}
 }
 
@@ -675,7 +690,8 @@ func (s claudeSourceSet) streamLocalSubtree(ctx context.Context, root, path stri
 		return incompleteDiscoveryError(s.spec.agent, "resolve "+s.spec.dirLabel+" "+path, err)
 	}
 	emit := func(path string, entry os.DirEntry) error {
-		if !strings.HasSuffix(entry.Name(), ".jsonl") {
+		if !strings.HasSuffix(entry.Name(), ".jsonl") &&
+			!isClaudeWholeJSONSessionFilename(entry.Name()) {
 			return nil
 		}
 		if source, ok := s.sourceRef(root, path); ok {
@@ -957,8 +973,9 @@ func claudeProjectHintFromPath(root, path string) (string, bool) {
 		return "", false
 	}
 	parts := strings.Split(rel, string(filepath.Separator))
-	if len(parts) == 2 && strings.HasSuffix(parts[1], ".jsonl") {
-		stem := strings.TrimSuffix(parts[1], ".jsonl")
+	if len(parts) == 2 && (strings.HasSuffix(parts[1], ".jsonl") ||
+		isClaudeWholeJSONSessionFilename(parts[1])) {
+		stem := claudeSessionStemFromPath(path)
 		if strings.HasPrefix(stem, "agent-") {
 			return "", false
 		}

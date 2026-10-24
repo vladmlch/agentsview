@@ -531,8 +531,11 @@ func ProjectJSONLSessionCandidates(
 // (<root>/<project>/*.jsonl plus nested subagents trees) labeling each
 // DiscoveredFile with the owning agent, and routes s3:// roots through the
 // agent's own S3 scanner so the provider segment and agent metadata match.
-// Transient read errors on individual projects are skipped: a project
-// directory echoed by a concurrent watch may disappear mid-walk.
+// Whole-JSON <uuid>.json session containers discovered next to the JSONL
+// transcripts are admitted when no same-stem .jsonl exists, mirroring the
+// JSONL-over-JSON preference of the VSCode layout. Transient read errors on
+// individual projects are skipped: a project directory echoed by a
+// concurrent watch may disappear mid-walk.
 func projectJSONLSessionFiles(
 	projectsDir string,
 	agent AgentType,
@@ -563,10 +566,13 @@ func projectJSONLSessionFiles(
 		projDir := filepath.Join(projectsDir, entry.Name())
 		if wanted != nil && !nested {
 			for id := range wanted {
-				path := filepath.Join(projDir, id+".jsonl")
-				info, err := os.Lstat(path)
-				if err == nil && !info.IsDir() {
-					files = append(files, DiscoveredFile{Path: path, Project: entry.Name(), Agent: agent})
+				for _, name := range claudeSessionFileNames(id) {
+					path := filepath.Join(projDir, name)
+					info, err := os.Lstat(path)
+					if err == nil && !info.IsDir() {
+						files = append(files, DiscoveredFile{Path: path, Project: entry.Name(), Agent: agent})
+						break
+					}
 				}
 			}
 			continue
@@ -576,15 +582,34 @@ func projectJSONLSessionFiles(
 			continue
 		}
 
+		hasJSONL := make(map[string]bool)
+		for _, sf := range sessionFiles {
+			if sf.IsDir() {
+				continue
+			}
+			if stem, ok := strings.CutSuffix(sf.Name(), ".jsonl"); ok {
+				hasJSONL[stem] = true
+			}
+		}
+
 		for _, sf := range sessionFiles {
 			if sf.IsDir() {
 				continue
 			}
 			name := sf.Name()
-			if !strings.HasSuffix(name, ".jsonl") {
+			if !strings.HasSuffix(name, ".jsonl") &&
+				!isClaudeWholeJSONSessionFilename(name) {
 				continue
 			}
 			stem := strings.TrimSuffix(name, ".jsonl")
+			if stem == name {
+				// Whole-JSON container: only the same-stem JSONL file
+				// can shadow it.
+				stem = strings.TrimSuffix(name, ".json")
+				if hasJSONL[stem] {
+					continue
+				}
+			}
 			if wanted != nil {
 				if _, ok := wanted[stem]; !ok {
 					continue
@@ -707,6 +732,60 @@ func claudeEnclosingSubagentsDir(sessionPath string) string {
 	}
 }
 
+// isStandardUUIDShape reports whether s is a standard UUID
+// (8-4-4-4-12 hex, case-insensitive).
+func isStandardUUIDShape(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if (c < '0' || c > '9') &&
+				(c < 'a' || c > 'f') &&
+				(c < 'A' || c > 'F') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// isClaudeWholeJSONSessionFilename reports whether name is a whole-JSON
+// Claude session container: a <uuid>.json file holding the session's
+// records as one JSON array instead of JSONL lines. The UUID stem gate
+// keeps unrelated .json files that happen to live in a Claude project
+// directory out of discovery, classification, and watch fan-out.
+func isClaudeWholeJSONSessionFilename(name string) bool {
+	stem, ok := strings.CutSuffix(name, ".json")
+	if !ok {
+		return false
+	}
+	return isStandardUUIDShape(stem)
+}
+
+// claudeSessionFileNames returns the on-disk filenames a Claude session ID
+// can live in, in lookup-preference order: the canonical JSONL transcript
+// first, then the whole-JSON container spelling.
+func claudeSessionFileNames(sessionID string) []string {
+	return []string{sessionID + ".jsonl", sessionID + ".json"}
+}
+
+// claudeSessionStemFromPath extracts the session ID stem from a Claude
+// session filename, across both the JSONL and whole-JSON container
+// spellings.
+func claudeSessionStemFromPath(path string) string {
+	base := filepath.Base(path)
+	if stem, ok := strings.CutSuffix(base, ".json"); ok {
+		return stem
+	}
+	return strings.TrimSuffix(base, ".jsonl")
+}
+
 // claudeFindSourceFile finds the original JSONL file for a Claude
 // session ID by searching all project directories. It is the
 // provider-owned lookup body used by the Claude provider source set's
@@ -724,22 +803,25 @@ func claudeFindSourceFile(
 		return ""
 	}
 
-	target := sessionID + ".jsonl"
-	for _, entry := range entries {
-		if !isDirOrSymlink(entry, projectsDir) {
-			continue
-		}
-		candidate := filepath.Join(
-			projectsDir, entry.Name(), target,
-		)
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate
+	for _, target := range claudeSessionFileNames(sessionID) {
+		for _, entry := range entries {
+			if !isDirOrSymlink(entry, projectsDir) {
+				continue
+			}
+			candidate := filepath.Join(
+				projectsDir, entry.Name(), target,
+			)
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			}
 		}
 	}
 
 	// Subagent files live under session directories:
-	// <project>/<session>/subagents/**/agent-<id>.jsonl
+	// <project>/<session>/subagents/**/agent-<id>.jsonl. They are JSONL
+	// transcripts only, so the container spelling does not apply.
 	if strings.HasPrefix(sessionID, "agent-") {
+		target := sessionID + ".jsonl"
 		for _, entry := range entries {
 			if !isDirOrSymlink(entry, projectsDir) {
 				continue
@@ -779,8 +861,12 @@ func claudeFindSourceFile(
 	return ""
 }
 
-// isCodexSessionFilename reports whether name is a Codex rollout, plain
-// (.jsonl) or compressed by Codex (.jsonl.zst); both forms name one session.
+// isCodexSessionFilename reports whether name matches Codex rollout
+// naming: the "rollout-" prefix plus one of the three released container
+// extensions (.jsonl live transcripts, .json legacy whole-JSON rollouts,
+// .jsonl.zst compressed archives). The UUID shape beyond the prefix is
+// enforced by extractUUIDFromRollout's regex, which callers gate on
+// before treating a filename as a session.
 func isCodexSessionFilename(name string) bool {
 	return strings.HasPrefix(name, "rollout-") && hasCodexRolloutSuffix(name)
 }
@@ -842,7 +928,7 @@ func CodexSessionPathInfo(root, path string) (CodexLayout, string, bool) {
 	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+sep) {
 		return CodexLayoutUnknown, "", false
 	}
-	if !hasCodexRolloutSuffix(path) {
+	if !isCodexSessionFilename(filepath.Base(path)) {
 		return CodexLayoutUnknown, "", false
 	}
 	parts := strings.Split(rel, sep)
@@ -908,9 +994,9 @@ func walkCodexDayDirs(
 }
 
 // extractUUIDFromRollout extracts the session key from a Codex filename
-// like rollout-{timestamp}-{uuid}.jsonl or its compressed .jsonl.zst form:
-// the thread UUID, or {thread}_{rollout} for a file Codex thread/revert
-// wrote.
+// like rollout-{timestamp}-{uuid}.jsonl (or the legacy .json and
+// compressed .jsonl.zst spellings): the thread UUID, or
+// {thread}_{rollout} for a file Codex thread/revert wrote.
 func extractUUIDFromRollout(filename string) string {
 	stem := codexRolloutStem(filename)
 	match := uuidRe.FindStringSubmatch(stem)
