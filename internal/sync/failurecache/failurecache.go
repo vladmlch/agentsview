@@ -27,6 +27,10 @@ type Cache struct {
 	mu       sync.Mutex
 	entries  map[string]Identity
 	revision uint64
+	// attempts is the bounded retry ledger keyed by cache key. It rides the
+	// durable source_failures rows through the fingerprint column's
+	// extension segment, so a restart keeps counting.
+	attempts map[string]attemptRecord
 	// flushedTo and flushedRevision identify the last durable copy, so an
 	// unchanged cache costs no write on an idle pass.
 	flushedTo       *db.DB
@@ -34,14 +38,36 @@ type Cache struct {
 }
 
 // Load replaces the cache contents with the failures persisted in source.
+// Durable bounded-retry ledgers seed the in-memory ledger, so a restart
+// keeps counting a poison source's attempts.
 func (c *Cache) Load(ctx context.Context, source *db.DB) error {
-	loaded, err := source.LoadSourceFailures(ctx)
+	loaded, extras, err := source.LoadSourceFailureDetails(ctx)
 	if err != nil {
 		return fmt.Errorf("loading failure cache: %w", err)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries = loaded
+	c.attempts = nil
+	for key, extra := range extras {
+		id, ok := loaded[key]
+		if !ok {
+			continue
+		}
+		class := Class(extra.Class)
+		if !class.QuarantineEligible() || extra.Attempts <= 0 {
+			continue
+		}
+		if c.attempts == nil {
+			c.attempts = make(map[string]attemptRecord)
+		}
+		c.attempts[key] = attemptRecord{
+			identity:    id,
+			class:       class,
+			attempts:    extra.Attempts,
+			dataVersion: extra.DataVersion,
+		}
+	}
 	c.revision++
 	c.flushedTo = source
 	c.flushedRevision = c.revision
@@ -60,9 +86,25 @@ func (c *Cache) Lookup(key string) (Identity, bool) {
 func (c *Cache) Merge(other *Cache) {
 	other.mu.Lock()
 	entries := maps.Clone(other.entries)
+	attempts := maps.Clone(other.attempts)
 	other.mu.Unlock()
 	for key, id := range entries {
 		c.Record(key, id)
+	}
+	if attempts == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, record := range attempts {
+		if _, ok := c.attempts[key]; ok {
+			continue
+		}
+		if c.attempts == nil {
+			c.attempts = make(map[string]attemptRecord)
+		}
+		c.attempts[key] = record
+		c.revision++
 	}
 }
 
@@ -101,26 +143,35 @@ func (c *Cache) Record(key string, id Identity) {
 	c.revision++
 }
 
-// Clear forgets key so its source is parsed again.
+// Clear forgets key — its recorded identity and its bounded retry ledger —
+// so its source is parsed again with a fresh budget. Successes and explicit
+// refreshes clear this way; bypasses that re-admit an unchanged source use
+// ClearEntry to keep the ledger counting.
 func (c *Cache) Clear(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.entries[key]; !ok {
+	_, hasEntry := c.entries[key]
+	_, hasLedger := c.attempts[key]
+	if !hasEntry && !hasLedger {
 		return
 	}
 	delete(c.entries, key)
+	delete(c.attempts, key)
 	c.revision++
 }
 
-// Reset forgets every entry. The engine calls it wherever it discards all other
-// freshness shortcuts, so the following pass parses every source again.
+// Reset forgets every entry and the whole retry ledger. The engine calls it
+// wherever it discards all other freshness shortcuts, so the following pass
+// parses every source again — including quarantined ones: a resync is how a
+// parser upgrade reconciles sources the previous parser gave up on.
 func (c *Cache) Reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.entries) == 0 {
+	if len(c.entries) == 0 && len(c.attempts) == 0 {
 		return
 	}
 	c.entries = nil
+	c.attempts = nil
 	c.revision++
 }
 
@@ -136,7 +187,25 @@ func (c *Cache) Flush(ctx context.Context, target *db.DB) error {
 	}
 	snapshot := maps.Clone(c.entries)
 	revision := c.revision
+	ledger := maps.Clone(c.attempts)
 	c.mu.Unlock()
+
+	// The bounded retry ledger rides each row's fingerprint column through an
+	// extension segment, so a restart keeps counting a poison source's
+	// attempts without a schema change.
+	for key, id := range snapshot {
+		record, ok := ledger[key]
+		if !ok {
+			continue
+		}
+		id.Fingerprint = db.EncodeSourceFailureFingerprint(id.Fingerprint,
+			db.SourceFailureExtra{
+				Class:       string(record.class),
+				Attempts:    record.attempts,
+				DataVersion: record.dataVersion,
+			})
+		snapshot[key] = id
+	}
 
 	if err := target.ReplaceSourceFailures(ctx, snapshot); err != nil {
 		return fmt.Errorf("persisting failure cache: %w", err)
