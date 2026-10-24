@@ -28,14 +28,18 @@ func newFailuresCommand() *cobra.Command {
 		Long: "List the source files whose last parse failed and that sync skips\n" +
 			"until they change. Read-only: this command never runs a sync and\n" +
 			"never modifies the archive.\n\n" +
-			"Each row shows the agent and source path, the failure class\n" +
-			"(parse-failed, or source-missing when the file did not exist), the\n" +
-			"identity recorded at failure time (file mtime and size), and the\n" +
-			"disposition the next sync will apply: waiting while the file is\n" +
-			"unchanged, due for retry once its stats changed or it came back,\n" +
-			"or missing while the file is absent. The engine re-verifies the\n" +
-			"fingerprint half of the identity at sync time, so a waiting row\n" +
-			"is advisory, not a guarantee of a skip.",
+			"Each row shows the agent and source path, the failure class the\n" +
+			"engine recorded (malformed-json, shape-violation, unsupported-version,\n" +
+			"parse-failed, or source-missing when the file did not exist), how many\n" +
+			"of the bounded parse attempts the recorded identity has spent on that\n" +
+			"class, the identity recorded at failure time (file mtime and size),\n" +
+			"and the disposition the next sync will apply: waiting while the file\n" +
+			"is unchanged, due for retry once its stats changed or it came back,\n" +
+			"or missing while the file is absent. A source whose attempt budget is\n" +
+			"exhausted stays skipped until its stats or failure class change or a\n" +
+			"parser upgrade lands. The engine re-verifies the fingerprint half of\n" +
+			"the identity at sync time, so a waiting row is advisory, not a\n" +
+			"guarantee of a skip.",
 		GroupID:      groupData,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
@@ -71,10 +75,20 @@ type failureRow struct {
 	Class       string
 	Recorded    db.SourceFailure
 	Disposition failurecache.Disposition
+	// Attempts is the bounded retry budget the recorded identity has spent
+	// on its failure class, when the engine persisted a quarantine ledger
+	// for the row. ok is false for rows without one.
+	Attempts    int
+	HasAttempts bool
 }
 
-// failureClass labels which kind of failure the recorded identity captures.
-func failureClass(recorded db.SourceFailure) string {
+// failureClass labels which kind of failure the recorded identity captures,
+// falling back to the coarse pre-quarantine labels when the engine recorded
+// no failure class for the row.
+func failureClass(recorded db.SourceFailure, durable string) string {
+	if durable != "" {
+		return durable
+	}
 	if recorded.Missing {
 		return "source-missing"
 	}
@@ -116,20 +130,25 @@ func agentFromSkipSuffix(suffix string) string {
 func collectFailureRows(
 	ctx context.Context, database *db.DB,
 ) ([]failureRow, error) {
-	entries, err := database.LoadSourceFailures(ctx)
+	entries, extras, err := database.LoadSourceFailureDetails(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("loading source failures: %w", err)
 	}
 	rows := make([]failureRow, 0, len(entries))
 	for key, recorded := range entries {
+		extra := extras[key]
 		path, suffix := sync.SplitProviderSkipCachePath(key)
+		hasAttempts := extra != db.SourceFailureExtra{} &&
+			failurecache.Class(extra.Class).QuarantineEligible()
 		rows = append(rows, failureRow{
 			CacheKey:    key,
 			Agent:       agentFromSkipSuffix(suffix),
 			Source:      path,
-			Class:       failureClass(recorded),
+			Class:       failureClass(recorded, extra.Class),
 			Recorded:    recorded,
 			Disposition: failurecache.Classify(path, recorded),
+			Attempts:    extra.Attempts,
+			HasAttempts: hasAttempts,
 		})
 	}
 	sort.Slice(rows, func(i, j int) bool {
@@ -147,7 +166,7 @@ func writeFailuresHuman(w io.Writer, rows []failureRow) error {
 		return nil
 	}
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "AGENT\tCLASS\tSOURCE\tRECORDED MTIME\tSIZE\tDISPOSITION")
+	fmt.Fprintln(tw, "AGENT\tCLASS\tATTEMPTS\tSOURCE\tRECORDED MTIME\tSIZE\tDISPOSITION")
 	for _, row := range rows {
 		agent := row.Agent
 		if agent == "" {
@@ -157,19 +176,25 @@ func writeFailuresHuman(w io.Writer, rows []failureRow) error {
 		if row.Recorded.MTimeNS != 0 {
 			mtime = time.Unix(0, row.Recorded.MTimeNS).UTC().Format(time.RFC3339)
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s B\t%s\n",
-			agent, row.Class, row.Source, mtime,
+		attempts := emDash
+		if row.HasAttempts {
+			attempts = fmtInt64(int64(row.Attempts))
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s B\t%s\n",
+			agent, row.Class, attempts, row.Source, mtime,
 			fmtInt64(row.Recorded.Size), dispositionLabel(row.Disposition))
 	}
 	return tw.Flush()
 }
 
 // failureJSON is the machine-readable form of a failureRow. The recorded
-// mtime is omitted for source-missing entries, which record none.
+// mtime is omitted for source-missing entries, which record none. The
+// attempts field is omitted for rows without a quarantine ledger.
 type failureJSON struct {
 	Agent             string `json:"agent"`
 	Source            string `json:"source"`
 	Class             string `json:"class"`
+	Attempts          int    `json:"attempts,omitzero"`
 	RecordedMTime     string `json:"recorded_mtime,omitempty"`
 	RecordedSizeBytes int64  `json:"recorded_size_bytes"`
 	Fingerprint       string `json:"recorded_fingerprint,omitempty"`
@@ -186,6 +211,9 @@ func writeFailuresJSON(w io.Writer, rows []failureRow) error {
 			RecordedSizeBytes: row.Recorded.Size,
 			Fingerprint:       row.Recorded.Fingerprint,
 			Disposition:       dispositionLabel(row.Disposition),
+		}
+		if row.HasAttempts {
+			entry.Attempts = row.Attempts
 		}
 		if row.Recorded.MTimeNS != 0 {
 			entry.RecordedMTime = time.Unix(0, row.Recorded.MTimeNS).UTC().Format(time.RFC3339)

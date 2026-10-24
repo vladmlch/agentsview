@@ -99,12 +99,12 @@ func TestWriteFailuresHuman(t *testing.T) {
 		require.NoError(t, writeFailuresHuman(&out, []failureRow{{
 			Agent:       "claude",
 			Source:      source,
-			Class:       failureClass(recorded),
+			Class:       failureClass(recorded, ""),
 			Recorded:    recorded,
 			Disposition: failurecache.DispositionWaiting,
 		}, {
 			Source:      dir + "/gone.jsonl",
-			Class:       failureClass(db.SourceFailure{Missing: true}),
+			Class:       failureClass(db.SourceFailure{Missing: true}, ""),
 			Recorded:    db.SourceFailure{Missing: true},
 			Disposition: failurecache.DispositionMissing,
 		}}))
@@ -168,12 +168,12 @@ func TestWriteFailuresJSON(t *testing.T) {
 	require.NoError(t, writeFailuresJSON(&out, []failureRow{{
 		Agent:       "claude",
 		Source:      "/sessions/a.jsonl",
-		Class:       failureClass(recorded),
+		Class:       failureClass(recorded, ""),
 		Recorded:    recorded,
 		Disposition: failurecache.DispositionRetryStatsChanged,
 	}, {
 		Source:      "/sessions/gone.jsonl",
-		Class:       failureClass(db.SourceFailure{Missing: true}),
+		Class:       failureClass(db.SourceFailure{Missing: true}, ""),
 		Recorded:    db.SourceFailure{Missing: true},
 		Disposition: failurecache.DispositionMissing,
 	}}))
@@ -199,4 +199,63 @@ func TestWriteFailuresJSON(t *testing.T) {
 		Disposition:       "missing (skip until it returns)",
 	}, decoded[1])
 	assert.NotContains(t, out.String(), `"recorded_mtime": ""`, "empty mtime omitted")
+}
+
+// Rows the engine recorded with a quarantine ledger show the durable error
+// class and the spent attempt budget; legacy rows keep the coarse labels
+// and carry no attempts.
+func TestCollectFailureRowsSurfacesQuarantineLedger(t *testing.T) {
+	dir := t.TempDir()
+	poison := filepath.Join(dir, "poison.jsonl")
+	require.NoError(t, os.WriteFile(poison, []byte("line\n"), 0o600))
+	poisonID := statIdentity(t, poison)
+	poisonKey := poison + "?agent=codex"
+
+	legacy := filepath.Join(dir, "legacy.jsonl")
+	require.NoError(t, os.WriteFile(legacy, []byte("line\n"), 0o600))
+	legacyID := statIdentity(t, legacy)
+
+	database, err := db.Open(t.Context(), filepath.Join(dir, "archive.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	require.NoError(t, database.ReplaceSourceFailures(t.Context(), map[string]db.SourceFailure{
+		poisonKey: db.SourceFailure{
+			MTimeNS: poisonID.MTimeNS, Size: poisonID.Size,
+			Fingerprint: db.EncodeSourceFailureFingerprint("", db.SourceFailureExtra{
+				Class: "malformed-json", Attempts: 3, DataVersion: 7,
+			}),
+		},
+		dir + "/legacy.jsonl?agent=claude": legacyID,
+	}))
+
+	rows, err := collectFailureRows(t.Context(), database)
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+
+	bySource := make(map[string]failureRow, len(rows))
+	for _, row := range rows {
+		bySource[row.Source] = row
+	}
+	poisonRow := bySource[poison]
+	assert.Equal(t, "malformed-json", poisonRow.Class)
+	assert.Equal(t, 3, poisonRow.Attempts)
+	assert.True(t, poisonRow.HasAttempts)
+
+	legacyRow := bySource[legacy]
+	assert.Equal(t, "parse-failed", legacyRow.Class)
+	assert.False(t, legacyRow.HasAttempts)
+
+	var out bytes.Buffer
+	require.NoError(t, writeFailuresHuman(&out, rows))
+	rendered := out.String()
+	assert.Contains(t, rendered, "ATTEMPTS")
+	assert.Contains(t, rendered, "malformed-json")
+	assert.Contains(t, rendered, "3")
+	assert.NotContains(t, rendered, "shape-violation")
+
+	out.Reset()
+	require.NoError(t, writeFailuresJSON(&out, rows))
+	assert.Contains(t, out.String(), `"class": "malformed-json"`)
+	assert.Contains(t, out.String(), `"attempts": 3`)
+	assert.NotContains(t, out.String(), `"attempts": 0`)
 }

@@ -5,12 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json/jsontext"
-	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"io"
 	"log"
 	"maps"
 	"os"
@@ -10065,8 +10062,14 @@ func (e *Engine) syncProviderDBBacked(
 					ctx, source, piebaldFailure, err,
 				)
 			}
-			if ctx.Err() == nil && failureIdentityOK && sourceParseFailureCacheable(err, file.Path) {
-				e.failures.Record(providerAgentSkipCacheKey(file.Path, agent), failureIdentity)
+			if ctx.Err() == nil && failureIdentityOK {
+				if class, cacheable := failurecache.ClassifyError(err, file.Path); cacheable {
+					attempts := e.failures.RecordFailure(
+						providerAgentSkipCacheKey(file.Path, agent),
+						failureIdentity, class, db.CurrentDataVersion(),
+					)
+					e.anomalies.recordQuarantineRetry(class, attempts)
+				}
 			}
 			log.Printf("sync %s parse: %v", agent, err)
 			sourceFailures++
@@ -10845,8 +10848,12 @@ func (e *Engine) collectAndBatchWithOptions(
 				stats.RecordCwdUpdated(1)
 			}
 			e.noteSQLiteContainerResult(r.containerResultPath(), false)
-			if r.cacheFailure {
-				e.failures.Record(r.failureCacheKey, r.failureIdentity)
+			if r.cacheFailure && ctx.Err() == nil {
+				attempts := e.failures.RecordFailure(
+					r.failureCacheKey, r.failureIdentity, r.failureClass,
+					db.CurrentDataVersion(),
+				)
+				e.anomalies.recordQuarantineRetry(r.failureClass, attempts)
 			}
 			if r.cacheSkip && r.mtime != 0 && !r.noCacheSkip {
 				e.cacheSkip(r.skipCacheKey(), r.mtime, r.sourceFingerprint)
@@ -11706,6 +11713,14 @@ type processResult struct {
 	cachedFailure    bool
 	failureCacheKey  string
 	failureIdentity  failurecache.Identity
+	// failureClass names the deterministic reason a parse failure was
+	// recorded for. Empty for identity-less or transient failures, which are
+	// never recorded.
+	failureClass failurecache.Class
+	// quarantined marks a skip taken because the source's bounded retry
+	// budget was exhausted: parse admission was denied without re-parsing,
+	// and the run's anomaly report counts it.
+	quarantined bool
 	// claudeRowlessFreshnessKey is staged by a successful complete Claude
 	// parse. The collector promotes it only when the parse leaves no admitted
 	// session row and a CWD-rejected stale fork still needs filter-scoped
@@ -12064,66 +12079,78 @@ func (e *Engine) sourcePathMissing(file parser.DiscoveredFile) bool {
 	return os.IsNotExist(err)
 }
 
+// sourceParseFailureCacheable reports whether a parse error is deterministic
+// enough to record in the failure cache. The classification itself lives in
+// the failurecache package, which names the class the failure is recorded
+// under.
 func sourceParseFailureCacheable(err error, paths ...string) bool {
-	if err == nil || errors.Is(err, context.Canceled) ||
-		errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) ||
-		errors.Is(err, os.ErrPermission) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return false
+	_, ok := failurecache.ClassifyError(err, paths...)
+	return ok
+}
+
+// markSourceFailure arms a process result so its caller records the failure
+// in the failure cache. class names the deterministic reason; an
+// unrecordable class (transient, or no identity to record against) leaves
+// the result unarmed.
+// parseFailureClass names the recordable class for a parse error, or "" when
+// the failure must not be recorded: a transient cause, or a source whose
+// identity could not be captured for the cache.
+func parseFailureClass(err error, path string, identityOK bool) failurecache.Class {
+	if err == nil || !identityOK {
+		return ""
 	}
-	// Classify structured causes before inspecting wrappers, which can include
-	// companion paths as well as the primary source path.
-	if _, ok := errors.AsType[*os.PathError](err); ok {
-		return false
+	class, ok := failurecache.ClassifyError(err, path)
+	if !ok {
+		return ""
 	}
-	if _, ok := errors.AsType[*jsontext.SyntacticError](err); ok {
-		return true
+	return class
+}
+
+// validationFailureClass names the class for a provider outcome that failed
+// its post-parse validation. The parse itself succeeded, so the outcome is
+// deterministic for the unchanged source: record it as unclassified parse
+// poison when the identity was captured.
+func validationFailureClass(identityOK bool) failurecache.Class {
+	if !identityOK {
+		return ""
 	}
-	if _, ok := errors.AsType[*json.SemanticError](err); ok {
-		return true
+	return failurecache.ClassParse
+}
+
+// missingFailureClass names the class for a failure whose source could not
+// be resolved: source-missing when the path is confirmed absent — recorded
+// so the cache skips until it returns — and nothing when the failure looks
+// transient.
+func missingFailureClass(missing bool) failurecache.Class {
+	if missing {
+		return failurecache.ClassMissing
 	}
-	message := err.Error()
-	// Parser wrappers include source paths. Directory names must not classify
-	// an otherwise transient error as malformed (or vice versa).
-	for _, path := range paths {
-		if path != "" {
-			message = strings.ReplaceAll(message, path, "")
-		}
-	}
-	lower := strings.ToLower(message)
-	for _, marker := range []string{
-		"permission", "access is denied", "temporary", "temporarily",
-		"timed out", "timeout", "database is locked", "database is busy",
-		"resource temporarily unavailable", "try again", "read ", "reading ",
-		"scan ", "scanning ", "open ", "stat ", "i/o", "input/output",
-		"unexpected eof", "truncated", "incomplete",
-	} {
-		if strings.Contains(lower, marker) {
-			return false
-		}
-	}
-	for _, marker := range []string{
-		"malformed", "invalid", "syntax", "unexpected token",
-		"no such column", "no such table",
-	} {
-		if strings.Contains(lower, marker) {
-			return true
-		}
-	}
-	return false
+	return ""
 }
 
 func markSourceFailure(
-	file parser.DiscoveredFile, result processResult, id failurecache.Identity, cacheable bool,
+	file parser.DiscoveredFile, result processResult, id failurecache.Identity, class failurecache.Class,
 ) processResult {
-	if cacheable && result.err != nil && !errors.Is(result.err, context.Canceled) &&
+	if class.Recordable() && result.err != nil && !errors.Is(result.err, context.Canceled) &&
 		!errors.Is(result.err, context.DeadlineExceeded) {
 		result.cacheFailure = true
 		result.failureCacheKey = providerAgentSkipCacheKey(file.Path, file.Agent)
 		result.failureIdentity = id
+		result.failureClass = class
 	}
 	return result
 }
 
+// cachedSourceFailure is the recorded-failure half of parse admission, shared
+// by every parse lane: the batch provider lane, the changed-path collector,
+// and processProviderFile. It returns a skip when the failure recorded for
+// file still matches the source identity id, quarantining the source once its
+// bounded retry budget is exhausted — the same identity, failure class, and
+// archive data version as the recorded attempts. A data-version or project
+// reparse bypass re-admits the source but keeps the ledger, so a poison
+// source cannot loop unboundedly through the bypass; the budget — not the
+// bypass — then denies admission until the identity, the failure class, or
+// the archive data version changes.
 func (e *Engine) cachedSourceFailure(
 	ctx context.Context, file parser.DiscoveredFile, id failurecache.Identity,
 ) (processResult, bool) {
@@ -12131,8 +12158,33 @@ func (e *Engine) cachedSourceFailure(
 	if !e.failures.Check(key, id) {
 		return processResult{}, false
 	}
-	if e.forceParseBypassesCache(file) || e.pathNeedsCachedSkipBypass(ctx, file.Agent, file.Path) {
+	if e.forceParseBypassesCache(file) {
+		// An explicit refresh is a fresh retry request: forget the ledger
+		// with the entry so the refresh starts a new budget. It outranks the
+		// quarantine, which only bounds automatic retries.
 		e.failures.Clear(key)
+		return processResult{}, false
+	}
+	// Quarantine holds while the recorded entry is intact, so it must be
+	// consulted before a bypass clears the entry: an exhausted budget
+	// denies admission on this pass and every later pass — without the
+	// entry, nothing would remember to ask.
+	if class, attempts, quarantined := e.failures.Quarantined(
+		key, id, db.CurrentDataVersion(),
+	); quarantined {
+		e.anomalies.recordQuarantineSkip(string(file.Agent), key)
+		e.gateVerdict(file, "failure_quarantine", "skip",
+			fmt.Sprintf("%s budget exhausted after %d attempts", class, attempts), nil)
+		return processResult{
+			skip: true, cachedFailure: true, quarantined: true,
+			suppressPresenceSweep: true,
+		}, true
+	}
+	if e.pathNeedsCachedSkipBypass(ctx, file.Agent, file.Path) {
+		// A data-version or project bypass re-admits an unchanged source
+		// but keeps the ledger counting, so a poison source cannot loop
+		// unboundedly through the bypass.
+		e.failures.ClearEntry(key)
 		return processResult{}, false
 	}
 	return processResult{
@@ -12252,7 +12304,8 @@ func (e *Engine) processProviderFile(
 	source, found, err := e.providerSourceForDiscoveredFile(ctx, provider, file)
 	if err != nil {
 		return markSourceFailure(
-			file, processResult{err: err}, failurecache.Identity{Missing: true}, e.sourcePathMissing(file),
+			file, processResult{err: err}, failurecache.Identity{Missing: true},
+			missingFailureClass(e.sourcePathMissing(file)),
 		), true
 	}
 	if !found {
@@ -12275,7 +12328,8 @@ func (e *Engine) processProviderFile(
 				file.Agent,
 				file.Path,
 			),
-		}, failurecache.Identity{Missing: true}, e.sourcePathMissing(file)), true
+		}, failurecache.Identity{Missing: true},
+			missingFailureClass(e.sourcePathMissing(file))), true
 	}
 	if source.ConfiguredRoot != "" {
 		if sourceMachine, ok := e.configuredMachineForPath(
@@ -12655,7 +12709,8 @@ func (e *Engine) processProviderFile(
 				}, true
 			}
 			return markSourceFailure(file, processResult{err: err},
-				failurecache.Identity{Missing: true}, errors.Is(err, os.ErrNotExist) && e.sourcePathMissing(file)), true
+				failurecache.Identity{Missing: true},
+				missingFailureClass(errors.Is(err, os.ErrNotExist) && e.sourcePathMissing(file))), true
 		}
 	}
 	cacheKey := providerProcessCacheKey(
@@ -13080,7 +13135,7 @@ func (e *Engine) processProviderFile(
 				cacheKey:         cacheKey,
 				noCacheSkip:      true,
 				retentionLease:   lease,
-			}, failureIdentity, failureIdentityOK && sourceParseFailureCacheable(err, file.Path)), true
+			}, failureIdentity, parseFailureClass(err, file.Path, failureIdentityOK)), true
 		}
 		return markSourceFailure(file, processResult{
 			err:            err,
@@ -13089,7 +13144,7 @@ func (e *Engine) processProviderFile(
 			cacheKey:       cacheKey,
 			noCacheSkip:    true,
 			retentionLease: lease,
-		}, failureIdentity, failureIdentityOK && sourceParseFailureCacheable(err, file.Path)), true
+		}, failureIdentity, parseFailureClass(err, file.Path, failureIdentityOK)), true
 	}
 	if file.Agent == parser.AgentPiebald && !e.forceParse {
 		e.clearPiebaldFailure(source)
@@ -13112,7 +13167,7 @@ func (e *Engine) processProviderFile(
 			cacheKey:       cacheKey,
 			noCacheSkip:    true,
 			retentionLease: lease,
-		}, failureIdentity, failureIdentityOK), true
+		}, failureIdentity, validationFailureClass(failureIdentityOK)), true
 	}
 	if codexFingerprintFromParse && fingerprint.Hash == "" {
 		// A completed parse captures the full source hash even when its pending
@@ -21632,7 +21687,11 @@ func (e *Engine) processAndWriteSessionFile(
 	if res.err != nil {
 		sessionsChanged = res.sourceCwdChanged
 		if res.cacheFailure && ctx.Err() == nil {
-			e.failures.Record(res.failureCacheKey, res.failureIdentity)
+			attempts := e.failures.RecordFailure(
+				res.failureCacheKey, res.failureIdentity, res.failureClass,
+				db.CurrentDataVersion(),
+			)
+			e.anomalies.recordQuarantineRetry(res.failureClass, attempts)
 		}
 		if res.cacheSkip && res.mtime != 0 && !res.noCacheSkip {
 			e.cacheSkip(res.skipCacheKey(path), res.mtime, res.sourceFingerprint)

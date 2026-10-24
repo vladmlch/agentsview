@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/sync/failurecache"
 )
 
 // Phase describes the current sync phase.
@@ -192,6 +193,24 @@ type AnomalyStats struct {
 	// GenMetadataWithoutUsageTotal is the grand total across all agents.
 	GenMetadataWithoutUsageTotal int `json:"gen_metadata_without_usage_total,omitempty"`
 
+	// QuarantineSkipsByAgent maps an agent type to the number of source
+	// files this run whose parse admission was denied without re-parsing
+	// because their deterministic-failure retry budget was exhausted: the
+	// same source identity, failure class, and archive data version already
+	// failed MaxParseAttemptsPerIdentity parse attempts. Skips are deduped
+	// per source, so a source declined on several lanes counts once.
+	QuarantineSkipsByAgent map[string]int `json:"quarantine_skips_by_agent,omitempty"`
+	// QuarantineSkipsTotal is the grand total across all agents.
+	QuarantineSkipsTotal int `json:"quarantine_skips_total,omitempty"`
+	// QuarantineRetriesByClass maps the failure class to the number of
+	// parse failures recorded this run against an existing quarantine
+	// ledger entry -- retry attempts the bounded budget absorbed, beyond a
+	// source's first failure of that class. Transient failures and first
+	// failures are not counted here.
+	QuarantineRetriesByClass map[string]int `json:"quarantine_retries_by_class,omitempty"`
+	// QuarantineRetriesTotal is the grand total across all classes.
+	QuarantineRetriesTotal int `json:"quarantine_retries_total,omitempty"`
+
 	// Sanitize aggregates the central validation/sanitization fix counts
 	// across every session, message, and usage event written this run.
 	Sanitize SanitizeStats `json:"sanitize,omitzero"`
@@ -246,6 +265,8 @@ func (a *AnomalyStats) IsZero() bool {
 		len(a.MalformedLineSamples) == 0 &&
 		a.UnknownSchemaSessionsTotal == 0 &&
 		a.GenMetadataWithoutUsageTotal == 0 &&
+		a.QuarantineSkipsTotal == 0 &&
+		a.QuarantineRetriesTotal == 0 &&
 		a.Sanitize.IsZero()
 }
 
@@ -302,6 +323,33 @@ func (a *AnomalyStats) RecordGenMetadataWithoutUsage(agent string, n int) {
 	a.GenMetadataWithoutUsageTotal += n
 }
 
+// RecordQuarantineSkips attributes n quarantine admission denials to the
+// given agent and updates the grand total. A non-positive count is ignored.
+func (a *AnomalyStats) RecordQuarantineSkips(agent string, n int) {
+	if n <= 0 {
+		return
+	}
+	if a.QuarantineSkipsByAgent == nil {
+		a.QuarantineSkipsByAgent = make(map[string]int)
+	}
+	a.QuarantineSkipsByAgent[agent] += n
+	a.QuarantineSkipsTotal += n
+}
+
+// RecordQuarantineRetries attributes n bounded-budget retry attempts to the
+// given failure class and updates the grand total. A non-positive count or a
+// class that is not quarantine-eligible is ignored.
+func (a *AnomalyStats) RecordQuarantineRetries(class string, n int) {
+	if n <= 0 || !failurecache.Class(class).QuarantineEligible() {
+		return
+	}
+	if a.QuarantineRetriesByClass == nil {
+		a.QuarantineRetriesByClass = make(map[string]int)
+	}
+	a.QuarantineRetriesByClass[class] += n
+	a.QuarantineRetriesTotal += n
+}
+
 // addSanitize accumulates the per-category counts from one
 // validateAndSanitize pass into the aggregate.
 func (a *AnomalyStats) addSanitize(v validationStats) {
@@ -332,6 +380,12 @@ func (a *AnomalyStats) merge(o AnomalyStats) {
 	for agent, n := range o.GenMetadataWithoutUsageByAgent {
 		a.RecordGenMetadataWithoutUsage(agent, n)
 	}
+	for agent, n := range o.QuarantineSkipsByAgent {
+		a.RecordQuarantineSkips(agent, n)
+	}
+	for class, n := range o.QuarantineRetriesByClass {
+		a.RecordQuarantineRetries(class, n)
+	}
 	a.Sanitize.ControlCharsStripped += o.Sanitize.ControlCharsStripped
 	a.Sanitize.ModelClamped += o.Sanitize.ModelClamped
 	a.Sanitize.TokensClamped += o.Sanitize.TokensClamped
@@ -354,6 +408,9 @@ type anomalyAccumulator struct {
 	// sessions counts its malformed lines once. Reset each run.
 	malformedFiles     map[string]bool
 	unsupportedSources map[string]bool
+	// quarantineSkips tracks cache keys whose quarantine admission denial
+	// has already been counted this run. Reset each run.
+	quarantineSkips map[string]bool
 }
 
 // reset clears the accumulator at the start of a sync run.
@@ -362,6 +419,7 @@ func (a *anomalyAccumulator) reset() {
 	a.stats = AnomalyStats{}
 	a.malformedFiles = nil
 	a.unsupportedSources = nil
+	a.quarantineSkips = nil
 	a.mu.Unlock()
 }
 
@@ -453,6 +511,37 @@ func (a *anomalyAccumulator) recordSanitize(v validationStats) {
 	}
 	a.mu.Lock()
 	a.stats.addSanitize(v)
+	a.mu.Unlock()
+}
+
+// recordQuarantineSkip counts one parse-admission denial for a source whose
+// bounded retry budget was exhausted. A source declined on several lanes in
+// one run counts once, mirroring the malformed-line per-file dedup.
+func (a *anomalyAccumulator) recordQuarantineSkip(agent, key string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.quarantineSkips == nil {
+		a.quarantineSkips = make(map[string]bool)
+	}
+	if a.quarantineSkips[key] {
+		return
+	}
+	a.quarantineSkips[key] = true
+	a.stats.RecordQuarantineSkips(agent, 1)
+}
+
+// recordQuarantineRetry counts parse failures recorded against an existing
+// quarantine ledger entry: attempts the bounded budget absorbed beyond a
+// source's first failure of the class. First failures and transient classes
+// record no retry.
+func (a *anomalyAccumulator) recordQuarantineRetry(
+	class failurecache.Class, attempts int,
+) {
+	if !class.QuarantineEligible() || attempts <= 1 {
+		return
+	}
+	a.mu.Lock()
+	a.stats.RecordQuarantineRetries(string(class), 1)
 	a.mu.Unlock()
 }
 

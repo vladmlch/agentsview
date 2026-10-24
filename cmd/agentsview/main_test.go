@@ -2450,6 +2450,23 @@ func TestFormatAnomalySummary(t *testing.T) {
 			},
 			wantOmit: []string{"malformed lines", "sanitized fields"},
 		},
+		{
+			name: "quarantine counters",
+			anomalies: agentsync.AnomalyStats{
+				QuarantineSkipsByAgent:   map[string]int{"codex": 2},
+				QuarantineSkipsTotal:     2,
+				QuarantineRetriesByClass: map[string]int{"malformed-json": 3},
+				QuarantineRetriesTotal:   3,
+			},
+			wantContain: []string{
+				"Parser anomalies (this run):",
+				"quarantine retries: 3 total",
+				"malformed-json: 3",
+				"quarantine skips: 2 total (admission denied, budget exhausted)",
+				"codex: 2",
+			},
+			wantOmit: []string{"malformed lines", "sanitized fields"},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

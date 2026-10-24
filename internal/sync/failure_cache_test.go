@@ -16,6 +16,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/sync/failurecache"
 )
 
 func TestProviderParseFailureIsCachedUntilSourceChanges(t *testing.T) {
@@ -813,4 +814,209 @@ func TestCachedOpenCodeFailureDoesNotVerifyContainer(t *testing.T) {
 	require.NotEmpty(t, messages)
 	assert.Equal(t, "repaired prompt", messages[0].Content,
 		"a cached failure must not authorize watermark-only discovery after repair")
+}
+
+// A poison source — deterministically malformed JSON — is recorded under a
+// named failure class, skipped without re-parsing while its stats stay
+// unchanged, and re-tested with a reset budget once its stats change.
+func TestPoisonSourceRecordedWithClassAndSkippedUntilStatsChange(t *testing.T) {
+	const agent parser.AgentType = "poison-class"
+
+	_, engine, provider, _, path := newChangedPathOutcomeEngine(
+		t, agent, func(string) parser.ParseOutcome { return parser.ParseOutcome{} },
+	)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	provider.fingerprint = parser.SourceFingerprint{
+		Key: path, MTimeNS: info.ModTime().UnixNano(),
+	}
+	provider.parseErr = errors.New("malformed source")
+	file := parser.DiscoveredFile{
+		Path: path, Agent: agent,
+		ProviderSource: provider.source, ProviderProcess: true,
+	}
+
+	first := engine.processFile(t.Context(), file)
+	require.Error(t, first.err)
+	require.True(t, first.cacheFailure)
+	assert.Equal(t, failurecache.ClassMalformedJSON, first.failureClass)
+	engine.failures.RecordFailure(
+		first.failureCacheKey, first.failureIdentity, first.failureClass,
+		db.CurrentDataVersion(),
+	)
+
+	second := engine.processFile(t.Context(), file)
+	require.NoError(t, second.err)
+	assert.True(t, second.skip)
+	assert.True(t, second.cachedFailure)
+	assert.False(t, second.quarantined)
+	assert.Equal(t, int32(1), provider.parseCalls.Load(),
+		"an unchanged poison source must not re-parse")
+
+	updated := info.ModTime().Add(time.Second)
+	require.NoError(t, os.Chtimes(path, updated, updated))
+	provider.fingerprint.MTimeNS = updated.UnixNano()
+	third := engine.processFile(t.Context(), file)
+	require.Error(t, third.err)
+	assert.Equal(t, int32(2), provider.parseCalls.Load(),
+		"a stats change re-admits the source")
+	attempts := engine.failures.RecordFailure(
+		third.failureCacheKey, third.failureIdentity, third.failureClass,
+		db.CurrentDataVersion(),
+	)
+	assert.Equal(t, 1, attempts, "a stats change resets the attempt budget")
+}
+
+// A poison source whose row stays at a stale data version re-admits through
+// the data-version bypass on every pass. The bounded retry budget absorbs
+// the loop: after cap attempts the admission gate denies the parse without
+// re-reading the source, and the run's anomaly report counts the skip.
+func TestQuarantineCapsDataVersionBypassLoop(t *testing.T) {
+	const agent parser.AgentType = "bypass-quarantine"
+
+	database, engine, provider, _, path := newChangedPathOutcomeEngine(
+		t, agent, func(string) parser.ParseOutcome { return parser.ParseOutcome{} },
+	)
+	seedActiveBaselineSource(t, database, agent, "bypass-quarantine", path)
+	require.NoError(t, database.SetSessionDataVersion(
+		t.Context(), "bypass-quarantine", db.CurrentDataVersion()-1,
+	))
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	provider.fingerprint = parser.SourceFingerprint{
+		Key: path, MTimeNS: info.ModTime().UnixNano(),
+	}
+	provider.parseErr = errors.New("malformed source")
+
+	syncPaths := func() (SyncStats, error) {
+		engine.syncMu.Lock()
+		defer engine.syncMu.Unlock()
+		stats, _, err := engine.syncChangedPathsLocked(t.Context(), []string{path})
+		return stats, err
+	}
+
+	first, err := syncPaths()
+	require.Error(t, err)
+	assert.Equal(t, int32(1), provider.parseCalls.Load())
+	assert.Equal(t, 0, first.Anomalies.QuarantineSkipsTotal)
+	assert.Equal(t, 0, first.Anomalies.QuarantineRetriesTotal)
+
+	// Attempts 2 and cap: each pass re-admits through the bypass and the
+	// budget absorbs one more retry.
+	for attempt := 2; attempt <= failurecache.MaxParseAttemptsPerIdentity; attempt++ {
+		retry, err := syncPaths()
+		require.Error(t, err)
+		assert.Equal(t, int32(attempt), provider.parseCalls.Load())
+		assert.Equal(t, 1, retry.Anomalies.QuarantineRetriesTotal,
+			"attempt %d counts as a bounded retry", attempt)
+	}
+
+	// Budget exhausted: admission denied without a parse.
+	exhausted, err := syncPaths()
+	require.NoError(t, err)
+	assert.Equal(t, int32(failurecache.MaxParseAttemptsPerIdentity),
+		provider.parseCalls.Load(),
+		"an exhausted budget must not re-parse the poison source")
+	assert.Equal(t, 1, exhausted.Anomalies.QuarantineSkipsTotal)
+	assert.Equal(t, 0, exhausted.Anomalies.QuarantineRetriesTotal)
+
+	// The hold is stable: later passes keep skipping without a parse, not
+	// falling through to admission now that the bypass consumed the entry.
+	still, err := syncPaths()
+	require.NoError(t, err)
+	assert.Equal(t, int32(failurecache.MaxParseAttemptsPerIdentity),
+		provider.parseCalls.Load())
+	assert.Equal(t, 1, still.Anomalies.QuarantineSkipsTotal)
+
+	// The stats change lifts the quarantine: the source is re-parsed and,
+	// still poison, starts a fresh budget.
+	updated := info.ModTime().Add(2 * time.Second)
+	require.NoError(t, os.Chtimes(path, updated, updated))
+	provider.fingerprint.MTimeNS = updated.UnixNano()
+	changed, err := syncPaths()
+	require.Error(t, err)
+	assert.Equal(t, int32(failurecache.MaxParseAttemptsPerIdentity+1),
+		provider.parseCalls.Load())
+	assert.Equal(t, 0, changed.Anomalies.QuarantineSkipsTotal)
+	assert.Equal(t, 0, changed.Anomalies.QuarantineRetriesTotal,
+		"a stats change resets the budget, so the failure is a first attempt")
+}
+
+// A transient IO failure must never enter the quarantine: every pass
+// retries, and no attempt ledger builds up.
+func TestTransientFailureNeverQuarantines(t *testing.T) {
+	const agent parser.AgentType = "transient-quarantine"
+
+	_, engine, provider, _, path := newChangedPathOutcomeEngine(
+		t, agent, func(string) parser.ParseOutcome { return parser.ParseOutcome{} },
+	)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	provider.fingerprint = parser.SourceFingerprint{
+		Key: path, MTimeNS: info.ModTime().UnixNano(),
+	}
+	provider.parseErr = errors.New("database is locked")
+	file := parser.DiscoveredFile{
+		Path: path, Agent: agent,
+		ProviderSource: provider.source, ProviderProcess: true,
+	}
+
+	for attempt := int32(1); attempt <= 4; attempt++ {
+		result := engine.processFile(t.Context(), file)
+		require.Error(t, result.err)
+		assert.False(t, result.cacheFailure)
+		assert.False(t, result.quarantined)
+		assert.Equal(t, attempt, provider.parseCalls.Load())
+	}
+	_, _, ok := engine.failures.Ledger(
+		providerAgentSkipCacheKey(path, agent),
+	)
+	assert.False(t, ok, "a transient failure must not build an attempt ledger")
+}
+
+// A real provider parsing a real unparseable JSON fixture records a
+// deterministic parse class durably — the Gemini lane rejects the broken
+// payload as a shape violation — so the failures command can surface the
+// class and the attempt budget after a restart.
+func TestRealProviderPoisonRecordsClassDurably(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "tmp/project/chats/session-broken.json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	require.NoError(t, os.WriteFile(path, []byte(`{"messages": invalid}`), 0o600))
+	database := openTestDB(t)
+	cfg := EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentGemini: {root}},
+		Machine:   "local",
+	}
+	engine := NewEngine(t.Context(), database, cfg)
+	t.Cleanup(engine.Close)
+	require.Error(t, engine.SyncPathsContext(t.Context(), []string{path}))
+
+	persisted, extras, err := database.LoadSourceFailureDetails(t.Context())
+	require.NoError(t, err)
+	require.Len(t, persisted, 1)
+	require.Len(t, extras, 1)
+	for key, extra := range extras {
+		assert.True(t, failurecache.Class(extra.Class).QuarantineEligible(),
+			"a deterministic fixture must record a quarantine-eligible class, got %q", extra.Class)
+		assert.Equal(t, 1, extra.Attempts, key)
+	}
+	// The identity half stays decodable: the plain loader never sees the
+	// ledger extension.
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, info.ModTime().UnixNano(),
+		persisted[providerAgentSkipCacheKey(path, parser.AgentGemini)].MTimeNS)
+
+	// A restart seeds the ledger back from the durable rows.
+	restarted := NewEngine(t.Context(), database, cfg)
+	t.Cleanup(restarted.Close)
+	class, attempts, ok := restarted.failures.Ledger(
+		providerAgentSkipCacheKey(path, parser.AgentGemini),
+	)
+	require.True(t, ok)
+	assert.True(t, class.QuarantineEligible())
+	assert.Equal(t, 1, attempts)
+	assert.NoError(t, restarted.SyncPathsContext(t.Context(), []string{path}),
+		"the unchanged poison source skips without a parse error")
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/sync/failurecache"
 )
 
 func TestSyncStats_RecordSkip(t *testing.T) {
@@ -607,4 +608,66 @@ func TestMergeSyncStatsCarriesMetadataChanges(t *testing.T) {
 				"metadata-only changes must still notify session consumers")
 		})
 	}
+}
+
+func TestAnomalyStats_QuarantineCounters(t *testing.T) {
+	var a AnomalyStats
+	assert.True(t, a.IsZero(), "a clean run reports no anomalies")
+
+	a.RecordQuarantineSkips("codex", 1)
+	a.RecordQuarantineSkips("codex", 2)
+	a.RecordQuarantineSkips("claude", 1)
+	a.RecordQuarantineSkips("claude", 0)
+	a.RecordQuarantineSkips("claude", -1)
+	assert.Equal(t, map[string]int{"codex": 3, "claude": 1}, a.QuarantineSkipsByAgent)
+	assert.Equal(t, 4, a.QuarantineSkipsTotal)
+	assert.False(t, a.IsZero())
+
+	b := AnomalyStats{}
+	b.RecordQuarantineRetries("malformed-json", 1)
+	b.RecordQuarantineRetries("malformed-json", 1)
+	b.RecordQuarantineRetries("transient-io", 3)
+	b.RecordQuarantineRetries("shape-violation", 0)
+	assert.Equal(t, map[string]int{"malformed-json": 2}, b.QuarantineRetriesByClass)
+	assert.Equal(t, 2, b.QuarantineRetriesTotal)
+
+	// merge folds both counters through the same Record paths.
+	var merged AnomalyStats
+	merged.merge(a)
+	merged.merge(b)
+	assert.Equal(t, 4, merged.QuarantineSkipsTotal)
+	assert.Equal(t, map[string]int{"codex": 3, "claude": 1}, merged.QuarantineSkipsByAgent)
+	assert.Equal(t, 2, merged.QuarantineRetriesTotal)
+	assert.Equal(t, map[string]int{"malformed-json": 2}, merged.QuarantineRetriesByClass)
+}
+
+func TestAnomalyAccumulator_QuarantineSkipDeduplicatedPerSource(t *testing.T) {
+	var acc anomalyAccumulator
+	acc.recordQuarantineSkip("codex", "codex:/s.jsonl?agent=codex")
+	acc.recordQuarantineSkip("codex", "codex:/s.jsonl?agent=codex")
+	acc.recordQuarantineSkip("claude", "claude:/t.jsonl?agent=claude")
+
+	var stats SyncStats
+	acc.applyTo(&stats)
+	anomalies := stats.Anomalies
+	assert.Equal(t, map[string]int{"codex": 1, "claude": 1}, anomalies.QuarantineSkipsByAgent)
+	assert.Equal(t, 2, anomalies.QuarantineSkipsTotal)
+
+	acc.reset()
+	var fresh SyncStats
+	acc.applyTo(&fresh)
+	assert.Equal(t, 0, fresh.Anomalies.QuarantineSkipsTotal)
+}
+
+func TestAnomalyAccumulator_QuarantineRetryCountsOnlyBudgetAbsorbed(t *testing.T) {
+	var acc anomalyAccumulator
+	acc.recordQuarantineRetry(failurecache.ClassMalformedJSON, 1)
+	acc.recordQuarantineRetry(failurecache.ClassTransient, 3)
+	acc.recordQuarantineRetry(failurecache.ClassMalformedJSON, 2)
+
+	var stats SyncStats
+	acc.applyTo(&stats)
+	assert.Equal(t, 1, stats.Anomalies.QuarantineRetriesTotal,
+		"only attempts beyond a class's first failure count as retries")
+	assert.Equal(t, map[string]int{"malformed-json": 1}, stats.Anomalies.QuarantineRetriesByClass)
 }
