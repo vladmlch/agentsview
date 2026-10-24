@@ -1882,11 +1882,33 @@ func extractToolResultAgentIDLink(line string) (ClaudeSubagentLink, bool) {
 // types (e.g. task_reminder) return ok=false. Whitespace-only or
 // empty prompts also return false to match the parser's general
 // "skip empty user content" behavior.
+//
+// Only human-typed prompts surface as user messages. Claude Code
+// funnels machine-origin prompts through the same attachment lane
+// (peer hand-backs, task notifications, coordinator injections)
+// marked by a non-human attachment.origin.kind, and may flag
+// bookkeeping entries with isMeta. Those are excluded here so they
+// never reach the message stream or session counts — same as any
+// other skipped record. A delivered queued prompt still surfaces
+// through its plain user record (promptSource:"queued"), which is
+// parsed by the ordinary user-entry lane and is unaffected.
 func extractQueuedCommand(line string) (claudeQueuedCommand, bool) {
-	if gjson.Get(line, "attachment.type").Str != "queued_command" {
+	attachment := gjson.Get(line, "attachment")
+	if attachment.Get("type").Str != "queued_command" {
 		return claudeQueuedCommand{}, false
 	}
-	prompt := gjson.Get(line, "attachment.prompt").Str
+	if gjson.Get(line, "isMeta").Bool() ||
+		attachment.Get("isMeta").Bool() {
+		return claudeQueuedCommand{}, false
+	}
+	// Absent or human origin is real user input; any explicit
+	// machine origin (peer, task-notification, coordinator, ...)
+	// is not.
+	if kind := attachment.Get("origin.kind").Str; kind != "" &&
+		kind != "human" {
+		return claudeQueuedCommand{}, false
+	}
+	prompt := attachment.Get("prompt").Str
 	var skip bool
 	prompt, skip = preprocessClaudeUserText(prompt)
 	if skip || strings.TrimSpace(prompt) == "" {
