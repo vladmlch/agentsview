@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -18,12 +19,12 @@ import (
 // per-thread primitives the provider uses (ListZedThreadMetas +
 // parseZedThreadFromDB), reproducing the deleted ParseZedSessions
 // whole-database free function for the retained parse tests.
-func parseZedAll(dbPath, machine string) ([]ParseResult, error) {
+func parseZedAll(ctx context.Context, dbPath, machine string) ([]ParseResult, error) {
 	info, err := os.Stat(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("stat %s: %w", dbPath, err)
 	}
-	conn, err := OpenZedDB(dbPath)
+	conn, err := OpenZedDB(ctx, dbPath)
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +72,7 @@ func TestParseZedSessions_JSON(t *testing.T) {
 		}`),
 	}})
 
-	results, err := parseZedAll(dbPath, "local")
+	results, err := parseZedAll(t.Context(), dbPath, "local")
 	if err != nil {
 		require.FailNowf(t, "test failed", "ParseZedSessions: %v", err)
 	}
@@ -235,7 +236,7 @@ func TestParseZedSessions_ZstdAndFiltersChildren(t *testing.T) {
 		},
 	})
 
-	results, err := parseZedAll(dbPath, "local")
+	results, err := parseZedAll(t.Context(), dbPath, "local")
 	if err != nil {
 		require.FailNowf(t, "test failed", "ParseZedSessions: %v", err)
 	}
@@ -260,7 +261,7 @@ func TestParseZedSessions_LegacyFiveColumnSchema(t *testing.T) {
 		"legacy", "Legacy thread", "2026-06-08T09:14:10Z", "json", []byte(`{"messages":[{"User":{"content":[{"Text":"hello"}]}}]}`))
 	require.NoError(t, err)
 
-	results, err := parseZedAll(dbPath, "local")
+	results, err := parseZedAll(t.Context(), dbPath, "local")
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	sess := results[0].Session
@@ -281,7 +282,7 @@ func TestZedLegacyCompatibilityRequiresCoreColumns(t *testing.T) {
 	_, err = db.ExecContext(t.Context(), `CREATE TABLE threads (id TEXT, summary TEXT, updated_at TEXT, data_type TEXT)`)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
-	_, err = parseZedAll(dbPath, "local")
+	_, err = parseZedAll(t.Context(), dbPath, "local")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing required Zed threads column data")
 }
@@ -292,7 +293,7 @@ func TestParseZedSessions_SkipsUnsupportedDataType(t *testing.T) {
 		dataType: "brotli",
 		data:     []byte("x"),
 	}})
-	results, err := parseZedAll(dbPath, "local")
+	results, err := parseZedAll(t.Context(), dbPath, "local")
 	if err != nil {
 		require.FailNowf(t, "test failed", "ParseZedSessions: %v", err)
 	}

@@ -167,7 +167,7 @@ func TestOpenDevinDBUsesReadOnlyMode(t *testing.T) {
 		devinSessionRow{ID: "session-readonly", Title: "Read only", WorkingDirectory: "/tmp/readonly", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))},
 	)
 
-	db, err := openDevinDB(fixture.DBPath)
+	db, err := openDevinDB(t.Context(), fixture.DBPath)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -200,7 +200,7 @@ func TestOpenDevinDBWithSpecialCharPath(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, writer.Close())
 
-	db, err := openDevinDB(dbPath)
+	db, err := openDevinDB(t.Context(), dbPath)
 	require.NoError(t, err)
 	defer db.Close()
 

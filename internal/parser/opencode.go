@@ -735,8 +735,10 @@ func openCodeStorageFingerprintFromSnapshot(
 	return hash, nil
 }
 
-func openOpenCodeDB(dbPath string) (*sql.DB, error) {
-	db, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{busyTimeoutMS: 3000})
+func openOpenCodeDB(ctx context.Context, dbPath string) (*sql.DB, error) {
+	db, err := openSQLiteReadOnlyWithBusyRetry(
+		ctx, dbPath, sqliteReadOptions{busyTimeoutMS: 3000},
+	)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"opening opencode db %s: %w", dbPath, err,

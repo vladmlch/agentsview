@@ -1,12 +1,14 @@
 package parser
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
@@ -50,7 +52,7 @@ func TestOpenSQLiteWithSpecialCharPath(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, writer.Close())
 
-	db, err := openOpenCodeDB(dbPath)
+	db, err := openOpenCodeDB(t.Context(), dbPath)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -299,4 +301,225 @@ func TestWithSQLiteReadOnly_PropagatesNonBusyErrors(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), "locked")
+}
+
+func TestRetrySQLiteBusy(t *testing.T) {
+	errBusy := sqlite3.Error{Code: sqlite3.ErrBusy}
+	errBusySnapshot := sqlite3.Error{
+		Code:         sqlite3.ErrBusy,
+		ExtendedCode: sqlite3.ErrBusySnapshot,
+	}
+	errOther := errors.New("file is not a database")
+
+	tests := []struct {
+		name        string
+		ctx         func() context.Context
+		results     []error
+		wantCalls   int
+		wantSleeps  []time.Duration
+		wantErr     error
+		wantErrText string
+	}{
+		{
+			name:       "succeeds on first attempt",
+			results:    []error{nil},
+			wantCalls:  1,
+			wantSleeps: nil,
+		},
+		{
+			name:       "retries busy then succeeds",
+			results:    []error{errBusy, errBusy, nil},
+			wantCalls:  3,
+			wantSleeps: []time.Duration{50 * time.Millisecond, 150 * time.Millisecond},
+		},
+		{
+			name:       "retries extended busy snapshot codes",
+			results:    []error{fmt.Errorf("read: %w", errBusySnapshot), nil},
+			wantCalls:  2,
+			wantSleeps: []time.Duration{50 * time.Millisecond},
+		},
+		{
+			name:        "exhausted ladder reports busy",
+			results:     []error{errBusy, errBusy, errBusy, errBusy},
+			wantCalls:   4,
+			wantSleeps:  []time.Duration{50 * time.Millisecond, 150 * time.Millisecond, 300 * time.Millisecond},
+			wantErr:     errBusy,
+			wantErrText: "sqlite busy",
+		},
+		{
+			name:       "non-busy error fails without retry",
+			results:    []error{errOther},
+			wantCalls:  1,
+			wantSleeps: nil,
+			wantErr:    errOther,
+		},
+		{
+			name:       "non-busy error after a busy retry stops the ladder",
+			results:    []error{errBusy, errOther},
+			wantCalls:  2,
+			wantSleeps: []time.Duration{50 * time.Millisecond},
+			wantErr:    errOther,
+		},
+		{
+			name: "canceled context stops the ladder",
+			ctx: func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+			results:    []error{errBusy, nil},
+			wantCalls:  1,
+			wantSleeps: nil,
+			wantErr:    errBusy,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			if tc.ctx != nil {
+				ctx = tc.ctx()
+			}
+			calls := 0
+			var sleeps []time.Duration
+			err := retrySQLiteBusy(ctx, "testing", sqliteBusyRetryDelays,
+				func(d time.Duration) { sleeps = append(sleeps, d) },
+				func() error {
+					i := calls
+					calls++
+					if i >= len(tc.results) {
+						return errBusy
+					}
+					return tc.results[i]
+				})
+			assert.Equal(t, tc.wantCalls, calls, "op call count")
+			assert.Equal(t, tc.wantSleeps, sleeps, "slept delays")
+			if tc.wantErr != nil {
+				require.Error(t, err)
+				assert.ErrorIs(t, err, tc.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+			if tc.wantErrText != "" {
+				assert.ErrorContains(t, err, tc.wantErrText)
+			}
+		})
+	}
+}
+
+func TestOpenSQLiteReadOnlyWithBusyRetry_BusyThenSuccess(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "locked.db")
+
+	writer, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	writer.SetMaxOpenConns(1)
+
+	_, err = writer.ExecContext(t.Context(), `
+		PRAGMA journal_mode=WAL;
+		CREATE TABLE items (id TEXT PRIMARY KEY, value TEXT);
+		INSERT INTO items VALUES ('item1', 'committed_value');
+	`)
+	require.NoError(t, err)
+
+	// Acquire an exclusive lock to simulate the live writer process holding
+	// sessions.db while agentsview reads it.
+	_, err = writer.ExecContext(t.Context(), "PRAGMA locking_mode=EXCLUSIVE")
+	require.NoError(t, err)
+	tx, err := writer.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	_, err = tx.ExecContext(t.Context(), "INSERT INTO items VALUES ('item2', 'uncommitted_value')")
+	require.NoError(t, err)
+
+	// The initial read of the retrying open must hit the same busy
+	// classification the caller's first query would.
+	probe, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{busyTimeoutMS: 1})
+	require.NoError(t, err)
+	var one int
+	err = probe.QueryRowContext(t.Context(), "SELECT 1").Scan(&one)
+	require.Error(t, err, "the SELECT 1 initial read must fail while the writer holds the exclusive lock")
+	assert.True(t, isSQLiteBusyOrLocked(err), "the failed initial read must classify as busy/locked, got: %v", err)
+	require.NoError(t, probe.Close())
+
+	// The first inter-attempt pause releases the writer, so attempt 2 must
+	// succeed; the ladder values are recorded, never slept.
+	var sleeps []time.Duration
+	released := false
+	db, err := openSQLiteReadOnlyWithBusyRetryDelays(
+		t.Context(), dbPath, sqliteReadOptions{busyTimeoutMS: 1},
+		sqliteBusyRetryDelays,
+		func(d time.Duration) {
+			sleeps = append(sleeps, d)
+			if !released {
+				released = true
+				require.NoError(t, tx.Rollback())
+				require.NoError(t, writer.Close())
+			}
+		},
+	)
+	require.NoError(t, err, "the retrying open must succeed once the writer releases the lock")
+	defer db.Close()
+	assert.Equal(t, []time.Duration{sqliteBusyRetryDelays[0]}, sleeps,
+		"exactly one busy retry must precede the successful attempt")
+
+	var value string
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT value FROM items WHERE id = 'item1'").Scan(&value))
+	assert.Equal(t, "committed_value", value)
+}
+
+func TestOpenSQLiteReadOnlyWithBusyRetry_ExhaustedLadderReportsBusy(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "locked.db")
+
+	writer, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer writer.Close()
+	writer.SetMaxOpenConns(1)
+
+	_, err = writer.ExecContext(t.Context(), `
+		PRAGMA journal_mode=WAL;
+		CREATE TABLE items (id TEXT PRIMARY KEY);
+	`)
+	require.NoError(t, err)
+
+	_, err = writer.ExecContext(t.Context(), "PRAGMA locking_mode=EXCLUSIVE")
+	require.NoError(t, err)
+	tx, err := writer.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.ExecContext(t.Context(), "INSERT INTO items VALUES ('item1')")
+	require.NoError(t, err)
+
+	// Tiny delays keep the exhaustion path fast while still proving the
+	// ladder runs to its end and reports the busy classification.
+	db, err := openSQLiteReadOnlyWithBusyRetryDelays(
+		t.Context(), dbPath, sqliteReadOptions{busyTimeoutMS: 1},
+		[]time.Duration{time.Millisecond, time.Millisecond, time.Millisecond},
+		time.Sleep,
+	)
+	require.Nil(t, db)
+	require.Error(t, err, "a lock that outlives the ladder must surface as an error")
+	assert.ErrorContains(t, err, "sqlite busy")
+	assert.ErrorContains(t, err, "locked")
+	assert.True(t, isSQLiteBusyOrLocked(err),
+		"the exhausted error must keep the busy classification, got: %v", err)
+}
+
+func TestOpenSQLiteReadOnlyWithBusyRetry_NonBusyFailsWithoutRetry(t *testing.T) {
+	// A file that is not a database fails the initial read with a non-busy
+	// error, which must return immediately instead of burning the ladder.
+	dbPath := filepath.Join(t.TempDir(), "not-a.db")
+	require.NoError(t, os.WriteFile(dbPath, []byte("stub"), 0o600))
+
+	var sleeps []time.Duration
+	db, err := openSQLiteReadOnlyWithBusyRetryDelays(
+		t.Context(), dbPath, sqliteReadOptions{busyTimeoutMS: 1},
+		sqliteBusyRetryDelays,
+		func(d time.Duration) { sleeps = append(sleeps, d) },
+	)
+	require.Nil(t, db)
+	require.Error(t, err)
+	assert.Empty(t, sleeps, "non-busy failures must not sleep")
+	assert.False(t, isSQLiteBusyOrLocked(err))
+	assert.ErrorContains(t, err, "not a database")
 }

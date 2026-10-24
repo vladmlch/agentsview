@@ -569,7 +569,7 @@ func devinFingerprintHash(ctx context.Context,
 // length still slips through, which is accepted for a hint. A database
 // without a usable message_nodes table contributes an empty digest.
 func devinAppendMessageNodesDigest(ctx context.Context, h io.Writer, dbPath, rawSessionID string) error {
-	db, err := openDevinDB(dbPath)
+	db, err := openDevinDB(ctx, dbPath)
 	if err != nil {
 		return err
 	}
