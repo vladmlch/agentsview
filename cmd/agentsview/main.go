@@ -2076,6 +2076,19 @@ func formatAnomalySummary(a sync.AnomalyStats) string {
 			)
 		}
 	}
+	if a.ActiveDefersTotal > 0 {
+		fmt.Fprintf(&b,
+			"  active-writer defers: %d total (parse re-admitted on next event)\n",
+			a.ActiveDefersTotal,
+		)
+		for _, agent := range slices.Sorted(
+			maps.Keys(a.ActiveDefersByAgent),
+		) {
+			fmt.Fprintf(&b,
+				"    %s: %d\n", agent, a.ActiveDefersByAgent[agent],
+			)
+		}
+	}
 	if !a.Sanitize.IsZero() {
 		fmt.Fprintf(&b,
 			"  sanitized fields: %d total\n", a.Sanitize.Total(),
