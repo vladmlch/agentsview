@@ -181,6 +181,63 @@ func TestSyncEngineAntigravityCLI_StaleDataVersionRenormalizesProject(t *testing
 		"reparse must restamp the session at the current data version")
 }
 
+// TestSyncEngineAntigravityCLI_SameStatRewriteReparses pins the av-3 fix for
+// the CLI lane: a same-size, same-mtime rewrite of a companion the size/mtime
+// freshness composite folds in is invisible to that composite, so the
+// per-component stat digest (ctime+inode) must break the skip and the
+// required fingerprint content hash must force a reparse. Before the
+// antigravity-cli MultiFileStatHasher and FingerprintHashRequiredForFreshness
+// semantics, such a rewrite stayed skipped forever.
+func TestSyncEngineAntigravityCLI_SameStatRewriteReparses(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentAntigravityCLI)
+	uuid := "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb"
+	sessionID := "antigravity-cli:" + uuid
+
+	convDir := filepath.Join(env.antigravityCLIDir, "conversations")
+	require.NoError(t, os.MkdirAll(convDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(env.antigravityCLIDir, "history.jsonl"),
+		[]byte(`{"conversationId": "`+uuid+
+			`", "workspace": "/home/user/my-cli-project"}`+"\n"), 0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(convDir, uuid+".pb"), []byte("pb-stub"), 0o644,
+	))
+	trajectoryPath := filepath.Join(convDir, uuid+".trajectory.json")
+	mtime := time.Now().Add(-time.Hour).Truncate(time.Second)
+	swapTrajectory := func(prompt string) {
+		payload := []byte(
+			antigravityCLISingleUserTrajectory(uuid, prompt))
+		tmp := trajectoryPath + ".swap"
+		require.NoError(t, os.WriteFile(tmp, payload, 0o644))
+		require.NoError(t, os.Rename(tmp, trajectoryPath))
+		require.NoError(t, os.Chtimes(trajectoryPath, mtime, mtime))
+	}
+	swapTrajectory("av three check one")
+
+	runSyncAndAssert(t, env.engine, sync.SyncStats{TotalSessions: 1, Synced: 1})
+	msgs := fetchMessages(t, env.db, sessionID)
+	require.Len(t, msgs, 1)
+	require.Equal(t, "av three check one", msgs[0].Content)
+
+	// Same size, same mtime, new inode and ctime: the rewrite the old
+	// size/mtime-only skip composite could never distinguish.
+	swapTrajectory("av three check twu")
+	second := env.engine.SyncAll(t.Context(), nil)
+	require.Equal(t, 1, second.Synced,
+		"a same-size, same-mtime companion rewrite must not stay skipped")
+	msgs = fetchMessages(t, env.db, sessionID)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "av three check twu", msgs[0].Content,
+		"the rewrite's content must reach the archive")
+
+	// The reparse re-stamped the digest, so an unchanged source skips again.
+	third := env.engine.SyncAll(t.Context(), nil)
+	assert.Equal(t, 0, third.Synced,
+		"an unchanged source must skip once the digest converged")
+	assert.GreaterOrEqual(t, third.Skipped, 1)
+}
+
 // TestSyncEngineAntigravityCLI_DisabledProjectDiscoveryHonoredBySyncAll pins
 // the DisableFilesystemProjectDiscovery contract on the full-sync path:
 // every sync entry point, not just SyncPaths, must put the policy on the

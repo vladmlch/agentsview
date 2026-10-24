@@ -111,6 +111,22 @@ func (p *antigravityProvider) Fingerprint(
 	return p.sources.Fingerprint(ctx, source)
 }
 
+// ComputeMultiFileStatHash implements parser.MultiFileStatHasher for the IDE
+// session composite: the conversations/<id>.db plus exactly the companions
+// AntigravityFileInfo folds into the effective stat. Each component
+// contributes a (size, mtime, ctime, inode) tuple, so a same-size,
+// same-mtime rewrite of the source — invisible to the size/mtime skip
+// composite — bumps a ctime or swaps an inode and breaks the digest, forcing
+// the fingerprint whose content hash then gates the skip
+// (FingerprintHashRequiredForFreshness). An unverifiable identity field
+// zeroes the digest (see antigravityStatTupleDigest); freshness then rests
+// on the content-hash gate alone instead of a composite the platform cannot
+// back.
+func (p *antigravityProvider) ComputeMultiFileStatHash(chatPath string) uint64 {
+	return antigravityStatTupleDigest(antigravityIDEStatDigestSep, chatPath,
+		antigravityIDECompanionPaths(chatPath)...)
+}
+
 func (p *antigravityProvider) Parse(
 	ctx context.Context,
 	req ParseRequest,
@@ -871,8 +887,19 @@ func antigravityProviderCapabilities() Capabilities {
 	source.StreamingDiscovery = CapabilitySupported
 	source.ForceReplaceOnParse = CapabilitySupported
 	source.ChangedPathRelevance = CapabilitySupported
+	source.MultiFileStatHash = CapabilitySupported
 	return Capabilities{
 		Source: source,
+		Sync: ProviderSyncSemantics{
+			// The stored size/mtime of the composite stat cannot distinguish
+			// a same-size, same-mtime rewrite (or a rename-swap that lands in
+			// the same clock tick), so the fingerprint's content SHA must
+			// gate every stat-matching skip. The per-component stat digest
+			// (MultiFileStatHash) keeps warm passes stat-only; the hash gate
+			// is what makes a broken digest or an unverifiable identity
+			// field force a real re-verification instead of a stale skip.
+			FingerprintHashRequiredForFreshness: true,
+		},
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
 			SessionName:          CapabilitySupported,

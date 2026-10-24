@@ -96,6 +96,27 @@ func (p *antigravityCLIProvider) Fingerprint(
 	return p.sources.Fingerprint(ctx, source)
 }
 
+// ComputeMultiFileStatHash implements parser.MultiFileStatHasher for the CLI
+// session composite: the source plus exactly the companions
+// AntigravityCLIFileInfo folds into the effective stat (history.jsonl, the
+// wal sibling, the trajectory sidecar, brain artifacts, and the workspace
+// cache). Each component contributes a (size, mtime, ctime, inode) tuple, so
+// a same-size, same-mtime rewrite — invisible to the size/mtime skip
+// composite — bumps a ctime or swaps an inode and breaks the digest, forcing
+// the fingerprint whose content hash then gates the skip
+// (FingerprintHashRequiredForFreshness). An unverifiable identity field
+// zeroes the digest (see antigravityStatTupleDigest); freshness then rests
+// on the content-hash gate alone.
+func (p *antigravityCLIProvider) ComputeMultiFileStatHash(chatPath string) uint64 {
+	root := filepath.Dir(filepath.Dir(chatPath))
+	companions := append(
+		antigravityCLICompanionPaths(chatPath),
+		filepath.Join(root, "cache", "last_conversations.json"),
+	)
+	return antigravityStatTupleDigest(antigravityCLIStatDigestSep, chatPath,
+		companions...)
+}
+
 func (p *antigravityCLIProvider) Parse(
 	ctx context.Context,
 	req ParseRequest,
@@ -811,8 +832,17 @@ func antigravityCLIProviderCapabilities() Capabilities {
 	source.StreamingDiscovery = CapabilitySupported
 	source.ForceReplaceOnParse = CapabilitySupported
 	source.ChangedPathRelevance = CapabilitySupported
+	source.MultiFileStatHash = CapabilitySupported
 	return Capabilities{
 		Source: source,
+		Sync: ProviderSyncSemantics{
+			// Same doctrine as the IDE provider: the composite's stored
+			// size/mtime cannot distinguish a same-size, same-mtime
+			// rewrite, so the fingerprint's content SHA must gate every
+			// stat-matching skip while the per-component stat digest keeps
+			// warm passes stat-only.
+			FingerprintHashRequiredForFreshness: true,
+		},
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
 			Cwd:                  CapabilitySupported,

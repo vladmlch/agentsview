@@ -1108,6 +1108,63 @@ func antigravityCompanionCounts(path string, info os.FileInfo) bool {
 	return !strings.HasSuffix(path, "-wal") || SQLiteWALInfoHasFrames(info)
 }
 
+// The stat-digest domain separators for the two antigravity lanes. The byte
+// doubles as the composite's format version: antigravity never persisted a
+// provider_freshness digest before these constants existed (the engine only
+// writes digests for providers implementing MultiFileStatHasher), so no
+// stored row can predate this format — and any future change to the tuple
+// shape must pick fresh separators so an old-format digest can never compare
+// equal to a new one.
+const (
+	antigravityIDEStatDigestSep byte = 0xA3
+	antigravityCLIStatDigestSep byte = 0xA4
+)
+
+// antigravityStatTupleDigest computes the per-component stat digest for an
+// antigravity source: the FNV-1a tuple digest (size, mtime, ctime, inode) over
+// the primary file plus exactly the companions that count toward the effective
+// stat composite (see antigravityCLICombinedFileInfo), so the digest moves on
+// every stat the size/mtime skip gate can observe plus the identity fields it
+// cannot. A same-size, same-mtime rewrite — the rewrite class the old
+// size/mtime-only freshness composite could never distinguish — bumps ctime or
+// swaps the inode and breaks the digest. Companions are sorted and deduplicated
+// like antigravityCompositeHash so the digest is deterministic across process
+// restarts; missing, directory, and frame-less-WAL companions contribute no
+// tuple, matching the effective-stat filter. An unverifiable ctime or inode
+// zeroes the whole digest (the fileStatTupleDigest doctrine): platforms
+// without reliable identity fields never trust the digest for freshness and
+// fall back to the content-hash gate.
+func antigravityStatTupleDigest(
+	sep byte, path string, companions ...string,
+) uint64 {
+	return antigravityStatTupleDigestWithChangeTime(
+		codexIndexChangeTime, sep, path, companions...,
+	)
+}
+
+func antigravityStatTupleDigestWithChangeTime(
+	changeTime func(string, os.FileInfo) (int64, bool),
+	sep byte, path string, companions ...string,
+) uint64 {
+	sorted := append([]string(nil), companions...)
+	sort.Strings(sorted)
+	paths := []string{path}
+	var prev string
+	for _, companion := range sorted {
+		if companion == "" || companion == prev {
+			continue
+		}
+		prev = companion
+		info, err := os.Stat(companion)
+		if err != nil || info.IsDir() ||
+			!antigravityCompanionCounts(companion, info) {
+			continue
+		}
+		paths = append(paths, companion)
+	}
+	return fileStatTupleDigestWithChangeTime(changeTime, sep, paths...)
+}
+
 func antigravityCompositeHash(path string, companions ...string) (string, error) {
 	return antigravityCompositeHashWithExtra(path, companions, nil)
 }
