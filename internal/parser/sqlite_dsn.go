@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mattn/go-sqlite3"
 )
@@ -90,6 +92,95 @@ func WithSQLiteReadOnly(
 	defer scratchConn.Close()
 
 	return fn(scratchConn)
+}
+
+// sqliteBusyRetryDelays is the stepped pause between retries of a read-only
+// open that failed on SQLite lock contention. The 50+150+300ms ladder totals
+// 500ms, at (not past) the watch layer's ~500ms debounce window: a transiently
+// locked store can delay one scan batch up to the window, but never stall the
+// next one. Contention that outlives the ladder is already absorbed by the
+// caller's busy_timeout inside SQLite, and callers that need a guaranteed read
+// use the WithSQLiteReadOnly scratch-copy lane instead.
+var sqliteBusyRetryDelays = []time.Duration{
+	50 * time.Millisecond,
+	150 * time.Millisecond,
+	300 * time.Millisecond,
+}
+
+// openSQLiteReadOnlyWithBusyRetry opens the SQLite database at path read-only
+// and performs one initial read, retrying that open+initial-read seam while it
+// fails with SQLITE_BUSY/SQLITE_LOCKED (the same classification as the
+// WithSQLiteReadOnly scratch-copy lane). sql.Open never touches the file, so
+// without the initial read a momentary SQLITE_BUSY from a live writer process
+// — the Devin CLI holding its sessions.db — surfaces later as the caller's
+// first-query parse failure, outside any retry. Non-busy errors fail
+// immediately with unchanged behavior.
+func openSQLiteReadOnlyWithBusyRetry(
+	ctx context.Context, path string, options sqliteReadOptions,
+) (*sql.DB, error) {
+	return openSQLiteReadOnlyWithBusyRetryDelays(
+		ctx, path, options, sqliteBusyRetryDelays, time.Sleep,
+	)
+}
+
+func openSQLiteReadOnlyWithBusyRetryDelays(
+	ctx context.Context,
+	path string,
+	options sqliteReadOptions,
+	delays []time.Duration,
+	sleep func(time.Duration),
+) (*sql.DB, error) {
+	var db *sql.DB
+	err := retrySQLiteBusy(ctx, "opening "+filepath.Base(path), delays, sleep, func() error {
+		opened, openErr := openSQLiteReadOnly(path, options)
+		if openErr != nil {
+			return openErr
+		}
+		// The initial read forces the lazy sql.Open connection to prepare its
+		// first statement, so busy lock contention surfaces here, inside the
+		// retry window, instead of on the caller's first query.
+		var one int
+		if pingErr := opened.QueryRowContext(ctx, "SELECT 1").Scan(&one); pingErr != nil {
+			_ = opened.Close()
+			return pingErr
+		}
+		db = opened
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return db, nil
+}
+
+// retrySQLiteBusy runs op until it succeeds, fails with a non-busy error, or
+// exhausts delays, sleeping delay[i] before retry i+1. sleep is injected so
+// tests can run the ladder without real pauses. A canceled context stops the
+// ladder after the current attempt; an exhausted ladder reports the busy
+// classification alongside the final underlying error.
+func retrySQLiteBusy(
+	ctx context.Context,
+	label string,
+	delays []time.Duration,
+	sleep func(time.Duration),
+	op func() error,
+) error {
+	var err error
+	for attempt := 0; ; attempt++ {
+		if err = op(); err == nil {
+			return nil
+		}
+		if ctx.Err() != nil || !isSQLiteBusyOrLocked(err) {
+			return err
+		}
+		if attempt >= len(delays) {
+			return fmt.Errorf("sqlite busy %s after %d retries: %w",
+				label, len(delays), err)
+		}
+		log.Printf("sqlite: busy %s (attempt %d of %d), retrying in %s: %v",
+			label, attempt+1, len(delays)+1, delays[attempt], err)
+		sleep(delays[attempt])
+	}
 }
 
 func copySQLiteContainerFiles(src, dst string) error {

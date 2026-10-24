@@ -50,7 +50,7 @@ type listedCursorIDEToken struct {
 
 func listCursorIDETokensForTest(t *testing.T, dbPath string) []listedCursorIDEToken {
 	t.Helper()
-	conn, err := openCursorIDEDB(dbPath)
+	conn, err := openCursorIDEDB(t.Context(), dbPath)
 	require.NoError(t, err)
 	defer conn.Close()
 	var listed []listedCursorIDEToken

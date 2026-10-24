@@ -392,7 +392,7 @@ func TestOpenOpenCodeDBDoesNotForceWALMode(t *testing.T) {
 	dbPath, _, writer := newTestDB(t)
 	require.NoError(t, writer.Close())
 
-	reader, err := openOpenCodeDB(dbPath)
+	reader, err := openOpenCodeDB(t.Context(), dbPath)
 	require.NoError(t, err)
 	defer reader.Close()
 	_, err = reader.ExecContext(t.Context(), "CREATE TABLE must_stay_read_only (id INTEGER)")

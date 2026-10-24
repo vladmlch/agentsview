@@ -70,8 +70,10 @@ func cursorIDEDefaultDirs() []string {
 	}
 }
 
-func openCursorIDEDB(dbPath string) (*sql.DB, error) {
-	db, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{busyTimeoutMS: 3000})
+func openCursorIDEDB(ctx context.Context, dbPath string) (*sql.DB, error) {
+	db, err := openSQLiteReadOnlyWithBusyRetry(
+		ctx, dbPath, sqliteReadOptions{busyTimeoutMS: 3000},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("opening cursor IDE db %s: %w", dbPath, err)
 	}

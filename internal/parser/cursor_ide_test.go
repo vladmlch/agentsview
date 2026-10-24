@@ -352,7 +352,7 @@ func TestParseCursorIDEComposer_ResultValues(t *testing.T) {
 				{id: "visible", bubbleType: 2, text: "answer"},
 				{id: "bookkeeping", bubbleType: 3},
 			}}})
-			conn, err := openCursorIDEDB(dbPath)
+			conn, err := openCursorIDEDB(t.Context(), dbPath)
 			require.NoError(t, err)
 			defer conn.Close()
 			info, err := os.Stat(dbPath)
@@ -395,7 +395,7 @@ func TestParseCursorIDEComposer_MalformedResult(t *testing.T) {
 		{id: "before", bubbleType: 1, text: "before"},
 		{id: "broken", bubbleType: 2, raw: []byte(raw)},
 	}}})
-	conn, err := openCursorIDEDB(dbPath)
+	conn, err := openCursorIDEDB(t.Context(), dbPath)
 	require.NoError(t, err)
 	defer conn.Close()
 	info, err := os.Stat(dbPath)
@@ -467,7 +467,7 @@ func TestParseCursorIDEComposer_ToleratesMissingBubbleRow(t *testing.T) {
 		omitBubbleIDs: map[string]bool{"missing": true},
 	}})
 
-	conn, err := openCursorIDEDB(dbPath)
+	conn, err := openCursorIDEDB(t.Context(), dbPath)
 	require.NoError(t, err)
 	defer conn.Close()
 	info, err := os.Stat(dbPath)
@@ -489,7 +489,7 @@ func TestParseCursorIDEComposer_EmptyComposerSkipped(t *testing.T) {
 	dbPath := createCursorIDEDB(t, []cursorIDETestComposer{{
 		id: "empty-0000-0000-0000-000000000000",
 	}})
-	conn, err := openCursorIDEDB(dbPath)
+	conn, err := openCursorIDEDB(t.Context(), dbPath)
 	require.NoError(t, err)
 	defer conn.Close()
 	info, err := os.Stat(dbPath)
@@ -524,7 +524,7 @@ func TestParseCursorIDEComposer_MalformedBubbleFailsInsteadOfTruncating(t *testi
 	require.NoError(t, err)
 	require.NoError(t, writer.Close())
 
-	conn, err := openCursorIDEDB(dbPath)
+	conn, err := openCursorIDEDB(t.Context(), dbPath)
 	require.NoError(t, err)
 	defer conn.Close()
 	info, err := os.Stat(dbPath)
@@ -560,7 +560,7 @@ func TestParseCursorIDEComposer_MalformedComposerFailsInsteadOfRetiring(t *testi
 	require.NoError(t, err)
 	require.NoError(t, writer.Close())
 
-	conn, err := openCursorIDEDB(dbPath)
+	conn, err := openCursorIDEDB(t.Context(), dbPath)
 	require.NoError(t, err)
 	defer conn.Close()
 	info, err := os.Stat(dbPath)
@@ -592,7 +592,7 @@ func TestParseCursorIDEComposer_EndedAtNotBeforeLastMessage(t *testing.T) {
 			{id: "b2", bubbleType: cursorIDEBubbleTypeAssistant, text: "reply", createdAt: "2026-06-21T07:28:05.000Z"},
 		},
 	}})
-	conn, err := openCursorIDEDB(dbPath)
+	conn, err := openCursorIDEDB(t.Context(), dbPath)
 	require.NoError(t, err)
 	defer conn.Close()
 	info, err := os.Stat(dbPath)
@@ -710,7 +710,7 @@ func TestParseCursorIDEComposer_SessionBounds(t *testing.T) {
 				updatedAt: tt.updatedAt,
 				bubbles:   tt.bubbles,
 			}})
-			conn, err := openCursorIDEDB(dbPath)
+			conn, err := openCursorIDEDB(t.Context(), dbPath)
 			require.NoError(t, err)
 			defer conn.Close()
 			info, err := os.Stat(dbPath)
@@ -877,7 +877,7 @@ func TestParseCursorIDEComposer_NullBubbleValueBecomesGap(t *testing.T) {
 			// call. P6 requires the digest to hash every stored bubble's key
 			// and value bytes unconditionally, so husking b2 must change it.
 			intactPath := createCursorIDEDB(t, composer)
-			intactConn, err := openCursorIDEDB(intactPath)
+			intactConn, err := openCursorIDEDB(t.Context(), intactPath)
 			require.NoError(t, err)
 			intactInfo, err := os.Stat(intactPath)
 			require.NoError(t, err)
@@ -902,7 +902,7 @@ func TestParseCursorIDEComposer_NullBubbleValueBecomesGap(t *testing.T) {
 			assertCursorDiskKVStoredShape(t, dbPath,
 				"bubbleId:null-bubble-0000-0000-000000000000:b2", tc.value == nil)
 
-			conn, err := openCursorIDEDB(dbPath)
+			conn, err := openCursorIDEDB(t.Context(), dbPath)
 			require.NoError(t, err)
 			defer conn.Close()
 			info, err := os.Stat(dbPath)
@@ -945,7 +945,7 @@ func TestCursorIDEEmptyJSONObjectValuesTakeExistingPaths(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, writer.Close())
 
-		conn, err := openCursorIDEDB(dbPath)
+		conn, err := openCursorIDEDB(t.Context(), dbPath)
 		require.NoError(t, err)
 		defer conn.Close()
 		info, err := os.Stat(dbPath)
@@ -998,7 +998,7 @@ func TestCursorIDEEmptyJSONObjectValuesTakeExistingPaths(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, writer.Close())
 
-		conn, err := openCursorIDEDB(dbPath)
+		conn, err := openCursorIDEDB(t.Context(), dbPath)
 		require.NoError(t, err)
 		defer conn.Close()
 		info, err := os.Stat(dbPath)
@@ -1073,7 +1073,7 @@ func TestLoadCursorIDEComposerMetaNullValueReportsNotFound(t *testing.T) {
 			assertCursorDiskKVStoredShape(t, dbPath,
 				"composerData:null-meta-0000-0000-000000000000", tc.value == nil)
 
-			conn, err := openCursorIDEDB(dbPath)
+			conn, err := openCursorIDEDB(t.Context(), dbPath)
 			require.NoError(t, err)
 			defer conn.Close()
 
@@ -1114,7 +1114,7 @@ func TestParseCursorIDEComposer_TypelessBubbleFallsBackToHeaderType(t *testing.T
 	require.NoError(t, err)
 	require.NoError(t, writer.Close())
 
-	conn, err := openCursorIDEDB(dbPath)
+	conn, err := openCursorIDEDB(t.Context(), dbPath)
 	require.NoError(t, err)
 	defer conn.Close()
 	info, err := os.Stat(dbPath)
@@ -1464,7 +1464,7 @@ func TestParseCursorIDEComposer_ContextTokensUsedDistributed(t *testing.T) {
 			},
 		},
 	}})
-	conn, err := openCursorIDEDB(dbPath)
+	conn, err := openCursorIDEDB(t.Context(), dbPath)
 	require.NoError(t, err)
 	defer conn.Close()
 	info, err := os.Stat(dbPath)
@@ -1504,7 +1504,7 @@ func TestParseCursorIDEComposer_ZeroContextTokensUsedLeavesTokensUnset(t *testin
 			},
 		},
 	}})
-	conn, err := openCursorIDEDB(dbPath)
+	conn, err := openCursorIDEDB(t.Context(), dbPath)
 	require.NoError(t, err)
 	defer conn.Close()
 	info, err := os.Stat(dbPath)

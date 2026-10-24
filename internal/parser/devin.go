@@ -74,7 +74,7 @@ func ForEachDevinSessionMeta(
 		return nil
 	}
 
-	db, err := openDevinDB(dbPath)
+	db, err := openDevinDB(ctx, dbPath)
 	if err != nil {
 		return err
 	}
@@ -131,8 +131,15 @@ func ForEachDevinSessionMeta(
 	return nil
 }
 
-func openDevinDB(dbPath string) (*sql.DB, error) {
-	db, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{busyTimeoutMS: 3000})
+// openDevinDB opens the live Devin sessions.db read-only. The CLI process
+// writes this database while agentsview reads it, so the open goes through
+// openSQLiteReadOnlyWithBusyRetry: a momentary SQLITE_BUSY at the connection's
+// first statement is retried on a short stepped ladder instead of failing the
+// whole listing or parse.
+func openDevinDB(ctx context.Context, dbPath string) (*sql.DB, error) {
+	db, err := openSQLiteReadOnlyWithBusyRetry(
+		ctx, dbPath, sqliteReadOptions{busyTimeoutMS: 3000},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("opening devin db %s: %w", dbPath, err)
 	}
@@ -142,7 +149,7 @@ func openDevinDB(dbPath string) (*sql.DB, error) {
 func getDevinSessionMeta(ctx context.Context,
 	dbPath, rawSessionID string,
 ) (*DevinSessionMeta, error) {
-	db, err := openDevinDB(dbPath)
+	db, err := openDevinDB(ctx, dbPath)
 	if err != nil {
 		return nil, err
 	}
@@ -677,7 +684,7 @@ type devinMessageNodeRow struct {
 }
 
 func listDevinMessageNodes(ctx context.Context, dbPath, rawSessionID string) ([]devinMessageNodeRow, error) {
-	db, err := openDevinDB(dbPath)
+	db, err := openDevinDB(ctx, dbPath)
 	if err != nil {
 		return nil, err
 	}

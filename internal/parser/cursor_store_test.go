@@ -364,7 +364,7 @@ func TestCursorStoreSkipsUndecodableBlobWithoutDroppingSiblings(t *testing.T) {
 
 func TestCursorStoreResolvesInline32ByteMessage(t *testing.T) {
 	fx := setupCursorStoreFixture(t, false)
-	db, err := openCursorIDEDB(fx.StorePath)
+	db, err := openCursorIDEDB(t.Context(), fx.StorePath)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1128,7 +1128,7 @@ func TestCursorStoreRemovalKeepsTranscript(t *testing.T) {
 
 func TestCursorStoreOpensReadOnly(t *testing.T) {
 	fx := setupCursorStoreFixture(t, false)
-	conn, err := openCursorIDEDB(fx.StorePath)
+	conn, err := openCursorIDEDB(t.Context(), fx.StorePath)
 	require.NoError(t, err)
 	defer conn.Close()
 	_, err = conn.ExecContext(t.Context(), `CREATE TABLE should_fail (id INTEGER)`)

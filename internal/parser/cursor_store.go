@@ -198,7 +198,7 @@ func readCursorStoreTurns(
 	if storePath == "" || !IsValidSessionID(agentID) {
 		return nil, fmt.Errorf("%w: missing agent id", errCursorStoreFormat)
 	}
-	conn, err := openCursorIDEDB(storePath)
+	conn, err := openCursorIDEDB(ctx, storePath)
 	if err != nil {
 		return nil, err
 	}

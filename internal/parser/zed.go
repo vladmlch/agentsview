@@ -264,12 +264,14 @@ func parseZedThreadFromDBWithSchema(
 
 // OpenZedDB opens the Zed threads.db file read-only.
 // Callers are responsible for calling Close on the returned *sql.DB.
-func OpenZedDB(dbPath string) (*sql.DB, error) {
-	return openZedDB(dbPath)
+func OpenZedDB(ctx context.Context, dbPath string) (*sql.DB, error) {
+	return openZedDB(ctx, dbPath)
 }
 
-func openZedDB(dbPath string) (*sql.DB, error) {
-	db, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{busyTimeoutMS: 3000})
+func openZedDB(ctx context.Context, dbPath string) (*sql.DB, error) {
+	db, err := openSQLiteReadOnlyWithBusyRetry(
+		ctx, dbPath, sqliteReadOptions{busyTimeoutMS: 3000},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("opening zed db %s: %w", dbPath, err)
 	}
