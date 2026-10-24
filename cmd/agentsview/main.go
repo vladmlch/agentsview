@@ -2210,6 +2210,31 @@ func formatAnomalySummary(a sync.AnomalyStats) string {
 			)
 		}
 	}
+	if a.QuarantineRetriesTotal > 0 {
+		fmt.Fprintf(&b,
+			"  quarantine retries: %d total\n", a.QuarantineRetriesTotal,
+		)
+		for _, class := range slices.Sorted(
+			maps.Keys(a.QuarantineRetriesByClass),
+		) {
+			fmt.Fprintf(&b,
+				"    %s: %d\n", class, a.QuarantineRetriesByClass[class],
+			)
+		}
+	}
+	if a.QuarantineSkipsTotal > 0 {
+		fmt.Fprintf(&b,
+			"  quarantine skips: %d total (admission denied, budget exhausted)\n",
+			a.QuarantineSkipsTotal,
+		)
+		for _, agent := range slices.Sorted(
+			maps.Keys(a.QuarantineSkipsByAgent),
+		) {
+			fmt.Fprintf(&b,
+				"    %s: %d\n", agent, a.QuarantineSkipsByAgent[agent],
+			)
+		}
+	}
 	if !a.Sanitize.IsZero() {
 		fmt.Fprintf(&b,
 			"  sanitized fields: %d total\n", a.Sanitize.Total(),

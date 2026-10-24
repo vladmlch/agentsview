@@ -7655,12 +7655,32 @@ components:
         gen_metadata_without_usage_total:
           format: int64
           type: integer
+        malformed_line_samples:
+          items:
+            $ref: "#/components/schemas/SyncMalformedLineSample"
+          type: array
         malformed_lines_by_agent:
           additionalProperties:
             format: int64
             type: integer
           type: object
         malformed_lines_total:
+          format: int64
+          type: integer
+        quarantine_retries_by_class:
+          additionalProperties:
+            format: int64
+            type: integer
+          type: object
+        quarantine_retries_total:
+          format: int64
+          type: integer
+        quarantine_skips_by_agent:
+          additionalProperties:
+            format: int64
+            type: integer
+          type: object
+        quarantine_skips_total:
           format: int64
           type: integer
         sanitize:
@@ -7681,6 +7701,29 @@ components:
         unsupported_source_layouts_total:
           format: int64
           type: integer
+      type: object
+    SyncMalformedLineSample:
+      additionalProperties: false
+      properties:
+        agent:
+          type: string
+        class:
+          type: string
+        count:
+          format: int64
+          type: integer
+        lines:
+          items:
+            format: int64
+            type: integer
+          type: array
+        path:
+          type: string
+      required:
+        - agent
+        - class
+        - count
+        - lines
       type: object
     SyncProgress:
       additionalProperties: false

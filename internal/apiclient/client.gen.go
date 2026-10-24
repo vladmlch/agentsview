@@ -25437,6 +25437,10 @@ type SyncAnomalyStats struct {
 	GenMetadataWithoutUsageTotal    *int64             `json:"gen_metadata_without_usage_total,omitempty"`
 	MalformedLinesByAgent           map[string]int64   `json:"malformed_lines_by_agent,omitempty"`
 	MalformedLinesTotal             *int64             `json:"malformed_lines_total,omitempty"`
+	QuarantineRetriesByClass        map[string]int64   `json:"quarantine_retries_by_class,omitempty"`
+	QuarantineRetriesTotal          *int64             `json:"quarantine_retries_total,omitempty"`
+	QuarantineSkipsByAgent          map[string]int64   `json:"quarantine_skips_by_agent,omitempty"`
+	QuarantineSkipsTotal            *int64             `json:"quarantine_skips_total,omitempty"`
 	Sanitize                        *SyncSanitizeStats `json:"sanitize,omitempty"`
 	UnknownSchemaSessionsByAgent    map[string]int64   `json:"unknown_schema_sessions_by_agent,omitempty"`
 	UnknownSchemaSessionsTotal      *int64             `json:"unknown_schema_sessions_total,omitempty"`
