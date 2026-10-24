@@ -708,6 +708,127 @@ func TestParseClaudeSession_QueuedCommand(t *testing.T) {
 		assert.Equal(t, "queued_command", msgs[2].SourceSubtype)
 		assert.Equal(t, 2, sess.UserMessageCount)
 	})
+
+	t.Run("human origin stays a user message", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.ClaudeUserJSON("first request", tsZero),
+			testjsonl.ClaudeQueuedCommandOriginJSON(
+				"hold on, also do X", tsZeroS1, "human",
+			),
+			testjsonl.ClaudeAssistantJSON([]map[string]any{
+				{"type": "text", "text": "ok"},
+			}, tsZeroS2),
+		)
+		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
+		require.Len(t, msgs, 3)
+		assert.Equal(t, 2, sess.UserMessageCount)
+		assert.Equal(t, RoleUser, msgs[1].Role)
+		assert.Equal(t, "hold on, also do X", msgs[1].Content)
+		assert.False(t, msgs[1].IsSystem)
+		assert.Equal(t, "queued_command", msgs[1].SourceSubtype)
+	})
+
+	t.Run("absent origin stays a user message", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.ClaudeUserJSON("first request", tsZero),
+			testjsonl.ClaudeQueuedCommandOriginJSON(
+				"hold on, also do X", tsZeroS1, "",
+			),
+			testjsonl.ClaudeAssistantJSON([]map[string]any{
+				{"type": "text", "text": "ok"},
+			}, tsZeroS2),
+		)
+		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
+		require.Len(t, msgs, 3)
+		assert.Equal(t, 2, sess.UserMessageCount)
+		assert.Equal(t, RoleUser, msgs[1].Role)
+		assert.Equal(t, "queued_command", msgs[1].SourceSubtype)
+	})
+
+	t.Run("machine-origin and meta queued commands are excluded", func(t *testing.T) {
+		cases := []struct {
+			name string
+			line string
+		}{
+			{
+				name: "peer origin",
+				line: testjsonl.ClaudeQueuedCommandOriginJSON(
+					"peer hand-back", tsZeroS1, "peer",
+				),
+			},
+			{
+				name: "task-notification origin",
+				line: testjsonl.ClaudeQueuedCommandOriginJSON(
+					"<task-notification>done</task-notification>",
+					tsZeroS1, "task-notification",
+				),
+			},
+			{
+				name: "coordinator origin",
+				line: testjsonl.ClaudeQueuedCommandOriginJSON(
+					"coordinator injection", tsZeroS1, "coordinator",
+				),
+			},
+			{
+				name: "record-level isMeta",
+				line: `{"type":"attachment","timestamp":"` + tsZeroS1 +
+					`","isMeta":true,"attachment":{"type":"queued_command",` +
+					`"commandMode":"prompt","prompt":"meta note"}}`,
+			},
+			{
+				name: "attachment-level isMeta",
+				line: `{"type":"attachment","timestamp":"` + tsZeroS1 +
+					`","attachment":{"type":"queued_command",` +
+					`"commandMode":"prompt","prompt":"meta note",` +
+					`"isMeta":true}}`,
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				content := testjsonl.JoinJSONL(
+					testjsonl.ClaudeUserJSON("first request", tsZero),
+					tc.line,
+					testjsonl.ClaudeAssistantJSON([]map[string]any{
+						{"type": "text", "text": "ok"},
+					}, tsZeroS2),
+				)
+				sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
+				require.Len(t, msgs, 2)
+				assert.Equal(t, 2, sess.MessageCount)
+				assert.Equal(t, 1, sess.UserMessageCount)
+				assert.Equal(t, "first request", sess.FirstMessage)
+				assert.Equal(t, RoleUser, msgs[0].Role)
+				assert.Equal(t, RoleAssistant, msgs[1].Role)
+			})
+		}
+	})
+
+	t.Run("delivered promptSource queued user record is unaffected", func(t *testing.T) {
+		// A delivered queued prompt is re-emitted as a plain user
+		// record with promptSource "queued". Its machine-origin
+		// attachment twin must be excluded without suppressing or
+		// duplicating the delivered record.
+		delivered := `{"type":"user","timestamp":"` + tsZeroS2 + `",` +
+			`"promptSource":"queued","message":{"content":"delivered prompt"}}`
+		twin := testjsonl.ClaudeQueuedCommandOriginJSON(
+			"delivered prompt", tsZeroS2, "task-notification",
+		)
+		content := testjsonl.JoinJSONL(
+			testjsonl.ClaudeUserJSON("first request", tsZero),
+			testjsonl.ClaudeAssistantJSON([]map[string]any{
+				{"type": "text", "text": "working"},
+			}, tsZeroS1),
+			twin,
+			delivered,
+		)
+		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
+		require.Len(t, msgs, 3)
+		assert.Equal(t, 2, sess.UserMessageCount)
+		assert.Equal(t, RoleUser, msgs[2].Role)
+		assert.Equal(t, "delivered prompt", msgs[2].Content)
+		assert.Equal(t, "queued", msgs[2].PromptSource)
+		assert.NotEqual(t, "queued_command", msgs[2].SourceSubtype)
+	})
 }
 
 func TestParseClaudeSession_QueuedSystemMessagesDoNotCount(t *testing.T) {

@@ -117,6 +117,30 @@ func ClaudeQueuedCommandJSON(
 	return mustMarshal(m)
 }
 
+// ClaudeQueuedCommandOriginJSON returns a Claude queued_command
+// attachment carrying an explicit attachment.origin.kind. An empty
+// originKind omits the origin object entirely, "human" marks user
+// input, and any other value (peer, task-notification, coordinator)
+// marks a machine-origin prompt.
+func ClaudeQueuedCommandOriginJSON(
+	prompt, timestamp, originKind string,
+) string {
+	attachment := map[string]any{
+		"type":        "queued_command",
+		"commandMode": "prompt",
+		"prompt":      prompt,
+	}
+	if originKind != "" {
+		attachment["origin"] = map[string]any{"kind": originKind}
+	}
+	m := map[string]any{
+		"type":       "attachment",
+		"timestamp":  timestamp,
+		"attachment": attachment,
+	}
+	return mustMarshal(m)
+}
+
 // ClaudeSnapshotJSON returns a Claude snapshot message as a
 // JSON string.
 func ClaudeSnapshotJSON(timestamp string) string {
