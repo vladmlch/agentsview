@@ -483,6 +483,18 @@ type EngineConfig struct {
 	// remote sync leaves it empty because the prefixes describe
 	// local paths.
 	IncludeCwdPrefixes []string
+	// ExcludePatterns are the watch_exclude_patterns shared with the watcher
+	// backends. Batch discovery and reconciliation exclude every source whose
+	// path matches relative to a configured agent root, using the watcher's
+	// component-wise semantics, so both lanes stay in agreement. Patterns are
+	// validated at config load; an engine built with invalid patterns fails
+	// closed by excluding every source.
+	ExcludePatterns []string
+	// MaxSourceBytes is the per-source byte ceiling at parse admission: a
+	// source file (or, for sources inside one, the container database file)
+	// larger than the ceiling is skipped with a recorded source failure
+	// instead of parsed. Zero means unlimited.
+	MaxSourceBytes int64
 	// ScanProtectedPaths lets local Git discovery read working directories
 	// inside macOS TCC-protected locations (Documents, Downloads, Desktop,
 	// iCloud Drive, cloud-provider folders, and volumes under /Volumes). It
@@ -611,6 +623,14 @@ type Engine struct {
 	stagedCodexDir   string
 	toolResultImages config.ToolResultImages
 	cwdFilter        cwdPrefixFilter
+	// batchExcludes applies watch_exclude_patterns to batch discovery and
+	// reconciliation so both lanes agree with the watcher backends. The zero
+	// value admits everything (exclusion not configured); a broken pattern
+	// set compiles to the exclude-everything matcher (see batch_exclude.go).
+	batchExcludes batchExcludeMatcher
+	// maxSourceBytes is the per-source byte ceiling at parse admission.
+	// Zero means unlimited.
+	maxSourceBytes int64
 	// scanProtectedPaths, homeDir, and goos gate passive probing of macOS
 	// TCC-protected locations. homeDir is empty when the home directory
 	// cannot be resolved, which disables the gate rather than guessing.
@@ -1015,6 +1035,14 @@ func NewEngine(ctx context.Context,
 	if progressStallAfter <= 0 {
 		progressStallAfter = defaultProgressStallAfter
 	}
+	// Compile the shared exclusion set once. Config loading already rejects
+	// invalid patterns (the process refuses to start); an engine that reaches
+	// construction with an unusable set fails closed by excluding everything,
+	// so a broken configuration can never silently admit every source.
+	batchExcludes, excludeErr := newBatchExcludeMatcher(cfg.ExcludePatterns)
+	if excludeErr != nil {
+		batchExcludes = newFailClosedBatchExcludeMatcher(excludeErr)
+	}
 	toolResultImages := database.ToolResultImages()
 	if cfg.AssetsDir != "" {
 		database.SetAssetsDir(cfg.AssetsDir)
@@ -1031,6 +1059,8 @@ func NewEngine(ctx context.Context,
 		blockedResultCategories: blockedCategorySet(cfg.BlockedResultCategories),
 		stagedCodexMin:          stagedCodexMinBytes(cfg.StagedCodexParseMinBytes),
 		stagedCodexDir:          stagedCodexDir,
+		batchExcludes:           batchExcludes,
+		maxSourceBytes:          cfg.MaxSourceBytes,
 		toolResultImages:        toolResultImages,
 		cwdFilter:               newCwdPrefixFilter(cfg.IncludeCwdPrefixes),
 		scanProtectedPaths:      cfg.ScanProtectedPaths,
@@ -6974,6 +7004,12 @@ func (e *Engine) reconciliationCandidate(ctx context.Context,
 	if path == "" || isRemoteReconciliationRoot(path) {
 		return reconciliationCandidate{}, false
 	}
+	// Keep reconciliation in agreement with the watcher and full-discovery
+	// lanes: a source excluded by watch_exclude_patterns must not re-enter
+	// through a bounded or recovery reconciliation pass either.
+	if e.batchExcludes.excludesSource(source, roots) {
+		return reconciliationCandidate{}, false
+	}
 	agent := source.Provider
 	if agent == "" {
 		agent = provider.Definition().Type
@@ -9010,6 +9046,20 @@ func (e *Engine) discoverProviderSources(
 			if !incomplete || ctx.Err() != nil || !provider.Capabilities().Sync.PartialDiscovery {
 				continue
 			}
+		}
+		// Apply the user's exclusion patterns to the batch lane at the same
+		// seam for every file-based provider: before scope arbitration,
+		// dedup, or any freshness state can observe the source, so an
+		// excluded path stays invisible to the whole pass (no skip-cache,
+		// provider_freshness, or presence entries are written for it).
+		sources, excludedSources := e.batchExcludes.filterExcludedSources(
+			sources, providerRoots,
+		)
+		if excludedSources > 0 {
+			log.Printf(
+				"discovery: excluded %d %s sources by watch_exclude_patterns",
+				excludedSources, agentType,
+			)
 		}
 		if agentType == parser.AgentKiro {
 			sources = filterProviderSourcesToScope(sources, scope)
@@ -12668,6 +12718,12 @@ func (e *Engine) processProviderFile(
 		machine = e.machineForProviderSource(file.Agent, source, file.Path)
 	}
 	file.Machine = machine
+	// Per-source byte ceiling (sync_max_source_bytes): applied at parse
+	// admission, after the source resolves, so every lane that reaches a
+	// parse decision sees the same budget. See applySourceByteBudget.
+	if res, budgeted := e.applySourceByteBudget(file, source); budgeted {
+		return res, true
+	}
 	providerSemantics := provider.Capabilities().Sync
 
 	// SyncSingleSession resolves a single session by ID and carries the

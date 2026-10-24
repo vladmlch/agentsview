@@ -3216,3 +3216,55 @@ func TestLoadFile_ModelAliases(t *testing.T) {
 		})
 	}
 }
+
+func TestWatchExcludePatternsTOMLValidation(t *testing.T) {
+	t.Run("valid patterns load", func(t *testing.T) {
+		cfg, err := Default()
+		require.NoError(t, err)
+		require.NoError(t, cfg.applyConfigTOML(
+			`watch_exclude_patterns = [".git", "node_modules", "*.lock*", "secrets/*"]`))
+		assert.Equal(t, []string{".git", "node_modules", "*.lock*", "secrets/*"},
+			cfg.WatchExcludePatterns)
+	})
+
+	t.Run("malformed glob refuses to load", func(t *testing.T) {
+		cfg, err := Default()
+		require.NoError(t, err)
+		err = cfg.applyConfigTOML(`watch_exclude_patterns = ["["]`)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "watch_exclude_patterns")
+	})
+
+	t.Run("malformed glob among valid patterns refuses to load", func(t *testing.T) {
+		cfg, err := Default()
+		require.NoError(t, err)
+		err = cfg.applyConfigTOML(
+			`watch_exclude_patterns = [".git", "broken["]`)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `pattern "broken["`)
+	})
+}
+
+func TestSyncMaxSourceBytesTOML(t *testing.T) {
+	t.Run("unset stays unlimited", func(t *testing.T) {
+		cfg, err := Default()
+		require.NoError(t, err)
+		require.NoError(t, cfg.applyConfigTOML(``))
+		assert.Zero(t, cfg.SyncMaxSourceBytes)
+	})
+
+	t.Run("positive ceiling loads", func(t *testing.T) {
+		cfg, err := Default()
+		require.NoError(t, err)
+		require.NoError(t, cfg.applyConfigTOML(`sync_max_source_bytes = 1048576`))
+		assert.Equal(t, int64(1048576), cfg.SyncMaxSourceBytes)
+	})
+
+	t.Run("negative ceiling refuses to load", func(t *testing.T) {
+		cfg, err := Default()
+		require.NoError(t, err)
+		err = cfg.applyConfigTOML(`sync_max_source_bytes = -1`)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "sync_max_source_bytes")
+	})
+}

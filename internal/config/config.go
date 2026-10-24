@@ -946,45 +946,51 @@ type sessionSourceConfig struct {
 type Config struct {
 	// CodexCloud is the [agents.codex-cloud] table, read from config.toml
 	// only.
-	CodexCloud           CodexCloudConfig            `json:"-" toml:"-"`
-	Host                 string                      `json:"host" toml:"host"`
-	Port                 int                         `json:"port" toml:"port"`
-	ChartPalette         ChartPalette                `json:"chart_palette" toml:"chart_palette"`
-	ZoomLevel            *ZoomLevel                  `json:"zoom_level,omitempty" toml:"zoom_level,omitempty"`
-	DataDir              string                      `json:"data_dir" toml:"data_dir"`
-	DBPath               string                      `json:"-" toml:"-"`
-	PublicURL            string                      `json:"public_url,omitempty" toml:"public_url"`
-	PublicOrigins        []string                    `json:"public_origins,omitempty" toml:"public_origins"`
-	Proxy                ProxyConfig                 `json:"proxy,omitempty" toml:"proxy"`
-	WatchExcludePatterns []string                    `json:"watch_exclude_patterns,omitempty" toml:"watch_exclude_patterns"`
-	DisabledAgents       []parser.AgentType          `json:"disabled_agents,omitempty" toml:"disabled_agents"`
-	CursorSecret         string                      `json:"cursor_secret" toml:"cursor_secret"`
-	CursorAdminAPIKey    string                      `json:"cursor_admin_api_key,omitempty" toml:"cursor_admin_api_key"`
-	CursorAdminEmail     string                      `json:"cursor_admin_email,omitempty" toml:"cursor_admin_email"`
-	CursorAdminUserID    string                      `json:"cursor_admin_user_id,omitempty" toml:"cursor_admin_user_id"`
-	GithubToken          string                      `json:"github_token,omitempty" toml:"github_token"`
-	Terminal             TerminalConfig              `json:"terminal,omitempty" toml:"terminal"`
-	AuthToken            string                      `json:"auth_token,omitempty" toml:"auth_token"`
-	RequireAuth          bool                        `json:"require_auth" toml:"require_auth"`
-	NoBrowser            bool                        `json:"no_browser" toml:"no_browser"`
-	DisableUpdateCheck   bool                        `json:"disable_update_check" toml:"disable_update_check"`
-	NoSync               bool                        `json:"-" toml:"-"`
-	SkipInitialSync      bool                        `json:"-" toml:"-"`
-	ArchiveContent       ArchiveContent              `json:"archive_content" toml:"archive_content"`
-	PG                   PGConfig                    `json:"pg,omitempty" toml:"pg"`
-	DefaultPG            string                      `json:"default_pg,omitempty" toml:"default_pg"`
-	PGTargets            map[string]PGConfig         `json:"-" toml:"-"`
-	ClickHouse           ClickHouseConfig            `json:"clickhouse,omitempty" toml:"clickhouse"`
-	DefaultClickHouse    string                      `json:"default_clickhouse,omitempty" toml:"default_clickhouse"`
-	ClickHouseTargets    map[string]ClickHouseConfig `json:"-" toml:"-"`
-	DuckDB               DuckDBConfig                `json:"duckdb,omitempty" toml:"duckdb"`
-	Vector               VectorConfig                `json:"vector,omitempty" toml:"vector"`
-	Recall               RecallConfig                `json:"recall,omitempty" toml:"recall"`
-	Insights             InsightsConfig              `json:"insights,omitempty" toml:"insights"`
-	Friction             FrictionConfig              `json:"friction,omitempty" toml:"friction"`
-	Automated            AutomatedConfig             `json:"automated,omitempty" toml:"automated"`
-	Agent                map[string]AgentConfig      `json:"agent,omitempty" toml:"agent"`
-	WriteTimeout         time.Duration               `json:"-" toml:"-"`
+	CodexCloud           CodexCloudConfig `json:"-" toml:"-"`
+	Host                 string           `json:"host" toml:"host"`
+	Port                 int              `json:"port" toml:"port"`
+	ChartPalette         ChartPalette     `json:"chart_palette" toml:"chart_palette"`
+	ZoomLevel            *ZoomLevel       `json:"zoom_level,omitempty" toml:"zoom_level,omitempty"`
+	DataDir              string           `json:"data_dir" toml:"data_dir"`
+	DBPath               string           `json:"-" toml:"-"`
+	PublicURL            string           `json:"public_url,omitempty" toml:"public_url"`
+	PublicOrigins        []string         `json:"public_origins,omitempty" toml:"public_origins"`
+	Proxy                ProxyConfig      `json:"proxy,omitempty" toml:"proxy"`
+	WatchExcludePatterns []string         `json:"watch_exclude_patterns,omitempty" toml:"watch_exclude_patterns"`
+	// SyncMaxSourceBytes is the per-source byte ceiling at parse admission.
+	// A source file (or the container database backing a virtual source)
+	// larger than the ceiling is skipped with a recorded source failure
+	// instead of parsed. Zero, the default, means unlimited; raising the
+	// ceiling requires a resync to re-admit sources the old value skipped.
+	SyncMaxSourceBytes int64                       `json:"sync_max_source_bytes,omitempty" toml:"sync_max_source_bytes"`
+	DisabledAgents     []parser.AgentType          `json:"disabled_agents,omitempty" toml:"disabled_agents"`
+	CursorSecret       string                      `json:"cursor_secret" toml:"cursor_secret"`
+	CursorAdminAPIKey  string                      `json:"cursor_admin_api_key,omitempty" toml:"cursor_admin_api_key"`
+	CursorAdminEmail   string                      `json:"cursor_admin_email,omitempty" toml:"cursor_admin_email"`
+	CursorAdminUserID  string                      `json:"cursor_admin_user_id,omitempty" toml:"cursor_admin_user_id"`
+	GithubToken        string                      `json:"github_token,omitempty" toml:"github_token"`
+	Terminal           TerminalConfig              `json:"terminal,omitempty" toml:"terminal"`
+	AuthToken          string                      `json:"auth_token,omitempty" toml:"auth_token"`
+	RequireAuth        bool                        `json:"require_auth" toml:"require_auth"`
+	NoBrowser          bool                        `json:"no_browser" toml:"no_browser"`
+	DisableUpdateCheck bool                        `json:"disable_update_check" toml:"disable_update_check"`
+	NoSync             bool                        `json:"-" toml:"-"`
+	SkipInitialSync    bool                        `json:"-" toml:"-"`
+	ArchiveContent     ArchiveContent              `json:"archive_content" toml:"archive_content"`
+	PG                 PGConfig                    `json:"pg,omitempty" toml:"pg"`
+	DefaultPG          string                      `json:"default_pg,omitempty" toml:"default_pg"`
+	PGTargets          map[string]PGConfig         `json:"-" toml:"-"`
+	ClickHouse         ClickHouseConfig            `json:"clickhouse,omitempty" toml:"clickhouse"`
+	DefaultClickHouse  string                      `json:"default_clickhouse,omitempty" toml:"default_clickhouse"`
+	ClickHouseTargets  map[string]ClickHouseConfig `json:"-" toml:"-"`
+	DuckDB             DuckDBConfig                `json:"duckdb,omitempty" toml:"duckdb"`
+	Vector             VectorConfig                `json:"vector,omitempty" toml:"vector"`
+	Recall             RecallConfig                `json:"recall,omitempty" toml:"recall"`
+	Insights           InsightsConfig              `json:"insights,omitempty" toml:"insights"`
+	Friction           FrictionConfig              `json:"friction,omitempty" toml:"friction"`
+	Automated          AutomatedConfig             `json:"automated,omitempty" toml:"automated"`
+	Agent              map[string]AgentConfig      `json:"agent,omitempty" toml:"agent"`
+	WriteTimeout       time.Duration               `json:"-" toml:"-"`
 	// InstallationID identifies this data directory independently of its label.
 	InstallationID string `json:"-" toml:"-"`
 	// InstallationCreatedAt is when InstallationID was created, or zero for
@@ -1136,6 +1142,22 @@ func (c Config) LocalProviderFactories() []parser.ProviderFactory {
 	return slices.DeleteFunc(factories, func(factory parser.ProviderFactory) bool {
 		return c.AgentDisabled(factory.Definition().Type)
 	})
+}
+
+// ValidateWatchExcludePatterns reports whether every exclude pattern is a
+// well-formed filepath.Match glob. Invalid patterns fail configuration
+// loading — the process refuses to start — because both the watcher and the
+// batch discovery lane must interpret the same set, and a set that cannot be
+// interpreted must never silently admit every path.
+func ValidateWatchExcludePatterns(patterns []string) error {
+	for _, pattern := range patterns {
+		if _, err := filepath.Match(pattern, "agentsview-probe"); err != nil {
+			return fmt.Errorf(
+				"watch_exclude_patterns: pattern %q: %w", pattern, err,
+			)
+		}
+	}
+	return nil
 }
 
 func NormalizeDisabledAgents(
@@ -1791,6 +1813,7 @@ func (c *Config) applyConfigTOML(data string) error {
 		PublicOrigins                  []string               `toml:"public_origins"`
 		Proxy                          ProxyConfig            `toml:"proxy"`
 		WatchExcludePatterns           []string               `toml:"watch_exclude_patterns"`
+		SyncMaxSourceBytes             int64                  `toml:"sync_max_source_bytes"`
 		DisabledAgents                 []string               `toml:"disabled_agents"`
 		SyncIncludeCwdPrefixes         []string               `toml:"sync_include_cwd_prefixes"`
 		ScanProtectedPaths             bool                   `toml:"scan_protected_paths"`
@@ -1903,7 +1926,18 @@ func (c *Config) applyConfigTOML(data string) error {
 		c.Proxy = file.Proxy
 	}
 	if file.WatchExcludePatterns != nil {
+		if err := ValidateWatchExcludePatterns(file.WatchExcludePatterns); err != nil {
+			return err
+		}
 		c.WatchExcludePatterns = file.WatchExcludePatterns
+	}
+	if file.SyncMaxSourceBytes != 0 {
+		if file.SyncMaxSourceBytes < 0 {
+			return fmt.Errorf(
+				"sync_max_source_bytes must be >= 0, got %d", file.SyncMaxSourceBytes,
+			)
+		}
+		c.SyncMaxSourceBytes = file.SyncMaxSourceBytes
 	}
 	if meta.IsDefined("disabled_agents") {
 		disabled, err := NormalizeDisabledAgents(file.DisabledAgents)
