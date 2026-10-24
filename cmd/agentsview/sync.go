@@ -886,6 +886,8 @@ func coordinateLocalSync(
 		ProviderMetadata:        appCfg.ProviderMetadata,
 		DisabledAgents:          appCfg.DisabledAgents,
 		IncludeCwdPrefixes:      appCfg.SyncIncludeCwdPrefixes,
+		ExcludePatterns:         appCfg.WatchExcludePatterns,
+		MaxSourceBytes:          appCfg.SyncMaxSourceBytes,
 		ScanProtectedPaths:      appCfg.ScanProtectedPaths,
 		Machine:                 appCfg.InstallationID,
 		BlockedResultCategories: appCfg.ResultContentBlockedCategories,

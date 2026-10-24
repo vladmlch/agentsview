@@ -332,6 +332,8 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 			ProviderMetadata:        cfg.ProviderMetadata,
 			DisabledAgents:          cfg.DisabledAgents,
 			IncludeCwdPrefixes:      cfg.SyncIncludeCwdPrefixes,
+			ExcludePatterns:         cfg.WatchExcludePatterns,
+			MaxSourceBytes:          cfg.SyncMaxSourceBytes,
 			ScanProtectedPaths:      cfg.ScanProtectedPaths,
 			Machine:                 cfg.InstallationID,
 			BlockedResultCategories: cfg.ResultContentBlockedCategories,
