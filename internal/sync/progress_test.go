@@ -2,10 +2,13 @@ package sync
 
 import (
 	"encoding/json/v2"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 func TestSyncStats_RecordSkip(t *testing.T) {
@@ -268,10 +271,10 @@ func TestAnomalyAccumulator_Aggregate(t *testing.T) {
 
 	// Two sessions of one agent, one of another, plus sanitize fixes
 	// from messages and usage events across the run.
-	acc.recordMalformedLines("claude", "a.jsonl", 4)
-	acc.recordMalformedLines("codex", "b.jsonl", 1)
-	acc.recordMalformedLines("claude", "c.jsonl", 2)
-	acc.recordMalformedLines("gemini", "d.jsonl", 0) // ignored
+	acc.recordMalformedLines("claude", "a.jsonl", 4, nil)
+	acc.recordMalformedLines("codex", "b.jsonl", 1, nil)
+	acc.recordMalformedLines("claude", "c.jsonl", 2, nil)
+	acc.recordMalformedLines("gemini", "d.jsonl", 0, nil) // ignored
 
 	acc.recordSanitize(validationStats{ControlCharsStripped: 3, RoleCoerced: 1})
 	acc.recordSanitize(validationStats{ModelClamped: 2, TokensClamped: 5})
@@ -301,14 +304,14 @@ func TestAnomalyAccumulator_DedupesMalformedLinesPerSourceFile(t *testing.T) {
 	acc.reset()
 
 	// Three forked sessions of one Claude file all carry the same count.
-	acc.recordMalformedLines("claude", "fork.jsonl", 2)
-	acc.recordMalformedLines("claude", "fork.jsonl", 2)
-	acc.recordMalformedLines("claude", "fork.jsonl", 2)
+	acc.recordMalformedLines("claude", "fork.jsonl", 2, nil)
+	acc.recordMalformedLines("claude", "fork.jsonl", 2, nil)
+	acc.recordMalformedLines("claude", "fork.jsonl", 2, nil)
 	// A different source file counts independently.
-	acc.recordMalformedLines("claude", "other.jsonl", 5)
+	acc.recordMalformedLines("claude", "other.jsonl", 5, nil)
 	// Empty path (DB-backed agent) is not deduped.
-	acc.recordMalformedLines("warp", "", 1)
-	acc.recordMalformedLines("warp", "", 1)
+	acc.recordMalformedLines("warp", "", 1, nil)
+	acc.recordMalformedLines("warp", "", 1, nil)
 
 	var stats SyncStats
 	acc.applyTo(&stats)
@@ -321,7 +324,7 @@ func TestAnomalyAccumulator_DedupesMalformedLinesPerSourceFile(t *testing.T) {
 
 func TestAnomalyAccumulator_ResetClears(t *testing.T) {
 	var acc anomalyAccumulator
-	acc.recordMalformedLines("claude", "x.jsonl", 9)
+	acc.recordMalformedLines("claude", "x.jsonl", 9, nil)
 	acc.recordSanitize(validationStats{TimestampsBlanked: 1})
 	acc.reset()
 
@@ -330,6 +333,128 @@ func TestAnomalyAccumulator_ResetClears(t *testing.T) {
 	assert.True(t, stats.Anomalies.IsZero())
 	assert.Zero(t, stats.Anomalies.MalformedLinesTotal)
 	assert.Nil(t, stats.Anomalies.MalformedLinesByAgent)
+	assert.Nil(t, stats.Anomalies.MalformedLineSamples)
+}
+
+// TestAnomalyAccumulator_MalformedLineSamples pins the payload-free line
+// records that ride along with the malformed-line counters: one sample per
+// class per source file, deduplicated by the same per-path rule as the
+// counts, and capped per run so a large corpus cannot bloat the report.
+func TestAnomalyAccumulator_MalformedLineSamples(t *testing.T) {
+	t.Run("records classes with line samples", func(t *testing.T) {
+		var acc anomalyAccumulator
+		acc.reset()
+		acc.recordMalformedLines("antigravity", "transcript.jsonl", 3,
+			[]parser.ParsedMalformedLineClass{
+				{Class: parser.MalformedLineInvalidJSON, Count: 2, Lines: []int{2, 7}},
+				{Class: parser.MalformedLineNoStepFields, Count: 1, Lines: []int{5}},
+			})
+
+		var stats SyncStats
+		acc.applyTo(&stats)
+		assert.Equal(t, 3, stats.Anomalies.MalformedLinesTotal)
+		assert.Equal(t, []MalformedLineSample{
+			{
+				Agent: "antigravity", Path: "transcript.jsonl",
+				Class: parser.MalformedLineInvalidJSON,
+				Count: 2, Lines: []int{2, 7},
+			},
+			{
+				Agent: "antigravity", Path: "transcript.jsonl",
+				Class: parser.MalformedLineNoStepFields,
+				Count: 1, Lines: []int{5},
+			},
+		}, stats.Anomalies.MalformedLineSamples)
+	})
+
+	t.Run("record's own source path wins over the session's", func(t *testing.T) {
+		var acc anomalyAccumulator
+		acc.reset()
+		// A brain transcript folded into its conversation's database
+		// session: the sample must name the transcript its line numbers
+		// refer to, not the session's primary database file.
+		acc.recordMalformedLines("antigravity", "conv.db", 1,
+			[]parser.ParsedMalformedLineClass{{
+				Class:      parser.MalformedLineInvalidJSON,
+				Count:      1,
+				Lines:      []int{2},
+				SourcePath: "brain/id/.system_generated/logs/transcript.jsonl",
+			}})
+
+		var stats SyncStats
+		acc.applyTo(&stats)
+		require.Len(t, stats.Anomalies.MalformedLineSamples, 1)
+		assert.Equal(t,
+			"brain/id/.system_generated/logs/transcript.jsonl",
+			stats.Anomalies.MalformedLineSamples[0].Path,
+			"the record names its own file")
+	})
+
+	t.Run("per-path dedup drops samples with the count", func(t *testing.T) {
+		var acc anomalyAccumulator
+		acc.reset()
+		classes := []parser.ParsedMalformedLineClass{
+			{Class: parser.MalformedLineInvalidJSON, Count: 1, Lines: []int{2}},
+		}
+		acc.recordMalformedLines("antigravity", "fork.jsonl", 1, classes)
+		acc.recordMalformedLines("antigravity", "fork.jsonl", 1, classes)
+
+		var stats SyncStats
+		acc.applyTo(&stats)
+		assert.Equal(t, 1, stats.Anomalies.MalformedLinesTotal)
+		assert.Len(t, stats.Anomalies.MalformedLineSamples, 1,
+			"a forked file's samples are recorded once")
+	})
+
+	t.Run("clean run records nothing", func(t *testing.T) {
+		var acc anomalyAccumulator
+		acc.reset()
+		acc.recordMalformedLines("antigravity", "ok.jsonl", 0, nil)
+
+		var stats SyncStats
+		acc.applyTo(&stats)
+		assert.True(t, stats.Anomalies.IsZero())
+		assert.Empty(t, stats.Anomalies.MalformedLineSamples)
+	})
+
+	t.Run("run cap bounds the sample list", func(t *testing.T) {
+		var acc anomalyAccumulator
+		acc.reset()
+		classes := []parser.ParsedMalformedLineClass{
+			{Class: parser.MalformedLineInvalidJSON, Count: 1, Lines: []int{1}},
+		}
+		for i := range maxMalformedLineSamplesPerRun + 5 {
+			acc.recordMalformedLines("antigravity",
+				fmt.Sprintf("t%d.jsonl", i), 1, classes)
+		}
+
+		var stats SyncStats
+		acc.applyTo(&stats)
+		assert.Equal(t, maxMalformedLineSamplesPerRun+5,
+			stats.Anomalies.MalformedLinesTotal, "totals stay complete")
+		assert.Len(t, stats.Anomalies.MalformedLineSamples,
+			maxMalformedLineSamplesPerRun, "samples are capped")
+	})
+}
+
+// TestAnomalyStatsMergeFoldsMalformedLineSamples pins that worker stats
+// fold their samples into the parent, still respecting the run cap.
+func TestAnomalyStatsMergeFoldsMalformedLineSamples(t *testing.T) {
+	var a, b AnomalyStats
+	a.RecordMalformedLines("antigravity", 1)
+	b.RecordMalformedLines("antigravity", 2)
+	b.MalformedLineSamples = []MalformedLineSample{{
+		Agent: "antigravity", Path: "t.jsonl",
+		Class: parser.MalformedLineInvalidJSON, Count: 2, Lines: []int{3},
+	}}
+
+	a.merge(b)
+	assert.Equal(t, 3, a.MalformedLinesTotal)
+	require.Len(t, a.MalformedLineSamples, 1)
+	assert.Equal(t, MalformedLineSample{
+		Agent: "antigravity", Path: "t.jsonl",
+		Class: parser.MalformedLineInvalidJSON, Count: 2, Lines: []int{3},
+	}, a.MalformedLineSamples[0])
 }
 
 func TestAnomalyStats_IsZero(t *testing.T) {
