@@ -660,6 +660,45 @@ func parseDiffCodexTranscriptChangedSinceStored(
 	return consumedSize != storedSize
 }
 
+// claudeSourceVerdict derives the typed per-source recoverability
+// verdict for one claude source's parse-diff outcome (audit av-21,
+// report-only). The inputs are exactly the parse state the re-parse
+// itself produced:
+//
+//   - parseFailed: the current binary could not parse the source, so
+//     no content was derived from it (VerdictUnreadable).
+//   - malformedLines: the parser's malformed-line drop count. Drops
+//     are the claude lane's only coercion class — the content is
+//     indexed but had to be coerced (VerdictReadableWithCoercions).
+//
+// Claude's parse has no transient low-fidelity class (needsRetry is
+// antigravity-cli-only) and the report-only run never writes parser
+// checkpoints (parse-diff runs on an ephemeral engine that persists
+// nothing), so checkpoint state carries no parse-recoverability
+// signal here: a missing checkpoint in this report means "report-only
+// run", not "unrecoverable source".
+func claudeSourceVerdict(parseFailed bool, malformedLines int) SourceVerdict {
+	switch {
+	case parseFailed:
+		return VerdictUnreadable
+	case malformedLines > 0:
+		return VerdictReadableWithCoercions
+	default:
+		return VerdictHealthy
+	}
+}
+
+// parseDiffSourceVerdict scopes claudeSourceVerdict to the claude lane
+// (audit av-21): every other agent's report entries carry no verdict.
+func parseDiffSourceVerdict(
+	agent parser.AgentType, parseFailed bool, malformedLines int,
+) SourceVerdict {
+	if agent != parser.AgentClaude {
+		return ""
+	}
+	return claudeSourceVerdict(parseFailed, malformedLines)
+}
+
 // parseDiffCollectFile folds one worker result into the report.
 func (e *Engine) parseDiffCollectFile(
 	ctx context.Context,
@@ -682,6 +721,9 @@ func (e *Engine) parseDiffCollectFile(
 				FilePath: job.path,
 				Class:    DiffParseError,
 				Reason:   job.err.Error(),
+				Verdict: parseDiffSourceVerdict(
+					fileAgents[job.path], true, 0,
+				),
 			})
 			report.Totals.ParseErrors++
 			return nil
@@ -695,6 +737,9 @@ func (e *Engine) parseDiffCollectFile(
 				Class:             DiffParseError,
 				Reason:            job.err.Error(),
 				StoredDataVersion: s.DataVersion,
+				Verdict: parseDiffSourceVerdict(
+					parser.AgentType(s.Agent), true, 0,
+				),
 			})
 			report.Totals.ParseErrors++
 		}
@@ -866,6 +911,11 @@ func (e *Engine) parseDiffCollectFile(
 			Class:     class,
 			Reason:    reason,
 			Fields:    fields,
+			// The parse succeeded for this result, so the verdict
+			// rides on the parser's malformed-line drop count.
+			Verdict: parseDiffSourceVerdict(
+				pw.sess.Agent, false, pw.sess.MalformedLines,
+			),
 		}
 		if stored != nil {
 			entry.StoredDataVersion = stored.DataVersion
@@ -937,6 +987,9 @@ func (e *Engine) parseDiffCollectFile(
 			FilePath: se.virtualPath,
 			Class:    DiffParseError,
 			Reason:   se.err.Error(),
+			Verdict: parseDiffSourceVerdict(
+				fileAgents[job.path], true, 0,
+			),
 		}
 		if entry.FilePath == "" {
 			entry.FilePath = job.path

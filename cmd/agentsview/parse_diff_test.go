@@ -787,6 +787,97 @@ func TestRenderParseDiffReport_ParseErrorsListed(t *testing.T) {
 	assert.Contains(t, out, "invalid character")
 }
 
+// TestRenderParseDiffReport_ClaudeVerdicts covers the audit av-21
+// verdict rollup: the one-line per-verdict counts appear in the fixed
+// healthy / readable_with_coercions / unreadable order, each listed
+// claude entry shows its own verdict (changed drill-down and
+// parse-error listing, verbose block), and a report with no verdicts
+// renders without the rollup line at all so non-claude runs stay
+// byte-identical to the pre-verdict output.
+func TestRenderParseDiffReport_ClaudeVerdicts(t *testing.T) {
+	r := &sync.ParseDiffReport{
+		DataVersion: 42,
+		Totals: sync.ParseDiffTotals{
+			Examined: 4, Changed: 2, Identical: 1, ParseErrors: 1,
+		},
+		Sessions: []sync.SessionDiff{
+			{
+				SessionID: "clean-1", Agent: "claude",
+				Class:   sync.DiffChanged,
+				Verdict: sync.VerdictHealthy,
+				Fields: []sync.FieldDiff{{
+					Field:  sync.FieldFirstMessage,
+					Stored: "old", Parsed: "new",
+				}},
+			},
+			{
+				SessionID: "coerced-1", Agent: "claude",
+				Class:   sync.DiffIdentical,
+				Verdict: sync.VerdictReadableWithCoercions,
+			},
+			{
+				Agent:    "claude",
+				FilePath: "/data/proj/broken.jsonl",
+				Class:    sync.DiffParseError,
+				Reason:   "unexpected end of JSON input",
+				Verdict:  sync.VerdictUnreadable,
+			},
+			{
+				SessionID: "codex-no-verdict", Agent: "codex",
+				Class: sync.DiffChanged,
+				Fields: []sync.FieldDiff{{
+					Field:  sync.FieldFirstMessage,
+					Stored: "old", Parsed: "new",
+				}},
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	renderParseDiffReport(&buf, r, "db", "claude, codex", false)
+	out := buf.String()
+
+	assert.Contains(t, out,
+		"Claude source verdicts: 1 healthy, "+
+			"1 readable_with_coercions, 1 unreadable\n",
+		"verdict rollup must list every present verdict in lane order")
+	assert.NotContains(t, out, "0 healthy",
+		"absent verdicts must not be listed with a zero count")
+	assert.NotContains(t, out, "codex-no-verdict",
+		"the codex changed line must not gain a verdict suffix")
+
+	// Verbose shows the per-entry verdict under the session header for
+	// the entries that get a verbose block (changed sessions,
+	// parse errors). The informational-only identical entry feeds the
+	// rollup line above but has no verbose block of its own.
+	var verbose bytes.Buffer
+	renderParseDiffReport(&verbose, r, "db", "claude, codex", true)
+	vout := verbose.String()
+	assert.Contains(t, vout, "verdict: healthy\n")
+	assert.Contains(t, vout, "verdict: unreadable\n")
+
+	// A report without any verdict (non-claude run, or older report)
+	// must not render the rollup line.
+	noVerdicts := &sync.ParseDiffReport{
+		DataVersion: 42,
+		Totals:      sync.ParseDiffTotals{Examined: 1, Changed: 1},
+		Sessions: []sync.SessionDiff{
+			{
+				SessionID: "codex-only", Agent: "codex",
+				Class: sync.DiffChanged,
+				Fields: []sync.FieldDiff{{
+					Field:  sync.FieldFirstMessage,
+					Stored: "old", Parsed: "new",
+				}},
+			},
+		},
+	}
+	var plain bytes.Buffer
+	renderParseDiffReport(&plain, noVerdicts, "db", "codex", false)
+	assert.NotContains(t, plain.String(), "Claude source verdicts",
+		"the rollup must be suppressed entirely when no entry carries a verdict")
+}
+
 // TestRenderParseDiffReport_SanitizesControlSequences proves the
 // human renderer strips terminal control bytes from every
 // session-derived value (agents, IDs, paths, field values, details,

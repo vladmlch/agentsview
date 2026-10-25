@@ -316,6 +316,7 @@ func renderParseDiffReport(
 	}
 
 	renderParseDiffSummary(w, r.Totals)
+	renderParseDiffClaudeVerdicts(w, r.Sessions)
 	renderParseDiffFieldCounts(w, r.FieldCounts)
 	renderParseDiffParseErrors(w, r.Sessions)
 	renderParseDiffChanged(w, r.Sessions, verbose)
@@ -392,6 +393,9 @@ func renderParseDiffParseErrors(w io.Writer, sessions []sync.SessionDiff) {
 		fmt.Fprintf(w, "  %s  %s\n    %s\n",
 			sanitizeTerminal(s.Agent), sanitizeTerminal(path),
 			sanitizeTerminal(s.Reason))
+		if s.Verdict != "" {
+			fmt.Fprintf(w, "    verdict: %s\n", string(s.Verdict))
+		}
 	}
 	fmt.Fprintln(w)
 }
@@ -431,6 +435,39 @@ func renderParseDiffSummary(w io.Writer, t sync.ParseDiffTotals) {
 	line("Informational only", t.InformationalOnly,
 		"(identical except informational diffs)")
 	tw.Flush()
+	fmt.Fprintln(w)
+}
+
+// renderParseDiffClaudeVerdicts prints the one-line rollup of the
+// typed per-source recoverability verdicts the claude lane attaches to
+// its report entries (audit av-21). A verdict is parse state, not
+// drift: a healthy verdict says the current binary parsed the source
+// cleanly and does not preclude the session sitting in the changed
+// list. The line is suppressed entirely when no claude entry carried a
+// verdict, so non-claude runs render byte-identically to before.
+func renderParseDiffClaudeVerdicts(w io.Writer, sessions []sync.SessionDiff) {
+	counts := map[sync.SourceVerdict]int{}
+	total := 0
+	for _, s := range sessions {
+		if s.Verdict != "" {
+			counts[s.Verdict]++
+			total++
+		}
+	}
+	if total == 0 {
+		return
+	}
+	parts := make([]string, 0, 3)
+	for _, v := range []sync.SourceVerdict{
+		sync.VerdictHealthy,
+		sync.VerdictReadableWithCoercions,
+		sync.VerdictUnreadable,
+	} {
+		if counts[v] > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", counts[v], v))
+		}
+	}
+	fmt.Fprintf(w, "Claude source verdicts: %s\n", strings.Join(parts, ", "))
 	fmt.Fprintln(w)
 }
 
@@ -596,6 +633,9 @@ func renderParseDiffSessionVerbose(w io.Writer, s sync.SessionDiff) {
 		fmt.Fprintf(w, "  %s", sanitizeTerminal(s.FilePath))
 	}
 	fmt.Fprintln(w)
+	if s.Verdict != "" {
+		fmt.Fprintf(w, "    verdict: %s\n", string(s.Verdict))
+	}
 	for _, f := range s.Fields {
 		fmt.Fprintf(w, "    %s: %s -> %s",
 			sanitizeTerminal(f.Field),
