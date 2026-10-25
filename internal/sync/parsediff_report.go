@@ -164,6 +164,28 @@ type FieldDiff struct {
 	Informational bool `json:"informational,omitempty"`
 }
 
+// SourceVerdict is the typed per-source recoverability verdict for the
+// claude parse-diff lane (audit av-21), folding cass #391's
+// readable-with-coercions / unreadable classes into the report-only
+// surface. It is derived from the parse state the re-parse itself
+// produced; it never changes parsing and never feeds --fail-on-change.
+type SourceVerdict string
+
+const (
+	// VerdictHealthy: the source parsed cleanly with no dropped lines
+	// and no coercion the report can observe.
+	VerdictHealthy SourceVerdict = "healthy"
+	// VerdictReadableWithCoercions: the source parsed and its derived
+	// content is indexed, but the parse had to coerce the input —
+	// malformed lines were dropped. The content is trustworthy to the
+	// same extent the parser's own toleration is; the verdict just makes
+	// the coercion visible per source.
+	VerdictReadableWithCoercions SourceVerdict = "readable_with_coercions"
+	// VerdictUnreadable: the current binary failed to parse the source,
+	// so no content was derived from it.
+	VerdictUnreadable SourceVerdict = "unreadable"
+)
+
 // SessionDiff is one listed session. Identical sessions appear only
 // when they carry informational-only diffs.
 type SessionDiff struct {
@@ -174,6 +196,15 @@ type SessionDiff struct {
 	Reason            string      `json:"reason,omitempty"`
 	StoredDataVersion int         `json:"stored_data_version,omitempty"`
 	Fields            []FieldDiff `json:"fields,omitempty"`
+	// Verdict is the per-source recoverability verdict. Populated only
+	// for claude-lane entries that carry a direct parse outcome (audit
+	// av-21 scopes the verdict to the claude lane): claude sources are
+	// one session per file, so the session entry is the source's
+	// verdict carrier. Empty for every other agent and for entries
+	// without a parse outcome of their own (skipped, excluded,
+	// trashed, presence-sweep) — those are policy or bookkeeping
+	// outcomes, not parse-recoverability outcomes.
+	Verdict SourceVerdict `json:"verdict,omitempty"`
 }
 
 // ParseDiffTotals aggregates per-class session counts.
