@@ -117,7 +117,7 @@ func writeSQLiteStateDBSnapshot(ctx context.Context, tw *tar.Writer, stateDB str
 	return writeArchiveFileAs(tw, stateDB, snapshotPath, info)
 }
 
-var writeSQLiteSnapshotFile = writeSQLiteSnapshot
+var writeSQLiteSnapshotFile = WriteSQLiteSnapshot
 
 func writeWindsurfArchiveFiles(ctx context.Context,
 	tw *tar.Writer, files []string, forbidden forbiddenRootMatcher,

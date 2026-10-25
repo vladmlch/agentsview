@@ -17,7 +17,18 @@ import (
 
 const sqliteSnapshotBusyTimeoutMS = 5000
 
-func writeSQLiteSnapshot(dstPath, srcPath string) (err error) {
+// WriteSQLiteSnapshot copies the database at srcPath into a standalone
+// SQLite file at dstPath through the SQLite online-backup API. The source
+// opens read-only and never sees a write; the copy reflects one consistent
+// committed point in time even while writers are active, so the source's
+// -wal/-shm sidecars are not needed and are not copied. The copy is
+// finalized in DELETE journal mode so dstPath is a single self-contained
+// file. An existing dstPath is removed first, and a failed copy removes
+// the partial destination.
+//
+// This is the shared snapshot primitive for the remote-sync transfer
+// archive and the `agentsview backup` command.
+func WriteSQLiteSnapshot(dstPath, srcPath string) (err error) {
 	if err := os.Remove(dstPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("replace sqlite snapshot: %w", err)
 	}
