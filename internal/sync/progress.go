@@ -221,6 +221,22 @@ type AnomalyStats struct {
 	// ActiveDefersTotal is the grand total across all agents.
 	ActiveDefersTotal int `json:"active_defers_total,omitempty"`
 
+	// LayoutChangesTotal counts Codex-format sessions roots whose observed
+	// on-disk layout set changed between discovery passes in this process
+	// (a dated tree flattened, a flat archive re-dated, or a mixed root
+	// losing one side). Validation-only av-19 hedge: the drift itself is
+	// benign while the layout-independent agent:UUID source key and the
+	// live-over-archived dedup hold, but it is the shape a flat↔dated
+	// rename takes before it could fork history, so the receipt surfaces it
+	// early instead of waiting for a merge lane to be needed.
+	LayoutChangesTotal int `json:"layout_changes_total,omitempty"`
+	// LayoutChangeSamples holds bounded, payload-free per-root drift
+	// records behind LayoutChangesTotal: which root changed, and from
+	// which observed layout set to which. Capped at
+	// maxLayoutChangeSamplesPerRun entries; the total stays complete past
+	// the cap.
+	LayoutChangeSamples []parser.CodexLayoutChange `json:"layout_change_samples,omitempty"`
+
 	// Sanitize aggregates the central validation/sanitization fix counts
 	// across every session, message, and usage event written this run.
 	Sanitize SanitizeStats `json:"sanitize,omitzero"`
@@ -242,6 +258,11 @@ type SanitizeStats struct {
 // one run's report carries, so a corpus-wide resync over many malformed
 // files cannot bloat the summary. Totals are unaffected by the cap.
 const maxMalformedLineSamplesPerRun = 64
+
+// maxLayoutChangeSamplesPerRun bounds how many per-root layout drift records
+// one run's report carries. Roots are few, so the cap is tight; totals are
+// unaffected by the cap.
+const maxLayoutChangeSamplesPerRun = 16
 
 // MalformedLineSample is one source file's malformed-line breakdown for one
 // reason class. It is a payload-free quarantine record: the file's agent
@@ -278,6 +299,7 @@ func (a *AnomalyStats) IsZero() bool {
 		a.QuarantineSkipsTotal == 0 &&
 		a.QuarantineRetriesTotal == 0 &&
 		a.ActiveDefersTotal == 0 &&
+		a.LayoutChangesTotal == 0 &&
 		a.Sanitize.IsZero()
 }
 
@@ -361,6 +383,15 @@ func (a *AnomalyStats) RecordQuarantineRetries(class string, n int) {
 	a.QuarantineRetriesTotal += n
 }
 
+// RecordLayoutChange records one per-root Codex layout drift observed this
+// run. The total stays complete past the sample cap.
+func (a *AnomalyStats) RecordLayoutChange(change parser.CodexLayoutChange) {
+	a.LayoutChangesTotal++
+	if len(a.LayoutChangeSamples) < maxLayoutChangeSamplesPerRun {
+		a.LayoutChangeSamples = append(a.LayoutChangeSamples, change)
+	}
+}
+
 // RecordActiveDefers attributes n active-writer admission deferrals to the
 // given agent and updates the grand total. A non-positive count is ignored.
 func (a *AnomalyStats) RecordActiveDefers(agent string, n int) {
@@ -412,6 +443,13 @@ func (a *AnomalyStats) merge(o AnomalyStats) {
 	}
 	for agent, n := range o.ActiveDefersByAgent {
 		a.RecordActiveDefers(agent, n)
+	}
+	a.LayoutChangesTotal += o.LayoutChangesTotal
+	for _, change := range o.LayoutChangeSamples {
+		if len(a.LayoutChangeSamples) >= maxLayoutChangeSamplesPerRun {
+			continue
+		}
+		a.LayoutChangeSamples = append(a.LayoutChangeSamples, change)
 	}
 	a.Sanitize.ControlCharsStripped += o.Sanitize.ControlCharsStripped
 	a.Sanitize.ModelClamped += o.Sanitize.ModelClamped
@@ -576,6 +614,18 @@ func (a *anomalyAccumulator) recordActiveDefer(agent, key string) {
 	}
 	a.activeDefers[key] = true
 	a.stats.RecordActiveDefers(agent, 1)
+}
+
+// RecordCodexLayoutChange implements parser.CodexLayoutChangeSink so the
+// engine can inject the per-run accumulator into every Codex-format provider
+// at construction; discovery-time layout drift lands in the run's anomaly
+// summary the same way write-seam signals do.
+func (a *anomalyAccumulator) RecordCodexLayoutChange(
+	change parser.CodexLayoutChange,
+) {
+	a.mu.Lock()
+	a.stats.RecordLayoutChange(change)
+	a.mu.Unlock()
 }
 
 // recordQuarantineRetry counts parse failures recorded against an existing

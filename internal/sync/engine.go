@@ -1055,7 +1055,7 @@ func NewEngine(ctx context.Context,
 	// slice in baseProviderFactories keeps the injection through
 	// ReconfigureSources rebuilds as well.
 	providerFactories = injectPipelineObserverSource(
-		providerFactories, e.pipelineObserverSource,
+		providerFactories, e.pipelineObserverSource, &e.anomalies,
 	)
 	e.baseProviderFactories = providerFactories
 	e.sourceSet.Store(newEngineSources(providerFactories, SourceConfig{

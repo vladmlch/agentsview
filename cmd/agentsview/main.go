@@ -2089,6 +2089,17 @@ func formatAnomalySummary(a sync.AnomalyStats) string {
 			)
 		}
 	}
+	if a.LayoutChangesTotal > 0 {
+		fmt.Fprintf(&b,
+			"  codex layout changes: %d total\n", a.LayoutChangesTotal,
+		)
+		for _, sample := range a.LayoutChangeSamples {
+			fmt.Fprintf(&b,
+				"    %s: %s: %s -> %s\n",
+				sample.Agent, sample.Root, sample.From, sample.To,
+			)
+		}
+	}
 	if !a.Sanitize.IsZero() {
 		fmt.Fprintf(&b,
 			"  sanitized fields: %d total\n", a.Sanitize.Total(),

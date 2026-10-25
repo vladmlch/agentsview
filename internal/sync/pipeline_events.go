@@ -57,14 +57,16 @@ func (e *Engine) pipelineObserverSource() pipevents.Observer {
 	return e.pipelineObserver()
 }
 
-// pipelineObserverFactory injects the engine's observer source into every
-// provider it materializes. Wrapping the factories — rather than each
-// NewProvider call site — covers every construction path uniformly,
-// including ReconfigureSources rebuilds from baseProviderFactories and
-// ad-hoc providers built for fingerprints or watch plans.
+// pipelineObserverFactory injects the engine's observer source and per-run
+// layout-drift sink into every materialized provider. Wrapping the factories
+// — rather than each NewProvider call site — covers every construction path
+// uniformly, including ReconfigureSources rebuilds from
+// baseProviderFactories and ad-hoc providers built for fingerprints or watch
+// plans.
 type pipelineObserverFactory struct {
 	parser.ProviderFactory
-	source parser.ObserverSource
+	source     parser.ObserverSource
+	layoutSink parser.CodexLayoutChangeSink
 }
 
 func (f pipelineObserverFactory) NewProvider(
@@ -74,20 +76,26 @@ func (f pipelineObserverFactory) NewProvider(
 	if observed, ok := provider.(parser.PipelineObserverProvider); ok {
 		observed.SetPipelineObserverSource(f.source)
 	}
+	if sinkProvider, ok := provider.(parser.CodexLayoutChangeSinkProvider); ok {
+		sinkProvider.SetCodexLayoutChangeSink(f.layoutSink)
+	}
 	return provider
 }
 
 // injectPipelineObserverSource wraps every factory so each materialized
-// provider receives the engine's lazy observer source.
+// provider receives the engine's lazy observer source and per-run anomaly
+// sink.
 func injectPipelineObserverSource(
 	factories []parser.ProviderFactory,
 	source parser.ObserverSource,
+	layoutSink parser.CodexLayoutChangeSink,
 ) []parser.ProviderFactory {
 	injected := make([]parser.ProviderFactory, len(factories))
 	for i, factory := range factories {
 		injected[i] = pipelineObserverFactory{
 			ProviderFactory: factory,
 			source:          source,
+			layoutSink:      layoutSink,
 		}
 	}
 	return injected

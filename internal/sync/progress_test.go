@@ -458,6 +458,83 @@ func TestAnomalyStatsMergeFoldsMalformedLineSamples(t *testing.T) {
 	}, a.MalformedLineSamples[0])
 }
 
+// TestAnomalyStats_RecordLayoutChange pins the per-root drift counter: the
+// total stays complete past the sample cap, and clean runs report nothing.
+func TestAnomalyStats_RecordLayoutChange(t *testing.T) {
+	t.Run("records each change with its sample", func(t *testing.T) {
+		var a AnomalyStats
+		a.RecordLayoutChange(parser.CodexLayoutChange{
+			Agent: "codex", Root: "/r1", From: "dated", To: "flat",
+		})
+		a.RecordLayoutChange(parser.CodexLayoutChange{
+			Agent: "codex", Root: "/r2", From: "flat+dated", To: "dated",
+		})
+		assert.Equal(t, 2, a.LayoutChangesTotal)
+		assert.Equal(t, []parser.CodexLayoutChange{
+			{Agent: "codex", Root: "/r1", From: "dated", To: "flat"},
+			{Agent: "codex", Root: "/r2", From: "flat+dated", To: "dated"},
+		}, a.LayoutChangeSamples)
+		assert.False(t, a.IsZero())
+	})
+
+	t.Run("run cap bounds the sample list", func(t *testing.T) {
+		var a AnomalyStats
+		for i := range maxLayoutChangeSamplesPerRun + 5 {
+			a.RecordLayoutChange(parser.CodexLayoutChange{
+				Agent: "codex",
+				Root:  fmt.Sprintf("/root-%d", i),
+				From:  "dated",
+				To:    "flat",
+			})
+		}
+		assert.Equal(t, maxLayoutChangeSamplesPerRun+5,
+			a.LayoutChangesTotal, "totals stay complete")
+		assert.Len(t, a.LayoutChangeSamples,
+			maxLayoutChangeSamplesPerRun, "samples are capped")
+	})
+
+	t.Run("merge folds totals and capped samples", func(t *testing.T) {
+		var a, b AnomalyStats
+		a.RecordLayoutChange(parser.CodexLayoutChange{
+			Agent: "codex", Root: "/r1", From: "dated", To: "flat",
+		})
+		b.RecordLayoutChange(parser.CodexLayoutChange{
+			Agent: "traex", Root: "/r2", From: "flat", To: "dated",
+		})
+		a.merge(b)
+		assert.Equal(t, 2, a.LayoutChangesTotal)
+		require.Len(t, a.LayoutChangeSamples, 2)
+		assert.Equal(t, parser.AgentTraeX, a.LayoutChangeSamples[1].Agent)
+	})
+}
+
+// TestAnomalyAccumulator_RecordCodexLayoutChange verifies the engine-injected
+// sink: drift recorded at discovery time lands in the run's stats and a reset
+// clears it.
+func TestAnomalyAccumulator_RecordCodexLayoutChange(t *testing.T) {
+	var acc anomalyAccumulator
+	acc.reset()
+
+	acc.RecordCodexLayoutChange(parser.CodexLayoutChange{
+		Agent: "codex", Root: "/sessions", From: "dated", To: "flat",
+	})
+
+	var stats SyncStats
+	acc.applyTo(&stats)
+	assert.Equal(t, 1, stats.Anomalies.LayoutChangesTotal)
+	require.Len(t, stats.Anomalies.LayoutChangeSamples, 1)
+	assert.Equal(t, "/sessions", stats.Anomalies.LayoutChangeSamples[0].Root)
+	assert.False(t, stats.Anomalies.IsZero())
+
+	// A fresh run starts from zero.
+	acc.reset()
+	var next SyncStats
+	acc.applyTo(&next)
+	assert.True(t, next.Anomalies.IsZero())
+	assert.Zero(t, next.Anomalies.LayoutChangesTotal)
+	assert.Nil(t, next.Anomalies.LayoutChangeSamples)
+}
+
 func TestAnomalyStats_IsZero(t *testing.T) {
 	tests := []struct {
 		name string
@@ -488,6 +565,11 @@ func TestAnomalyStats_IsZero(t *testing.T) {
 		{
 			name: "unsupported source layout only",
 			a:    AnomalyStats{UnsupportedSourceLayoutsTotal: 1},
+			want: false,
+		},
+		{
+			name: "layout change only",
+			a:    AnomalyStats{LayoutChangesTotal: 1},
 			want: false,
 		},
 	}
