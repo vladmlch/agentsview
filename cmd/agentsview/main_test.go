@@ -2652,6 +2652,24 @@ func TestFormatAnomalySummary(t *testing.T) {
 			},
 			wantOmit: []string{"malformed lines", "sanitized fields"},
 		},
+		{
+			name: "codex layout changes render root and flip",
+			anomalies: agentsync.AnomalyStats{
+				LayoutChangesTotal: 1,
+				LayoutChangeSamples: []parser.CodexLayoutChange{{
+					Agent: parser.AgentCodex,
+					Root:  "/home/u/.codex/sessions",
+					From:  "dated",
+					To:    "flat",
+				}},
+			},
+			wantContain: []string{
+				"Parser anomalies (this run):",
+				"codex layout changes: 1 total",
+				"codex: /home/u/.codex/sessions: dated -> flat",
+			},
+			wantOmit: []string{"malformed lines", "sanitized fields"},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

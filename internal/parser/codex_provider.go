@@ -69,6 +69,10 @@ type codexProviderFactory struct {
 	cursorCache     *codexCursorCache
 	parentTurnCache *codexParentTurnCache
 	threadFiles     codexThreadFileCache
+	// receipts is the validation-only av-19 layout receipt registry shared
+	// by every provider this factory materializes, so layout drift is
+	// detected between passes even though providers are rebuilt per pass.
+	receipts *codexLayoutReceipts
 }
 
 func newCodexProviderFactory(def AgentDef) ProviderFactory {
@@ -77,6 +81,7 @@ func newCodexProviderFactory(def AgentDef) ProviderFactory {
 		spec:            codexProviderSpecForAgent(AgentCodex),
 		cursorCache:     newProductionCodexCursorCache(),
 		parentTurnCache: newCodexProductionParentTurnCache(),
+		receipts:        newCodexLayoutReceipts(AgentCodex),
 	}
 }
 
@@ -88,6 +93,7 @@ func newTraeXProviderFactory(def AgentDef) ProviderFactory {
 		spec:            codexProviderSpecForAgent(AgentTraeX),
 		cursorCache:     newProductionCodexCursorCache(),
 		parentTurnCache: newCodexProductionParentTurnCache(),
+		receipts:        newCodexLayoutReceipts(AgentTraeX),
 	}
 }
 
@@ -100,6 +106,7 @@ func newAugureCodeProviderFactory(def AgentDef) ProviderFactory {
 		spec:            codexProviderSpecForAgent(AgentAugureCode),
 		cursorCache:     newProductionCodexCursorCache(),
 		parentTurnCache: newCodexProductionParentTurnCache(),
+		receipts:        newCodexLayoutReceipts(AgentAugureCode),
 	}
 }
 
@@ -122,6 +129,7 @@ func (f *codexProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	sources := newCodexSourceSet(f.spec.agent, cfg.Roots)
 	sources.metadata = CodexMetadata{roots: cfg.MetadataDirs}
 	sources.threadFiles = &f.threadFiles
+	sources.receipts = f.receipts
 	return &codexProvider{
 		Def:             cloneAgentDef(f.def),
 		Caps:            f.Capabilities(),
@@ -148,6 +156,13 @@ type codexProvider struct {
 // SetPipelineObserverSource implements PipelineObserverProvider.
 func (p *codexProvider) SetPipelineObserverSource(source ObserverSource) {
 	p.obsSource = source
+}
+
+// SetCodexLayoutChangeSink implements CodexLayoutChangeSinkProvider. The
+// sync engine injects its per-run anomaly accumulator so the validation-only
+// layout receipt's drift records land in the run's anomaly summary.
+func (p *codexProvider) SetCodexLayoutChangeSink(sink CodexLayoutChangeSink) {
+	p.sources.layoutSink = sink
 }
 
 // parseObserver builds the emit helper for one transcript path. When the
@@ -987,6 +1002,12 @@ type codexSourceSet struct {
 	roots       []string
 	metadata    CodexMetadata
 	threadFiles *codexThreadFileCache
+	// receipts is the validation-only av-19 layout receipt registry; nil
+	// disables receipts (source sets built outside a factory).
+	receipts *codexLayoutReceipts
+	// layoutSink receives committed layout drift records; the engine
+	// injects its per-run anomaly accumulator at construction.
+	layoutSink CodexLayoutChangeSink
 }
 
 func newCodexSourceSet(agent AgentType, roots []string) codexSourceSet {
@@ -1040,7 +1061,8 @@ func (s codexSourceSet) discoverEachRoot(
 		}
 		return nil
 	}
-	return streamDirectoryTree(ctx, root, func(path string, entry os.DirEntry) error {
+	var obs codexLayoutObservation
+	err := streamDirectoryTree(ctx, root, func(path string, entry os.DirEntry) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -1058,8 +1080,34 @@ func (s codexSourceSet) discoverEachRoot(
 		if !ok {
 			return nil
 		}
+		if src, ok := source.Opaque.(codexSource); ok {
+			obs.note(src.Layout, src.UUID)
+		}
 		return yield(source)
 	})
+	if err == nil {
+		// Only a completed walk is an authoritative per-pass observation:
+		// an aborted walk may have seen a partial tree, which would read as
+		// spurious layout drift.
+		s.observeLayout(root, obs)
+	}
+	return err
+}
+
+// observeLayout commits one pass's layout observation for root to the
+// validation-only receipt and delivers any drift record to the injected
+// sink. No-op when the source set carries no receipt registry.
+func (s codexSourceSet) observeLayout(
+	root string, obs codexLayoutObservation,
+) {
+	if s.receipts == nil {
+		return
+	}
+	for _, change := range s.receipts.observe(root, obs) {
+		if s.layoutSink != nil {
+			s.layoutSink.RecordCodexLayoutChange(change)
+		}
+	}
 }
 
 func (s codexSourceSet) discover(
@@ -1120,8 +1168,13 @@ func (s codexSourceSet) discover(
 // sessionsDir, covering both the standard year/month/day layout and a flat
 // archived directory. Paths are returned sorted for deterministic discovery,
 // matching the behavior the package-level entrypoint provided before the fold.
+// The pass also commits a validation-only layout receipt for the root
+// (audit av-19): flags come free from the two construction loops, and
+// same-uuid-in-both-layouts detection runs only when both layouts are
+// present, so single-layout archives pay no extra uuid extraction.
 func (s codexSourceSet) discoverSessionPaths(sessionsDir string) []string {
 	var paths []string
+	var obs codexLayoutObservation
 
 	entries, err := os.ReadDir(sessionsDir)
 	if err != nil {
@@ -1135,6 +1188,7 @@ func (s codexSourceSet) discoverSessionPaths(sessionsDir string) []string {
 			continue
 		}
 		paths = append(paths, filepath.Join(sessionsDir, entry.Name()))
+		obs.note(CodexLayoutArchivedFlat, "")
 	}
 
 	walkCodexDayDirs(sessionsDir, func(dayPath string) bool {
@@ -1150,9 +1204,24 @@ func (s codexSourceSet) discoverSessionPaths(sessionsDir string) []string {
 				continue
 			}
 			paths = append(paths, filepath.Join(dayPath, sf.Name()))
+			obs.note(CodexLayoutDated, "")
 		}
 		return true
 	})
+
+	// Dual-layout detection needs each copy's UUID; pay for the extra
+	// classification only in the mixed-layout case where a dual can exist.
+	if obs.flags == codexFlatObserved|codexDatedObserved {
+		for _, path := range paths {
+			layout, uuid, ok := CodexSessionPathInfo(sessionsDir, path)
+			if !ok || uuid == "" {
+				continue
+			}
+			obs.note(layout, uuid)
+		}
+	}
+
+	s.observeLayout(sessionsDir, obs)
 
 	slices.Sort(paths)
 	return paths
