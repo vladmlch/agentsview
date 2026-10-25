@@ -113,6 +113,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newPruneCommand())
 	root.AddCommand(newDBCommand())
 	root.AddCommand(newBackupCommand())
+	root.AddCommand(newRestoreCommand())
 	root.AddCommand(newUpdateCommand())
 	root.AddCommand(newTokenUseCommand())
 	root.AddCommand(newImportCommand())
