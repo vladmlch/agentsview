@@ -13,7 +13,9 @@
     PipelineStore,
     type PipelineStage,
   } from "../../stores/pipeline.svelte.js";
+  import { m } from "../../i18n/index.js";
   import { RefreshCwIcon } from "../../icons.js";
+  import PipelineRunSummary from "./PipelineRunSummary.svelte";
   import PipelineDiagram from "./PipelineDiagram.svelte";
   import PipelineInspector from "./PipelineInspector.svelte";
   import PipelineTimeline from "./PipelineTimeline.svelte";
@@ -31,6 +33,10 @@
   let stageFilter = $state<PipelineStage | null>(null);
   let observing = $state(false);
   let fileInput: HTMLInputElement | undefined = $state();
+  let localFileInput: HTMLInputElement | undefined = $state();
+  const canExport = $derived(store.events.length > 0 && (
+    store.header !== null || store.events.some((event) => event.kind === "run_started")
+  ));
 
   // Second-row list filters live on the page so a deliberate kind /
   // text / anomaly filter survives run and recording switches —
@@ -111,8 +117,7 @@
   }
 
   async function selectRecording(value: string) {
-    recordingName = value;
-    await store.playRecording(value);
+    if (await store.playRecording(value)) recordingName = value;
   }
 
   async function toggleObserve() {
@@ -135,6 +140,35 @@
     if (!file) return;
     const name = await store.importRecording(file);
     if (name !== undefined) await selectRecording(name);
+  }
+
+  async function openLocal(input: HTMLInputElement): Promise<void> {
+    const file = input.files?.[0];
+    input.value = "";
+    if (file && await store.playRecording(file)) recordingName = "";
+  }
+
+  function exportCapture(): void {
+    const recording = store.exportRecording();
+    if (recording === undefined) return;
+    try {
+      const url = URL.createObjectURL(new Blob([recording.text], { type: "application/x-ndjson" }));
+      const link = document.createElement("a");
+      try {
+        link.href = url;
+        link.download = recording.name;
+        document.body.appendChild(link);
+        link.click();
+      } finally {
+        link.remove();
+        // Let the browser consume the click before releasing the temporary URL.
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+    } catch (cause) {
+      store.error = m.pipeline_recording_action_error({
+        detail: cause instanceof Error ? cause.message : String(cause),
+      });
+    }
   }
 
   function shortRunId(id: string): string {
@@ -216,16 +250,26 @@
         size="sm"
         surface="outline"
         label="Import…"
-        title="Upload a .jsonl recording and replay it"
+        title={m.pipeline_upload_hint()}
         onclick={() => fileInput?.click()}
       />
       <input
         bind:this={fileInput}
         type="file"
-        accept=".jsonl"
+        accept=".jsonl,.ndjson"
         hidden
         onchange={(e) => void importSelected(e.currentTarget)}
       />
+      <Button size="sm" surface="outline" label={m.pipeline_open_local()}
+        title={m.pipeline_open_local_hint()} onclick={() => localFileInput?.click()} />
+      <input bind:this={localFileInput} type="file" accept=".jsonl,.ndjson"
+        aria-label={m.pipeline_local_file_label()} hidden
+        onchange={(e) => void openLocal(e.currentTarget)} />
+      <Button size="sm" surface="outline" label={m.pipeline_export_capture()}
+        title={m.pipeline_export_hint()} disabled={!canExport} onclick={exportCapture} />
+      {#if store.recordingLoading}
+        <span class="recording-note" role="status">{m.pipeline_recording_loading()}</span>
+      {/if}
       <IconButton
         ariaLabel="Refresh runs and recordings"
         size="sm"
@@ -257,7 +301,11 @@
         {/each}
       </div>
     </div>
+    <p class="recording-note">{m.pipeline_recording_privacy()} {m.pipeline_recording_limits()}</p>
   </header>
+
+  <PipelineRunSummary events={store.events} runId={store.runId}
+    header={store.header} dropped={store.dropped} />
 
   <PipelineDiagram
     stageStatus={view.stageStatus}
@@ -339,6 +387,7 @@
     flex: 1;
     min-height: 0;
     min-width: 0;
+    overflow: auto;
   }
 
   .pipeline-header {
@@ -381,6 +430,12 @@
     white-space: nowrap;
   }
 
+  .recording-note {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+  }
+
   .pipeline-error {
     font-size: var(--font-size-xs);
     color: var(--accent-red);
@@ -409,7 +464,7 @@
     flex: 1;
     display: grid;
     grid-template-columns: minmax(0, 3fr) minmax(280px, 2fr);
-    min-height: 0;
+    min-height: 360px;
     border-top: 1px solid var(--border-default);
   }
 
@@ -444,5 +499,12 @@
 
   .timeline-col :global(.inspector) {
     flex: none;
+  }
+  @media (max-width: 900px) {
+    .pipeline-split {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: minmax(360px, 1fr) minmax(280px, 1fr);
+      min-height: 640px;
+    }
   }
 </style>

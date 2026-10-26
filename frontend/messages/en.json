@@ -8,7 +8,9 @@
         "local savedNumber = saved: number",
         "local countNumber = count: number"
       ],
-      "match": { "*": "Saving {savedNumber} of {countNumber}…" }
+      "match": {
+        "*": "Saving {savedNumber} of {countNumber}…"
+      }
     }
   ],
   "data_candidate_worktree_prefix": "Worktree prefix",
@@ -21,7 +23,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} observed folder",
         "countPlural=other": "{countNumber} observed folders"
@@ -106,8 +110,14 @@
   "status_bar_archive_rebuilding": "Archive results may be stale. Changes are paused until the rebuild finishes.",
   "status_bar_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session",
         "countPlural=other": "{countLabel} sessions"
@@ -116,8 +126,14 @@
   ],
   "status_bar_messages": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} message",
         "countPlural=other": "{countLabel} messages"
@@ -126,8 +142,14 @@
   ],
   "status_bar_projects": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} project",
         "countPlural=other": "{countLabel} projects"
@@ -199,8 +221,14 @@
   "session_breadcrumb_total_cost": "Total",
   "session_breadcrumb_total_cost_title": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Total cost including {countLabel} subagent",
         "countPlural=other": "Total cost including {countLabel} subagents"
@@ -211,8 +239,14 @@
   "session_breadcrumb_usage_breakdown_loading": "Loading usage...",
   "session_breadcrumb_usage_breakdown_steps": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} step",
         "countPlural=other": "{countLabel} steps"
@@ -240,8 +274,13 @@
   "session_breadcrumb_summary_mode_tooltip": "Tool results, thinking, and diffs are missing from this transcript. Full fidelity needs the agy-reader sidecar — install it, or if installed, let it catch up. Click to learn how.",
   "session_breadcrumb_malformed_lines": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} malformed line",
         "countPlural=other": "{count} malformed lines"
@@ -250,8 +289,13 @@
   ],
   "session_breadcrumb_malformed_lines_tooltip": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} line in the source file could not be parsed",
         "countPlural=other": "{count} lines in the source file could not be parsed"
@@ -302,8 +346,14 @@
   "message_content_running_duration": "running {duration}+",
   "message_content_turn_summary": [
     {
-      "declarations": ["input count", "input duration", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input duration",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "turn {duration} · {count} call",
         "countPlural=other": "turn {duration} · {count} calls"
@@ -312,8 +362,14 @@
   ],
   "message_content_running_turn_summary": [
     {
-      "declarations": ["input count", "input duration", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input duration",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "running {duration}+ · {count} call",
         "countPlural=other": "running {duration}+ · {count} calls"
@@ -322,8 +378,13 @@
   ],
   "tool_call_group_call_count": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} tool call",
         "countPlural=other": "{count} tool calls"
@@ -337,8 +398,13 @@
   "parallel_group_label": "parallel",
   "parallel_group_call_count": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} call",
         "countPlural=other": "{count} calls"
@@ -349,8 +415,13 @@
   "subagent_inline_label": "Subagent session",
   "subagent_inline_message_count": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} message",
         "countPlural=other": "{count} messages"
@@ -381,8 +452,13 @@
   "tool_block_show_less": "show less",
   "tool_block_show_all_lines": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "show all {count} line",
         "countPlural=other": "show all {count} lines"
@@ -395,8 +471,14 @@
   "compact_boundary_show_full_summary": "Show full summary",
   "sidebar_session_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session",
         "countPlural=other": "{countLabel} sessions"
@@ -519,8 +601,13 @@
   "shared_range_custom_range": "Custom range",
   "shared_range_last_days": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Last {count} day",
         "countPlural=other": "Last {count} days"
@@ -614,8 +701,14 @@
   "analytics_tool_usage_title": "Tool Usage",
   "analytics_tool_usage_call_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} call",
         "countPlural=other": "{countLabel} calls"
@@ -628,8 +721,14 @@
   "analytics_tool_usage_top_tools": "Top tools",
   "analytics_tool_usage_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session",
         "countPlural=other": "{countLabel} sessions"
@@ -651,8 +750,14 @@
   "analytics_projects_title": "Projects",
   "analytics_project_messages": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} message",
         "countPlural=other": "{countLabel} messages"
@@ -661,8 +766,14 @@
   ],
   "analytics_project_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session",
         "countPlural=other": "{countLabel} sessions"
@@ -694,7 +805,9 @@
         "input countLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{day} {hour}:00 - {countLabel} message",
         "countPlural=other": "{day} {hour}:00 - {countLabel} messages"
@@ -706,8 +819,14 @@
   "analytics_session_shape_autonomy": "Autonomy",
   "analytics_session_shape_session_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session",
         "countPlural=other": "{countLabel} sessions"
@@ -751,7 +870,9 @@
         "input pct",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{skill}: {countLabel} call ({pct}%)",
         "countPlural=other": "{skill}: {countLabel} calls ({pct}%)"
@@ -768,7 +889,10 @@
         "local callsPlural = calls: plural",
         "local skillsPlural = skills: plural"
       ],
-      "selectors": ["callsPlural", "skillsPlural"],
+      "selectors": [
+        "callsPlural",
+        "skillsPlural"
+      ],
       "match": {
         "callsPlural=one, skillsPlural=one": "{callsLabel} call · {skillsLabel} skill",
         "callsPlural=one, skillsPlural=other": "{callsLabel} call · {skillsLabel} skills",
@@ -827,8 +951,14 @@
   "usage_filter_deselect_all": "Deselect all",
   "usage_filter_all_items": [
     {
-      "declarations": ["input label", "input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input label",
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "All {label}",
         "countPlural=other": "All {label}s"
@@ -912,7 +1042,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} project",
         "countPlural=other": "{countNumber} projects"
@@ -926,7 +1058,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} session",
         "countPlural=other": "{countNumber} sessions"
@@ -940,7 +1074,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} machine",
         "countPlural=other": "{countNumber} machines"
@@ -954,7 +1090,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} folder suggestion",
         "countPlural=other": "{countNumber} folder suggestions"
@@ -968,7 +1106,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} session governed by rules",
         "countPlural=other": "{countNumber} sessions governed by rules"
@@ -983,7 +1123,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} project selected",
         "countPlural=other": "{countNumber} projects selected"
@@ -999,7 +1141,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} project selected",
         "countPlural=other": "{countNumber} projects selected"
@@ -1020,7 +1164,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} folder",
         "countPlural=other": "{countNumber} folders"
@@ -1036,7 +1182,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Save {countNumber} correction",
         "countPlural=other": "Save {countNumber} corrections"
@@ -1061,7 +1209,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} enabled rule targets this project",
         "countPlural=other": "{countNumber} enabled rules target this project"
@@ -1095,7 +1245,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} session",
         "countPlural=other": "{countNumber} sessions"
@@ -1117,7 +1269,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} session matched",
         "countPlural=other": "{countNumber} sessions matched"
@@ -1131,7 +1285,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} session will change",
         "countPlural=other": "{countNumber} sessions will change"
@@ -1145,7 +1301,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} project",
         "countPlural=other": "{countNumber} projects"
@@ -1161,7 +1319,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} session",
         "countPlural=other": "{countNumber} sessions"
@@ -1175,7 +1335,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} session preview",
         "countPlural=other": "{countNumber} session previews"
@@ -1284,8 +1446,14 @@
   "activity_no_sessions_selected_range": "No sessions active in the selected time range.",
   "activity_output_tokens_value": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} output token",
         "countPlural=other": "{countLabel} output tokens"
@@ -1332,7 +1500,9 @@
         "input automated",
         "local subagentPlural = subagents: plural"
       ],
-      "selectors": ["subagentPlural"],
+      "selectors": [
+        "subagentPlural"
+      ],
       "match": {
         "subagentPlural=one": "{interactive} interactive / {subagentsLabel} subagent / {automated} automated",
         "subagentPlural=other": "{interactive} interactive / {subagentsLabel} subagents / {automated} automated"
@@ -1470,8 +1640,14 @@
   "call_group_parallel_label": "parallel",
   "call_group_parallel_call_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} call",
         "countPlural=other": "{countLabel} calls"
@@ -1488,7 +1664,10 @@
         "input running",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural", "running"],
+      "selectors": [
+        "countPlural",
+        "running"
+      ],
       "match": {
         "countPlural=one,running=true": "{countLabel} call · running {duration}+",
         "countPlural=other,running=true": "{countLabel} calls · running {duration}+",
@@ -1500,8 +1679,14 @@
   "activity_lane_activity": "activity",
   "activity_lane_message_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} message",
         "countPlural=other": "{countLabel} messages"
@@ -1649,7 +1834,10 @@
         "local countPlural = count: plural",
         "local runningPlural = runningCount: plural"
       ],
-      "selectors": ["countPlural", "runningPlural"],
+      "selectors": [
+        "countPlural",
+        "runningPlural"
+      ],
       "match": {
         "countPlural=one,runningPlural=one": "{countLabel} call · {runningCount} running",
         "countPlural=other,runningPlural=one": "{countLabel} calls · {runningCount} running",
@@ -1787,8 +1975,14 @@
   "insights_page_pct_affected": "{pct}% affected",
   "insights_pattern_recommendation_rationale": [
     {
-      "declarations": ["input affected", "input total", "local totalPlural = total: plural"],
-      "selectors": ["totalPlural"],
+      "declarations": [
+        "input affected",
+        "input total",
+        "local totalPlural = total: plural"
+      ],
+      "selectors": [
+        "totalPlural"
+      ],
       "match": {
         "totalPlural=one": "{affected} of {total} session has this deterministic pattern.",
         "totalPlural=other": "{affected} of {total} sessions have this deterministic pattern."
@@ -1847,7 +2041,9 @@
         "input failureSignals",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} session, {completedRate}% completed, {failureSignals} avg failures",
         "countPlural=other": "{count} sessions, {completedRate}% completed, {failureSignals} avg failures"
@@ -1856,8 +2052,14 @@
   ],
   "insights_page_driver_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session",
         "countPlural=other": "{countLabel} sessions"
@@ -2085,7 +2287,9 @@
         "input totalLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{doneLabel} / {totalLabel} chunk",
         "countPlural=other": "{doneLabel} / {totalLabel} chunks"
@@ -2094,8 +2298,14 @@
   ],
   "settings_embeddings_rate": [
     {
-      "declarations": ["input count", "input rateLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input rateLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{rateLabel} chunk/s",
         "countPlural=other": "{rateLabel} chunks/s"
@@ -2214,8 +2424,14 @@
   "trash_empty_trash": "Empty Trash",
   "trash_msgs": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} msg",
         "countPlural=other": "{countLabel} msgs"
@@ -2353,8 +2569,14 @@
   "settings_image_cleanup_empty": "No stored tool result in this selection holds an inline image payload.",
   "settings_image_cleanup_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session selected",
         "countPlural=other": "{countLabel} sessions selected"
@@ -2363,8 +2585,14 @@
   ],
   "settings_image_cleanup_payloads": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} image payload",
         "countPlural=other": "{countLabel} image payloads"
@@ -2390,8 +2618,14 @@
   "settings_image_cleanup_applied": "Image removal completed.",
   "settings_image_cleanup_changed": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session changed",
         "countPlural=other": "{countLabel} sessions changed"
@@ -2406,8 +2640,14 @@
   "assistant_turn_event_message": "Message",
   "assistant_turn_message_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} message",
         "countPlural=other": "{countLabel} messages"
@@ -2416,8 +2656,14 @@
   ],
   "assistant_turn_tool_call_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} tool call",
         "countPlural=other": "{countLabel} tool calls"
@@ -2462,8 +2708,14 @@
   "tool_sequences_no_sequences": "No tool call returned an error or empty result.",
   "tool_sequences_sequence_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} sequence",
         "countPlural=other": "{countLabel} sequences"
@@ -2490,17 +2742,32 @@
   "tool_sequences_no_input": "No input recorded.",
   "tool_sequences_byte_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
-      "match": { "countPlural=one": "{countLabel} byte", "countPlural=other": "{countLabel} bytes" }
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{countLabel} byte",
+        "countPlural=other": "{countLabel} bytes"
+      }
     }
   ],
   "tool_sequences_result": "Result",
   "tool_sequences_result_unknown": "This result isn't text, so its outcome is unknown.",
   "tool_sequences_result_unavailable": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "The retained {countLabel} byte of result text is unavailable here.",
         "countPlural=other": "The retained {countLabel} bytes of result text are unavailable here."
@@ -2517,8 +2784,14 @@
   "tool_sequences_flag_tool_switch": "Tool switched",
   "tool_sequences_sequence_calls": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} call in sequences",
         "countPlural=other": "{countLabel} calls in sequences"
@@ -2527,8 +2800,14 @@
   ],
   "tool_sequences_session_calls": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} tool call in session",
         "countPlural=other": "{countLabel} tool calls in session"
@@ -2541,8 +2820,14 @@
   "tool_sequences_jump_label": "Message {ordinal}: open the {tool} call in the transcript",
   "tool_sequences_more_calls": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "+{countLabel} more",
         "countPlural=other": "+{countLabel} more"
@@ -2558,7 +2843,9 @@
         "input to",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} more call between message {from} and message {to} isn't shown.",
         "countPlural=other": "{countLabel} more calls between message {from} and message {to} aren't shown."
@@ -2567,8 +2854,14 @@
   ],
   "tool_sequences_calls_in_row": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} call in a row.",
         "countPlural=other": "{countLabel} calls in a row."
@@ -2583,7 +2876,9 @@
         "input shownLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Showing {shownLabel} of {countLabel} sequence. The rest come later in the session.",
         "countPlural=other": "Showing {shownLabel} of {countLabel} sequences. The rest come later in the session."
@@ -2592,8 +2887,14 @@
   ],
   "tool_sequences_calls_not_shown": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} call in sequences isn't shown in this view.",
         "countPlural=other": "{countLabel} calls in sequences aren't shown in this view."
@@ -2608,7 +2909,9 @@
         "input shownLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Preview shows {shownLabel} of {countLabel} byte.",
         "countPlural=other": "Preview shows {shownLabel} of {countLabel} bytes."
@@ -2659,7 +2962,9 @@
         "input keptLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} call input cut to at most {keptLabel} bytes",
         "countPlural=other": "{countLabel} call inputs cut to at most {keptLabel} bytes each"
@@ -2674,7 +2979,9 @@
         "input keptLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} call result cut to at most {keptLabel} bytes",
         "countPlural=other": "{countLabel} call results cut to at most {keptLabel} bytes each"
@@ -2683,8 +2990,14 @@
   ],
   "tool_effectiveness_omission_unretained": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} call result not retained",
         "countPlural=other": "{countLabel} call results not retained"
@@ -2693,8 +3006,14 @@
   ],
   "tool_effectiveness_omission_no_result": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} call with no recorded result",
         "countPlural=other": "{countLabel} calls with no recorded result"
@@ -2709,7 +3028,9 @@
         "input charsLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} message shown as a preview of {charsLabel} characters",
         "countPlural=other": "{countLabel} messages shown as previews of {charsLabel} characters"
@@ -2725,7 +3046,9 @@
         "input currentLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "The session changed after this report: the model judged {countLabel} call and the session now has {currentLabel}.",
         "countPlural=other": "The session changed after this report: the model judged {countLabel} calls and the session now has {currentLabel}."
@@ -2737,8 +3060,14 @@
   "tool_sequences_jump_call_label": "Message {ordinal}, call {callNumber}: open the {tool} call in the transcript",
   "tool_effectiveness_calls_judged": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} call judged",
         "countPlural=other": "{countLabel} calls judged"
@@ -2747,8 +3076,14 @@
   ],
   "tool_effectiveness_conclusion_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} conclusion",
         "countPlural=other": "{countLabel} conclusions"
@@ -2757,8 +3092,14 @@
   ],
   "tool_effectiveness_count_helped": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} helped",
         "countPlural=other": "{countLabel} helped"
@@ -2767,8 +3108,14 @@
   ],
   "tool_effectiveness_count_did_not_help": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} did not help",
         "countPlural=other": "{countLabel} did not help"
@@ -2777,8 +3124,14 @@
   ],
   "tool_effectiveness_count_unknown": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} unclear",
         "countPlural=other": "{countLabel} unclear"
@@ -2793,7 +3146,9 @@
         "input citedLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{citedLabel} of {countLabel} call cited",
         "countPlural=other": "{citedLabel} of {countLabel} calls cited"
@@ -2803,8 +3158,14 @@
   "tool_effectiveness_select_citation": "Select a citation to see the calls",
   "tool_effectiveness_citation_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} citation",
         "countPlural=other": "{countLabel} citations"
@@ -2816,8 +3177,14 @@
   "tool_effectiveness_left_out": "Left out of the model's input",
   "tool_effectiveness_model_saw": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "model saw {countLabel} byte",
         "countPlural=other": "model saw {countLabel} bytes"
@@ -2827,8 +3194,14 @@
   "tool_effectiveness_open_session": "Open session",
   "tool_effectiveness_message_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} message",
         "countPlural=other": "{countLabel} messages"
@@ -2853,8 +3226,14 @@
   "analytics_tool_recovery_note": "Recovery means a later call returned content. The tool that started the sequence owns its recovery rate.",
   "analytics_tool_evidence_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session",
         "countPlural=other": "{countLabel} sessions"
@@ -2887,8 +3266,14 @@
   "plan_usage_five_hour_share": "{percent}% of the five-hour Codex limit",
   "plan_usage_credits": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} credit",
         "countPlural=other": "{countLabel} credits"
@@ -2903,8 +3288,14 @@
   "capture_tokens_live": "Tokens captured live, as of {time}",
   "capture_turns_not_captured": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} turn not captured",
         "countPlural=other": "{countLabel} turns not captured"
@@ -2919,7 +3310,9 @@
         "input time",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} turn not captured; plan usage counts it if it ran before {time}",
         "countPlural=other": "{countLabel} turns not captured; plan usage counts the ones that ran before {time}"
@@ -2928,8 +3321,14 @@
   ],
   "usage_plan_only_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session billed as plan usage, not priced",
         "countPlural=other": "{countLabel} sessions billed as plan usage, not priced"
@@ -2938,8 +3337,14 @@
   ],
   "usage_partly_captured_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session partly captured; its token counts are low.",
         "countPlural=other": "{countLabel} sessions partly captured; their token counts are low."
@@ -2949,8 +3354,14 @@
   "status_bar_codex_cloud_waiting": "Codex Cloud: waiting for first sync",
   "status_bar_codex_cloud_importing_found": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Codex Cloud: importing, found {countLabel} chat so far",
         "countPlural=other": "Codex Cloud: importing, found {countLabel} chats so far"
@@ -2961,8 +3372,14 @@
   "status_bar_codex_cloud_up_to_date": "Codex Cloud: up to date as of {time}",
   "status_bar_codex_cloud_retrying": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Codex Cloud: {countLabel} chat could not be imported",
         "countPlural=other": "Codex Cloud: {countLabel} chats could not be imported"
@@ -2975,5 +3392,56 @@
   "status_bar_codex_cloud_live_attention": "Codex Cloud: live tokens need attention",
   "status_bar_codex_cloud_oldest_failure": "Oldest failure: {time}",
   "status_bar_codex_cloud_last_success": "Last successful sync: {time}",
-  "status_bar_codex_cloud_homes": "Codex homes: {homes}"
+  "status_bar_codex_cloud_homes": "Codex homes: {homes}",
+  "session_breadcrumb_session_health": "Session health",
+  "usage_click_to_hide_hint": "Click to hide from chart",
+  "usage_click_to_hide": "Click to hide {label}",
+  "usage_hide_from_chart": "Hide {label} from chart",
+  "usage_click_to_hide_item": "Click to hide {label}",
+  "pipeline_summary_title": "Run comparison",
+  "pipeline_summary_current": "Current",
+  "pipeline_summary_baseline": "Baseline",
+  "pipeline_summary_pin": "Pin as baseline",
+  "pipeline_summary_clear": "Clear baseline",
+  "pipeline_summary_details": "Metrics and stages",
+  "pipeline_summary_full_buffer": "Totals cover the full captured buffer, not the replay position or active filters. The baseline is a fixed snapshot kept only on this page.",
+  "pipeline_summary_empty": "no events",
+  "pipeline_summary_unknown": "unknown",
+  "pipeline_summary_partial": "Partial capture: a run bookend is missing or sequence gaps were detected. These totals are observations, not complete run results.",
+  "pipeline_summary_scenario_mismatch": "Different scenarios: current {current}, baseline {baseline}. Differences are not evidence of a regression.",
+  "pipeline_summary_complete": "complete capture",
+  "pipeline_summary_incomplete": "partial capture",
+  "pipeline_summary_metric": "Metric",
+  "pipeline_summary_delta": "Change",
+  "pipeline_summary_events": "Events",
+  "pipeline_summary_paths": "Observed paths",
+  "pipeline_summary_anomalies": "Anomalies",
+  "pipeline_summary_missing": "Missing sequence events",
+  "pipeline_summary_lines": "Classified lines",
+  "pipeline_summary_inserts": "Message inserts",
+  "pipeline_summary_span": "Observed span (ms)",
+  "pipeline_summary_stage": "Stage",
+  "pipeline_summary_metric_notes": "Span is the observed timestamp range, not summed stage time. Inserts count messages_written only; transaction totals are not added. Lower counts are not necessarily better.",
+  "pipeline_open_local": "Open local…",
+  "pipeline_open_local_hint": "Read a recording in this browser without uploading it",
+  "pipeline_export_capture": "Export capture",
+  "pipeline_export_hint": "Save all captured events as JSONL; requires the original header or run_started event",
+  "pipeline_recording_loading": "Reading recording…",
+  "pipeline_recording_privacy": "Open local and Export capture do not upload data. Recordings may contain private paths and transcript text; review before sharing.",
+  "pipeline_recording_limits": "Browser recording limit: 32 MiB and 50,000 events.",
+  "pipeline_upload_hint": "Upload a recording to the connected server and replay it",
+  "pipeline_local_file_label": "Local pipeline recording",
+  "pipeline_recording_action_error": "Recording operation failed: {detail}",
+  "pipeline_recording_header_expected": "pipeline recording: line {line}: expected a header object",
+  "pipeline_recording_version_error": "pipeline recording: unsupported format_version",
+  "pipeline_recording_header_fields": "pipeline recording: line {line}: invalid header fields",
+  "pipeline_recording_event_fields": "pipeline recording: line {line}: invalid event fields",
+  "pipeline_recording_run_id_error": "pipeline recording: line {line}: run_id does not match the header",
+  "pipeline_recording_sequence_error": "pipeline recording: line {line}: seq must be strictly increasing",
+  "pipeline_recording_size_error": "pipeline recording: exceeds the 32 MiB browser limit",
+  "pipeline_recording_event_limit": "pipeline recording: exceeds the 50000 event browser limit",
+  "pipeline_recording_json_error": "pipeline recording: decode line {line}: invalid JSON",
+  "pipeline_recording_empty_error": "pipeline recording: empty recording; header required",
+  "pipeline_recording_missing_start": "pipeline recording: run_started is missing; original start metadata unavailable",
+  "pipeline_recording_http_error": "pipeline recording: HTTP {status}"
 }

@@ -8,7 +8,9 @@
         "local savedNumber = saved: number",
         "local countNumber = count: number"
       ],
-      "match": { "*": "Enregistrement de {savedNumber} sur {countNumber}…" }
+      "match": {
+        "*": "Enregistrement de {savedNumber} sur {countNumber}…"
+      }
     }
   ],
   "data_candidate_worktree_prefix": "Préfixe de worktree",
@@ -21,7 +23,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} dossier observé",
         "countPlural=other": "{countNumber} dossiers observés"
@@ -74,7 +78,7 @@
   "header_transcript_blocks_system": "Limites système",
   "header_actions_follow_latest": "Suivre les derniers messages",
   "header_actions_toggle_sort": "Inverser l'ordre de tri (o)",
-  "header_actions_cycle_layout": "Changer de disposition\u202f: {layout} (l)",
+  "header_actions_cycle_layout": "Changer de disposition : {layout} (l)",
   "header_actions_cycle_layout_label": "Changer la disposition des messages",
   "header_actions_export_options": "Options d'export de la session",
   "header_actions_export_session": "Exporter la session",
@@ -87,7 +91,7 @@
   "header_actions_publish_public": "Publier un Gist public",
   "header_actions_publish_secret": "Publier un Gist secret",
   "header_actions_more_actions": "Plus d'actions",
-  "header_actions_layout": "Disposition\u202f: {layout}",
+  "header_actions_layout": "Disposition : {layout}",
   "header_actions_refresh_data": "Actualiser les données",
   "header_actions_refresh_data_shortcut": "Actualiser les données (r)",
   "header_actions_sync_sessions": "Synchroniser les sessions",
@@ -106,8 +110,14 @@
   "status_bar_archive_rebuilding": "Les résultats des archives peuvent être obsolètes. Les modifications sont suspendues jusqu'à la fin de la reconstruction.",
   "status_bar_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session",
         "countPlural=other": "{countLabel} sessions"
@@ -116,8 +126,14 @@
   ],
   "status_bar_messages": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} message",
         "countPlural=other": "{countLabel} messages"
@@ -126,8 +142,14 @@
   ],
   "status_bar_projects": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} projet",
         "countPlural=other": "{countLabel} projets"
@@ -142,7 +164,7 @@
   "status_bar_zoom_out": "Zoom arrière ({shortcut} -)",
   "status_bar_reset_zoom": "Réinitialiser le zoom ({shortcut} 0)",
   "status_bar_zoom_in": "Zoom avant ({shortcut} +)",
-  "status_bar_update_available_title": "Une nouvelle version est disponible\u202f: {version}",
+  "status_bar_update_available_title": "Une nouvelle version est disponible : {version}",
   "status_bar_update_available": "mise à jour disponible",
   "status_bar_version_mismatch_title": "Les versions du frontend et du backend diffèrent. Cliquez pour recharger.",
   "status_bar_version_mismatch": "versions incompatibles — recharger",
@@ -150,7 +172,7 @@
   "status_bar_syncing_percent": "Synchronisation {percent}% ({done}/{total})",
   "status_bar_syncing": "Synchronisation...",
   "status_bar_synced_ago": "synchronisé {time}",
-  "status_bar_build": "Build\u202f: {commit}",
+  "status_bar_build": "Build : {commit}",
   "command_palette_placeholder": "Rechercher dans les sessions et les messages...",
   "command_palette_search_mode_label": "Mode de recherche",
   "command_palette_mode_fulltext": "Texte intégral",
@@ -159,8 +181,8 @@
   "command_palette_search_error": "Recherche indisponible",
   "command_palette_search_failed": "La recherche a échoué. Veuillez réessayer.",
   "command_palette_semantic_setup_title": "La recherche sémantique n'est pas configurée",
-  "command_palette_semantic_setup_config_step": "1. Ajoutez une section [vector] à config.toml, en adaptant le modèle et l'endpoint à votre serveur d'embeddings (tout endpoint compatible OpenAI convient, p. ex. Ollama)\u202f:",
-  "command_palette_semantic_setup_build_step": "2. Redémarrez le démon, puis construisez l'index\u202f:",
+  "command_palette_semantic_setup_config_step": "1. Ajoutez une section [vector] à config.toml, en adaptant le modèle et l'endpoint à votre serveur d'embeddings (tout endpoint compatible OpenAI convient, p. ex. Ollama) :",
+  "command_palette_semantic_setup_build_step": "2. Redémarrez le démon, puis construisez l'index :",
   "command_palette_semantic_copy_config": "Copier l'extrait de configuration",
   "command_palette_semantic_copy_command": "Copier la commande",
   "command_palette_semantic_copied": "Copié !",
@@ -193,14 +215,20 @@
   "session_breadcrumb_copy_directory_path": "Copier le chemin du répertoire",
   "session_breadcrumb_open_in": "Ouvrir dans",
   "session_breadcrumb_copy_session_id": "Copier l'ID de la session",
-  "session_breadcrumb_copy_session_id_value": "Copier l'ID de la session\u202f: {id}",
+  "session_breadcrumb_copy_session_id_value": "Copier l'ID de la session : {id}",
   "session_breadcrumb_copied": "Copié !",
   "session_breadcrumb_estimated_session_cost": "Coût estimé de la session",
   "session_breadcrumb_total_cost": "Total",
   "session_breadcrumb_total_cost_title": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Coût total avec {countLabel} sous-agent",
         "countPlural=other": "Coût total avec {countLabel} sous-agents"
@@ -211,8 +239,14 @@
   "session_breadcrumb_usage_breakdown_loading": "Chargement de la consommation...",
   "session_breadcrumb_usage_breakdown_steps": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} étape",
         "countPlural=other": "{countLabel} étapes"
@@ -240,8 +274,13 @@
   "session_breadcrumb_summary_mode_tooltip": "Les résultats d'outil, la réflexion et les diffs sont absents de cette transcription. La fidélité complète nécessite le sidecar agy-reader — installez-le, ou s'il est déjà installé, laissez-le rattraper son retard. Cliquez pour savoir comment.",
   "session_breadcrumb_malformed_lines": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} ligne mal formée",
         "countPlural=other": "{count} lignes mal formées"
@@ -250,8 +289,13 @@
   ],
   "session_breadcrumb_malformed_lines_tooltip": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} ligne du fichier source n'a pas pu être analysée",
         "countPlural=other": "{count} lignes du fichier source n'ont pas pu être analysées"
@@ -302,8 +346,14 @@
   "message_content_running_duration": "en cours depuis {duration}+",
   "message_content_turn_summary": [
     {
-      "declarations": ["input count", "input duration", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input duration",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "tour {duration} · {count} appel",
         "countPlural=other": "tour {duration} · {count} appels"
@@ -312,8 +362,14 @@
   ],
   "message_content_running_turn_summary": [
     {
-      "declarations": ["input count", "input duration", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input duration",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "en cours depuis {duration}+ · {count} appel",
         "countPlural=other": "en cours depuis {duration}+ · {count} appels"
@@ -322,8 +378,13 @@
   ],
   "tool_call_group_call_count": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} appel d'outil",
         "countPlural=other": "{count} appels d'outil"
@@ -337,8 +398,13 @@
   "parallel_group_label": "parallèle",
   "parallel_group_call_count": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} appel",
         "countPlural=other": "{count} appels"
@@ -349,8 +415,13 @@
   "subagent_inline_label": "Session de sous-agent",
   "subagent_inline_message_count": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} message",
         "countPlural=other": "{count} messages"
@@ -363,7 +434,7 @@
   "shared_failed_to_load": "Échec du chargement",
   "subagent_inline_loading": "Chargement...",
   "subagent_inline_no_messages": "Aucun message",
-  "skill_block_label": "Skill\u202f: {name}",
+  "skill_block_label": "Skill : {name}",
   "tool_block_copy_input": "Copier l'entrée",
   "tool_block_copied_input": "Entrée copiée",
   "tool_block_copy_output": "Copier la sortie",
@@ -373,16 +444,21 @@
   "tool_block_formatted": "Formaté",
   "tool_block_output_mode": "Format de sortie",
   "tool_block_history": "historique",
-  "tool_block_status_label": "état\u202f:",
-  "tool_block_source_label": "source\u202f:",
-  "tool_block_agent_label": "agent\u202f:",
-  "tool_block_subagent_label": "Sous-agent\u202f:",
-  "tool_block_subagent_result_label": "Résultat du sous-agent\u202f:",
+  "tool_block_status_label": "état :",
+  "tool_block_source_label": "source :",
+  "tool_block_agent_label": "agent :",
+  "tool_block_subagent_label": "Sous-agent :",
+  "tool_block_subagent_result_label": "Résultat du sous-agent :",
   "tool_block_show_less": "afficher moins",
   "tool_block_show_all_lines": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "afficher la ligne ({count})",
         "countPlural=other": "afficher les {count} lignes"
@@ -395,8 +471,14 @@
   "compact_boundary_show_full_summary": "Afficher le résumé complet",
   "sidebar_session_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session",
         "countPlural=other": "{countLabel} sessions"
@@ -411,7 +493,7 @@
   "sidebar_clear_selection": "Effacer la sélection",
   "sidebar_batch_clear": "Effacer",
   "sidebar_batch_all": "Tout",
-  "sidebar_selected_count": "Sélection\u202f: {countLabel}",
+  "sidebar_selected_count": "Sélection : {countLabel}",
   "sidebar_move_selected_to_trash": "Déplacer les sessions sélectionnées vers la corbeille",
   "sidebar_deleting": "Suppression...",
   "sidebar_delete": "Supprimer",
@@ -473,7 +555,7 @@
   "shared_project_filter_placeholder": "Filtrer les projets...",
   "shared_select_project": "Sélectionner un projet",
   "shared_no_matching_projects": "Aucun projet correspondant",
-  "shared_active_filters_label": "Filtres\u202f:",
+  "shared_active_filters_label": "Filtres :",
   "shared_active_filters_clear_project": "Effacer le filtre de projet",
   "shared_active_filters_remove_machine": "Retirer le filtre {machine}",
   "shared_active_filters_remove_agent": "Retirer le filtre {agent}",
@@ -519,8 +601,13 @@
   "shared_range_custom_range": "Plage personnalisée",
   "shared_range_last_days": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} dernier jour",
         "countPlural=other": "{count} derniers jours"
@@ -592,7 +679,7 @@
   "analytics_status_unclean": "Interrompue",
   "analytics_filters_clear_date": "Effacer le filtre de date",
   "analytics_filters_remove_status": "Retirer {status} du filtre d'état",
-  "analytics_filters_status": "État\u202f: {status}",
+  "analytics_filters_status": "État : {status}",
   "analytics_filters_only_automated": "Automatisées uniquement",
   "analytics_filters_clear_time": "Effacer le filtre horaire",
   "analytics_agent_comparison_title": "Comparaison des agents",
@@ -614,8 +701,14 @@
   "analytics_tool_usage_title": "Utilisation des outils",
   "analytics_tool_usage_call_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} appel",
         "countPlural=other": "{countLabel} appels"
@@ -628,8 +721,14 @@
   "analytics_tool_usage_top_tools": "Outils principaux",
   "analytics_tool_usage_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session",
         "countPlural=other": "{countLabel} sessions"
@@ -651,8 +750,14 @@
   "analytics_projects_title": "Projets",
   "analytics_project_messages": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} message",
         "countPlural=other": "{countLabel} messages"
@@ -661,8 +766,14 @@
   ],
   "analytics_project_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session",
         "countPlural=other": "{countLabel} sessions"
@@ -671,8 +782,8 @@
   ],
   "analytics_total_count": "{countLabel} au total",
   "analytics_projects_empty": "Aucune donnée de projet",
-  "analytics_activity_timeline_tooltip_value": "{label}\u202f: {value} {metric}",
-  "analytics_activity_timeline_tooltip_messages": "utilisateur\u202f: {user} / assistant\u202f: {assistant} / autre\u202f: {other}",
+  "analytics_activity_timeline_tooltip_value": "{label} : {value} {metric}",
+  "analytics_activity_timeline_tooltip_messages": "utilisateur : {user} / assistant : {assistant} / autre : {other}",
   "analytics_activity_timeline_mode_absolute": "Absolu",
   "analytics_activity_timeline_mode_percent": "Pourcentage",
   "analytics_metric_messages": "Messages",
@@ -694,7 +805,9 @@
         "input countLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{day} {hour}:00 - {countLabel} message",
         "countPlural=other": "{day} {hour}:00 - {countLabel} messages"
@@ -706,8 +819,14 @@
   "analytics_session_shape_autonomy": "Autonomie",
   "analytics_session_shape_session_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session",
         "countPlural=other": "{countLabel} sessions"
@@ -724,7 +843,7 @@
   "analytics_velocity_no_breakdown": "Aucune donnée de répartition",
   "analytics_grade_distribution_title": "Répartition des notes",
   "analytics_outcome_distribution_title": "Répartition des issues",
-  "analytics_outcome_count": "{outcome}\u202f: {count}",
+  "analytics_outcome_count": "{outcome} : {count}",
   "analytics_health_trend_title": "Tendance de santé",
   "analytics_health_trend_no_scored_sessions": "aucune session notée",
   "analytics_health_trend_caption": "Score de santé moyen par jour · couleur de la barre = note",
@@ -751,10 +870,12 @@
         "input pct",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
-        "countPlural=one": "{skill}\u202f: {countLabel} appel ({pct} %)",
-        "countPlural=other": "{skill}\u202f: {countLabel} appels ({pct} %)"
+        "countPlural=one": "{skill} : {countLabel} appel ({pct} %)",
+        "countPlural=other": "{skill} : {countLabel} appels ({pct} %)"
       }
     }
   ],
@@ -768,7 +889,10 @@
         "local callsPlural = calls: plural",
         "local skillsPlural = skills: plural"
       ],
-      "selectors": ["callsPlural", "skillsPlural"],
+      "selectors": [
+        "callsPlural",
+        "skillsPlural"
+      ],
       "match": {
         "callsPlural=one, skillsPlural=one": "{callsLabel} appel · {skillsLabel} skill",
         "callsPlural=one, skillsPlural=other": "{callsLabel} appel · {skillsLabel} skills",
@@ -779,7 +903,7 @@
   ],
   "analytics_top_skills_agent_breakdown": "Répartition par agent",
   "analytics_top_skills_agents": "Agents",
-  "analytics_top_skills_projects": "Projets\u202f: {projects}",
+  "analytics_top_skills_projects": "Projets : {projects}",
   "analytics_top_skills_empty": "Aucune donnée d'utilisation des skills",
   "analytics_skill_trend_title": "Utilisation des skills dans le temps",
   "analytics_skill_trend_other": "Autre",
@@ -794,9 +918,9 @@
   "usage_mode_cost": "Coût",
   "usage_mode_tokens": "Tokens",
   "usage_token_types_label": "Types de tokens",
-  "usage_token_types_all": "Types de tokens\u202f: Tous",
-  "usage_token_types_single": "Types de tokens\u202f: {tokenType}",
-  "usage_token_types_multiple": "Types de tokens\u202f: {countLabel} sélectionnés",
+  "usage_token_types_all": "Types de tokens : Tous",
+  "usage_token_types_single": "Types de tokens : {tokenType}",
+  "usage_token_types_multiple": "Types de tokens : {countLabel} sélectionnés",
   "usage_token_type_input": "Entrée",
   "usage_token_type_cache_write": "Écritures de cache",
   "usage_token_type_cache_read": "Lecture en cache",
@@ -818,20 +942,26 @@
   "usage_summary_vs_prior": "{value} vs précédent",
   "usage_summary_cached_tokens": "{value} en cache",
   "usage_summary_avg_day": "moy./jour",
-  "usage_filter_all": "{label}\u202f: tout",
-  "usage_filter_selected": "{label}\u202f: {countLabel} sélectionné(s)",
-  "usage_filter_none": "{label}\u202f: aucun",
-  "usage_filter_hidden": "{label}\u202f: {countLabel} masqué(s)",
+  "usage_filter_all": "{label} : tout",
+  "usage_filter_selected": "{label} : {countLabel} sélectionné(s)",
+  "usage_filter_none": "{label} : aucun",
+  "usage_filter_hidden": "{label} : {countLabel} masqué(s)",
   "usage_filter_search": "Rechercher...",
   "usage_filter_select_all": "Tout sélectionner",
   "usage_filter_deselect_all": "Tout désélectionner",
   "usage_filter_all_items": [
     {
-      "declarations": ["input label", "input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input label",
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
-        "countPlural=one": "Tout\u202f: {label}",
-        "countPlural=other": "Tout\u202f: {label}"
+        "countPlural=one": "Tout : {label}",
+        "countPlural=other": "Tout : {label}"
       }
     }
   ],
@@ -845,7 +975,7 @@
   "usage_chart_style_smooth": "Lissé",
   "usage_chart_style_lines": "Lignes",
   "usage_chart_style_bars": "Barres",
-  "usage_chart_day_label": "{date}\u202f: {value}",
+  "usage_chart_day_label": "{date} : {value}",
   "usage_cache_efficiency_title": "Efficacité du cache",
   "usage_cache_reads": "Lectures de cache",
   "usage_cache_writes": "Écritures de cache",
@@ -912,7 +1042,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} projet",
         "countPlural=other": "{countNumber} projets"
@@ -926,7 +1058,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} session",
         "countPlural=other": "{countNumber} sessions"
@@ -940,7 +1074,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} machine",
         "countPlural=other": "{countNumber} machines"
@@ -954,7 +1090,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} suggestion de dossier",
         "countPlural=other": "{countNumber} suggestions de dossier"
@@ -968,7 +1106,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} session régie par des règles",
         "countPlural=other": "{countNumber} sessions régies par des règles"
@@ -983,7 +1123,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} projet sélectionné",
         "countPlural=other": "{countNumber} projets sélectionnés"
@@ -999,7 +1141,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} projet sélectionné",
         "countPlural=other": "{countNumber} projets sélectionnés"
@@ -1020,7 +1164,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} dossier",
         "countPlural=other": "{countNumber} dossiers"
@@ -1036,7 +1182,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Enregistrer {countNumber} correction",
         "countPlural=other": "Enregistrer {countNumber} corrections"
@@ -1061,7 +1209,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} règle activée cible ce projet",
         "countPlural=other": "{countNumber} règles activées ciblent ce projet"
@@ -1074,7 +1224,7 @@
   "data_no_matches": "Aucun projet ne correspond au filtre",
   "data_unknown_project_key": "Le projet lié est introuvable dans l'archive. Affichage de tous les projets.",
   "data_project_unclassified": "Non classé",
-  "data_reclassify_original": "Projet actuel\u202f: {project}",
+  "data_reclassify_original": "Projet actuel : {project}",
   "data_reclassify_candidates_loading": "Recherche des dossiers de session…",
   "data_reclassify_candidates_failed": "Impossible de trouver les dossiers de session",
   "data_reclassify_no_candidates": "Aucun dossier de session trouvé pour ce projet.",
@@ -1095,7 +1245,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} session",
         "countPlural=other": "{countNumber} sessions"
@@ -1117,7 +1269,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} session correspond",
         "countPlural=other": "{countNumber} sessions correspondent"
@@ -1131,7 +1285,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} session sera modifiée",
         "countPlural=other": "{countNumber} sessions seront modifiées"
@@ -1145,7 +1301,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} projet",
         "countPlural=other": "{countNumber} projets"
@@ -1161,7 +1319,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} session",
         "countPlural=other": "{countNumber} sessions"
@@ -1175,7 +1335,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} aperçu de session",
         "countPlural=other": "{countNumber} aperçus de sessions"
@@ -1284,8 +1446,14 @@
   "activity_no_sessions_selected_range": "Aucune session active dans la plage horaire sélectionnée.",
   "activity_output_tokens_value": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} token de sortie",
         "countPlural=other": "{countLabel} tokens de sortie"
@@ -1301,7 +1469,7 @@
   "activity_peak_at": "pic {count} à {time}",
   "activity_all_sessions_overlay": "Superposition globale",
   "activity_class_split": "int {int} / sous-agents {sub} / auto {auto}",
-  "activity_message_bucket_label": "{range}, {metric}\u202f: {count}. Filtrer les sessions de cette période.",
+  "activity_message_bucket_label": "{range}, {metric} : {count}. Filtrer les sessions de cette période.",
   "activity_timeline_metric": "Mesure de la chronologie",
   "activity_user_messages": "Messages utilisateur",
   "activity_assistant_messages": "Messages assistant",
@@ -1318,7 +1486,7 @@
   "activity_window": "Fenêtre",
   "activity_sessions": "Sessions",
   "activity_clear_time_filter": "Effacer le filtre horaire",
-  "activity_active_filter": "Actif\u202f: {label}",
+  "activity_active_filter": "Actif : {label}",
   "activity_total_count": "{count} au total",
   "activity_session": "Session",
   "activity_automated_session": "Session automatisée",
@@ -1332,7 +1500,9 @@
         "input automated",
         "local subagentPlural = subagents: plural"
       ],
-      "selectors": ["subagentPlural"],
+      "selectors": [
+        "subagentPlural"
+      ],
       "match": {
         "subagentPlural=one": "{interactive} interactives / {subagentsLabel} sous-agent / {automated} automatisées",
         "subagentPlural=other": "{interactive} interactives / {subagentsLabel} sous-agents / {automated} automatisées"
@@ -1360,7 +1530,7 @@
   "analytics_weekday_fri": "Ven",
   "analytics_weekday_sat": "Sam",
   "analytics_weekday_sun": "Dim",
-  "active_filters_label": "Filtres\u202f:",
+  "active_filters_label": "Filtres :",
   "active_filters_clear_date": "Effacer le filtre de date",
   "active_filters_clear_project": "Effacer le filtre de projet",
   "active_filters_remove_filter": "Retirer le filtre {name}",
@@ -1369,7 +1539,7 @@
   "active_filters_clear_recently_active": "Effacer le filtre d'activité récente",
   "active_filters_active24h": "Actives 24 h",
   "active_filters_remove_status": "Retirer {status} du filtre d'état",
-  "active_filters_status_prefix": "État\u202f: {status}",
+  "active_filters_status_prefix": "État : {status}",
   "active_filters_clear_single_turn": "Effacer le filtre à un tour",
   "active_filters_single_turn_hidden": "Un seul tour masqué",
   "active_filters_clear_automated": "Effacer le filtre des sessions automatisées",
@@ -1380,7 +1550,7 @@
   "active_filters_clear_all": "Tout effacer",
   "analytics_messages": "Messages",
   "analytics_sessions": "Sessions",
-  "analytics_user_assistant_split": "utilisateur\u202f: {user} / assistant\u202f: {assistant}",
+  "analytics_user_assistant_split": "utilisateur : {user} / assistant : {assistant}",
   "analytics_day": "Jour",
   "analytics_week": "Semaine",
   "analytics_month": "Mois",
@@ -1445,7 +1615,7 @@
   "analytics_skills_count": "{count} skills",
   "analytics_agent_breakdown": "Répartition par agent",
   "analytics_agents": "Agents",
-  "analytics_projects_breakdown": "Projets\u202f: {breakdown}",
+  "analytics_projects_breakdown": "Projets : {breakdown}",
   "analytics_no_skill_data": "Aucune donnée d'utilisation des skills",
   "analytics_velocity": "Vélocité",
   "analytics_overview": "Vue d'ensemble",
@@ -1470,8 +1640,14 @@
   "call_group_parallel_label": "parallèle",
   "call_group_parallel_call_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} appel",
         "countPlural=other": "{countLabel} appels"
@@ -1488,7 +1664,10 @@
         "input running",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural", "running"],
+      "selectors": [
+        "countPlural",
+        "running"
+      ],
       "match": {
         "countPlural=one,running=true": "{countLabel} appel · en cours depuis {duration}+",
         "countPlural=other,running=true": "{countLabel} appels · en cours depuis {duration}+",
@@ -1500,8 +1679,14 @@
   "activity_lane_activity": "activité",
   "activity_lane_message_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} message",
         "countPlural=other": "{countLabel} messages"
@@ -1552,7 +1737,7 @@
   "recall_page_review_archive_message": "Archiver « {title} » comme rejetée ? Elle restera exclue du corpus Recall servi.",
   "recall_page_review_cancel": "Annuler",
   "recall_page_review_close": "Fermer la confirmation d’archivage",
-  "recall_page_review_error": "Impossible de vérifier cette entrée Recall\u202f: {error}",
+  "recall_page_review_error": "Impossible de vérifier cette entrée Recall : {error}",
   "recall_page_table_label": "Entrées de rappel",
   "recall_page_fact_column": "Fait",
   "recall_page_project_column": "Projet",
@@ -1566,7 +1751,7 @@
   "recall_page_load_more": "Afficher plus",
   "recall_page_loading_more": "Chargement…",
   "recall_page_ranked_result_cap": "La recherche classée est limitée aux {countLabel} premiers résultats.",
-  "recall_page_entries_shown": "Entrées affichées\u202f: {countLabel}",
+  "recall_page_entries_shown": "Entrées affichées : {countLabel}",
   "recall_page_extraction_title": "État de l’extraction",
   "recall_page_extraction_unconfigured": "L’extraction du rappel n’est pas configurée.",
   "recall_page_extraction_error": "Impossible de charger l’état de l’extraction.",
@@ -1604,7 +1789,7 @@
   "recall_page_generation_close": "Fermer la confirmation de génération",
   "recall_page_generation_activate_message": "Activer {model} ({fingerprint}) ? Ses entrées automatiques remplaceront le corpus distillé actuellement servi.",
   "recall_page_generation_retire_message": "Retirer {model} ({fingerprint}) ? Ses entrées automatiques resteront archivées.",
-  "recall_page_generation_action_error": "Impossible de mettre à jour la génération d’extraction\u202f: {error}",
+  "recall_page_generation_action_error": "Impossible de mettre à jour la génération d’extraction : {error}",
   "session_vitals_title": "Analyse",
   "session_vitals_close": "Fermer l'analyse de la session",
   "session_vitals_resize": "Redimensionner le panneau d'analyse de la session",
@@ -1648,7 +1833,10 @@
         "input runningCount",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural", "runningCount"],
+      "selectors": [
+        "countPlural",
+        "runningCount"
+      ],
       "match": {
         "countPlural=one,runningCount=0": "{countLabel} appel",
         "countPlural=other,runningCount=0": "{countLabel} appels",
@@ -1676,14 +1864,14 @@
   "signal_panel_not_enough_activity": "Activité insuffisante pour analyser cette session.",
   "signal_panel_health_grade": "Note de santé {grade}",
   "signal_panel_outcome_confidence": "{outcome} (confiance {confidence})",
-  "signal_panel_based_on": "Basé sur\u202f:",
+  "signal_panel_based_on": "Basé sur :",
   "signal_panel_basis_title": "{factor} pris en compte dans le score",
   "signal_panel_compaction_interrupted": "{mid} sur {total} ont interrompu un travail en cours",
   "signal_panel_compaction_title": "Compactions du contexte dans cette session",
   "signal_panel_compaction_count": "{count} compactions",
   "signal_panel_mid_task": "{count} en pleine tâche",
   "signal_panel_no_penalties": "Aucune pénalité",
-  "signal_panel_penalties": "Pénalités\u202f:",
+  "signal_panel_penalties": "Pénalités :",
   "signal_panel_penalty_title": "{label} a retiré {value} au score",
   "subagent_inline_subagent_session": "Session de sous-agent",
   "thinking_block_thinking": "Réflexion",
@@ -1773,7 +1961,7 @@
   "insights_page_retry": "Réessayer",
   "insights_page_no_scored_data": "Aucune donnée de qualité notée pour cette plage.",
   "insights_page_no_scored_data_hint": "Synchronisez ou réalimentez les sessions avec les signaux de qualité de la phase 3 pour alimenter les motifs de prompt, de contexte, de workflow et d'outils.",
-  "insights_page_cached_warning": "Affichage des données déterministes en cache. La dernière actualisation a échoué\u202f: {error}",
+  "insights_page_cached_warning": "Affichage des données déterministes en cache. La dernière actualisation a échoué : {error}",
   "insights_page_average_score": "Score moyen",
   "insights_page_no_scored_sessions": "Aucune session notée",
   "insights_page_scored_sessions": "Sessions notées",
@@ -1786,8 +1974,14 @@
   "insights_page_pct_affected": "{pct} % affectées",
   "insights_pattern_recommendation_rationale": [
     {
-      "declarations": ["input affected", "input total", "local totalPlural = total: plural"],
-      "selectors": ["totalPlural"],
+      "declarations": [
+        "input affected",
+        "input total",
+        "local totalPlural = total: plural"
+      ],
+      "selectors": [
+        "totalPlural"
+      ],
       "match": {
         "totalPlural=one": "{affected} session sur {total} présente ce motif déterministe.",
         "totalPlural=other": "{affected} sessions sur {total} présentent ce motif déterministe."
@@ -1846,7 +2040,9 @@
         "input failureSignals",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} session, {completedRate} % terminées, {failureSignals} échecs en moyenne",
         "countPlural=other": "{count} sessions, {completedRate} % terminées, {failureSignals} échecs en moyenne"
@@ -1855,8 +2051,14 @@
   ],
   "insights_page_driver_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session",
         "countPlural=other": "{countLabel} sessions"
@@ -1923,7 +2125,7 @@
   "breadcrumb_copy_command": "Copier la commande",
   "breadcrumb_copy_directory_path": "Copier le chemin du répertoire",
   "breadcrumb_open_in": "Ouvrir dans",
-  "breadcrumb_copy_session_id_value": "Copier l'ID de la session\u202f: {id}",
+  "breadcrumb_copy_session_id_value": "Copier l'ID de la session : {id}",
   "breadcrumb_copy_session_id": "Copier l'ID de la session",
   "breadcrumb_copied": "Copié !",
   "breadcrumb_estimated_cost": "Coût estimé de la session",
@@ -1972,8 +2174,8 @@
   "resync_start": "Lancer la resynchronisation complète",
   "resync_syncing_progress": "Synchronisation de {done} / {total} sessions...",
   "resync_preparing": "Préparation...",
-  "resync_sessions_synced": "Sessions synchronisées\u202f: {count}",
-  "resync_failed": "Échecs\u202f: {count}",
+  "resync_sessions_synced": "Sessions synchronisées : {count}",
+  "resync_failed": "Échecs : {count}",
   "resync_close_btn": "Fermer",
   "resync_retry": "Réessayer",
   "resync_error_read_only": "La resynchronisation complète est indisponible sur un backend en lecture seule.",
@@ -2003,7 +2205,7 @@
   "shortcuts_close": "Fermer les raccourcis",
   "update_title": "Mise à jour du logiciel",
   "update_close": "Fermer la fenêtre de mise à jour",
-  "update_available": "Une nouvelle version est disponible\u202f: {version}",
+  "update_available": "Une nouvelle version est disponible : {version}",
   "update_current": "Vous utilisez la version {version}.",
   "update_instructions": "Exécutez {cmd} en ligne de commande pour l'installer.",
   "update_latest": "Vous utilisez la dernière version ({version}).",
@@ -2084,7 +2286,9 @@
         "input totalLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{doneLabel} / {totalLabel} chunk",
         "countPlural=other": "{doneLabel} / {totalLabel} chunks"
@@ -2093,8 +2297,14 @@
   ],
   "settings_embeddings_rate": [
     {
-      "declarations": ["input count", "input rateLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input rateLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{rateLabel} chunk/s",
         "countPlural=other": "{rateLabel} chunks/s"
@@ -2130,8 +2340,8 @@
   "settings_remote_require_auth": "Exiger un token d'authentification",
   "settings_remote_enabled": "Activé",
   "settings_remote_disabled": "Désactivé",
-  "settings_remote_restart_note": "Remarque\u202f: la modification de l'authentification nécessite un redémarrage du serveur pour prendre effet.",
-  "settings_remote_security_warning": "Avertissement\u202f: les connexions distantes utilisent du HTTP non chiffré. Utilisez un tunnel sécurisé (Tailscale, tunnel SSH, ou un reverse proxy avec TLS) pour protéger vos données en transit.",
+  "settings_remote_restart_note": "Remarque : la modification de l'authentification nécessite un redémarrage du serveur pour prendre effet.",
+  "settings_remote_security_warning": "Avertissement : les connexions distantes utilisent du HTTP non chiffré. Utilisez un tunnel sécurisé (Tailscale, tunnel SSH, ou un reverse proxy avec TLS) pour protéger vos données en transit.",
   "settings_remote_auth_token": "Token d'authentification",
   "settings_remote_copied": "Copié",
   "settings_remote_copy": "Copier",
@@ -2203,7 +2413,7 @@
   "system_boundary_task_notification": "Notification de tâche",
   "system_boundary_stop_hook": "Retour du hook d'arrêt",
   "system_boundary_peer_message": "Message d'une autre session",
-  "system_boundary_title": "Limite système\u202f: {subtype}",
+  "system_boundary_title": "Limite système : {subtype}",
   "system_boundary_show_content": "Afficher le contenu",
   "trash_loading": "Chargement de la corbeille...",
   "trash_empty": "La corbeille est vide",
@@ -2213,8 +2423,14 @@
   "trash_empty_trash": "Vider la corbeille",
   "trash_msgs": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} msg",
         "countPlural=other": "{countLabel} msgs"
@@ -2260,7 +2476,7 @@
   "filter_dropdown_search": "Rechercher...",
   "filter_dropdown_select_all": "Tout sélectionner",
   "filter_dropdown_deselect_all": "Tout désélectionner",
-  "filter_dropdown_all_items": "Tout\u202f: {label}",
+  "filter_dropdown_all_items": "Tout : {label}",
   "filter_dropdown_no_matches": "Aucune correspondance",
   "usage_retry": "Réessayer",
   "usage_no_sessions_range": "Aucune session dans cette plage",
@@ -2285,7 +2501,7 @@
   "usage_pairwise_not_enough_data": "Il faut au moins deux ensembles de modèles ou de projets dans cette plage pour les comparer.",
   "usage_pairwise_metric": "Métrique",
   "usage_pairwise_delta": "Delta",
-  "usage_pairwise_side_heading": "{dimension}\u202f: {value}",
+  "usage_pairwise_side_heading": "{dimension} : {value}",
   "usage_pairwise_cost_per_session": "Coût / session",
   "usage_pairwise_total_tokens": "Total des tokens",
   "usage_pairwise_tokens_per_session": "Tokens / session",
@@ -2352,8 +2568,14 @@
   "settings_image_cleanup_empty": "Aucun résultat d'outil stocké dans cette sélection ne contient de charge d'image intégrée.",
   "settings_image_cleanup_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session sélectionnée",
         "countPlural=other": "{countLabel} sessions sélectionnées"
@@ -2362,8 +2584,14 @@
   ],
   "settings_image_cleanup_payloads": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} charge d'image",
         "countPlural=other": "{countLabel} charges d'images"
@@ -2389,8 +2617,14 @@
   "settings_image_cleanup_applied": "Suppression des images terminée.",
   "settings_image_cleanup_changed": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session modifiée",
         "countPlural=other": "{countLabel} sessions modifiées"
@@ -2405,8 +2639,14 @@
   "assistant_turn_event_message": "Message",
   "assistant_turn_message_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} message",
         "countPlural=other": "{countLabel} messages"
@@ -2415,8 +2655,14 @@
   ],
   "assistant_turn_tool_call_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} appel d'outil",
         "countPlural=other": "{countLabel} appels d'outil"
@@ -2450,8 +2696,8 @@
   "analytics_outcome_loading": "Lecture de l'historique git...",
   "analytics_outcome_empty": "Aucune activité git sur cette période.",
   "analytics_outcome_filters_unsupported": "Supprimez les filtres de machine, modèle, fin de session, nombre minimal de messages, activité récente et heure pour afficher les totaux des résultats.",
-  "analytics_outcome_partial": "Non comptabilisé\u202f:",
-  "analytics_outcome_partial_entry": "{repo} ({op})\u202f: {reason}",
+  "analytics_outcome_partial": "Non comptabilisé :",
+  "analytics_outcome_partial_entry": "{repo} ({op}) : {reason}",
   "session_breadcrumb_session_health_and_tool_sequences": "État de la session et séquences d’outils",
   "tool_sequences_title": "Séquences d’outils observées",
   "tool_sequences_loading": "Chargement des séquences d’outils…",
@@ -2461,8 +2707,14 @@
   "tool_sequences_no_sequences": "Aucun appel d’outil n’a renvoyé d’erreur ni de résultat vide.",
   "tool_sequences_sequence_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} séquence",
         "countPlural=other": "{countLabel} séquences",
@@ -2490,8 +2742,14 @@
   "tool_sequences_no_input": "Aucune entrée enregistrée.",
   "tool_sequences_byte_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} octet",
         "countPlural=other": "{countLabel} octets",
@@ -2503,8 +2761,14 @@
   "tool_sequences_result_unknown": "Ce résultat n’est pas du texte, son issue est donc inconnue.",
   "tool_sequences_result_unavailable": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Le texte conservé de {countLabel} octet est indisponible ici.",
         "countPlural=other": "Le texte conservé de {countLabel} octets est indisponible ici.",
@@ -2522,8 +2786,14 @@
   "tool_sequences_flag_tool_switch": "Outil changé",
   "tool_sequences_sequence_calls": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} appel dans des séquences",
         "countPlural=other": "{countLabel} appels dans des séquences",
@@ -2533,8 +2803,14 @@
   ],
   "tool_sequences_session_calls": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} appel d’outil dans la session",
         "countPlural=other": "{countLabel} appels d’outils dans la session",
@@ -2545,11 +2821,17 @@
   "tool_sequences_legend": "Couleurs des issues",
   "tool_sequences_message": "Message {ordinal}",
   "tool_sequences_messages_range": "Messages {first}–{last}",
-  "tool_sequences_jump_label": "Message {ordinal}\u202f: ouvrir l’appel {tool} dans la transcription",
+  "tool_sequences_jump_label": "Message {ordinal} : ouvrir l’appel {tool} dans la transcription",
   "tool_sequences_more_calls": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "+{countLabel} autre",
         "countPlural=other": "+{countLabel} autres",
@@ -2566,7 +2848,9 @@
         "input to",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} autre appel entre le message {from} et le message {to} n’est pas affiché.",
         "countPlural=other": "{countLabel} autres appels entre le message {from} et le message {to} ne sont pas affichés.",
@@ -2576,8 +2860,14 @@
   ],
   "tool_sequences_calls_in_row": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} appel d’affilée.",
         "countPlural=other": "{countLabel} appels d’affilée.",
@@ -2593,7 +2883,9 @@
         "input shownLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{shownLabel} séquence affichée sur {countLabel}. Les autres viennent plus tard dans la session.",
         "countPlural=other": "{shownLabel} séquences affichées sur {countLabel}. Les autres viennent plus tard dans la session.",
@@ -2603,8 +2895,14 @@
   ],
   "tool_sequences_calls_not_shown": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} appel des séquences n’est pas affiché dans cette vue.",
         "countPlural=other": "{countLabel} appels des séquences ne sont pas affichés dans cette vue.",
@@ -2620,7 +2918,9 @@
         "input shownLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "L’aperçu montre {shownLabel} octet sur {countLabel}.",
         "countPlural=other": "L’aperçu montre {shownLabel} octets sur {countLabel}.",
@@ -2672,7 +2972,9 @@
         "input keptLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} entrée d’appel réduite à {keptLabel} octets au plus",
         "countPlural=other": "{countLabel} entrées d’appel réduites à {keptLabel} octets au plus chacune",
@@ -2688,7 +2990,9 @@
         "input keptLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} résultat d’appel réduit à {keptLabel} octets au plus",
         "countPlural=other": "{countLabel} résultats d’appel réduits à {keptLabel} octets au plus chacun",
@@ -2698,8 +3002,14 @@
   ],
   "tool_effectiveness_omission_unretained": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} résultat d’appel non conservé",
         "countPlural=other": "{countLabel} résultats d’appel non conservés",
@@ -2709,8 +3019,14 @@
   ],
   "tool_effectiveness_omission_no_result": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} appel sans résultat enregistré",
         "countPlural=other": "{countLabel} appels sans résultat enregistré",
@@ -2726,7 +3042,9 @@
         "input charsLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} message affiché en aperçu de {charsLabel} caractères",
         "countPlural=other": "{countLabel} messages affichés en aperçus de {charsLabel} caractères",
@@ -2743,21 +3061,29 @@
         "input currentLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
-        "countPlural=one": "La session a changé après ce rapport\u202f: le modèle a évalué {countLabel} appel et la session en compte maintenant {currentLabel}.",
-        "countPlural=other": "La session a changé après ce rapport\u202f: le modèle a évalué {countLabel} appels et la session en compte maintenant {currentLabel}.",
-        "countPlural=many": "La session a changé après ce rapport\u202f: le modèle a évalué {countLabel} appels et la session en compte maintenant {currentLabel}."
+        "countPlural=one": "La session a changé après ce rapport : le modèle a évalué {countLabel} appel et la session en compte maintenant {currentLabel}.",
+        "countPlural=other": "La session a changé après ce rapport : le modèle a évalué {countLabel} appels et la session en compte maintenant {currentLabel}.",
+        "countPlural=many": "La session a changé après ce rapport : le modèle a évalué {countLabel} appels et la session en compte maintenant {currentLabel}."
       }
     }
   ],
-  "tool_effectiveness_session_revised": "La session a changé après la génération de ce rapport\u202f: les faits ci-dessous peuvent donc différer de ce que le modèle a évalué.",
+  "tool_effectiveness_session_revised": "La session a changé après la génération de ce rapport : les faits ci-dessous peuvent donc différer de ce que le modèle a évalué.",
   "tool_sequences_message_call": "Message {ordinal}, appel {callNumber}",
-  "tool_sequences_jump_call_label": "Message {ordinal}, appel {callNumber}\u202f: ouvrir l’appel {tool} dans la transcription",
+  "tool_sequences_jump_call_label": "Message {ordinal}, appel {callNumber} : ouvrir l’appel {tool} dans la transcription",
   "tool_effectiveness_calls_judged": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} appel évalué",
         "countPlural=other": "{countLabel} appels évalués"
@@ -2766,8 +3092,14 @@
   ],
   "tool_effectiveness_conclusion_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} conclusion",
         "countPlural=other": "{countLabel} conclusions"
@@ -2776,8 +3108,14 @@
   ],
   "tool_effectiveness_count_helped": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} utile",
         "countPlural=other": "{countLabel} utiles",
@@ -2787,8 +3125,14 @@
   ],
   "tool_effectiveness_count_did_not_help": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} inutile",
         "countPlural=other": "{countLabel} inutiles",
@@ -2798,8 +3142,14 @@
   ],
   "tool_effectiveness_count_unknown": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} incertaine",
         "countPlural=other": "{countLabel} incertaines",
@@ -2815,7 +3165,9 @@
         "input citedLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{citedLabel} sur {countLabel} appel cité",
         "countPlural=other": "{citedLabel} sur {countLabel} appels cités",
@@ -2826,8 +3178,14 @@
   "tool_effectiveness_select_citation": "Sélectionnez une citation pour voir les appels",
   "tool_effectiveness_citation_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} citation",
         "countPlural=other": "{countLabel} citations"
@@ -2839,8 +3197,14 @@
   "tool_effectiveness_left_out": "Retiré de l'entrée du modèle",
   "tool_effectiveness_model_saw": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "le modèle a vu {countLabel} octet",
         "countPlural=other": "le modèle a vu {countLabel} octets",
@@ -2851,8 +3215,14 @@
   "tool_effectiveness_open_session": "Ouvrir la session",
   "tool_effectiveness_message_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} message",
         "countPlural=other": "{countLabel} messages"
@@ -2872,13 +3242,19 @@
   "analytics_tool_more_sessions": "Plus de sessions",
   "analytics_tool_empty_explanation": "{count}/{total} résultats vides parmi les résultats connus.",
   "analytics_tool_repeat_explanation": "{count}/{total} appels de suivi identiques ou presque parmi les appels analysés.",
-  "analytics_tool_recovery_explanation": "{count}/{total} séquences récupérées. Ouvertes\u202f: {open}. Inconnues\u202f: {unknown}.",
+  "analytics_tool_recovery_explanation": "{count}/{total} séquences récupérées. Ouvertes : {open}. Inconnues : {unknown}.",
   "analytics_tool_coverage_explanation": "Appels analysés / tous les appels. Les recalculs en attente et les anciennes sessions sans calcul ont une couverture incomplète.",
   "analytics_tool_recovery_note": "La récupération signifie qu’un appel ultérieur a renvoyé du contenu. Le taux appartient à l’outil qui a commencé la séquence.",
   "analytics_tool_evidence_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session",
         "countPlural=other": "{countLabel} sessions"
@@ -2886,33 +3262,39 @@
     }
   ],
   "analytics_tool_history_note": "Les taux excluent les appels des sessions en cours de recalcul ou enregistrées sans résultats d'outils.",
-  "analytics_tool_rate_button_label": "{tool} – {rate}\u202f: {value}",
-  "analytics_tool_latest_matching_call": "Dernier appel correspondant\u202f: {date}",
-  "analytics_tool_matching_calls": "Appels correspondants\u202f: {count}",
+  "analytics_tool_rate_button_label": "{tool} – {rate} : {value}",
+  "analytics_tool_latest_matching_call": "Dernier appel correspondant : {date}",
+  "analytics_tool_matching_calls": "Appels correspondants : {count}",
   "usage_all_projects": "Tous les projets",
   "usage_clear_selection": "Effacer la sélection",
   "usage_open_project": "Ouvrir",
   "usage_loading": "Chargement...",
   "plan_usage_title": "Utilisation du forfait",
-  "plan_usage_trigger_weekly": "Utilisation du forfait\u202f: {percent} % par semaine",
+  "plan_usage_trigger_weekly": "Utilisation du forfait : {percent} % par semaine",
   "plan_usage_as_of": "Utilisation du forfait, au {time}",
-  "plan_usage_not_checked": "Utilisation du forfait\u202f: pas encore vérifiée",
-  "plan_usage_still_updating": "Utilisation du forfait\u202f: mise à jour en cours, au {time}",
-  "plan_usage_not_reported_yet": "Utilisation du forfait\u202f: pas encore communiquée, au {time}",
+  "plan_usage_not_checked": "Utilisation du forfait : pas encore vérifiée",
+  "plan_usage_still_updating": "Utilisation du forfait : mise à jour en cours, au {time}",
+  "plan_usage_not_reported_yet": "Utilisation du forfait : pas encore communiquée, au {time}",
   "plan_usage_partial": "Utilisation du forfait partielle, au {time}",
   "plan_usage_not_reported": "Non communiquée par OpenAI",
   "plan_usage_too_many_subagents": "Trop de conversations de sous-agents pour le rapport d'utilisation d'OpenAI",
   "plan_usage_could_not_check": "AgentsView n'a pas pu vérifier l'utilisation du forfait",
   "plan_usage_account_unavailable": "L'utilisation n'est pas disponible pour ce compte",
   "plan_usage_counted_under": "Comptée dans la conversation {title}",
-  "plan_usage_stale": "Depuis lors\u202f: {reason} ({time}). Ces chiffres ne sont peut-être plus à jour.",
+  "plan_usage_stale": "Depuis lors : {reason} ({time}). Ces chiffres ne sont peut-être plus à jour.",
   "plan_usage_left_out_later": "Le rapport d'utilisation d'OpenAI a omis cette conversation",
   "plan_usage_weekly_share": "{percent} % de la limite hebdomadaire de Codex",
   "plan_usage_five_hour_share": "{percent} % de la limite de cinq heures de Codex",
   "plan_usage_credits": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} crédit",
         "countPlural=other": "{countLabel} crédits"
@@ -2927,8 +3309,14 @@
   "capture_tokens_live": "Tokens capturés en direct, au {time}",
   "capture_turns_not_captured": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} tour non capturé",
         "countPlural=other": "{countLabel} tours non capturés"
@@ -2943,7 +3331,9 @@
         "input time",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} tour non capturé ; l'utilisation du forfait le compte s'il a eu lieu avant {time}",
         "countPlural=other": "{countLabel} tours non capturés ; l'utilisation du forfait compte ceux qui ont eu lieu avant {time}"
@@ -2952,8 +3342,14 @@
   ],
   "usage_plan_only_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session facturée comme utilisation du forfait, sans prix",
         "countPlural=other": "{countLabel} sessions facturées comme utilisation du forfait, sans prix"
@@ -2962,42 +3358,111 @@
   ],
   "usage_partly_captured_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} session partiellement capturée ; ses comptes de tokens sont bas.",
         "countPlural=other": "{countLabel} sessions partiellement capturées ; leurs comptes de tokens sont bas."
       }
     }
   ],
-  "status_bar_codex_cloud_waiting": "Codex Cloud\u202f: en attente de la première synchronisation",
+  "status_bar_codex_cloud_waiting": "Codex Cloud : en attente de la première synchronisation",
   "status_bar_codex_cloud_importing_found": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
-        "countPlural=one": "Codex Cloud\u202f: importation, {countLabel} conversation trouvée pour l'instant",
-        "countPlural=other": "Codex Cloud\u202f: importation, {countLabel} conversations trouvées pour l'instant"
+        "countPlural=one": "Codex Cloud : importation, {countLabel} conversation trouvée pour l'instant",
+        "countPlural=other": "Codex Cloud : importation, {countLabel} conversations trouvées pour l'instant"
       }
     }
   ],
-  "status_bar_codex_cloud_importing_progress": "Codex Cloud\u202f: importation de {imported} conversations sur {total}",
-  "status_bar_codex_cloud_up_to_date": "Codex Cloud\u202f: à jour au {time}",
+  "status_bar_codex_cloud_importing_progress": "Codex Cloud : importation de {imported} conversations sur {total}",
+  "status_bar_codex_cloud_up_to_date": "Codex Cloud : à jour au {time}",
   "status_bar_codex_cloud_retrying": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
-        "countPlural=one": "Codex Cloud\u202f: {countLabel} conversation n'a pas pu être importée",
-        "countPlural=other": "Codex Cloud\u202f: {countLabel} conversations n'ont pas pu être importées"
+        "countPlural=one": "Codex Cloud : {countLabel} conversation n'a pas pu être importée",
+        "countPlural=other": "Codex Cloud : {countLabel} conversations n'ont pas pu être importées"
       }
     }
   ],
-  "status_bar_codex_cloud_error": "Codex Cloud\u202f: erreur",
-  "status_bar_codex_cloud_off": "Codex Cloud\u202f: désactivé",
-  "status_bar_codex_cloud_config_error": "Codex Cloud\u202f: erreur de réglages",
-  "status_bar_codex_cloud_live_attention": "Codex Cloud\u202f: les jetons en direct demandent votre attention",
-  "status_bar_codex_cloud_oldest_failure": "Plus ancien échec\u202f: {time}",
-  "status_bar_codex_cloud_last_success": "Dernière synchronisation réussie\u202f: {time}",
-  "status_bar_codex_cloud_homes": "Dossiers Codex\u202f: {homes}"
+  "status_bar_codex_cloud_error": "Codex Cloud : erreur",
+  "status_bar_codex_cloud_off": "Codex Cloud : désactivé",
+  "status_bar_codex_cloud_config_error": "Codex Cloud : erreur de réglages",
+  "status_bar_codex_cloud_live_attention": "Codex Cloud : les jetons en direct demandent votre attention",
+  "status_bar_codex_cloud_oldest_failure": "Plus ancien échec : {time}",
+  "status_bar_codex_cloud_last_success": "Dernière synchronisation réussie : {time}",
+  "status_bar_codex_cloud_homes": "Dossiers Codex : {homes}",
+  "session_breadcrumb_session_health": "Santé de la session",
+  "usage_click_to_hide_hint": "Cliquez pour masquer dans le graphique",
+  "usage_click_to_hide": "Cliquez pour masquer {label}",
+  "usage_hide_from_chart": "Masquer {label} du graphique",
+  "usage_click_to_hide_item": "Cliquez pour masquer {label}",
+  "pipeline_summary_title": "Comparaison des exécutions",
+  "pipeline_summary_current": "Actuelle",
+  "pipeline_summary_baseline": "Référence",
+  "pipeline_summary_pin": "Définir comme référence",
+  "pipeline_summary_clear": "Effacer la référence",
+  "pipeline_summary_details": "Indicateurs et étapes",
+  "pipeline_summary_full_buffer": "Les totaux couvrent tous les événements capturés, indépendamment de la position de lecture et des filtres. La référence est un instantané fixe conservé uniquement sur cette page.",
+  "pipeline_summary_empty": "aucun événement",
+  "pipeline_summary_unknown": "inconnue",
+  "pipeline_summary_partial": "Capture partielle : un événement de début ou de fin manque, ou la séquence présente des lacunes. Ces totaux sont des observations, pas les résultats complets de l’exécution.",
+  "pipeline_summary_scenario_mismatch": "Scénarios différents : actuel {current}, référence {baseline}. Les écarts ne prouvent pas une régression.",
+  "pipeline_summary_complete": "capture complète",
+  "pipeline_summary_incomplete": "capture partielle",
+  "pipeline_summary_metric": "Indicateur",
+  "pipeline_summary_delta": "Écart",
+  "pipeline_summary_events": "Événements",
+  "pipeline_summary_paths": "Chemins observés",
+  "pipeline_summary_anomalies": "Anomalies",
+  "pipeline_summary_missing": "Événements manquants dans la séquence",
+  "pipeline_summary_lines": "Lignes classées",
+  "pipeline_summary_inserts": "Messages insérés",
+  "pipeline_summary_span": "Plage temporelle observée (ms)",
+  "pipeline_summary_stage": "Étape",
+  "pipeline_summary_metric_notes": "La plage est celle des horodatages observés, pas la somme des durées des étapes. Seuls les événements messages_written sont comptés pour les insertions, sans ajouter les totaux des transactions. Une valeur plus faible n’est pas forcément meilleure.",
+  "pipeline_open_local": "Ouvrir un fichier local…",
+  "pipeline_open_local_hint": "Lire un enregistrement dans ce navigateur sans le téléverser",
+  "pipeline_export_capture": "Exporter la capture",
+  "pipeline_export_hint": "Enregistrer tous les événements capturés en JSONL ; nécessite l’en-tête d’origine ou l’événement run_started",
+  "pipeline_recording_loading": "Lecture de l’enregistrement…",
+  "pipeline_recording_privacy": "L’ouverture locale et l’exportation n’envoient aucune donnée. Les enregistrements peuvent contenir des chemins privés et des conversations ; vérifiez-les avant de les partager.",
+  "pipeline_recording_limits": "Limite du navigateur : 32 MiB et 50 000 événements.",
+  "pipeline_upload_hint": "Téléverser un enregistrement vers le serveur connecté et le relire",
+  "pipeline_local_file_label": "Enregistrement local du pipeline",
+  "pipeline_recording_action_error": "Échec de l’opération sur l’enregistrement : {detail}",
+  "pipeline_recording_header_expected": "enregistrement du pipeline : ligne {line} : objet header attendu",
+  "pipeline_recording_version_error": "enregistrement du pipeline : format_version non pris en charge",
+  "pipeline_recording_header_fields": "enregistrement du pipeline : ligne {line} : champs header invalides",
+  "pipeline_recording_event_fields": "enregistrement du pipeline : ligne {line} : champs d’événement invalides",
+  "pipeline_recording_run_id_error": "enregistrement du pipeline : ligne {line} : run_id ne correspond pas à l’en-tête",
+  "pipeline_recording_sequence_error": "enregistrement du pipeline : ligne {line} : seq doit être strictement croissant",
+  "pipeline_recording_size_error": "enregistrement du pipeline : dépasse la limite du navigateur de 32 MiB",
+  "pipeline_recording_event_limit": "enregistrement du pipeline : dépasse la limite du navigateur de 50000 événements",
+  "pipeline_recording_json_error": "enregistrement du pipeline : décodage de la ligne {line} : JSON invalide",
+  "pipeline_recording_empty_error": "enregistrement du pipeline : enregistrement vide ; header requis",
+  "pipeline_recording_missing_start": "enregistrement du pipeline : run_started absent ; métadonnées de début d’origine indisponibles",
+  "pipeline_recording_http_error": "enregistrement du pipeline : HTTP {status}"
 }

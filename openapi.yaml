@@ -7647,6 +7647,14 @@ components:
     SyncAnomalyStats:
       additionalProperties: false
       properties:
+        active_defers_by_agent:
+          additionalProperties:
+            format: int64
+            type: integer
+          type: object
+        active_defers_total:
+          format: int64
+          type: integer
         gen_metadata_without_usage_by_agent:
           additionalProperties:
             format: int64

@@ -9,6 +9,20 @@ import {
 } from "../api/generated/index.js";
 import type { EventSource } from "eventsource";
 
+import {
+  checkPipelineRecordingSize,
+  countPipelineSequenceGaps,
+  parsePipelineRecording,
+  pipelineRecordingFilename,
+  recordingHeaderFromEvents,
+  readPipelineRecordingResponse,
+  serializePipelineRecording,
+  type PipelineRecordingHeader,
+} from "../utils/pipelineRecording.js";
+
+export { parsePipelineRecording } from "../utils/pipelineRecording.js";
+export type { PipelineRecordingHeader } from "../utils/pipelineRecording.js";
+
 export type { PipelineEvent, PipelineStage } from "../api/client.js";
 
 /** Stage order matching pipevents.Stage* constants — used to infer
@@ -164,59 +178,6 @@ export interface PipelineViewState {
    * emits or its closing kind arrives, "idle" until first use. */
   stageStatus: Record<PipelineStage, PipelineStageStatus>;
   run: PipelineRunState;
-}
-
-/** Line 1 of a .jsonl run recording (pipevents.RecordingHeader). */
-export interface PipelineRecordingHeader {
-  kind: "header";
-  format_version: number;
-  run_id: string;
-  scenario_id?: string;
-  started_at_ms: number;
-  source_file?: string;
-  source_sha256?: string;
-}
-
-const RECORDING_FORMAT_VERSION = 1;
-
-/** Parse a downloaded/uploaded .jsonl recording the same way
- * pipevents.ReadRecording does: first non-empty line must be the
- * header, the rest are pipevents.Event JSON. */
-export function parsePipelineRecording(text: string): {
-  header: PipelineRecordingHeader;
-  events: PipelineEvent[];
-} {
-  let header: PipelineRecordingHeader | null = null;
-  const events: PipelineEvent[] = [];
-  let lineNo = 0;
-  for (const raw of text.split("\n")) {
-    lineNo += 1;
-    if (raw.trim() === "") continue;
-    let decoded: unknown;
-    try {
-      decoded = JSON.parse(raw);
-    } catch (cause) {
-      throw new Error(
-        `pipeline recording: decode line ${lineNo}: ${cause instanceof Error ? cause.message : String(cause)}`,
-      );
-    }
-    if (header === null) {
-      const h = decoded as PipelineRecordingHeader;
-      if (h.kind !== "header") {
-        throw new Error(
-          `pipeline recording: line ${lineNo} kind ${JSON.stringify(h.kind)}, want "header"`,
-        );
-      }
-      if (h.format_version !== RECORDING_FORMAT_VERSION) {
-        throw new Error(`pipeline recording: unsupported format_version ${h.format_version}`);
-      }
-      header = h;
-      continue;
-    }
-    events.push(decoded as PipelineEvent);
-  }
-  if (header === null) throw new Error("pipeline recording: empty recording");
-  return { header, events };
 }
 
 function num(v: unknown): number {
@@ -491,7 +452,8 @@ const STAGE_CLOSING_KINDS: Record<string, PipelineStage | "all"> = {
 function emptyViewState(): PipelineViewState {
   return {
     fileLines: [],
-    files: {},
+    // Recording paths are data, including names such as "__proto__".
+    files: Object.create(null),
     parsedEvents: [],
     gates: [],
     dbDiff: [],
@@ -529,7 +491,9 @@ function applyStageStatus(state: PipelineViewState, ev: PipelineEvent): void {
     }
     state.stageStatus[ev.stage] = "active";
   }
-  const closing = STAGE_CLOSING_KINDS[ev.kind];
+  const closing = Object.hasOwn(STAGE_CLOSING_KINDS, ev.kind)
+    ? STAGE_CLOSING_KINDS[ev.kind]
+    : undefined;
   if (closing === "all") {
     for (const st of PIPELINE_STAGES) {
       if (state.stageStatus[st] !== "idle") state.stageStatus[st] = "done";
@@ -550,8 +514,8 @@ export function reduceEvents(evs: PipelineEvent[]): PipelineViewState {
   // lastLineNo is the line_no of the previous line_classified inside
   // the current pass; passStart is the files[path] index where the
   // current pass began appending. Both reset on each parse_started.
-  const lastLineNo: Record<string, number> = {};
-  const passStart: Record<string, number> = {};
+  const lastLineNo: Record<string, number> = Object.create(null);
+  const passStart: Record<string, number> = Object.create(null);
   // Per-path journey accumulation. journeys keeps insertion order —
   // the order each path first appears in the stream. foldMalformed
   // remembers the malformed-line count of each open folded step so a
@@ -766,6 +730,11 @@ export class PipelineStore {
   /** Wall-clock speed multiplier for "time" playback. */
   rtSpeed = $state(10);
   error = $state<string | null>(null);
+  recordingLoading = $state(false);
+
+  /** Invalidates a pending recording when another source wins or we leave. */
+  private sourceRevision = 0;
+  private streamRevision = 0;
 
   viewState = $derived.by(() => reduceEvents(this.events.slice(0, this.cursor)));
 
@@ -899,14 +868,18 @@ export class PipelineStore {
     }, PIPELINE_PLAY_TICK_MS);
   }
 
-  /** Shared post-tick logic for play(): pause where playback stands
-   * when a newly consumed event is anomalous (pauseOnAnomaly), else
-   * hand the cursor back to live tail-following at the buffer's end. */
+  /** Shared post-tick logic: stop immediately after the first anomaly
+   * in this tick, or resume live tail-following at the buffer's end. */
   private afterPlayAdvance(prev: number, next: number): void {
     if (this.pauseOnAnomaly) {
       for (let i = prev; i < next; i++) {
         const e = this.events[i];
         if (e !== undefined && eventAnomaly(e) !== null) {
+          // A fast tick may have advanced past this event. Stop at the first
+          // anomaly, not after every other event scheduled for this tick.
+          this.cursor = i + 1;
+          this.selected = i;
+          this.live = false;
           this.pauseTimer();
           return;
         }
@@ -939,17 +912,31 @@ export class PipelineStore {
     this.detach();
     this.resetBuffer();
     this.runId = runId;
+    this.error = null;
     this.live = true;
-    this.es = this.deps.watch(runId, (e) => this.pushEvent(e), {
-      onPermanentFailure: () => {
-        this.error = `pipeline run ${runId}: event stream never opened`;
+    const revision = this.streamRevision;
+    this.es = this.deps.watch(
+      runId,
+      (e) => {
+        // A queued callback from a closed stream must not pollute a new source.
+        if (revision === this.streamRevision) this.pushEvent(e);
       },
-      ...opts,
-    });
+      {
+        onPermanentFailure: () => {
+          if (revision === this.streamRevision) {
+            this.error = `pipeline run ${runId}: event stream never opened`;
+          }
+        },
+        ...opts,
+      },
+    );
   }
 
   /** Close the stream and stop playback. Call from onDestroy. */
   detach(): void {
+    this.sourceRevision += 1;
+    this.streamRevision += 1;
+    this.recordingLoading = false;
     this.pauseTimer();
     this.es?.close();
     this.es = null;
@@ -1012,27 +999,59 @@ export class PipelineStore {
    * recording name (downloaded via the recordings API) or a local
    * File. The buffer lands frozen at the end with live off, so the
    * user scrubs backwards or hits play to watch the run again. */
-  async playRecording(source: File | string): Promise<void> {
-    const text =
-      typeof source === "string"
-        ? await (await this.capture(this.deps.downloadRecording(source)))?.text()
-        : await source.text();
-    if (text === undefined) return;
-    let parsed: { header: PipelineRecordingHeader; events: PipelineEvent[] };
+  async playRecording(source: File | string): Promise<boolean> {
+    const revision = ++this.sourceRevision;
+    this.recordingLoading = true;
     try {
-      parsed = parsePipelineRecording(text);
+      let text: string | undefined;
+      if (typeof source === "string") {
+        const response = await this.deps.downloadRecording(source);
+        if (revision !== this.sourceRevision) {
+          await response.body?.cancel().catch(() => {});
+          return false;
+        }
+        text = await readPipelineRecordingResponse(
+          response,
+          () => revision === this.sourceRevision,
+        );
+      } else {
+        checkPipelineRecordingSize(source.size);
+        text = await source.text();
+      }
+      if (revision !== this.sourceRevision || text === undefined) return false;
+      const parsed = parsePipelineRecording(text);
+      this.detach();
+      this.resetBuffer();
+      this.header = parsed.header;
+      this.runId = parsed.header.run_id;
+      this.events = parsed.events;
+      this.lastSeq = parsed.events.at(-1)?.seq ?? 0;
+      this.dropped = countPipelineSequenceGaps(parsed.events);
+      this.live = false;
+      this.cursor = this.events.length;
+      this.error = null;
+      return true;
+    } catch (cause) {
+      if (revision === this.sourceRevision) {
+        this.error = cause instanceof Error ? cause.message : String(cause);
+      }
+      return false;
+    } finally {
+      if (revision === this.sourceRevision) this.recordingLoading = false;
+    }
+  }
+
+  /** Snapshot the entire buffer, never its filtered or consumed prefix. */
+  exportRecording(): { name: string; text: string } | undefined {
+    try {
+      const header = this.header ?? recordingHeaderFromEvents(this.runId ?? "", this.events);
+      const text = serializePipelineRecording(header, this.events);
+      this.error = null;
+      return { name: pipelineRecordingFilename(header.run_id), text };
     } catch (cause) {
       this.error = cause instanceof Error ? cause.message : String(cause);
-      return;
+      return undefined;
     }
-    this.detach();
-    this.resetBuffer();
-    this.header = parsed.header;
-    this.runId = parsed.header.run_id;
-    this.events = parsed.events;
-    this.lastSeq = parsed.events.reduce((m, e) => Math.max(m, e.seq), 0);
-    this.live = false;
-    this.cursor = this.events.length;
   }
 
   private async capture<T>(p: Promise<T>): Promise<T | undefined> {

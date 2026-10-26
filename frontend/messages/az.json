@@ -23,7 +23,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} müşahidə edilmiş qovluq",
         "countPlural=other": "{countNumber} müşahidə edilmiş qovluq"
@@ -108,8 +110,14 @@
   "status_bar_archive_rebuilding": "Arxiv nəticələri köhnəlmiş ola bilər. Yenidən qurma bitənədək dəyişikliklər dayandırılıb.",
   "status_bar_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} sessiya",
         "countPlural=other": "{countLabel} sessiya"
@@ -118,8 +126,14 @@
   ],
   "status_bar_messages": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} mesaj",
         "countPlural=other": "{countLabel} mesaj"
@@ -128,8 +142,14 @@
   ],
   "status_bar_projects": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} layihə",
         "countPlural=other": "{countLabel} layihə"
@@ -201,8 +221,14 @@
   "session_breadcrumb_total_cost": "Cəmi",
   "session_breadcrumb_total_cost_title": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} alt agent daxil olmaqla ümumi xərc",
         "countPlural=other": "{countLabel} alt agent daxil olmaqla ümumi xərc"
@@ -213,8 +239,14 @@
   "session_breadcrumb_usage_breakdown_loading": "İstifadə məlumatları yüklənir...",
   "session_breadcrumb_usage_breakdown_steps": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} addım",
         "countPlural=other": "{countLabel} addım"
@@ -242,8 +274,13 @@
   "session_breadcrumb_summary_mode_tooltip": "Bu yazışma mətnində alət nəticələri, düşünmə və diff-lər yoxdur. Tam məzmun üçün agy-reader köməkçi xidməti lazımdır, onu quraşdırın və ya artıq quraşdırılıbsa, sinxronlaşdırmanın tamamlanmasını gözləyin. Necə edildiyini öyrənmək üçün klikləyin.",
   "session_breadcrumb_malformed_lines": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} yanlış quruluşlu sətir",
         "countPlural=other": "{count} yanlış quruluşlu sətir"
@@ -252,8 +289,13 @@
   ],
   "session_breadcrumb_malformed_lines_tooltip": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Mənbə faylındakı {count} sətri təhlil etmək mümkün olmadı",
         "countPlural=other": "Mənbə faylındakı {count} sətri təhlil etmək mümkün olmadı"
@@ -304,8 +346,14 @@
   "message_content_running_duration": "İcra olunur {duration}+",
   "message_content_turn_summary": [
     {
-      "declarations": ["input count", "input duration", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input duration",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Növbə {duration} · {count} çağırış",
         "countPlural=other": "Növbə {duration} · {count} çağırış"
@@ -314,8 +362,14 @@
   ],
   "message_content_running_turn_summary": [
     {
-      "declarations": ["input count", "input duration", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input duration",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "İcra olunur {duration}+ · {count} çağırış",
         "countPlural=other": "İcra olunur {duration}+ · {count} çağırış"
@@ -324,8 +378,13 @@
   ],
   "tool_call_group_call_count": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} alət çağırışı",
         "countPlural=other": "{count} alət çağırışı"
@@ -339,8 +398,13 @@
   "parallel_group_label": "Paralel",
   "parallel_group_call_count": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} çağırış",
         "countPlural=other": "{count} çağırış"
@@ -351,8 +415,13 @@
   "subagent_inline_label": "Alt agent sessiyası",
   "subagent_inline_message_count": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} mesaj",
         "countPlural=other": "{count} mesaj"
@@ -383,8 +452,13 @@
   "tool_block_show_less": "Daha az göstər",
   "tool_block_show_all_lines": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Bütün {count} sətri göstər",
         "countPlural=other": "Bütün {count} sətri göstər"
@@ -397,8 +471,14 @@
   "compact_boundary_show_full_summary": "Tam xülasəni göstər",
   "sidebar_session_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} sessiya",
         "countPlural=other": "{countLabel} sessiya"
@@ -521,8 +601,13 @@
   "shared_range_custom_range": "Fərdi aralıq",
   "shared_range_last_days": [
     {
-      "declarations": ["input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Son {count} gün",
         "countPlural=other": "Son {count} gün"
@@ -616,8 +701,14 @@
   "analytics_tool_usage_title": "Alət istifadəsi",
   "analytics_tool_usage_call_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} çağırış",
         "countPlural=other": "{countLabel} çağırış"
@@ -630,8 +721,14 @@
   "analytics_tool_usage_top_tools": "Aparıcı alətlər",
   "analytics_tool_usage_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} sessiya",
         "countPlural=other": "{countLabel} sessiya"
@@ -653,8 +750,14 @@
   "analytics_projects_title": "Layihələr",
   "analytics_project_messages": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} mesaj",
         "countPlural=other": "{countLabel} mesaj"
@@ -663,8 +766,14 @@
   ],
   "analytics_project_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} sessiya",
         "countPlural=other": "{countLabel} sessiya"
@@ -696,7 +805,9 @@
         "input countLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{day} {hour}:00 - {countLabel} mesaj",
         "countPlural=other": "{day} {hour}:00 - {countLabel} mesaj"
@@ -708,8 +819,14 @@
   "analytics_session_shape_autonomy": "Avtonomiya",
   "analytics_session_shape_session_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} sessiya",
         "countPlural=other": "{countLabel} sessiya"
@@ -753,7 +870,9 @@
         "input pct",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{skill}: {countLabel} çağırış ({pct}%)",
         "countPlural=other": "{skill}: {countLabel} çağırış ({pct}%)"
@@ -770,7 +889,10 @@
         "local callsPlural = calls: plural",
         "local skillsPlural = skills: plural"
       ],
-      "selectors": ["callsPlural", "skillsPlural"],
+      "selectors": [
+        "callsPlural",
+        "skillsPlural"
+      ],
       "match": {
         "callsPlural=one, skillsPlural=one": "{callsLabel} çağırış · {skillsLabel} bacarıq",
         "callsPlural=one, skillsPlural=other": "{callsLabel} çağırış · {skillsLabel} bacarıq",
@@ -829,8 +951,14 @@
   "usage_filter_deselect_all": "Bütün seçimləri ləğv et",
   "usage_filter_all_items": [
     {
-      "declarations": ["input label", "input count", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input label",
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Bütün {label}",
         "countPlural=other": "Bütün {label}"
@@ -914,7 +1042,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} layihə",
         "countPlural=other": "{countNumber} layihə"
@@ -928,7 +1058,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} sessiya",
         "countPlural=other": "{countNumber} sessiya"
@@ -942,7 +1074,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} kompüter",
         "countPlural=other": "{countNumber} kompüter"
@@ -956,7 +1090,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} qovluq təklifi",
         "countPlural=other": "{countNumber} qovluq təklifi"
@@ -970,7 +1106,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Qaydalarla idarə olunan {countNumber} sessiya",
         "countPlural=other": "Qaydalarla idarə olunan {countNumber} sessiya"
@@ -985,7 +1123,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} layihə seçilib",
         "countPlural=other": "{countNumber} layihə seçilib"
@@ -1001,7 +1141,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} layihə seçilib",
         "countPlural=other": "{countNumber} layihə seçilib"
@@ -1022,7 +1164,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} qovluq",
         "countPlural=other": "{countNumber} qovluq"
@@ -1038,7 +1182,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} düzəlişi yadda saxla",
         "countPlural=other": "{countNumber} düzəlişi yadda saxla"
@@ -1063,7 +1209,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} aktivləşdirilmiş qayda bu layihəni hədəfləyir",
         "countPlural=other": "{countNumber} aktivləşdirilmiş qayda bu layihəni hədəfləyir"
@@ -1097,7 +1245,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} sessiya",
         "countPlural=other": "{countNumber} sessiya"
@@ -1119,7 +1269,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} sessiya uyğun gəldi",
         "countPlural=other": "{countNumber} sessiya uyğun gəldi"
@@ -1133,7 +1285,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} sessiya dəyişəcək",
         "countPlural=other": "{countNumber} sessiya dəyişəcək"
@@ -1147,7 +1301,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} layihə",
         "countPlural=other": "{countNumber} layihə"
@@ -1163,7 +1319,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} sessiya",
         "countPlural=other": "{countNumber} sessiya"
@@ -1177,7 +1335,9 @@
         "local countPlural = count: plural",
         "local countNumber = count: number"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countNumber} sessiya önbaxışı",
         "countPlural=other": "{countNumber} sessiya önbaxışı"
@@ -1286,8 +1446,14 @@
   "activity_no_sessions_selected_range": "Seçilmiş vaxt aralığında aktiv sessiya yoxdur.",
   "activity_output_tokens_value": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} çıxış tokeni",
         "countPlural=other": "{countLabel} çıxış tokeni"
@@ -1334,7 +1500,9 @@
         "input automated",
         "local subagentPlural = subagents: plural"
       ],
-      "selectors": ["subagentPlural"],
+      "selectors": [
+        "subagentPlural"
+      ],
       "match": {
         "subagentPlural=one": "{interactive} interaktiv / {subagentsLabel} alt agent / {automated} avtomatlaşdırılmış",
         "subagentPlural=other": "{interactive} interaktiv / {subagentsLabel} alt agent / {automated} avtomatlaşdırılmış"
@@ -1472,8 +1640,14 @@
   "call_group_parallel_label": "Paralel",
   "call_group_parallel_call_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} çağırış",
         "countPlural=other": "{countLabel} çağırış"
@@ -1490,7 +1664,10 @@
         "input running",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural", "running"],
+      "selectors": [
+        "countPlural",
+        "running"
+      ],
       "match": {
         "countPlural=one,running=true": "{countLabel} çağırış · icra olunur {duration}+",
         "countPlural=other,running=true": "{countLabel} çağırış · icra olunur {duration}+",
@@ -1502,8 +1679,14 @@
   "activity_lane_activity": "Fəaliyyət",
   "activity_lane_message_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} mesaj",
         "countPlural=other": "{countLabel} mesaj"
@@ -1651,7 +1834,10 @@
         "local countPlural = count: plural",
         "local runningPlural = runningCount: plural"
       ],
-      "selectors": ["countPlural", "runningPlural"],
+      "selectors": [
+        "countPlural",
+        "runningPlural"
+      ],
       "match": {
         "countPlural=one,runningPlural=one": "{countLabel} çağırış · {runningCount} icra olunur",
         "countPlural=other,runningPlural=one": "{countLabel} çağırış · {runningCount} icra olunur",
@@ -1789,8 +1975,14 @@
   "insights_page_pct_affected": "{pct}% təsirlənib",
   "insights_pattern_recommendation_rationale": [
     {
-      "declarations": ["input affected", "input total", "local totalPlural = total: plural"],
-      "selectors": ["totalPlural"],
+      "declarations": [
+        "input affected",
+        "input total",
+        "local totalPlural = total: plural"
+      ],
+      "selectors": [
+        "totalPlural"
+      ],
       "match": {
         "totalPlural=one": "{total} sessiyadan {affected} sessiyada bu deterministik qanunauyğunluq var.",
         "totalPlural=other": "{total} sessiyadan {affected} sessiyada bu deterministik qanunauyğunluq var."
@@ -1849,7 +2041,9 @@
         "input failureSignals",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{count} sessiya, {completedRate}% tamamlanıb, orta hesabla {failureSignals} uğursuzluq",
         "countPlural=other": "{count} sessiya, {completedRate}% tamamlanıb, orta hesabla {failureSignals} uğursuzluq"
@@ -1858,8 +2052,14 @@
   ],
   "insights_page_driver_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} sessiya",
         "countPlural=other": "{countLabel} sessiya"
@@ -2087,7 +2287,9 @@
         "input totalLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{doneLabel} / {totalLabel} hissə",
         "countPlural=other": "{doneLabel} / {totalLabel} hissə"
@@ -2096,8 +2298,14 @@
   ],
   "settings_embeddings_rate": [
     {
-      "declarations": ["input count", "input rateLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input rateLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{rateLabel} hissə/san.",
         "countPlural=other": "{rateLabel} hissə/san."
@@ -2216,8 +2424,14 @@
   "trash_empty_trash": "Zibil qutusunu boşalt",
   "trash_msgs": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} mesaj",
         "countPlural=other": "{countLabel} mesaj"
@@ -2355,8 +2569,14 @@
   "settings_image_cleanup_empty": "Bu seçimdə saxlanılmış heç bir alət nəticəsinin daxilində şəkil məlumat yükü yoxdur.",
   "settings_image_cleanup_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} sessiya seçildi",
         "countPlural=other": "{countLabel} sessiya seçildi"
@@ -2365,8 +2585,14 @@
   ],
   "settings_image_cleanup_payloads": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} şəkil məlumat yükü",
         "countPlural=other": "{countLabel} şəkil məlumat yükü"
@@ -2392,8 +2618,14 @@
   "settings_image_cleanup_applied": "Şəkillərin silinməsi tamamlandı.",
   "settings_image_cleanup_changed": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} sessiya dəyişdirildi",
         "countPlural=other": "{countLabel} sessiya dəyişdirildi"
@@ -2408,8 +2640,14 @@
   "assistant_turn_event_message": "Mesaj",
   "assistant_turn_message_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} mesaj",
         "countPlural=other": "{countLabel} mesaj"
@@ -2418,8 +2656,14 @@
   ],
   "assistant_turn_tool_call_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} alət çağırışı",
         "countPlural=other": "{countLabel} alət çağırışı"
@@ -2464,8 +2708,14 @@
   "tool_sequences_no_sequences": "Heç bir alət çağırışı xəta və ya boş nəticə qaytarmayıb.",
   "tool_sequences_sequence_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} ardıcıllıq",
         "countPlural=other": "{countLabel} ardıcıllıq"
@@ -2492,17 +2742,32 @@
   "tool_sequences_no_input": "Giriş qeydə alınmayıb.",
   "tool_sequences_byte_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
-      "match": { "countPlural=one": "{countLabel} bayt", "countPlural=other": "{countLabel} bayt" }
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{countLabel} bayt",
+        "countPlural=other": "{countLabel} bayt"
+      }
     }
   ],
   "tool_sequences_result": "Nəticə",
   "tool_sequences_result_unknown": "Bu nəticə mətn deyil, ona görə nəticə naməlumdur.",
   "tool_sequences_result_unavailable": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Saxlanmış {countLabel} bayt nəticə mətni burada əlçatan deyil.",
         "countPlural=other": "Saxlanmış {countLabel} bayt nəticə mətni burada əlçatan deyil."
@@ -2519,8 +2784,14 @@
   "tool_sequences_flag_tool_switch": "Alət dəyişdi",
   "tool_sequences_sequence_calls": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Ardıcıllıqlarda {countLabel} çağırış",
         "countPlural=other": "Ardıcıllıqlarda {countLabel} çağırış"
@@ -2529,8 +2800,14 @@
   ],
   "tool_sequences_session_calls": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Sessiyada {countLabel} alət çağırışı",
         "countPlural=other": "Sessiyada {countLabel} alət çağırışı"
@@ -2543,8 +2820,14 @@
   "tool_sequences_jump_label": "Mesaj {ordinal}: transkriptdə {tool} çağırışını aç",
   "tool_sequences_more_calls": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "+{countLabel} daha",
         "countPlural=other": "+{countLabel} daha"
@@ -2560,7 +2843,9 @@
         "input to",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{from} və {to} nömrəli mesajlar arasında daha {countLabel} çağırış göstərilmir.",
         "countPlural=other": "{from} və {to} nömrəli mesajlar arasında daha {countLabel} çağırış göstərilmir."
@@ -2569,8 +2854,14 @@
   ],
   "tool_sequences_calls_in_row": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Ardıcıl {countLabel} çağırış.",
         "countPlural=other": "Ardıcıl {countLabel} çağırış."
@@ -2585,7 +2876,9 @@
         "input shownLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} ardıcıllıqdan {shownLabel} göstərilir. Qalanları sessiyada daha sonra gəlir.",
         "countPlural=other": "{countLabel} ardıcıllıqdan {shownLabel} göstərilir. Qalanları sessiyada daha sonra gəlir."
@@ -2594,8 +2887,14 @@
   ],
   "tool_sequences_calls_not_shown": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Ardıcıllıqlardakı {countLabel} çağırış bu görünüşdə göstərilmir.",
         "countPlural=other": "Ardıcıllıqlardakı {countLabel} çağırış bu görünüşdə göstərilmir."
@@ -2610,7 +2909,9 @@
         "input shownLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Önbaxış {countLabel} baytdan {shownLabel} baytı göstərir.",
         "countPlural=other": "Önbaxış {countLabel} baytdan {shownLabel} baytı göstərir."
@@ -2661,7 +2962,9 @@
         "input keptLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} çağırış girişi ən çox {keptLabel} bayta qısaldıldı",
         "countPlural=other": "{countLabel} çağırış girişi ən çox {keptLabel} bayta qısaldıldı"
@@ -2676,7 +2979,9 @@
         "input keptLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} çağırış nəticəsi ən çox {keptLabel} bayta qısaldıldı",
         "countPlural=other": "{countLabel} çağırış nəticəsi ən çox {keptLabel} bayta qısaldıldı"
@@ -2685,8 +2990,14 @@
   ],
   "tool_effectiveness_omission_unretained": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} çağırış nəticəsi saxlanmayıb",
         "countPlural=other": "{countLabel} çağırış nəticəsi saxlanmayıb"
@@ -2695,8 +3006,14 @@
   ],
   "tool_effectiveness_omission_no_result": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Nəticəsi qeydə alınmamış {countLabel} çağırış",
         "countPlural=other": "Nəticəsi qeydə alınmamış {countLabel} çağırış"
@@ -2711,7 +3028,9 @@
         "input charsLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} mesaj {charsLabel} simvolluq önizləmə kimi göstərilib",
         "countPlural=other": "{countLabel} mesaj {charsLabel} simvolluq önizləmə kimi göstərilib"
@@ -2727,7 +3046,9 @@
         "input currentLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Bu hesabatdan sonra sessiya dəyişib: model {countLabel} çağırışı qiymətləndirib, sessiyada indi {currentLabel} var.",
         "countPlural=other": "Bu hesabatdan sonra sessiya dəyişib: model {countLabel} çağırışı qiymətləndirib, sessiyada indi {currentLabel} var."
@@ -2739,8 +3060,14 @@
   "tool_sequences_jump_call_label": "Mesaj {ordinal}, çağırış {callNumber}: transkriptdə {tool} çağırışını aç",
   "tool_effectiveness_calls_judged": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} çağırış qiymətləndirilib",
         "countPlural=other": "{countLabel} çağırış qiymətləndirilib"
@@ -2749,8 +3076,14 @@
   ],
   "tool_effectiveness_conclusion_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} nəticə",
         "countPlural=other": "{countLabel} nəticə"
@@ -2759,8 +3092,14 @@
   ],
   "tool_effectiveness_count_helped": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} kömək etdi",
         "countPlural=other": "{countLabel} kömək etdi"
@@ -2769,8 +3108,14 @@
   ],
   "tool_effectiveness_count_did_not_help": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} kömək etmədi",
         "countPlural=other": "{countLabel} kömək etmədi"
@@ -2779,8 +3124,14 @@
   ],
   "tool_effectiveness_count_unknown": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} aydın deyil",
         "countPlural=other": "{countLabel} aydın deyil"
@@ -2795,7 +3146,9 @@
         "input citedLabel",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} çağırışdan {citedLabel} istinad edilib",
         "countPlural=other": "{countLabel} çağırışdan {citedLabel} istinad edilib"
@@ -2805,8 +3158,14 @@
   "tool_effectiveness_select_citation": "Çağırışları görmək üçün istinad seçin",
   "tool_effectiveness_citation_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} istinad",
         "countPlural=other": "{countLabel} istinad"
@@ -2818,8 +3177,14 @@
   "tool_effectiveness_left_out": "Modelin girişindən kənarda qalanlar",
   "tool_effectiveness_model_saw": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "model {countLabel} bayt gördü",
         "countPlural=other": "model {countLabel} bayt gördü"
@@ -2829,8 +3194,14 @@
   "tool_effectiveness_open_session": "Sessiyanı aç",
   "tool_effectiveness_message_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} mesaj",
         "countPlural=other": "{countLabel} mesaj"
@@ -2855,8 +3226,14 @@
   "analytics_tool_recovery_note": "Bərpa sonrakı çağırışın məzmun qaytarmasıdır. Bərpa faizi ardıcıllığı başlayan alətə aiddir.",
   "analytics_tool_evidence_count": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} sessiya",
         "countPlural=other": "{countLabel} sessiya"
@@ -2889,8 +3266,14 @@
   "plan_usage_five_hour_share": "Beş saatlıq Codex limitinin {percent}%-i",
   "plan_usage_credits": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} kredit",
         "countPlural=other": "{countLabel} kredit"
@@ -2905,8 +3288,14 @@
   "capture_tokens_live": "Tokenlər canlı tutulub, {time} vəziyyətinə",
   "capture_turns_not_captured": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} növbə tutulmayıb",
         "countPlural=other": "{countLabel} növbə tutulmayıb"
@@ -2921,7 +3310,9 @@
         "input time",
         "local countPlural = count: plural"
       ],
-      "selectors": ["countPlural"],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} növbə tutulmayıb; {time} tarixindən əvvəl baş veribsə, plan istifadəsi onu sayır",
         "countPlural=other": "{countLabel} növbə tutulmayıb; plan istifadəsi {time} tarixindən əvvəl baş verənləri sayır"
@@ -2930,8 +3321,14 @@
   ],
   "usage_plan_only_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} sessiya plan istifadəsi kimi hesablanıb, qiymətləndirilməyib",
         "countPlural=other": "{countLabel} sessiya plan istifadəsi kimi hesablanıb, qiymətləndirilməyib"
@@ -2940,8 +3337,14 @@
   ],
   "usage_partly_captured_sessions": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "{countLabel} sessiya qismən tutulub; onun token sayları azdır.",
         "countPlural=other": "{countLabel} sessiya qismən tutulub; onların token sayları azdır."
@@ -2951,8 +3354,14 @@
   "status_bar_codex_cloud_waiting": "Codex Cloud: ilk sinxronizasiya gözlənilir",
   "status_bar_codex_cloud_importing_found": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Codex Cloud: idxal edilir, indiyədək {countLabel} söhbət tapılıb",
         "countPlural=other": "Codex Cloud: idxal edilir, indiyədək {countLabel} söhbət tapılıb"
@@ -2963,8 +3372,14 @@
   "status_bar_codex_cloud_up_to_date": "Codex Cloud: {time} vəziyyətinə aktualdır",
   "status_bar_codex_cloud_retrying": [
     {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
       "match": {
         "countPlural=one": "Codex Cloud: {countLabel} söhbət idxal edilə bilmədi",
         "countPlural=other": "Codex Cloud: {countLabel} söhbət idxal edilə bilmədi"
@@ -2977,5 +3392,56 @@
   "status_bar_codex_cloud_live_attention": "Codex Cloud: canlı tokenlər diqqət tələb edir",
   "status_bar_codex_cloud_oldest_failure": "Ən köhnə uğursuzluq: {time}",
   "status_bar_codex_cloud_last_success": "Son uğurlu sinxronizasiya: {time}",
-  "status_bar_codex_cloud_homes": "Codex qovluqları: {homes}"
+  "status_bar_codex_cloud_homes": "Codex qovluqları: {homes}",
+  "session_breadcrumb_session_health": "Sessiya sağlamlığı",
+  "usage_click_to_hide_hint": "Diaqramdan gizlətmək üçün klikləyin",
+  "usage_click_to_hide": "{label} məlumatlarını gizlətmək üçün klikləyin",
+  "usage_hide_from_chart": "{label} məlumatlarını diaqramdan gizlət",
+  "usage_click_to_hide_item": "{label} məlumatlarını gizlətmək üçün klikləyin",
+  "pipeline_summary_title": "İcraların müqayisəsi",
+  "pipeline_summary_current": "Cari",
+  "pipeline_summary_baseline": "Baza",
+  "pipeline_summary_pin": "Baza kimi sabitlə",
+  "pipeline_summary_clear": "Bazanı sil",
+  "pipeline_summary_details": "Göstəricilər və mərhələlər",
+  "pipeline_summary_full_buffer": "Cəmlər oxutma mövqeyindən və filtrlərdən asılı olmayaraq bütün qeydə alınmış hadisələri əhatə edir. Baza yalnız bu səhifədə saxlanılan sabit anlıq görüntüdür.",
+  "pipeline_summary_empty": "hadisə yoxdur",
+  "pipeline_summary_unknown": "naməlum",
+  "pipeline_summary_partial": "Natamam qeyd: icranın başlanğıc və ya son hadisəsi yoxdur, yaxud ardıcıllıqda boşluqlar aşkarlanıb. Bu cəmlər müşahidələrdir, tam icra nəticələri deyil.",
+  "pipeline_summary_scenario_mismatch": "Ssenarilər fərqlidir: cari {current}, baza {baseline}. Fərqlər geriləmənin sübutu deyil.",
+  "pipeline_summary_complete": "tam qeyd",
+  "pipeline_summary_incomplete": "natamam qeyd",
+  "pipeline_summary_metric": "Göstərici",
+  "pipeline_summary_delta": "Dəyişiklik",
+  "pipeline_summary_events": "Hadisələr",
+  "pipeline_summary_paths": "Müşahidə edilmiş yollar",
+  "pipeline_summary_anomalies": "Anomaliyalar",
+  "pipeline_summary_missing": "Ardıcıllıqda çatışmayan hadisələr",
+  "pipeline_summary_lines": "Təsnif edilmiş sətirlər",
+  "pipeline_summary_inserts": "Əlavə edilmiş mesajlar",
+  "pipeline_summary_span": "Müşahidə müddəti (ms)",
+  "pipeline_summary_stage": "Mərhələ",
+  "pipeline_summary_metric_notes": "Müddət müşahidə edilmiş vaxt nişanlarının aralığıdır, mərhələ vaxtlarının cəmi deyil. Əlavələr yalnız messages_written üzrə hesablanır; tranzaksiya cəmləri əlavə edilmir. Daha kiçik say mütləq daha yaxşı demək deyil.",
+  "pipeline_open_local": "Yerli faylı aç…",
+  "pipeline_open_local_hint": "Qeydi yükləmədən bu brauzerdə oxu",
+  "pipeline_export_capture": "Qeydi ixrac et",
+  "pipeline_export_hint": "Bütün qeydə alınmış hadisələri JSONL kimi saxla; ilkin başlıq və ya run_started hadisəsi tələb olunur",
+  "pipeline_recording_loading": "Qeyd oxunur…",
+  "pipeline_recording_privacy": "Yerli faylı açmaq və qeydi ixrac etmək məlumatları serverə göndərmir. Qeydlərdə şəxsi yollar və söhbət mətni ola bilər; paylaşmazdan əvvəl yoxlayın.",
+  "pipeline_recording_limits": "Brauzer üçün qeyd həddi: 32 MiB və 50 000 hadisə.",
+  "pipeline_upload_hint": "Qeydi qoşulmuş serverə yüklə və oxut",
+  "pipeline_local_file_label": "Yerli konveyer qeydi",
+  "pipeline_recording_action_error": "Qeyd əməliyyatı alınmadı: {detail}",
+  "pipeline_recording_header_expected": "konveyer qeydi: sətir {line}: header obyekti gözlənilir",
+  "pipeline_recording_version_error": "konveyer qeydi: dəstəklənməyən format_version",
+  "pipeline_recording_header_fields": "konveyer qeydi: sətir {line}: yanlış header sahələri",
+  "pipeline_recording_event_fields": "konveyer qeydi: sətir {line}: yanlış hadisə sahələri",
+  "pipeline_recording_run_id_error": "konveyer qeydi: sətir {line}: run_id başlıqla uyğun gəlmir",
+  "pipeline_recording_sequence_error": "konveyer qeydi: sətir {line}: seq əvvəlki dəyərdən böyük olmalıdır",
+  "pipeline_recording_size_error": "konveyer qeydi: brauzerin 32 MiB həddini aşır",
+  "pipeline_recording_event_limit": "konveyer qeydi: brauzerin 50000 hadisə həddini aşır",
+  "pipeline_recording_json_error": "konveyer qeydi: sətir {line} açıla bilmədi: yanlış JSON",
+  "pipeline_recording_empty_error": "konveyer qeydi: boş qeyd; header tələb olunur",
+  "pipeline_recording_missing_start": "konveyer qeydi: run_started yoxdur; ilkin başlanğıc metadatası mövcud deyil",
+  "pipeline_recording_http_error": "konveyer qeydi: HTTP {status}"
 }

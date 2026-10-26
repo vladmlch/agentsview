@@ -34,6 +34,11 @@ ancestor permissions satisfy their checks.
 
 - Build with `CGO_ENABLED=1`; the SQLite driver requires CGO.
 - Use the `fts5` build tag for full-text search.
+- On macOS, when Command Line Tools ship a newer SDK than Xcode (e.g. CLT
+  MacOSX27.0.sdk with Xcode 26.5), cgo linking fails with `tapi error:
+  malformed file ... unknown architecture arm64e.x1`. Prefix Go builds and
+  `npm run check` with `SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"` to
+  use the Xcode SDK that its linker understands.
 - Do not add the `kit_posthog_disabled` tag to `go test`. The telemetry reporter
   disables itself under `testing.Testing()`. E2E binaries run as real
   processes, so their build keeps the tag.

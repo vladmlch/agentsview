@@ -73,7 +73,9 @@ export function parsePath(): {
   const isRootPath = pathname === "/";
 
   const segments = pathname.split("/").filter((s) => s.length > 0);
-  const routeStr = segments[0] ?? "";
+  const segment = segments[0] ?? "";
+  // Public alias; keep the internal route and existing /pipeline links stable.
+  const routeStr = segment === "playground" ? "pipeline" : segment;
   const route: Route = VALID_ROUTES.has(routeStr) ? (routeStr as Route) : DEFAULT_ROUTE;
 
   let sessionId: string | null = null;
