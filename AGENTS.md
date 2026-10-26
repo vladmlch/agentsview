@@ -1,3 +1,5 @@
+# Git fork sync strategy
+- always use git merge
 
 # Язык ответов
 
