@@ -974,9 +974,258 @@ describe("PipelineStore", () => {
     store.seek(0);
     store.pauseOnAnomaly = true;
     store.play();
-    vi.advanceTimersByTime(100); // playhead 2000 → all three consumed, e2 anomalous
-    expect(store.cursor).toBe(3);
+    vi.advanceTimersByTime(100); // Tick reaches e3, but e2 is the first anomaly.
+    expect(store.cursor).toBe(2);
+    expect(store.selected).toBe(1);
     expect(store.playing).toBe(false);
     expect(store.live).toBe(false);
+  });
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
+  return { promise, resolve, reject };
+}
+
+function sampleRecording(runId: string, gap = false): string {
+  return [
+    {
+      kind: "header",
+      format_version: 1,
+      run_id: runId,
+      started_at_ms: 1000,
+      scenario_id: "cold",
+      source_file: "sessions/example.jsonl",
+      source_sha256: "abc",
+    },
+    { seq: 101, at_ms: 1000, stage: "finalize", kind: "run_started", run_id: runId },
+    { seq: gap ? 105 : 102, at_ms: 1200, stage: "finalize", kind: "run_finished", run_id: runId },
+  ]
+    .map((item) => JSON.stringify(item))
+    .join("\n");
+}
+
+describe("PipelineStore recording replacement", () => {
+  it("makes the last requested recording win even when reads resolve out of order", async () => {
+    const first = deferred<Response>();
+    const second = deferred<Response>();
+    const store = new PipelineStore({
+      downloadRecording: (name) => (name === "a" ? first.promise : second.promise),
+    });
+    const a = store.playRecording("a");
+    const b = store.playRecording("b");
+    expect(store.recordingLoading).toBe(true);
+    second.resolve(new Response(sampleRecording("b")));
+    expect(await b).toBe(true);
+    first.resolve(new Response(sampleRecording("a")));
+    expect(await a).toBe(false);
+    expect(store.runId).toBe("b");
+    expect(store.recordingLoading).toBe(false);
+    expect(store.error).toBeNull();
+  });
+
+  it("does not surface an old download failure after a newer recording wins", async () => {
+    const first = deferred<Response>();
+    const store = new PipelineStore({
+      downloadRecording: (name) =>
+        name === "a" ? first.promise : Promise.resolve(new Response(sampleRecording("b"))),
+    });
+    const a = store.playRecording("a");
+    await store.playRecording("b");
+    first.reject(new Error("old failure"));
+    expect(await a).toBe(false);
+    expect(store.runId).toBe("b");
+    expect(store.error).toBeNull();
+  });
+
+  it.each(["detach", "live"])("invalidates an in-flight load on %s", async (action) => {
+    const pending = deferred<Response>();
+    const watch = fakeWatch();
+    const store = new PipelineStore({
+      watch: watch.watch,
+      downloadRecording: () => pending.promise,
+    });
+    const loading = store.playRecording("old");
+    if (action === "detach") store.detach();
+    else store.attachLive("new-live");
+    pending.resolve(new Response(sampleRecording("old")));
+    expect(await loading).toBe(false);
+    expect(store.events).toEqual([]);
+    expect(store.runId).toBe(action === "detach" ? null : "new-live");
+    expect(store.recordingLoading).toBe(false);
+    store.detach();
+  });
+
+  it("preserves the current stream during a failed local read", async () => {
+    const pending = deferred<string>();
+    const watch = fakeWatch();
+    const store = new PipelineStore({ watch: watch.watch });
+    store.attachLive("live");
+    watch.emit(ev("watch", "batch_formed"));
+    const file = { size: 10, text: () => pending.promise } as File;
+    const loading = store.playRecording(file);
+    watch.emit(ev("parse", "parse_started"));
+    expect(store.events).toHaveLength(2);
+    pending.reject(new Error("file read denied"));
+    expect(await loading).toBe(false);
+    watch.emit(ev("parse", "parse_done"));
+    expect(store.events).toHaveLength(3);
+    expect(store.cursor).toBe(3);
+    expect(store.runId).toBe("live");
+    expect(store.error).toContain("file read denied");
+    expect(store.recordingLoading).toBe(false);
+    store.detach();
+  });
+
+  it("ignores already queued callbacks from a stream after a recording replaces it", async () => {
+    const watch = fakeWatch();
+    const store = new PipelineStore({
+      watch: watch.watch,
+      downloadRecording: async () => new Response(sampleRecording("file")),
+    });
+    store.attachLive("old");
+    await store.playRecording("file");
+    watch.emit({ seq: 500, at_ms: 1300, stage: "watch", kind: "batch_formed" });
+    expect(store.events).toHaveLength(2);
+    expect(store.runId).toBe("file");
+  });
+
+  it.each(["malformed", "http", "body"])(
+    "keeps loaded data after a %s failure",
+    async (failure) => {
+      let failing = false;
+      const store = new PipelineStore({
+        downloadRecording: async () => {
+          if (!failing) return new Response(sampleRecording("good"));
+          if (failure === "http") return new Response("denied", { status: 403 });
+          if (failure === "body") {
+            return new Response(
+              new ReadableStream({
+                start(controller) {
+                  controller.error(new Error("body failed"));
+                },
+              }),
+            );
+          }
+          return new Response("null\n");
+        },
+      });
+      await store.playRecording("good");
+      failing = true;
+      expect(await store.playRecording("bad")).toBe(false);
+      expect(store.runId).toBe("good");
+      expect(store.events).toHaveLength(2);
+      expect(store.error).not.toBeNull();
+      expect(store.recordingLoading).toBe(false);
+    },
+  );
+
+  it("checks local file size before reading its contents", async () => {
+    const text = vi.fn(async () => sampleRecording("oversize"));
+    const file = { size: 32 * 1024 * 1024 + 1, text } as unknown as File;
+    const store = new PipelineStore();
+    expect(await store.playRecording(file)).toBe(false);
+    expect(text).not.toHaveBeenCalled();
+    expect(store.error).toContain("32 MiB");
+  });
+
+  it("counts imported sequence gaps and clears an old error after success", async () => {
+    const store = new PipelineStore({
+      downloadRecording: async () => new Response(sampleRecording("a", true)),
+    });
+    store.error = "old failure";
+    expect(await store.playRecording("a")).toBe(true);
+    expect(store.dropped).toBe(3);
+    expect(store.error).toBeNull();
+  });
+
+  it("exports the complete loaded buffer and original header despite a partial replay cursor", async () => {
+    const store = new PipelineStore({
+      downloadRecording: async () => new Response(sampleRecording("a", true)),
+    });
+    await store.playRecording("a");
+    store.seek(1);
+    const exported = store.exportRecording();
+    expect(exported?.name).toBe("pipeline-a.jsonl");
+    const parsed = parsePipelineRecording(exported!.text);
+    expect(parsed.events.map((event) => event.seq)).toEqual([101, 105]);
+    expect(parsed.header).toMatchObject({
+      source_sha256: "abc",
+      source_file: "sessions/example.jsonl",
+      started_at_ms: 1000,
+    });
+    expect(store.cursor).toBe(1);
+  });
+
+  it("refuses export when a live capture has no original start metadata", () => {
+    const store = new PipelineStore();
+    store.runId = "partial";
+    store.events = [ev("parse", "parse_done")];
+    expect(store.exportRecording()).toBeUndefined();
+    expect(store.error).toContain("run_started");
+  });
+});
+
+describe("PipelineStore precise anomaly stops", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it.each(["events", "time"] as const)(
+    "stops at successive anomalies in %s mode without overshooting",
+    (mode) => {
+      vi.useFakeTimers();
+      const watch = fakeWatch();
+      const store = new PipelineStore({ watch: watch.watch });
+      store.attachLive("a");
+      watch.emit(ev("watch", "batch_formed"));
+      watch.emit(ev("parse", "line_classified", { type: "malformed" }));
+      watch.emit(ev("parse", "line_classified", { type: "session_meta" }));
+      watch.emit(ev("parse", "parse_done", { error: "failed" }));
+      watch.emit(ev("finalize", "run_finished"));
+      store.seek(0);
+      store.playMode = mode;
+      store.rtSpeed = 1000;
+      store.pauseOnAnomaly = true;
+      store.play(20);
+      vi.advanceTimersByTime(100);
+      expect([store.cursor, store.selected, store.playing, store.live]).toEqual([
+        2,
+        1,
+        false,
+        false,
+      ]);
+      expect(store.viewState.run.finished).toBe(false);
+      store.play();
+      vi.advanceTimersByTime(100);
+      expect([store.cursor, store.selected, store.playing]).toEqual([4, 3, false]);
+      store.play();
+      vi.advanceTimersByTime(100);
+      expect([store.cursor, store.playing, store.live]).toEqual([5, false, true]);
+      expect(store.viewState.run.finished).toBe(true);
+      store.detach();
+    },
+  );
+});
+
+describe("recording-controlled property names", () => {
+  it.each(["__proto__", "constructor", "toString"])("reconstructs the literal path %s", (path) => {
+    const state = reduceEvents([
+      ev("parse", "parse_started", { mode: "incremental" }, path),
+      ev("parse", "line_classified", { line_no: 1, raw: "first" }, path),
+      ev("parse", "parse_started", { mode: "incremental" }, path),
+      ev("parse", "line_classified", { line_no: 1, raw: "second" }, path),
+    ]);
+    expect(Object.keys(state.files)).toEqual([path]);
+    expect(state.files[path]?.map((line) => line.raw)).toEqual(["first", "second"]);
+  });
+
+  it("does not treat an inherited property name as a stage-closing kind", () => {
+    const state = reduceEvents([ev("parse", "constructor")]);
+    expect(Object.keys(state.stageStatus)).toHaveLength(8);
+    expect(state.stageStatus.parse).toBe("active");
   });
 });

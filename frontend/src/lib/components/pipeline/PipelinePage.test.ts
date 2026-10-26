@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { tick } from "svelte";
-import { fireEvent, render, screen, within } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import PipelinePage from "./PipelinePage.svelte";
 import { PipelineStore, type PipelineEvent } from "../../stores/pipeline.svelte.js";
 
@@ -233,6 +233,157 @@ describe("PipelinePage", () => {
     await fireEvent.click(within(speed).getByRole("radio", { name: "20x" }));
     expect(store.speed).toBe(20);
 
+    unmount();
+  });
+});
+
+function localCapture(runId = "local-a"): string {
+  return [
+    { kind: "header", format_version: 1, run_id: runId, started_at_ms: 1000 },
+    { seq: 11, at_ms: 1000, stage: "finalize", kind: "run_started" },
+    { seq: 12, at_ms: 1200, stage: "finalize", kind: "run_finished" },
+  ]
+    .map((item) => JSON.stringify(item))
+    .join("\n");
+}
+
+function recordingFile(text: string): File {
+  const file = new File([text], "capture.jsonl", { type: "application/x-ndjson" });
+  // jsdom versions without Blob.text still exercise the actual File input.
+  Object.defineProperty(file, "text", { value: async () => text });
+  return file;
+}
+
+describe("PipelinePage local recordings", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("opens a local file without calling the upload or download API", async () => {
+    const upload = vi.fn(async () => ({ name: "uploaded.jsonl" }));
+    const download = vi.fn(async () => new Response(localCapture()));
+    const store = new PipelineStore({
+      listScenarios: async () => [],
+      listRuns: async () => [],
+      listRecordings: async () => [],
+      importRecordingApi: upload,
+      downloadRecording: download,
+    });
+    const { unmount } = render(PipelinePage, { props: { store } });
+    const input = screen.getByLabelText("Local pipeline recording") as HTMLInputElement;
+    await fireEvent.change(input, { target: { files: [recordingFile(localCapture())] } });
+    await waitFor(() => expect(store.runId).toBe("local-a"));
+    expect(store.events).toHaveLength(2);
+    expect(store.cursor).toBe(2);
+    expect(upload).not.toHaveBeenCalled();
+    expect(download).not.toHaveBeenCalled();
+    expect(input.value).toBe("");
+    unmount();
+  });
+
+  it("retains the current recording when local validation fails", async () => {
+    const store = testStore();
+    await store.playRecording(recordingFile(localCapture("good")));
+    const { unmount } = render(PipelinePage, { props: { store } });
+    await tick();
+    await fireEvent.change(screen.getByLabelText("Local pipeline recording"), {
+      target: { files: [recordingFile("null\n")] },
+    });
+    await screen.findByRole("alert");
+    expect(store.runId).toBe("good");
+    expect(store.events).toHaveLength(2);
+    unmount();
+  });
+
+  it("shows progress while a local read is pending", async () => {
+    let finish!: (text: string) => void;
+    const pending = new Promise<string>((resolve) => {
+      finish = resolve;
+    });
+    const file = new File(["data"], "slow.jsonl");
+    Object.defineProperty(file, "text", { value: () => pending });
+    const store = testStore();
+    const { unmount } = render(PipelinePage, { props: { store } });
+    await fireEvent.change(screen.getByLabelText("Local pipeline recording"), {
+      target: { files: [file] },
+    });
+    expect(screen.getByText("Reading recording\u2026")).toBeTruthy();
+    finish(localCapture());
+    await waitFor(() => expect(store.recordingLoading).toBe(false));
+    expect(screen.queryByText("Reading recording\u2026")).toBeNull();
+    unmount();
+  });
+
+  it("exports every captured event, keeps replay position, and releases the object URL", async () => {
+    const store = testStore();
+    await store.playRecording(recordingFile(localCapture()));
+    store.seek(1);
+    const exported = vi.spyOn(store, "exportRecording");
+    const createObjectURL = vi.fn(() => "blob:recording");
+    const revokeObjectURL = vi.fn();
+    class DownloadURL extends URL {
+      static override createObjectURL = createObjectURL;
+      static override revokeObjectURL = revokeObjectURL;
+    }
+    vi.stubGlobal("URL", DownloadURL);
+    let downloadName = "";
+    const click = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(function (this: HTMLAnchorElement) {
+        downloadName = this.download;
+      });
+    const { unmount } = render(PipelinePage, { props: { store } });
+    vi.useFakeTimers();
+    await fireEvent.click(screen.getByRole("button", { name: "Export capture" }));
+    expect(exported).toHaveBeenCalledTimes(1);
+    const snapshot = exported.mock.results[0]!.value as { text: string };
+    expect(snapshot.text.trim().split("\n")).toHaveLength(3);
+    expect(downloadName).toBe("pipeline-local-a.jsonl");
+    expect(store.cursor).toBe(1);
+    expect(click).toHaveBeenCalledTimes(1);
+    expect(createObjectURL).toHaveBeenCalledTimes(1);
+    expect(document.querySelector('a[download="pipeline-local-a.jsonl"]')).toBeNull();
+    vi.advanceTimersByTime(1000);
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:recording");
+    unmount();
+  });
+
+  it("does not let replay seeking alter the pinned comparison totals", async () => {
+    const store = testStore();
+    await store.playRecording(recordingFile(localCapture()));
+    const { unmount } = render(PipelinePage, { props: { store } });
+    await fireEvent.click(screen.getByRole("button", { name: "Pin as baseline" }));
+    store.seek(0);
+    await tick();
+    const table = screen.getByRole("table", { name: "Metric" });
+    const header = within(table).getByRole("rowheader", { name: "Events" });
+    expect(
+      within(header.closest("tr")!)
+        .getAllByRole("cell")
+        .map((cell) => cell.textContent),
+    ).toEqual(["2", "2", "0"]);
+    unmount();
+  });
+
+  it("keeps the existing Import action explicitly server-side", async () => {
+    const upload = vi.fn(async () => ({ name: "uploaded.jsonl" }));
+    const download = vi.fn(async () => new Response(localCapture("uploaded")));
+    const store = new PipelineStore({
+      listScenarios: async () => [],
+      listRuns: async () => [],
+      listRecordings: async () => [],
+      importRecordingApi: upload,
+      downloadRecording: download,
+    });
+    const { container, unmount } = render(PipelinePage, { props: { store } });
+    const input = container.querySelector('input[type="file"]:not([aria-label])')!;
+    const file = recordingFile(localCapture());
+    await fireEvent.change(input, { target: { files: [file] } });
+    await waitFor(() => expect(store.runId).toBe("uploaded"));
+    expect(upload).toHaveBeenCalledWith(file);
+    expect(download).toHaveBeenCalledWith("uploaded.jsonl");
     unmount();
   });
 });

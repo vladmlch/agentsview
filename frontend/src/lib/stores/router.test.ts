@@ -694,3 +694,43 @@ describe("RouterStore", () => {
     expect(href).toBe("/sessions/abc-123?starred=true");
   });
 });
+
+describe("playground route alias", () => {
+  afterEach(() => setURL("/"));
+
+  it.each(["/playground", "/playground/", "/pipeline"])("opens the pipeline page at %s", (path) => {
+    setURL(`${path}?desktop=1`);
+    expect(parsePath()).toEqual({
+      route: "pipeline",
+      sessionId: null,
+      params: { desktop: "1" },
+      isRootPath: false,
+    });
+    expect(window.location.pathname).toBe(path);
+  });
+
+  it("resolves the alias under an embedded base path", () => {
+    const base = document.createElement("base");
+    base.href = "/agentsview/";
+    document.head.appendChild(base);
+    try {
+      setURL("/agentsview/playground?desktop=1");
+      expect(parsePath()).toMatchObject({ route: "pipeline", params: { desktop: "1" } });
+    } finally {
+      base.remove();
+    }
+  });
+
+  it("restores the page on browser history navigation", () => {
+    setURL("/sessions");
+    const store = new RouterStore();
+    try {
+      setURL("/playground");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+      expect(store.route).toBe("pipeline");
+      expect(store.sessionId).toBeNull();
+    } finally {
+      store.destroy();
+    }
+  });
+});
